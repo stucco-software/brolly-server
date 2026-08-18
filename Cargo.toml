@@ -11,6 +11,8 @@ members = [
   "adapters/mastodon",
   "server",
   "test-support",
+  # Throwaway; removed when open decision O1 is closed.
+  "spikes/upstream",
 ]
 
 [workspace.package]
