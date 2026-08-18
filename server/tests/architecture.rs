@@ -135,6 +135,37 @@ fn only_server_depends_on_more_than_one_adapter() {
     }
 }
 
+/// Crates that mean I/O. `brolly-domain` must not reach any of them: the whole
+/// two-layer translation model is pure functions, which is what makes the
+/// round-trip property test in `domain/tests/roundtrip.rs` possible.
+///
+/// This deliberately checks `domain` only. Adapters legitimately need the
+/// network — Phase 7 speaks XRPC and PLC over HTTP — so *their* purity is a
+/// property of the `Adapter` impl, not of the crate, and review enforces it.
+#[test]
+fn domain_has_no_io_dependencies() {
+    let root = workspace_root();
+    let manifest: toml::Value = toml::from_str(
+        &std::fs::read_to_string(root.join("domain/Cargo.toml")).expect("read domain manifest"),
+    )
+    .expect("parse domain manifest");
+
+    const IO: [&str; 6] = ["sqlx", "reqwest", "tokio", "oxigraph", "axum", "hyper"];
+
+    let deps: Vec<String> = manifest
+        .get("dependencies")
+        .and_then(|d| d.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default();
+
+    let offenders: Vec<_> = deps.iter().filter(|d| IO.contains(&d.as_str())).collect();
+    assert!(
+        offenders.is_empty(),
+        "brolly-domain depends on {offenders:?}. It must stay pure — use oxrdf \
+         for the term model, not oxigraph, and let the store crate own I/O."
+    );
+}
+
 #[test]
 fn app_is_defined_only_in_the_server_crate() {
     let offenders: Vec<_> = source_files()

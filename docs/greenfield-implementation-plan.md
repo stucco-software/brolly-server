@@ -343,7 +343,7 @@ by intention.
 | Authz evaluates on every read path | conformance matrix run through all four surfaces |
 | Answer from the viewer's own store when possible | review rule; index additions need a stated reason |
 | Index holds pointers + filter keys only | schema test: no content predicates in the index graph |
-| Adapters are pure | adapter crates have no store/DB/network deps |
+| `brolly-domain` is pure | `server/tests/architecture.rs` — no sqlx/reqwest/tokio/oxigraph/axum/hyper. Adapter *impls* are pure too, but the crates legitimately need the network (XRPC, PLC), so that half is a review rule, not a test. |
 | Docs cite paths that exist | CI path-resolution check |
 | Migrations prefixed by owning crate | naming test in CI |
 

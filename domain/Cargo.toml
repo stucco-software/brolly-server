@@ -7,6 +7,11 @@ publish.workspace = true
 description = "Canonical vocabulary, quad model, projections, IRI canonicalization. Zero protocol deps, zero I/O."
 
 [dependencies]
+oxrdf = "0.3.3"
+serde_json = "1.0.151"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"
