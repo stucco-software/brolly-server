@@ -1,110 +1,44 @@
-/* Brolly design system — the single stylesheet and the single token source.
+/* Brolly components.
  *
- * A new feature extends the tokens or the components below. It does not add
- * another stylesheet: the checks in `server/tests/ui_invariants.rs` enforce
- * exactly one CSS entrypoint, and components must reference tokens rather than
- * literal colors.
+ * The ONLY hand-authored stylesheet. Every colour, space, type-size, radius and
+ * shadow below is a token from tokens.css — which is generated from
+ * batklubb.config.js and must not be edited directly (open decision O6,
+ * ADR 0004).
  *
- * Dark mode is defined at the token layer on purpose. Adding it here costs
- * almost nothing; retrofitting it after components exist does not.
- * (Open decision O7 — this file assumes "yes" until decided otherwise.)
+ * A new feature extends the tokens or the components here. It does not add a
+ * third stylesheet; server/tests/ui_invariants.rs enforces that.
  */
 
-:root {
-  color-scheme: light dark;
-
-  /* --- color: light ---------------------------------------------------- */
-  --color-bg:        #fbfbfa;
-  --color-surface:   #ffffff;
-  --color-border:    #e3e2df;
-  --color-fg:        #1a1a19;
-  --color-fg-muted:  #5c5b57;
-  --color-accent:    #2a5cdc;
-  --color-accent-fg: #ffffff;
-  --color-danger:    #b3261e;
-  --color-focus:     #2a5cdc;
-
-  /* --- space ----------------------------------------------------------- */
-  --space-2xs: 0.25rem;
-  --space-xs:  0.5rem;
-  --space-sm:  0.75rem;
-  --space-md:  1rem;
-  --space-lg:  1.5rem;
-  --space-xl:  2.5rem;
-  --space-2xl: 4rem;
-
-  /* --- type ------------------------------------------------------------ */
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
-  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-  --text-sm:   0.875rem;
-  --text-base: 1rem;
-  --text-lg:   1.25rem;
-  --text-xl:   1.75rem;
-  --text-2xl:  2.5rem;
-  --leading:   1.55;
-
-  /* --- shape ----------------------------------------------------------- */
-  --radius-sm: 4px;
-  --radius-md: 8px;
-  --radius-lg: 14px;
-  --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.06);
-  --shadow-md: 0 2px 8px rgb(0 0 0 / 0.08);
-
-  /* --- layout ---------------------------------------------------------- */
-  --measure: 68ch;
-  --shell-max: 60rem;
-}
-
-@media (prefers-color-scheme: dark) {
-  :root {
-    --color-bg:        #131314;
-    --color-surface:   #1c1c1e;
-    --color-border:    #333336;
-    --color-fg:        #ecebe8;
-    --color-fg-muted:  #a4a29c;
-    --color-accent:    #7ea2ff;
-    --color-accent-fg: #10131c;
-    --color-danger:    #f2b8b5;
-    --color-focus:     #7ea2ff;
-    --shadow-sm: 0 1px 2px rgb(0 0 0 / 0.5);
-    --shadow-md: 0 2px 8px rgb(0 0 0 / 0.55);
-  }
-}
-
-/* --- reset ------------------------------------------------------------- */
 *, *::before, *::after { box-sizing: border-box; }
 body, h1, h2, h3, p, figure, blockquote, ul, ol { margin: 0; }
 
 body {
   font-family: var(--font-sans);
-  font-size: var(--text-base);
-  line-height: var(--leading);
-  color: var(--color-fg);
-  background: var(--color-bg);
+  font-size: var(--txt-0);
+  line-height: var(--lead);
+  color: var(--foreground);
+  background: var(--background);
   min-height: 100vh;
   display: flex;
   flex-direction: column;
 }
 
-a { color: var(--color-accent); }
+a { color: var(--primary); }
 
 :focus-visible {
-  outline: 2px solid var(--color-focus);
+  outline: 2px solid var(--ring);
   outline-offset: 2px;
   border-radius: var(--radius-sm);
 }
 
-.skip-link {
-  position: absolute;
-  left: -9999px;
-}
+.skip-link { position: absolute; left: -9999px; }
 .skip-link:focus {
-  left: var(--space-md);
-  top: var(--space-md);
+  left: var(--sp-0);
+  top: var(--sp-0);
   z-index: 10;
-  padding: var(--space-xs) var(--space-sm);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
+  padding: var(--sp--1) var(--sp-0);
+  background: var(--surface);
+  border: 1px solid var(--border);
   border-radius: var(--radius-sm);
 }
 
@@ -113,90 +47,86 @@ a { color: var(--color-accent); }
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: var(--space-lg);
-  padding: var(--space-sm) var(--space-lg);
-  background: var(--color-surface);
-  border-bottom: 1px solid var(--color-border);
+  gap: var(--sp-1);
+  padding: var(--sp--1) var(--sp-1);
+  background: var(--surface);
+  border-bottom: 1px solid var(--border-subtle);
 }
-.brand {
-  font-weight: 650;
-  text-decoration: none;
-  color: var(--color-fg);
-}
-.shell-nav { display: flex; gap: var(--space-md); margin-left: auto; }
-.shell-nav a { color: var(--color-fg-muted); text-decoration: none; }
-.shell-nav a:hover { color: var(--color-fg); }
+.brand { font-weight: 650; text-decoration: none; color: var(--foreground); }
+.shell-nav { display: flex; gap: var(--sp-0); margin-left: auto; }
+.shell-nav a { color: var(--muted-fg); text-decoration: none; }
+.shell-nav a:hover { color: var(--foreground); }
 
 .shell-main {
   flex: 1;
   width: 100%;
-  max-width: var(--shell-max);
+  max-width: var(--grid-max-width);
   margin-inline: auto;
-  padding: var(--space-xl) var(--space-lg);
+  padding: var(--sp-2) var(--sp-1);
 }
 
 .shell-footer {
-  padding: var(--space-lg);
-  border-top: 1px solid var(--color-border);
-  color: var(--color-fg-muted);
-  font-size: var(--text-sm);
+  padding: var(--sp-1);
+  border-top: 1px solid var(--border-subtle);
+  color: var(--muted-fg);
+  font-size: var(--txt--1);
   text-align: center;
 }
 
 /* --- components -------------------------------------------------------- */
-.stack-lg > * + * { margin-top: var(--space-xl); }
+.stack-lg > * + * { margin-top: var(--sp-2); }
 
-.hero h1 { font-size: var(--text-2xl); line-height: 1.15; }
+.hero h1 { font-size: var(--txt-4); line-height: var(--lead-tight); }
 .lede {
-  font-size: var(--text-lg);
-  color: var(--color-fg-muted);
+  font-size: var(--txt-1);
+  color: var(--muted-fg);
   max-width: var(--measure);
-  margin-top: var(--space-sm);
+  margin-top: var(--sp--1);
 }
-.actions { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-lg); }
+.actions { display: flex; flex-wrap: wrap; gap: var(--sp--1); margin-top: var(--sp-1); }
 
 .button {
   display: inline-block;
-  padding: var(--space-xs) var(--space-md);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  color: var(--color-fg);
+  padding: var(--sp--1) var(--sp-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--secondary);
+  color: var(--secondary-fg);
   text-decoration: none;
-  font-size: var(--text-base);
+  font-size: var(--txt-0);
   cursor: pointer;
 }
-.button:hover { border-color: var(--color-fg-muted); }
+.button:hover { background: var(--hover); }
 .button-primary {
-  background: var(--color-accent);
-  border-color: var(--color-accent);
-  color: var(--color-accent-fg);
+  background: var(--primary);
+  border-color: var(--primary);
+  color: var(--primary-fg);
 }
 
 .card-grid {
   display: grid;
-  gap: var(--space-md);
+  gap: var(--sp-0);
   grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
 }
 .card {
-  padding: var(--space-lg);
-  background: var(--color-surface);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-lg);
-  box-shadow: var(--shadow-sm);
+  padding: var(--sp-1);
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
 }
-.card h2 { font-size: var(--text-lg); }
-.card p { color: var(--color-fg-muted); margin-top: var(--space-xs); }
+.card h2 { font-size: var(--txt-1); }
+.card p { color: var(--muted-fg); margin-top: var(--sp--1); }
 
 /* --- forms ------------------------------------------------------------- */
-.field { display: flex; flex-direction: column; gap: var(--space-2xs); }
-.field label { font-size: var(--text-sm); color: var(--color-fg-muted); }
+.field { display: flex; flex-direction: column; gap: var(--sp--2); }
+.field label { font-size: var(--txt--1); color: var(--muted-fg); }
 .field input, .field textarea, .field select {
-  padding: var(--space-xs) var(--space-sm);
-  border: 1px solid var(--color-border);
-  border-radius: var(--radius-md);
-  background: var(--color-surface);
-  color: var(--color-fg);
+  padding: var(--sp--1) var(--sp-0);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  color: var(--foreground);
   font: inherit;
 }
-.error { color: var(--color-danger); }
+.error { color: var(--destructive); }

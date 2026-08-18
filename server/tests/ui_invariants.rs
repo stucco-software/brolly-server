@@ -59,7 +59,7 @@ fn html_is_never_built_with_format() {
 }
 
 #[test]
-fn there_is_exactly_one_stylesheet() {
+fn there_is_exactly_one_hand_authored_stylesheet() {
     let static_dir = workspace_root().join("server/static");
     let sheets: Vec<_> = std::fs::read_dir(&static_dir)
         .expect("server/static exists")
@@ -68,28 +68,52 @@ fn there_is_exactly_one_stylesheet() {
         .filter(|p| p.extension().is_some_and(|e| e == "css"))
         .collect();
 
+    let generated: Vec<_> = sheets
+        .iter()
+        .filter(|p| {
+            std::fs::read_to_string(p)
+                .map(|t| t.starts_with("/* GENERATED FILE"))
+                .unwrap_or(false)
+        })
+        .collect();
+
     assert_eq!(
-        sheets.len(),
+        generated.len(),
         1,
-        "expected exactly one CSS entrypoint, found {sheets:?}. \
-         A new feature extends the tokens or components; it does not add a stylesheet."
+        "expected exactly one generated token file, found {generated:?}"
+    );
+    assert_eq!(
+        sheets.len() - generated.len(),
+        1,
+        "expected exactly one hand-authored stylesheet alongside the generated \
+         tokens, found {sheets:?}. A new feature extends the tokens or the \
+         components; it does not add a stylesheet."
+    );
+}
+
+#[test]
+fn the_token_file_is_never_hand_edited() {
+    let tokens = std::fs::read_to_string(workspace_root().join("server/static/tokens.css"))
+        .expect("read tokens.css");
+    assert!(
+        tokens.contains("DO NOT EDIT") && tokens.contains("tools/gen-tokens.sh"),
+        "tokens.css must carry its generated-file header"
+    );
+    assert!(
+        tokens.contains("prefers-color-scheme"),
+        "the OS colour-scheme bridge must survive regeneration — batklubb emits \
+         [data-theme] blocks only, so tools/gen-tokens.sh appends it"
     );
 }
 
 #[test]
 fn components_use_tokens_not_literal_colors() {
+    // Literal colours belong in batklubb.config.js, which generates tokens.css.
+    // The hand-authored stylesheet must reference tokens only.
     let css = std::fs::read_to_string(workspace_root().join("server/static/brolly.css"))
-        .expect("read stylesheet");
+        .expect("read brolly.css");
 
-    // Everything before the first component rule is the token layer, where
-    // literal colors are the point. After it, colors must come from var().
-    let marker = "/* --- reset ---";
-    let (tokens, components) = css
-        .split_once(marker)
-        .expect("stylesheet has a reset marker");
-    assert!(tokens.contains("--color-bg"), "token layer present");
-
-    let literals: Vec<_> = components
+    let literals: Vec<_> = css
         .lines()
         .filter(|l| {
             let l = l.trim();
@@ -99,7 +123,8 @@ fn components_use_tokens_not_literal_colors() {
 
     assert!(
         literals.is_empty(),
-        "literal colors outside the token layer: {literals:?}"
+        "literal colours in the hand-authored stylesheet: {literals:?}. \
+         Add them to batklubb.config.js and regenerate."
     );
 }
 

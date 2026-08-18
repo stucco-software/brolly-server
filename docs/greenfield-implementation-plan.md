@@ -353,13 +353,13 @@ by intention.
 
 | # | Decision | Needed by | Notes |
 |---|---|---|---|
-| O1 | **Library survey ADR** — `atrium-*` versions, `activitypub_federation` 0.7.x pin, cargo-deny clearance | end of Phase 0 | **Spike it, don't survey it.** The last attempt built its verdict table from line counts and four of eleven swaps turned out to be no-ops. Write one throwaway end-to-end path first: sign a commit, write a record, verify an inbound signature. |
-| O2 | **Instance-wide read inventory** — the complete list of queries no single pod can answer | Phase 2 | Public/local timeline, search, admin lists, ID routing, moderation. Short and knowable now; discovering it one denormalization at a time produced four create-then-drop migration pairs. |
+| ~~O1~~ | **CLOSED — ADR 0002, 0003.** Library survey ADR — `atrium-*` versions, `activitypub_federation` 0.7.x pin, cargo-deny clearance | end of Phase 0 | **Spike it, don't survey it.** The last attempt built its verdict table from line counts and four of eleven swaps turned out to be no-ops. Write one throwaway end-to-end path first: sign a commit, write a record, verify an inbound signature. |
+| ~~O2~~ | **CLOSED — ADR 0005.** Instance-wide read inventory — the complete list of queries no single pod can answer | Phase 2 | Public/local timeline, search, admin lists, ID routing, moderation. Short and knowable now; discovering it one denormalization at a time produced four create-then-drop migration pairs. |
 | O3 | **Publication container vocabulary term** — how a Solid app discovers a container is a publication surface | Phase 4 | Must be readable by a generic client, not a hardcoded path. |
 | O4 | **Mastodon status ID scheme** — owner-encoding ID, or `id → user_id` routing table | Phase 6 | Resource IRIs already name their owner; only Mastodon's opaque IDs lose it. |
 | O5 | **Store benchmark numbers** — open cost and steady-state memory per store | Phase 2 | Decides the LRU ceiling and the box. Never measured last time. |
-| O6 | **Design system source** — tokens from båtklubb, tokens *and* components, or hand-rolled | Phase 0 | Tokens-only is compatible with server-rendering. Components imply a build step and JS islands — viable, but decide it rather than drift into it. |
-| O7 | **Dark mode: yes or no** | Phase 0 | Nearly free at the token layer, expensive after components exist. Defaulting to "yes" costs almost nothing. |
+| ~~O6~~ | **CLOSED — ADR 0004.** Design system source — tokens from båtklubb, tokens *and* components, or hand-rolled | Phase 0 | Tokens-only is compatible with server-rendering. Components imply a build step and JS islands — viable, but decide it rather than drift into it. |
+| ~~O7~~ | **CLOSED — ADR 0004, yes.** Dark mode | Phase 0 | Nearly free at the token layer, expensive after components exist. Defaulting to "yes" costs almost nothing. |
 | O8 | **Scope vocabulary for the consent screen** — how Solid, ATProto, and Mastodon scopes render as one comprehensible question | Phase 3 | The highest-stakes screen in the product; three protocols must not each invent their own wording. |
 
 ---
