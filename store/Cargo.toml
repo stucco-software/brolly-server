@@ -8,6 +8,13 @@ description = "Per-user pod stores, the server-agent store, and query helpers."
 
 [dependencies]
 brolly-domain.workspace = true
+moka = { version = "0.12.16", features = ["sync"] }
+oxigraph = "0.5.9"
+serde_json = "1.0.151"
+uuid = { version = "1.24.1", features = ["v4", "serde"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

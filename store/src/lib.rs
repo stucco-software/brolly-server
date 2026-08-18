@@ -1,4 +1,4 @@
-//! Per-user pod stores, the server-agent store, and query helpers.
+//! Per-user pod stores, the server-agent store, and the single write path.
 //!
 //! Two surfaces, and every query resolves to exactly one of them:
 //!
@@ -7,7 +7,17 @@
 //! | pod | one user's data, all protocols | cross-*protocol* joins |
 //! | server agent | pointers + filter keys for all users | cross-*user* queries |
 //!
-//! The server-agent store holds **pointers and filter keys only, never content**.
-//! See `docs/greenfield-implementation-plan.md` §2.2 and §3 Phase 2.
+//! The server-agent store holds **pointers and filter keys only, never
+//! content** (decision D5), which is what makes account deletion `rm -rf` on
+//! one directory and leaves the index to self-heal.
+//!
+//! See `docs/greenfield-implementation-plan.md` §3 Phase 2 and ADR 0005.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+pub mod index;
+pub mod manager;
+pub mod write;
+
+pub use manager::{StoreError, StoreManager};
+pub use write::{insert_quads, insert_record};

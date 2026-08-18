@@ -16,6 +16,22 @@ ignore = [
   # Review trigger: re-evaluate if `rsa` ships a fix, if we gain an inbound path
   # that performs RSA decryption, or by 2027-08-18 — whichever comes first.
   "RUSTSEC-2023-0071",
+
+  # RUSTSEC-2026-0194 / RUSTSEC-2026-0195 — quadratic parse and unbounded
+  # namespace allocation in quick-xml 0.37.5, both denial-of-service class.
+  #
+  # Paired with a real mitigation, not waved through: we never parse RDF/XML
+  # from network input, so the vulnerable code is unreachable from untrusted
+  # data. See ADR 0007 — Phase 4 rejects `application/rdf+xml` on every write
+  # path with 415, and a test asserts it.
+  #
+  # Not fixable by us: quick-xml 0.37.5 is the newest in its line, pinned by
+  # oxrdfxml <- oxrdfio <- oxigraph, and RDF/XML is not an optional feature.
+  #
+  # Review trigger: any oxigraph bump. If it accepts a fixed quick-xml, drop
+  # these and reconsider accepting RDF/XML on input.
+  "RUSTSEC-2026-0194",
+  "RUSTSEC-2026-0195",
 ]
 
 [bans]

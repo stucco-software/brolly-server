@@ -1,0 +1,218 @@
+//! Phase 2 invariants, as tests rather than conventions.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+use brolly_domain::iri::{iris_in, is_canonical};
+use brolly_store::index::{self, NotePointer};
+use brolly_store::{StoreManager, insert_quads, insert_record};
+use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
+use serde_json::json;
+use uuid::Uuid;
+
+fn node(s: &str) -> NamedNode {
+    NamedNode::new_unchecked(s)
+}
+
+fn manager() -> (StoreManager, tempfile::TempDir) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mgr = StoreManager::open(dir.path(), 8, 60).expect("open manager");
+    (mgr, dir)
+}
+
+// --- the write path canonicalizes ------------------------------------------
+
+#[test]
+fn non_canonical_iris_cannot_survive_the_write_path() {
+    let (mgr, _dir) = manager();
+    let user = Uuid::new_v4();
+    let pod = mgr.pod(user).unwrap();
+    let graph = node("https://alice.brolly.id/inbox");
+
+    // Exactly what Mastodon sends: the http spelling of AS2.
+    let hostile = vec![Quad::new(
+        NamedOrBlankNode::NamedNode(node("https://alice.brolly.id/notes/1")),
+        node("http://www.w3.org/ns/activitystreams#content"),
+        Term::NamedNode(node("http://www.w3.org/ns/activitystreams#Public")),
+        GraphName::NamedNode(graph.clone()),
+    )];
+    insert_quads(&pod, &hostile).unwrap();
+
+    let stored: Vec<Quad> = pod
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(graph.as_ref())),
+        )
+        .filter_map(Result::ok)
+        .collect();
+
+    assert!(!stored.is_empty());
+    for quad in &stored {
+        for iri in iris_in(quad) {
+            assert!(is_canonical(iri), "{iri} reached storage non-canonical");
+        }
+    }
+}
+
+#[test]
+fn records_round_trip_through_a_real_store() {
+    let (mgr, _dir) = manager();
+    let pod = mgr.pod(Uuid::new_v4()).unwrap();
+    let subject = node("https://alice.brolly.id/records/1");
+
+    let record = json!({
+        "$type": "app.bsky.feed.post",
+        "text": "stored and read back",
+        "langs": ["en"],
+        "reply": {"root": {"uri": "at://x/1"}}
+    });
+    insert_record(&pod, &record, &subject, &subject, "app.bsky.feed.post").unwrap();
+
+    let quads: Vec<Quad> = pod
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(subject.as_ref())),
+        )
+        .filter_map(Result::ok)
+        .collect();
+
+    let decoded = brolly_domain::faithful::decode(&quads, &subject).unwrap();
+    assert_eq!(decoded, record, "storage must not be lossy");
+}
+
+// --- pods are isolated ------------------------------------------------------
+
+#[test]
+fn pods_are_isolated_and_delete_is_rm_rf() {
+    let (mgr, _dir) = manager();
+    let alice = Uuid::new_v4();
+    let bob = Uuid::new_v4();
+    let subject = node("https://alice.brolly.id/records/1");
+
+    insert_record(
+        &mgr.pod(alice).unwrap(),
+        &json!({"text": "alice's"}),
+        &subject,
+        &subject,
+        "test.note",
+    )
+    .unwrap();
+
+    let bob_pod = mgr.pod(bob).unwrap();
+    assert_eq!(
+        bob_pod.quads_for_pattern(None, None, None, None).count(),
+        0,
+        "one user's write must not appear in another's pod"
+    );
+
+    assert!(mgr.pod_bytes(alice).unwrap() > 0);
+    mgr.delete_pod(alice).unwrap();
+    assert!(!mgr.pod_exists(alice));
+    assert_eq!(mgr.pod_bytes(alice).unwrap(), 0, "delete is rm -rf");
+}
+
+// --- the index holds pointers, never content --------------------------------
+
+fn seed_index(store: &oxigraph::store::Store) {
+    for (n, when) in [("1", "2026-08-18T10:00:00Z"), ("2", "2026-08-18T11:00:00Z")] {
+        index::record_note(
+            store,
+            &NotePointer {
+                note: node(&format!("https://alice.brolly.id/notes/{n}")),
+                author: node("https://alice.brolly.id/actor"),
+                published: when.to_string(),
+                audience: node("https://www.w3.org/ns/activitystreams#Public"),
+                in_reply_to: None,
+            },
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+fn the_index_uses_only_allowlisted_predicates() {
+    let (mgr, _dir) = manager();
+    seed_index(mgr.instance());
+
+    let used: Vec<String> = mgr
+        .instance()
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(
+                node(index::PUBLIC_TIMELINE).as_ref(),
+            )),
+        )
+        .filter_map(Result::ok)
+        .map(|q| q.predicate.as_str().to_string())
+        .collect();
+
+    assert!(!used.is_empty());
+    for predicate in &used {
+        assert!(
+            index::ALLOWED_PREDICATES.contains(&predicate.as_str()),
+            "{predicate} is not a pointer or filter key — the index must never hold content"
+        );
+    }
+    assert!(
+        !used
+            .iter()
+            .any(|p| p.contains("content") || p.contains("#text")),
+        "content predicate leaked into the index"
+    );
+}
+
+#[test]
+fn public_timeline_is_ordered_and_paginated() {
+    let (mgr, _dir) = manager();
+    seed_index(mgr.instance());
+    let public = node("https://www.w3.org/ns/activitystreams#Public");
+
+    let page = index::public_timeline(mgr.instance(), &public, 10, None).unwrap();
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].published, "2026-08-18T11:00:00Z", "newest first");
+
+    let next =
+        index::public_timeline(mgr.instance(), &public, 10, Some("2026-08-18T11:00:00Z")).unwrap();
+    assert_eq!(next.len(), 1);
+    assert_eq!(next[0].published, "2026-08-18T10:00:00Z");
+
+    let limited = index::public_timeline(mgr.instance(), &public, 1, None).unwrap();
+    assert_eq!(limited.len(), 1, "limit is applied in the engine");
+}
+
+#[test]
+fn dangling_rows_sweep_and_the_index_rebuilds() {
+    let (mgr, _dir) = manager();
+    seed_index(mgr.instance());
+    let public = node("https://www.w3.org/ns/activitystreams#Public");
+
+    // A pod deletes a note; the row is left dangling until dereference sweeps it.
+    index::forget_note(mgr.instance(), &node("https://alice.brolly.id/notes/1")).unwrap();
+    assert_eq!(
+        index::public_timeline(mgr.instance(), &public, 10, None)
+            .unwrap()
+            .len(),
+        1
+    );
+
+    index::clear(mgr.instance()).unwrap();
+    assert!(
+        index::public_timeline(mgr.instance(), &public, 10, None)
+            .unwrap()
+            .is_empty(),
+        "clear is the first half of a rebuild"
+    );
+
+    seed_index(mgr.instance());
+    assert_eq!(
+        index::public_timeline(mgr.instance(), &public, 10, None)
+            .unwrap()
+            .len(),
+        2,
+        "replay reproduces the index"
+    );
+}

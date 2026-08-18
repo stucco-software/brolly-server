@@ -164,6 +164,9 @@ vocabulary hardest. Ship it before anything federates.
 - N3 Patch and `application/sparql-update` PATCH — both through the same solver
   this time, not one delegating to the engine and one hand-rolled.
 - Solid-OIDC provider (issuer) and verifier.
+- **Reject `application/rdf+xml` on every write path** with 415, per ADR 0007 —
+  two live DoS advisories in `quick-xml` are reachable from federation input
+  otherwise, and the dependency cannot be removed.
 - **The typed publication container** (D9): a container whose type marks it a
   publication surface. A write of `rdf:type as:Note` *there* is a post; anywhere
   else is private CRUD. ACL defaults must state that Append on it means "may post
@@ -357,7 +360,7 @@ by intention.
 | ~~O2~~ | **CLOSED — ADR 0005.** Instance-wide read inventory — the complete list of queries no single pod can answer | Phase 2 | Public/local timeline, search, admin lists, ID routing, moderation. Short and knowable now; discovering it one denormalization at a time produced four create-then-drop migration pairs. |
 | O3 | **Publication container vocabulary term** — how a Solid app discovers a container is a publication surface | Phase 4 | Must be readable by a generic client, not a hardcoded path. |
 | O4 | **Mastodon status ID scheme** — owner-encoding ID, or `id → user_id` routing table | Phase 6 | Resource IRIs already name their owner; only Mastodon's opaque IDs lose it. |
-| O5 | **Store benchmark numbers** — open cost and steady-state memory per store | Phase 2 | Decides the LRU ceiling and the box. Never measured last time. |
+| ~~O5~~ | **CLOSED — ADR 0006.** Store benchmark numbers | Phase 2 | LRU miss 8.1 ms vs hit 541 ns; 435 KB floor per empty pod. Resident memory still unmeasured. |
 | ~~O6~~ | **CLOSED — ADR 0004.** Design system source — tokens from båtklubb, tokens *and* components, or hand-rolled | Phase 0 | Tokens-only is compatible with server-rendering. Components imply a build step and JS islands — viable, but decide it rather than drift into it. |
 | ~~O7~~ | **CLOSED — ADR 0004, yes.** Dark mode | Phase 0 | Nearly free at the token layer, expensive after components exist. Defaulting to "yes" costs almost nothing. |
 | O8 | **Scope vocabulary for the consent screen** — how Solid, ATProto, and Mastodon scopes render as one comprehensible question | Phase 3 | The highest-stakes screen in the product; three protocols must not each invent their own wording. |
