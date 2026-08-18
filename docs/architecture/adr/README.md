@@ -33,7 +33,7 @@ Keep them to a screen or two.
 |---|-------|--------|
 | [0001](0001-locked-decisions-live-in-the-plan.md) | Locked decisions live in the plan, not in ADRs | Accepted |
 | [0002](0002-adopt-atrium-for-atproto.md) | Adopt `atrium-*` for ATProtocol primitives | Accepted |
-| [0003](0003-activitypub-federation-licence.md) | `activitypub_federation` forces AGPL-3.0 on the whole product | Proposed |
+| [0003](0003-activitypub-federation-licence.md) | Adopt `activitypub_federation`; brolly is AGPL-3.0-or-later | Accepted |
 
 ## When to write one
 

@@ -1,5 +1,22 @@
 [advisories]
 yanked = "deny"
+ignore = [
+  # RUSTSEC-2023-0071 — Marvin attack, timing sidechannel in the `rsa` crate.
+  #
+  # Accepted, not ignored casually:
+  #   * There is no fixed release. The advisory has been open since 2023 and the
+  #     only remediation upstream offers is "do not use this crate".
+  #   * It arrives transitively via activitypub_federation, which needs RSA for
+  #     cavage HTTP signatures. Every major fediverse implementation in Rust
+  #     carries the same exposure, as did our own predecessor.
+  #   * Exploitation requires an attacker able to induce and finely time many
+  #     private-key operations. Our RSA private-key use is outbound delivery
+  #     signing, not a decryption oracle.
+  #
+  # Review trigger: re-evaluate if `rsa` ships a fix, if we gain an inbound path
+  # that performs RSA decryption, or by 2027-08-18 — whichever comes first.
+  "RUSTSEC-2023-0071",
+]
 
 [bans]
 multiple-versions = "warn"
@@ -22,6 +39,13 @@ allow = [
   "MPL-2.0",
   # webpki-roots ships the Mozilla CA bundle under a permissive data license.
   "CDLA-Permissive-2.0",
+  # brolly itself is AGPL-3.0-or-later (ADR 0003), so the copyleft family in
+  # the ActivityPub stack is compatible rather than merely tolerated.
+  # Our own crates declare AGPL-3.0-or-later; the AP stack declares the
+  # bare/older forms. SPDX treats these as distinct expressions, so list each.
+  "AGPL-3.0-or-later",
+  "AGPL-3.0",
+  "GPL-3.0",
 ]
 confidence-threshold = 0.9
 

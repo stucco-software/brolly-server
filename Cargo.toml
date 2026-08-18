@@ -18,7 +18,9 @@ members = [
 [workspace.package]
 edition = "2024"
 version = "0.1.0"
-license = "Apache-2.0 OR MIT"
+# AGPL-3.0: brolly is a public good. The network clause is the point —
+# operators who modify it owe their users the source. See ADR 0003.
+license = "AGPL-3.0-or-later"
 publish = false
 
 [workspace.dependencies]

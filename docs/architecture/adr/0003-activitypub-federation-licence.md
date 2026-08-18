@@ -1,7 +1,7 @@
 # 0003 — `activitypub_federation` forces AGPL-3.0 on the whole product
 
-**Status:** Proposed — needs a product decision (2026-08-18)
-**Blocks:** open decision O1, ActivityPub half. Blocks Phase 5.
+**Status:** Accepted (2026-08-18)
+**Closes:** open decision O1, ActivityPub half. Unblocks Phase 5.
 
 ## Context
 
@@ -62,21 +62,52 @@ signature code back in our hands.
 **C — Adopt for the parts that are not AGPL.** Not available. The signature
 primitives are `pub(crate)`; there is nothing to take piecemeal.
 
-## Recommendation
+## Decision
 
-**B for Phase 5, with the licence question decided separately and deliberately.**
+**Option A. Adopt `activitypub_federation`, and licence brolly-server
+`AGPL-3.0-or-later`.**
 
-The rationale is that the licence decision should be driven by what we want the
-product to be, not by a transitive dependency of one adapter. If AGPL is right
-for brolly, choose it on its merits and then option A becomes free. If it is
-not, option A was never actually available and discovering that in Phase 5
-would be expensive.
+The licence is not a cost we are absorbing to get a dependency — it is the
+intended posture. brolly is meant as a public good, and the network clause is
+the point: an operator who modifies it owes their users the source. That places
+us in the same licence family as Mastodon, Lemmy, and Pixelfed, which is native
+to the fediverse rather than a concession to it.
 
-Hand-rolling cavage is a known quantity here — the predecessor's implementation
-interoperated with the whole fediverse, and its module boundary was clean. This
-is the one place where "we already did it once and it worked" is real evidence.
+Because the licence question is settled on its own merits, the framework's AGPL
+status stops being a blocker and the `pub(crate)` signature primitives stop
+mattering — we are adopting the whole framework deliberately.
+
+### Accepted alongside it
+
+- **`rsa 0.9.10` / RUSTSEC-2023-0071.** No fixed release exists and none is
+  expected; upstream's only remediation is "do not use this crate." Recorded as
+  an explicit, justified `ignore` in `deny.toml` with a review trigger, rather
+  than by loosening the advisory gate. Our RSA private-key use is outbound
+  signature generation, not a decryption oracle, and the exposure is identical
+  to the predecessor's and to the rest of the Rust fediverse.
+- **A stalled pre-release.** We pin `0.7.0-beta.11` because it is the only
+  version that unifies on axum 0.8; `0.7.0` has never shipped and beta.11 has
+  not moved in roughly three months. Treat a version bump as a change requiring
+  the spike to be re-run, and watch for the crate going unmaintained.
+
+## Consequences
+
+- **The whole workspace is AGPL-3.0-or-later.** `LICENSE` carries the full text;
+  the workspace manifest declares it; every crate inherits it. Permissive
+  relicensing is off the table from here, which is the intended outcome.
+- **Phase 5 is unblocked** and gets the framework's inbox, delivery, retry, and
+  cavage signature handling instead of ~450 hand-rolled lines.
+- **`cargo deny` now allows AGPL-3.0 and GPL-3.0** because they are compatible
+  with our own licence, not because the gate was weakened.
+- **ADR 0002's ATProtocol stack is unaffected** — `atrium-*` is MIT, which is
+  compatible with an AGPL combined work.
+
+## Superseded reasoning
+
+An earlier draft of this ADR recommended option B (hand-roll ActivityPub, keep
+Apache-2.0/MIT) on the grounds that the licence should be chosen deliberately
+rather than inherited from a transitive dependency. That reasoning was right and
+the deliberate choice was made — it simply came out the other way. Recorded here
+so the argument is not re-run.
 
 ## Consequences of deferring
-
-Phase 5 cannot start until this is decided. Phases 0–4 and 7 are unaffected:
-ADR 0002's ATProtocol stack is MIT throughout.

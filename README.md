@@ -8,6 +8,12 @@ writing the same per-user RDF store.
 - **Why it's shaped this way:** [`docs/greenfield-learnings.md`](docs/greenfield-learnings.md) — a retrospective on the predecessor
 - **Decisions:** plan §1 (D1–D16), plus [`docs/architecture/adr/`](docs/architecture/adr/)
 
+## Licence
+
+**AGPL-3.0-or-later.** brolly is intended as a public good: if you run a modified
+copy, the network clause means you owe your users the source. See
+[`docs/architecture/adr/0003-activitypub-federation-licence.md`](docs/architecture/adr/0003-activitypub-federation-licence.md).
+
 ## Status
 
 **Phase 0 — Foundations.** The workspace, the crate graph, the lint and test
