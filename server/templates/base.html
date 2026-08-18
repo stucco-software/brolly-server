@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}{{ instance_name }}{% endblock %}</title>
+  <link rel="stylesheet" href="/static/brolly.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="shell-header">
+    <a class="brand" href="/">{{ instance_name }}</a>
+    <nav class="shell-nav" aria-label="Primary">
+      {% block nav %}{% endblock %}
+    </nav>
+  </header>
+  <main id="main" class="shell-main">
+    {% block content %}{% endblock %}
+  </main>
+  <footer class="shell-footer">
+    <p>Running <a href="https://github.com/">Brolly</a> — a Solid pod, an ATProto PDS, and an ActivityPub server over one triplestore.</p>
+  </footer>
+</body>
+</html>

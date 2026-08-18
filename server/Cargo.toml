@@ -1,0 +1,38 @@
+[package]
+name = "brolly-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Composes the adapters, owns app(), spawns workers. The only crate depending on more than one adapter."
+
+[lib]
+name = "brolly_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "brolly-server"
+path = "src/main.rs"
+
+[dependencies]
+brolly-domain.workspace = true
+brolly-store.workspace = true
+brolly-authz.workspace = true
+brolly-identity.workspace = true
+brolly-solid.workspace = true
+brolly-atproto.workspace = true
+brolly-activitypub.workspace = true
+brolly-mastodon.workspace = true
+tracing.workspace = true
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+axum = "0.8.9"
+tokio = { version = "1.53.1", features = ["full"] }
+askama = "0.14"
+tower-http = { version = "0.7.0", features = ["fs"] }
+
+[dev-dependencies]
+brolly-test-support.workspace = true
+toml = "0.8"
+
+[lints]
+workspace = true

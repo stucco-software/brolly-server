@@ -1,0 +1,16 @@
+[package]
+name = "brolly-mastodon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Mastodon Client API. Projection only — no store writes, no sibling-adapter deps."
+
+[dependencies]
+brolly-domain.workspace = true
+brolly-store.workspace = true
+brolly-authz.workspace = true
+brolly-identity.workspace = true
+
+[lints]
+workspace = true

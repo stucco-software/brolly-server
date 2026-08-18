@@ -1,0 +1,14 @@
+[package]
+name = "brolly-authz"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Web Access Control, evaluated as SPARQL on every read path."
+
+[dependencies]
+brolly-domain.workspace = true
+brolly-store.workspace = true
+
+[lints]
+workspace = true

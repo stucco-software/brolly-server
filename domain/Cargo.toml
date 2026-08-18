@@ -1,0 +1,12 @@
+[package]
+name = "brolly-domain"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Canonical vocabulary, quad model, projections, IRI canonicalization. Zero protocol deps, zero I/O."
+
+[dependencies]
+
+[lints]
+workspace = true

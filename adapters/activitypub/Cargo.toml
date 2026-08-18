@@ -1,0 +1,16 @@
+[package]
+name = "brolly-activitypub"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "ActivityPub: AS2 delivery, inbox, HTTP signatures (cavage-09)."
+
+[dependencies]
+brolly-domain.workspace = true
+brolly-store.workspace = true
+brolly-authz.workspace = true
+brolly-identity.workspace = true
+
+[lints]
+workspace = true

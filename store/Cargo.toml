@@ -1,0 +1,13 @@
+[package]
+name = "brolly-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Per-user pod stores, the server-agent store, and query helpers."
+
+[dependencies]
+brolly-domain.workspace = true
+
+[lints]
+workspace = true

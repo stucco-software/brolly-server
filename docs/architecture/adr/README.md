@@ -1,0 +1,41 @@
+# Architecture Decision Records
+
+One decision per file. ADRs append; they don't get rewritten. If a decision is
+reversed, mark its status `Superseded by NNNN` and write a new ADR explaining
+the reversal.
+
+The locked decisions D1–D16 live in
+[`../../greenfield-implementation-plan.md`](../../greenfield-implementation-plan.md) §1.
+Reversing one of those requires an ADR here that supersedes that row.
+
+## Format (Michael Nygard)
+
+```markdown
+# NNNN — Short title
+
+**Status:** Accepted (YYYY-MM-DD)
+
+## Context
+What was happening, what alternatives existed.
+
+## Decision
+The choice we made, in active voice.
+
+## Consequences
+What follows. Both intended outcomes and accepted tradeoffs.
+```
+
+Keep them to a screen or two.
+
+## Index
+
+| # | Title | Status |
+|---|-------|--------|
+| [0001](0001-locked-decisions-live-in-the-plan.md) | Locked decisions live in the plan, not in ADRs | Accepted |
+
+## When to write one
+
+Whenever a decision constrains future code organization or routing, picks one
+approach where several are defensible, or documents a tradeoff that would
+surprise a maintainer in six months. If you can't state the Context in 4–6
+lines, it isn't ADR-worthy yet.

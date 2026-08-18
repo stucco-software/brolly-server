@@ -1,0 +1,2 @@
+# Keep function signatures legible; a wide arg list is usually a missing struct.
+too-many-arguments-threshold = 8

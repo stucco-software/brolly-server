@@ -1,0 +1,16 @@
+[package]
+name = "brolly-atproto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "ATProtocol: XRPC, MST/repo/CAR via atrium, PLC, OAuth, firehose."
+
+[dependencies]
+brolly-domain.workspace = true
+brolly-store.workspace = true
+brolly-authz.workspace = true
+brolly-identity.workspace = true
+
+[lints]
+workspace = true
