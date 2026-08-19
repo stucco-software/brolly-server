@@ -9,6 +9,11 @@ description = "Web Access Control, evaluated as SPARQL on every read path."
 [dependencies]
 brolly-domain.workspace = true
 brolly-store.workspace = true
+oxigraph = "0.5.9"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+uuid = { version = "1.24.1", features = ["v4"] }

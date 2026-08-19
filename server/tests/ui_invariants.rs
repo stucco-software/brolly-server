@@ -40,21 +40,64 @@ fn rust_sources() -> Vec<PathBuf> {
     out
 }
 
+/// HTML tags this looks for. A bare `format!("<` is not enough of a signal:
+/// SPARQL wraps IRIs in angle brackets, so `format!("<{iri}>")` in the authz
+/// and index queries tripped the naive version of this check. Matching real tag
+/// names keeps the invariant meaningful without punishing query builders.
+const HTML_TAGS: [&str; 14] = [
+    "<!DOCTYPE",
+    "<html",
+    "<head",
+    "<body",
+    "<div",
+    "<span",
+    "<p>",
+    "<p ",
+    "<a ",
+    "<form",
+    "<input",
+    "<table",
+    "<ul",
+    "<li",
+];
+
 #[test]
 fn html_is_never_built_with_format() {
     let needle = concat!("format!(\"", "<");
+
     let offenders: Vec<_> = rust_sources()
         .into_iter()
         .filter(|p| {
-            std::fs::read_to_string(p)
-                .map(|t| t.contains(needle))
-                .unwrap_or(false)
+            let Ok(text) = std::fs::read_to_string(p) else {
+                return false;
+            };
+            text.lines()
+                .any(|line| line.contains(needle) && HTML_TAGS.iter().any(|tag| line.contains(tag)))
         })
         .collect();
 
     assert!(
         offenders.is_empty(),
         "HTML built with format! in {offenders:?}. Use a template and the render() helper."
+    );
+}
+
+#[test]
+fn the_html_detector_actually_detects() {
+    // Guard the guard. A checker this specific can rot into a no-op, so assert
+    // it still fires on the thing it exists to catch — and does not fire on the
+    // SPARQL pattern that produced a false positive.
+    let html = r#"let s = format!("<div class=\"{}\">", x);"#;
+    let sparql = r#"let s = format!("<{iri}>");"#;
+    let needle = concat!("format!(\"", "<");
+
+    assert!(
+        html.contains(needle) && HTML_TAGS.iter().any(|t| html.contains(t)),
+        "detector must flag HTML built with format!"
+    );
+    assert!(
+        !HTML_TAGS.iter().any(|t| sparql.contains(t)),
+        "detector must not flag SPARQL IRI interpolation"
     );
 }
 
