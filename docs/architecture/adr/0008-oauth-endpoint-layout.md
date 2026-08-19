@@ -66,6 +66,13 @@ diagnosing, never for routing: a request that looks like ATProtocol at a
 Mastodon path is a client bug, and telling the developer where to go beats
 silently making it work at a path the spec never promised.
 
+## Host scope
+
+All of these are **apex-only** — `https://brolly.id/oauth/...`. They are not
+served on user subdomains, and because a user subdomain ends in a catch-all LDP
+handler, they must be *reserved* there rather than merely unmounted. See
+ADR 0009.
+
 ## Consequences
 
 - **Mastodon clients work unconfigured**, which was the requirement that forced

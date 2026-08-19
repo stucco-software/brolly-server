@@ -15,6 +15,7 @@
 
 pub mod did;
 pub mod oauth;
+pub mod routing;
 pub mod subject;
 pub mod webid;
 
