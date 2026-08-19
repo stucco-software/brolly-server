@@ -1,141 +1,194 @@
-//! Which host owns which path (ADR 0009).
+//! Which host and which namespace owns which path (ADR 0010).
 //!
-//! Server-wide protocol endpoints live on the apex; user resources live on the
-//! subdomain, where Solid LDP is generic CRUD. Those two facts collide unless
-//! the protocol prefixes are reserved: an unclaimed path on a subdomain is not
-//! unrouted, it is **user-writable**, so `alice.brolly.id/oauth/token` would
-//! otherwise be a resource inside Alice's pod that a misconfigured client could
-//! post an authorization code to.
+//! The subdomain root belongs to the server; the user owns `/~/`. That is an
+//! allowlist, and it is the whole point: the LDP catch-all is mounted *inside*
+//! `/~/`, so it cannot shadow a protocol endpoint and no reserved list has to be
+//! kept in sync. ADR 0009 tried the blocklist form and superseded itself.
 
-/// Path prefixes that belong to the apex and must never reach a user's LDP
-/// handler.
+/// Where user and app LDP content lives.
 ///
-/// `/inbox` is deliberately absent: the apex serves the ActivityPub *shared*
-/// inbox while a subdomain serves that user's own, and both are real.
-pub const RESERVED_ON_SUBDOMAIN: &[&str] = &[
-    "/oauth/",
-    "/.well-known/",
-    "/api/",
-    "/admin",
-    "/dashboard",
-    "/login",
-    "/logout",
-    "/register",
-    "/index/",
+/// Advertised as `space:storage` in the WebID profile, so a Solid client
+/// discovers it rather than assuming it. `~` is unreserved in RFC 3986, so it
+/// needs no encoding.
+pub const USER_STORAGE_ROOT: &str = "/~/";
+
+/// Protocol resources served at a subdomain root.
+///
+/// These are server-generated projections, not arbitrary user content, which is
+/// why they stay at the root — it keeps `https://alice.brolly.id/profile#me` as
+/// the WebID, the subject IRI every protocol asserts onto (D8).
+pub const USER_PROTOCOL_RESOURCES: &[&str] = &[
+    "/profile",
+    "/actor",
+    "/inbox",
+    "/outbox",
+    "/followers",
+    "/following",
 ];
 
-/// Paths served only by the apex, used to check the reservation list is complete.
-pub const APEX_ONLY_PREFIXES: &[&str] = &[
-    "/oauth/",
-    "/.well-known/",
-    "/api/",
-    "/admin",
-    "/dashboard",
-    "/login",
-    "/logout",
-    "/register",
-    "/index/",
-];
+/// Prefixes of protocol resources at a subdomain root.
+pub const USER_PROTOCOL_PREFIXES: &[&str] = &["/xrpc/"];
 
-/// Is `path` reserved on a user subdomain?
-///
-/// Returns the matched prefix, which the handler puts in the `Link` header so a
-/// client author can see where the request should have gone.
-pub fn reserved_on_subdomain(path: &str) -> Option<&'static str> {
-    RESERVED_ON_SUBDOMAIN
-        .iter()
-        .find(|prefix| path == prefix.trim_end_matches('/') || path.starts_with(*prefix))
-        .copied()
+/// What a path on a user subdomain resolves to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubdomainRoute {
+    /// Inside `/~/` — the LDP handler, user- and app-writable.
+    UserStorage,
+    /// A server-managed protocol resource at the root.
+    ProtocolResource,
+    /// The subdomain root itself: a server-rendered profile page.
+    Root,
+    /// Nothing. `404`, and deliberately no fallback — this is where the
+    /// predecessor leaked RDF to Mastodon clients and where a misrouted OAuth
+    /// request would otherwise have become a pod write.
+    NotFound,
 }
 
-/// The apex URL a reserved subdomain request should have used.
-pub fn apex_equivalent(base_domain: &str, path: &str) -> String {
-    format!("https://{base_domain}{path}")
+/// Resolve a path on a user subdomain.
+pub fn subdomain_route(path: &str) -> SubdomainRoute {
+    if path == "/" {
+        return SubdomainRoute::Root;
+    }
+    if path == USER_STORAGE_ROOT.trim_end_matches('/') || path.starts_with(USER_STORAGE_ROOT) {
+        return SubdomainRoute::UserStorage;
+    }
+    if USER_PROTOCOL_RESOURCES.contains(&path)
+        || USER_PROTOCOL_PREFIXES.iter().any(|p| path.starts_with(p))
+    {
+        return SubdomainRoute::ProtocolResource;
+    }
+    SubdomainRoute::NotFound
+}
+
+/// The storage root IRI for a user — the value `space:storage` must advertise.
+pub fn storage_root(username: &str, base_domain: &str) -> String {
+    format!("https://{username}.{base_domain}{USER_STORAGE_ROOT}")
+}
+
+/// Map an LDP path inside the storage root to its full resource IRI.
+pub fn storage_resource(username: &str, base_domain: &str, path: &str) -> String {
+    let path = path.trim_start_matches('/');
+    format!("{}{path}", storage_root(username, base_domain))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::oauth::{ENDPOINTS, Protocol};
+    use crate::oauth::ENDPOINTS;
+    use crate::webid;
 
     #[test]
-    fn oauth_is_reserved_on_subdomains() {
-        // The credential-exfiltration case: a client misconfigured with a user's
-        // subdomain must not be able to post an authorization code into that
-        // user's pod.
+    fn oauth_paths_cannot_be_written_on_a_subdomain() {
+        // The credential-exfiltration case from ADR 0009, now structurally
+        // impossible rather than excluded by a list.
         for (path, _) in ENDPOINTS {
-            assert!(
-                reserved_on_subdomain(path).is_some(),
-                "{path} would be a writable LDP resource on a user subdomain"
+            assert_eq!(
+                subdomain_route(path),
+                SubdomainRoute::NotFound,
+                "{path} must not resolve to anything on a user subdomain"
             );
         }
     }
 
     #[test]
-    fn every_apex_prefix_is_reserved() {
-        // Adding an apex endpoint without reserving it creates a writable
-        // shadow of that endpoint in every user's pod.
-        for prefix in APEX_ONLY_PREFIXES {
-            assert!(
-                reserved_on_subdomain(prefix).is_some(),
-                "apex prefix {prefix} is not reserved on subdomains"
+    fn no_apex_path_can_ever_reach_the_ldp_handler() {
+        // Includes endpoints that do not exist yet — the property holds for any
+        // path outside /~/, which is what deleting the reserved list bought.
+        for path in [
+            "/oauth/token",
+            "/api/v1/statuses",
+            "/.well-known/openid-configuration",
+            "/admin/users",
+            "/dashboard",
+            "/login",
+            "/index/public",
+            "/some-protocol-invented-in-2030/endpoint",
+        ] {
+            assert_ne!(
+                subdomain_route(path),
+                SubdomainRoute::UserStorage,
+                "{path} reached user storage"
             );
         }
     }
 
     #[test]
-    fn user_resources_are_not_reserved() {
+    fn user_content_lives_under_the_storage_root() {
+        for path in ["/~/", "/~/notes/first", "/~/projects/2026/plan.ttl", "/~"] {
+            assert_eq!(
+                subdomain_route(path),
+                SubdomainRoute::UserStorage,
+                "{path} should be user storage"
+            );
+        }
+    }
+
+    #[test]
+    fn protocol_resources_stay_at_the_root() {
         for path in [
             "/profile",
             "/actor",
+            "/inbox",
             "/outbox",
             "/followers",
             "/following",
-            "/notes/2026/first",
-            "/oauthtokens", // no trailing slash: not the /oauth/ prefix
-            "/apiary",      // not /api/
         ] {
             assert_eq!(
-                reserved_on_subdomain(path),
-                None,
-                "{path} is a user resource and must remain writable"
+                subdomain_route(path),
+                SubdomainRoute::ProtocolResource,
+                "{path}"
             );
         }
-    }
-
-    #[test]
-    fn inbox_exists_on_both_hosts() {
         assert_eq!(
-            reserved_on_subdomain("/inbox"),
-            None,
-            "the apex serves the shared inbox; a subdomain serves the user's own"
+            subdomain_route("/xrpc/com.atproto.repo.getRecord"),
+            SubdomainRoute::ProtocolResource
         );
     }
 
     #[test]
-    fn xrpc_is_not_reserved_because_users_own_their_repo() {
+    fn the_webid_is_unaffected_by_the_storage_split() {
+        // The reason protocol resources stay at the root: this stays pretty, and
+        // it is the subject IRI every protocol asserts onto (D8).
         assert_eq!(
-            reserved_on_subdomain("/xrpc/com.atproto.repo.getRecord"),
-            None
+            webid::webid("alice", "brolly.id"),
+            "https://alice.brolly.id/profile#me"
+        );
+        assert_eq!(
+            subdomain_route("/profile"),
+            SubdomainRoute::ProtocolResource
         );
     }
 
     #[test]
-    fn the_apex_equivalent_names_the_right_host() {
+    fn advertised_storage_root_matches_what_the_router_mounts() {
+        // The predecessor advertised space:storage <origin/> and never checked
+        // that the value agreed with the router. If these drift, every Solid app
+        // writes to a 404.
+        let advertised = storage_root("alice", "brolly.id");
+        let path = advertised
+            .strip_prefix("https://alice.brolly.id")
+            .expect("same origin");
+        assert_eq!(path, USER_STORAGE_ROOT);
+        assert_eq!(subdomain_route(path), SubdomainRoute::UserStorage);
+    }
+
+    #[test]
+    fn a_resource_iri_is_built_from_the_advertised_root() {
         assert_eq!(
-            apex_equivalent("brolly.id", "/oauth/token"),
-            "https://brolly.id/oauth/token"
+            storage_resource("alice", "brolly.id", "/notes/first"),
+            "https://alice.brolly.id/~/notes/first"
         );
     }
 
     #[test]
-    fn mastodon_bare_paths_are_reserved_too() {
-        // These are the ones clients hardcode, so they are the most likely to
-        // arrive at the wrong host.
-        for (path, proto) in ENDPOINTS {
-            if *proto == Protocol::Mastodon {
-                assert!(reserved_on_subdomain(path).is_some(), "{path}");
-            }
-        }
+    fn the_subdomain_root_is_the_servers_not_the_users() {
+        // One real restriction from ADR 0010: alice cannot own "/".
+        assert_eq!(subdomain_route("/"), SubdomainRoute::Root);
+    }
+
+    #[test]
+    fn unmatched_paths_are_not_found_rather_than_falling_through() {
+        assert_eq!(subdomain_route("/random"), SubdomainRoute::NotFound);
+        assert_eq!(subdomain_route("/notes/first"), SubdomainRoute::NotFound);
     }
 }

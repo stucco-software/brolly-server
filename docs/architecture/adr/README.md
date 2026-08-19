@@ -39,7 +39,8 @@ Keep them to a screen or two.
 | [0006](0006-store-budget.md) | Store budget: what a pod actually costs | Accepted |
 | [0007](0007-refuse-rdf-xml-on-input.md) | Refuse RDF/XML on input | Accepted |
 | [0008](0008-oauth-endpoint-layout.md) | OAuth endpoint layout: discovery, not shape-sniffing | Accepted |
-| [0009](0009-reserved-paths-on-user-subdomains.md) | Reserved paths on user subdomains | Accepted |
+| [0009](0009-reserved-paths-on-user-subdomains.md) | Reserved paths on user subdomains | Superseded by 0010 |
+| [0010](0010-user-storage-root.md) | All user LDP content under `/~/` | Accepted |
 
 ## When to write one
 

@@ -167,6 +167,10 @@ vocabulary hardest. Ship it before anything federates.
 - **Reject `application/rdf+xml` on every write path** with 415, per ADR 0007 —
   two live DoS advisories in `quick-xml` are reachable from federation input
   otherwise, and the dependency cannot be removed.
+- **User storage mounted at `/~/`** (ADR 0010), typed `pim:Storage` +
+  `ldp:BasicContainer`, with `space:storage` in the WebID profile advertising the
+  same root the router mounts. Everything outside `/~/` on a subdomain is an
+  explicit protocol resource or a 404 — no fallback.
 - **The typed publication container** (D9): a container whose type marks it a
   publication surface. A write of `rdf:type as:Note` *there* is a post; anywhere
   else is private CRUD. ACL defaults must state that Append on it means "may post

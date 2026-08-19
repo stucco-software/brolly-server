@@ -1,7 +1,14 @@
 # 0009 — Reserved paths on user subdomains
 
-**Status:** Accepted (2026-08-19)
+**Status:** Superseded by [0010](0010-user-storage-root.md) (2026-08-19)
 **Extends:** ADR 0008 (OAuth endpoint layout).
+
+> **Superseded the same day.** The analysis below stands — the
+> credential-exfiltration path was real and the host-scope table is still
+> correct. Only the *mechanism* changed: reserving apex prefixes is a blocklist
+> that can drift, so ADR 0010 scopes user content under `/~/` instead, which
+> makes the collision structurally impossible and deletes the list. Kept on the
+> record because the threat model is the reason ADR 0010 exists.
 
 ## Context
 
