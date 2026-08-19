@@ -39,6 +39,13 @@ tracing = "0.1"
 # Phase 0 keeps external deps minimal on purpose. Protocol crates take their
 # dependencies when their phase starts (see docs/greenfield-implementation-plan.md §3).
 
+# Dependencies get no debug info. RocksDB alone was two 947 MB rlibs plus 6 GB
+# of C++ objects in a 15 GB debug target, and we never step through it. Our own
+# crates keep full debug info, so breakpoints and backtraces in brolly-* are
+# unaffected.
+[profile.dev.package."*"]
+debug = false
+
 [workspace.lints.clippy]
 # Deny, not warn. Warn was not enough last time — see learnings §2.10.
 unwrap_used  = "deny"
