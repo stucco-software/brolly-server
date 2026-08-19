@@ -38,6 +38,7 @@ Keep them to a screen or two.
 | [0005](0005-instance-wide-read-inventory.md) | The instance-wide read inventory | Accepted |
 | [0006](0006-store-budget.md) | Store budget: what a pod actually costs | Accepted |
 | [0007](0007-refuse-rdf-xml-on-input.md) | Refuse RDF/XML on input | Accepted |
+| [0008](0008-oauth-endpoint-layout.md) | OAuth endpoint layout: discovery, not shape-sniffing | Accepted |
 
 ## When to write one
 

@@ -166,6 +166,44 @@ fn domain_has_no_io_dependencies() {
     );
 }
 
+/// Credential parsing lives in `brolly-identity` and nowhere else.
+///
+/// The predecessor had four independent `Authorization`-header paths — one each
+/// for Solid-OIDC, ATProtocol, Mastodon, and sessions — backed by four token
+/// tables. Every handler that wanted to know who was calling reimplemented the
+/// question, and the answers differed. One dispatcher produces one `Subject`;
+/// this keeps it that way.
+#[test]
+fn only_identity_parses_credentials() {
+    const CREDENTIAL_PATTERNS: [&str; 4] = [
+        "strip_prefix(\"Bearer ",
+        "strip_prefix(\"DPoP ",
+        "TypedHeader<Authorization",
+        "headers.get(\"authorization",
+    ];
+
+    let offenders: Vec<_> = source_files()
+        .into_iter()
+        .filter(|p| {
+            // brolly-identity owns this, and the spike is throwaway.
+            let s = p.to_string_lossy();
+            !s.contains("/identity/") && !s.contains("/spikes/")
+        })
+        .filter(|p| {
+            let Ok(text) = std::fs::read_to_string(p) else {
+                return false;
+            };
+            CREDENTIAL_PATTERNS.iter().any(|pat| text.contains(pat))
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "credential parsing outside brolly-identity in {offenders:?}. \
+         Take a Subject instead — see identity::subject."
+    );
+}
+
 #[test]
 fn app_is_defined_only_in_the_server_crate() {
     let offenders: Vec<_> = source_files()

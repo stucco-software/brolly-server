@@ -1,8 +1,21 @@
-//! Users, WebID, DIDs, keys, sessions, and the normalized `Subject`.
+//! Users, WebID, DIDs, and the one normalized [`Subject`] every handler takes.
 //!
-//! `did:web` is used for routing only; **`did:plc` appears in every wire format
-//! from the first commit** (decision D11) so no AT-URI migration is needed later.
-//! One auth dispatcher produces one `Subject`; handlers never parse an
-//! `Authorization` header themselves.
+//! Two rules from the plan hold here:
+//!
+//! * **`did:plc` in every wire format** (D11). `did:web` is derived from the
+//!   subdomain for routing only. The predecessor emitted `did:web` AT-URIs and
+//!   became invisible to the AppView, then needed a backfill it never wrote.
+//! * **One auth dispatcher.** Handlers receive a `Subject`; none parses an
+//!   `Authorization` header itself. The predecessor had four independent
+//!   header-parsing paths and four token tables.
+//!
+//! See `docs/greenfield-implementation-plan.md` §3 Phase 3 and ADR 0008.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+pub mod did;
+pub mod oauth;
+pub mod subject;
+pub mod webid;
+
+pub use subject::{Credential, Scope, Subject, Via};

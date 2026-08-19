@@ -745,8 +745,10 @@ dependencies = [
 name = "brolly-identity"
 version = "0.1.0"
 dependencies = [
+ "brolly-authz",
  "brolly-domain",
  "brolly-store",
+ "uuid",
 ]
 
 [[package]]

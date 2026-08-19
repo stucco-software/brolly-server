@@ -7,8 +7,10 @@ publish.workspace = true
 description = "Users, WebID, did:web routing, did:plc federation, keys, sessions, Subject."
 
 [dependencies]
+brolly-authz.workspace = true
 brolly-domain.workspace = true
 brolly-store.workspace = true
+uuid = { version = "1.24.1", features = ["v4", "serde"] }
 
 [lints]
 workspace = true
