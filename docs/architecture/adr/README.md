@@ -41,6 +41,7 @@ Keep them to a screen or two.
 | [0008](0008-oauth-endpoint-layout.md) | OAuth endpoint layout: discovery, not shape-sniffing | Accepted |
 | [0009](0009-reserved-paths-on-user-subdomains.md) | Reserved paths on user subdomains | Superseded by 0010 |
 | [0010](0010-user-storage-root.md) | All user LDP content under `/~/` | Accepted |
+| [0011](0011-consent-scope-vocabulary.md) | One consent vocabulary across three protocols | Accepted |
 
 ## When to write one
 

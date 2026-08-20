@@ -367,7 +367,7 @@ by intention.
 | ~~O5~~ | **CLOSED — ADR 0006.** Store benchmark numbers | Phase 2 | LRU miss 8.1 ms vs hit 541 ns; 435 KB floor per empty pod. Resident memory still unmeasured. |
 | ~~O6~~ | **CLOSED — ADR 0004.** Design system source — tokens from båtklubb, tokens *and* components, or hand-rolled | Phase 0 | Tokens-only is compatible with server-rendering. Components imply a build step and JS islands — viable, but decide it rather than drift into it. |
 | ~~O7~~ | **CLOSED — ADR 0004, yes.** Dark mode | Phase 0 | Nearly free at the token layer, expensive after components exist. Defaulting to "yes" costs almost nothing. |
-| O8 | **Scope vocabulary for the consent screen** — how Solid, ATProto, and Mastodon scopes render as one comprehensible question | Phase 3 | The highest-stakes screen in the product; three protocols must not each invent their own wording. |
+| ~~O8~~ | **CLOSED — ADR 0011.** Scope vocabulary for the consent screen — how Solid, ATProto, and Mastodon scopes render as one comprehensible question | Phase 3 | The highest-stakes screen in the product; three protocols must not each invent their own wording. |
 
 ---
 

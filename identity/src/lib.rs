@@ -13,6 +13,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod consent;
 pub mod db;
 pub mod did;
 pub mod oauth;

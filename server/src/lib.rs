@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use tower_http::services::ServeDir;
 
 pub mod auth;
+pub mod consent;
 pub mod views;
 
 /// Everything a handler needs. Composed here because `server` is the only crate
