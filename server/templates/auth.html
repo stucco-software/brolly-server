@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}{{ heading }} — {{ instance_name }}{% endblock %}
+
+{% block content %}
+<div class="auth-card">
+  <h1>{{ heading }}</h1>
+  {% if let Some(message) = intro %}<p class="lede">{{ message }}</p>{% endif %}
+
+  {% if let Some(message) = error %}
+  <p class="error" role="alert">{{ message }}</p>
+  {% endif %}
+
+  <form method="post" action="{{ action }}" class="stack-form">
+    {% for field in fields %}
+    <div class="field">
+      <label for="{{ field.name }}">{{ field.label }}</label>
+      <input
+        type="{{ field.kind }}"
+        id="{{ field.name }}"
+        name="{{ field.name }}"
+        value="{{ field.value }}"
+        {% if field.required %}required{% endif %}
+        {% if let Some(hint) = field.autocomplete %}autocomplete="{{ hint }}"{% endif %}
+      >
+    </div>
+    {% endfor %}
+    <button type="submit" class="button button-primary">{{ submit }}</button>
+  </form>
+
+  {% if let Some(link) = alternate %}
+  <p class="auth-alt">{{ link.prefix }} <a href="{{ link.href }}">{{ link.text }}</a></p>
+  {% endif %}
+</div>
+{% endblock %}

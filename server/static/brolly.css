@@ -130,3 +130,25 @@ a { color: var(--primary); }
   font: inherit;
 }
 .error { color: var(--destructive); }
+
+/* --- auth surfaces ----------------------------------------------------- */
+.auth-card {
+  max-width: 26rem;
+  margin-inline: auto;
+  padding: var(--sp-1);
+  background: var(--surface);
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
+}
+.auth-card h1 { font-size: var(--txt-2); }
+.auth-card .lede { font-size: var(--txt-0); margin-bottom: var(--sp-0); }
+.stack-form { display: flex; flex-direction: column; gap: var(--sp-0); margin-top: var(--sp-1); }
+.stack-form button { align-self: flex-start; }
+.auth-alt { margin-top: var(--sp-1); font-size: var(--txt--1); color: var(--muted-fg); }
+[role="alert"] {
+  padding: var(--sp--1) var(--sp-0);
+  border: 1px solid var(--destructive);
+  border-radius: var(--radius-sm);
+  margin-top: var(--sp-0);
+}

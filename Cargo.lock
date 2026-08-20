@@ -520,6 +520,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "axum-extra"
+version = "0.12.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "be44683b41ccb9ab2d23a5230015c9c3c55be97a25e4428366de8873103f7970"
+dependencies = [
+ "axum",
+ "axum-core",
+ "bytes",
+ "cookie",
+ "futures-core",
+ "futures-util",
+ "http 1.5.0",
+ "http-body",
+ "http-body-util",
+ "mime",
+ "pin-project-lite",
+ "tower-layer",
+ "tower-service",
+ "tracing",
+]
+
+[[package]]
 name = "base-x"
 version = "0.2.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,6 +821,7 @@ version = "0.1.0"
 dependencies = [
  "askama",
  "axum",
+ "axum-extra",
  "brolly-activitypub",
  "brolly-atproto",
  "brolly-authz",
@@ -808,8 +831,13 @@ dependencies = [
  "brolly-solid",
  "brolly-store",
  "brolly-test-support",
+ "http-body-util",
+ "serde",
+ "sqlx",
+ "time",
  "tokio",
  "toml",
+ "tower",
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
@@ -992,6 +1020,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
 dependencies = [
  "unicode-segmentation",
+]
+
+[[package]]
+name = "cookie"
+version = "0.18.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1a373e3602691c3cdea496d2f0ee5935151e6168fe87739483c463db1b2f2f87"
+dependencies = [
+ "percent-encoding",
+ "time",
+ "version_check",
 ]
 
 [[package]]

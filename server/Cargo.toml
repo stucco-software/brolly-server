@@ -29,10 +29,16 @@ axum = "0.8.9"
 tokio = { version = "1.53.1", features = ["full"] }
 askama = "0.14"
 tower-http = { version = "0.7.0", features = ["fs"] }
+axum-extra = { version = "0.12.6", features = ["cookie"] }
+time = "0.3.55"
+serde = { version = "1.0.229", features = ["derive"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "migrate"] }
 
 [dev-dependencies]
 brolly-test-support.workspace = true
+http-body-util = "0.1.5"
 toml = "0.8"
+tower = { version = "0.5.3", features = ["util"] }
 
 [lints]
 workspace = true

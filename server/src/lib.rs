@@ -9,20 +9,39 @@
 
 use axum::Router;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
+use sqlx::PgPool;
 use tower_http::services::ServeDir;
 
+pub mod auth;
 pub mod views;
+
+/// Everything a handler needs. Composed here because `server` is the only crate
+/// permitted to depend on more than one adapter.
+#[derive(Clone)]
+pub struct AppState {
+    pub pool: PgPool,
+    pub base_domain: String,
+}
 
 /// Build the application router.
 ///
 /// Adapters contribute their own routers here. Nothing else in the workspace
 /// constructs a `Router` at the top level.
-pub fn app(static_dir: &str) -> Router {
+pub fn app(state: AppState, static_dir: &str) -> Router {
     Router::new()
         .route("/", get(views::landing))
         .route("/health", get(health))
+        // Auth surfaces ship with identity, not after it (plan §4.4).
+        .route("/login", get(auth::login_form).post(auth::login_submit))
+        .route(
+            "/register",
+            get(auth::register_form).post(auth::register_submit),
+        )
+        // POST so a prefetch or a cross-site <img> cannot log someone out.
+        .route("/logout", post(auth::logout))
         .nest_service("/static", ServeDir::new(static_dir))
+        .with_state(state)
 }
 
 /// `GET /health` — liveness probe. No auth, no dependencies.
