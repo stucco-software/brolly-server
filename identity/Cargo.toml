@@ -7,10 +7,20 @@ publish.workspace = true
 description = "Users, WebID, did:web routing, did:plc federation, keys, sessions, Subject."
 
 [dependencies]
+argon2 = "0.5.3"
 brolly-authz.workspace = true
 brolly-domain.workspace = true
 brolly-store.workspace = true
+hex = "0.4.3"
+rand = "0.10.2"
+sha2 = "0.11.0"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "uuid", "time", "macros"] }
+time = { version = "0.3.55", features = ["serde"] }
 uuid = { version = "1.24.1", features = ["v4", "serde"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+brolly-test-support.workspace = true
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
