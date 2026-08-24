@@ -35,8 +35,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "migrate"] }
 
 [dev-dependencies]
+brolly-solid.workspace = true
+brolly-store.workspace = true
 brolly-test-support.workspace = true
 http-body-util = "0.1.5"
+oxigraph = "0.5.9"
+tempfile = "3.27.0"
+time = "0.3.55"
 toml = "0.8"
 tower = { version = "0.5.3", features = ["util"] }
 

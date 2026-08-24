@@ -215,6 +215,19 @@ pub fn append(
     Ok(target)
 }
 
+/// May this subject write to `path`?
+///
+/// Exposed for `PATCH`, which mutates through the SPARQL engine rather than
+/// through [`put`] and so cannot borrow its check.
+pub fn may_write(
+    store: &Store,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+) -> Result<bool, LdpError> {
+    check(store, base, path, subject, AccessMode::Write)
+}
+
 /// `DELETE`.
 pub fn delete(
     store: &Store,

@@ -1,0 +1,398 @@
+//! HTTP wiring for the pod: subdomain resolution and the LDP routes.
+//!
+//! Routing follows ADR 0010 exactly. `/~/**` reaches the LDP handlers; the
+//! protocol resources are explicit routes; everything else on a subdomain is a
+//! `404` with no fallback. The catch-all lives *inside* the storage prefix, so
+//! it cannot shadow a protocol endpoint.
+
+use axum::extract::{Path, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use brolly_identity::db::{self, User};
+use brolly_identity::routing::{SubdomainRoute, subdomain_route};
+use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
+use brolly_solid::ldp::{self, LdpError};
+use brolly_solid::patch;
+use std::sync::Arc;
+
+use crate::AppState;
+
+/// Everything a pod request needs once the host and credential are resolved.
+pub struct PodRequest {
+    pub user: User,
+    pub subject: Subject,
+    pub store: Arc<brolly_store::Store>,
+    pub base: String,
+    pub storage_root: String,
+}
+
+/// Resolve the subdomain to a user, and the credential to a `Subject`.
+///
+/// Handlers never see a header. This is the only path from an HTTP request to a
+/// `Subject` on the pod surface.
+async fn resolve(state: &AppState, headers: &HeaderMap) -> Result<PodRequest, Response> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+
+    let Some(username) = extract::subdomain_user(host, &state.base_domain) else {
+        return Err((StatusCode::NOT_FOUND, "no such pod").into_response());
+    };
+
+    let user = match db::find_by_username(&state.pool, &username).await {
+        Ok(Some(user)) if user.is_active() => user,
+        Ok(_) => return Err((StatusCode::NOT_FOUND, "no such pod").into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, "pod lookup failed");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+
+    let store = match state.stores.pod(user.id) {
+        Ok(store) => store,
+        Err(e) => {
+            tracing::error!(error = %e, user = %user.id, "pod store unavailable");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+
+    let subject = subject_for(state, headers).await;
+    Ok(PodRequest {
+        base: format!("https://{username}.{}", state.base_domain),
+        storage_root: routing::storage_root(&username, &state.base_domain),
+        user,
+        subject,
+        store,
+    })
+}
+
+/// Turn whatever credential the request carried into a `Subject`.
+///
+/// An unauthenticated request is anonymous rather than rejected: WAC decides
+/// whether anonymous is enough, so public resources work without a credential.
+async fn subject_for(state: &AppState, headers: &HeaderMap) -> Subject {
+    let anonymous = Subject {
+        user_id: None,
+        did: None,
+        webid: None,
+        scope: Scope::default(),
+        via: Via::Session,
+    };
+
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok());
+    let cookie = headers.get(header::COOKIE).and_then(|h| h.to_str().ok());
+
+    let Some(credential) = extract::credential(authorization, cookie) else {
+        return anonymous;
+    };
+
+    match credential {
+        Credential::Session(token) => match db::user_for_session(&state.pool, &token).await {
+            Ok(Some(user)) => Subject::local(
+                user.id,
+                user.did_plc.clone().unwrap_or_default(),
+                webid::webid(&user.username, &state.base_domain),
+                Scope::parse("webid"),
+                Via::Session,
+            ),
+            _ => anonymous,
+        },
+        // Bearer and DPoP resolve against OAuth token storage, which arrives
+        // with the Solid-OIDC provider. Until then they are not accepted —
+        // failing closed rather than honouring an unverified token.
+        Credential::Bearer(_) | Credential::Dpop { .. } => anonymous,
+    }
+}
+
+fn ldp_error(error: LdpError) -> Response {
+    match error {
+        // An unauthorized reader is told the resource does not exist; see
+        // `ldp::read`.
+        LdpError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
+        LdpError::Forbidden => (StatusCode::FORBIDDEN, "forbidden").into_response(),
+        LdpError::OutsideStorage => (
+            StatusCode::NOT_FOUND,
+            "not found; user storage lives under /~/",
+        )
+            .into_response(),
+        LdpError::Syntax(e) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()).into_response(),
+        LdpError::Store(e) => {
+            tracing::error!(error = %e, "ldp storage failure");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+fn wac_allow(granted: &[brolly_authz::AccessMode]) -> String {
+    use brolly_authz::AccessMode::*;
+    let names: Vec<&str> = granted
+        .iter()
+        .map(|m| match m {
+            Read => "read",
+            Write => "write",
+            Append => "append",
+            Control => "control",
+        })
+        .collect();
+    format!("user=\"{}\"", names.join(" "))
+}
+
+/// `GET /~/*path`
+pub async fn get(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    let request = match resolve(&state, &headers).await {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
+    let path = format!("/~/{path}");
+    let accept = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
+
+    match ldp::read(
+        &request.store,
+        &request.base,
+        &path,
+        &request.subject,
+        accept,
+    ) {
+        Ok(outcome) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, outcome.media_type.to_string()),
+                (
+                    header::HeaderName::from_static("wac-allow"),
+                    wac_allow(&outcome.granted),
+                ),
+                (
+                    header::LINK,
+                    format!("<{}{path}.acl>; rel=\"acl\"", request.base),
+                ),
+            ],
+            outcome.body,
+        )
+            .into_response(),
+        Err(e) => ldp_error(e),
+    }
+}
+
+/// `PUT /~/*path`
+pub async fn put(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request = match resolve(&state, &headers).await {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("text/turtle");
+
+    match ldp::put(
+        &request.store,
+        &request.base,
+        &format!("/~/{path}"),
+        &request.subject,
+        &body,
+        content_type,
+        &request.storage_root,
+    ) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => ldp_error(e),
+    }
+}
+
+/// `POST /~/*path`
+pub async fn post(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request = match resolve(&state, &headers).await {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("text/turtle");
+
+    match ldp::append(
+        &request.store,
+        &request.base,
+        &format!("/~/{path}"),
+        &request.subject,
+        &body,
+        content_type,
+        &request.storage_root,
+    ) {
+        Ok(created) => (StatusCode::CREATED, [(header::LOCATION, created)]).into_response(),
+        Err(e) => ldp_error(e),
+    }
+}
+
+/// `PATCH /~/*path` — N3 Patch or SPARQL Update, both through one solver.
+pub async fn patch(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let request = match resolve(&state, &headers).await {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
+    let resource = format!("{}/~/{path}", request.base);
+    if !resource.starts_with(&request.storage_root) {
+        return ldp_error(LdpError::OutsideStorage);
+    }
+
+    // A patch mutates, so it needs Write.
+    match ldp::may_write(
+        &request.store,
+        &request.base,
+        &format!("/~/{path}"),
+        &request.subject,
+    ) {
+        Ok(true) => {}
+        Ok(false) => return ldp_error(LdpError::Forbidden),
+        Err(e) => return ldp_error(e),
+    }
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+
+    let result = match content_type.split(';').next().unwrap_or_default().trim() {
+        "text/n3" => patch::apply_n3_patch(&request.store, &resource, &body),
+        "application/sparql-update" => match std::str::from_utf8(&body) {
+            Ok(sparql) => patch::apply_sparql_update(&request.store, &resource, sparql),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "body is not UTF-8").into_response();
+            }
+        },
+        other => {
+            return (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                format!("PATCH accepts text/n3 or application/sparql-update, not {other}"),
+            )
+                .into_response();
+        }
+    };
+
+    match result {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(patch::PatchError::Precondition(m)) => (StatusCode::CONFLICT, m).into_response(),
+        Err(patch::PatchError::EscapesGraph) => (
+            StatusCode::FORBIDDEN,
+            "a PATCH may not name a GRAPH or WITH",
+        )
+            .into_response(),
+        Err(patch::PatchError::Malformed(m) | patch::PatchError::NotAPatch(m)) => {
+            (StatusCode::BAD_REQUEST, m).into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "patch failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// `DELETE /~/*path`
+pub async fn delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    let request = match resolve(&state, &headers).await {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
+    match ldp::delete(
+        &request.store,
+        &request.base,
+        &format!("/~/{path}"),
+        &request.subject,
+        &request.storage_root,
+    ) {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => ldp_error(e),
+    }
+}
+
+/// `GET /~/` — the storage root itself.
+///
+/// A wildcard route does not match an empty remainder, so the root container
+/// needs its own entry or the pod root would 404.
+pub async fn get_root(state: State<AppState>, headers: HeaderMap) -> Response {
+    get(state, headers, Path(String::new())).await
+}
+
+/// `POST /~/`
+pub async fn post_root(
+    state: State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    post(state, headers, Path(String::new()), body).await
+}
+
+/// `OPTIONS /~/*path`
+pub async fn options() -> Response {
+    (
+        StatusCode::NO_CONTENT,
+        [
+            (
+                header::ALLOW,
+                "GET, HEAD, PUT, POST, PATCH, DELETE, OPTIONS".to_string(),
+            ),
+            (
+                header::HeaderName::from_static("accept-patch"),
+                "text/n3, application/sparql-update".to_string(),
+            ),
+            (
+                header::HeaderName::from_static("accept-post"),
+                ldp::accepted_write_types().to_string(),
+            ),
+        ],
+    )
+        .into_response()
+}
+
+/// Anything on a subdomain that is not `/~/` and not a protocol resource.
+///
+/// ADR 0010's default-deny. There is no LDP fallback here, which is why a
+/// misrouted OAuth request cannot become a pod write.
+pub async fn subdomain_fallback(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
+    let path = uri.path();
+    match subdomain_route(path) {
+        SubdomainRoute::UserStorage => {
+            // Reached only if the storage routes did not match, e.g. a bad method.
+            (StatusCode::METHOD_NOT_ALLOWED, "unsupported method").into_response()
+        }
+        SubdomainRoute::ProtocolResource => (
+            StatusCode::NOT_IMPLEMENTED,
+            "this protocol resource is not implemented yet",
+        )
+            .into_response(),
+        SubdomainRoute::Root | SubdomainRoute::NotFound => (
+            StatusCode::NOT_FOUND,
+            [(
+                header::LINK,
+                format!("<https://{}{}>; rel=\"canonical\"", state.base_domain, path),
+            )],
+            "not found; user storage lives under /~/",
+        )
+            .into_response(),
+    }
+}

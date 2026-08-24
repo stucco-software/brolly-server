@@ -11,15 +11,19 @@ use brolly_server::{AppState, app};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
-async fn harness() -> (brolly_test_support::TestDb, axum::Router) {
+async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
+    let dir = tempfile::tempdir().expect("tempdir");
     let state = AppState {
         pool: db.pool.clone(),
         base_domain: "brolly.test".into(),
+        stores: std::sync::Arc::new(
+            brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),
+        ),
     };
     let router = app(state, "server/static");
-    (db, router)
+    (db, dir, router)
 }
 
 async fn post(router: &axum::Router, path: &str, body: &str) -> (StatusCode, String, Vec<String>) {
@@ -62,7 +66,7 @@ async fn get(router: &axum::Router, path: &str) -> (StatusCode, String) {
 
 #[tokio::test]
 async fn the_login_page_renders_a_real_form() {
-    let (_db, router) = harness().await;
+    let (_db, _dir, router) = harness().await;
     let (status, body) = get(&router, "/login").await;
 
     assert_eq!(status, StatusCode::OK);
@@ -82,7 +86,7 @@ async fn the_login_page_renders_a_real_form() {
 
 #[tokio::test]
 async fn registration_requires_a_valid_invite() {
-    let (_db, router) = harness().await;
+    let (_db, _dir, router) = harness().await;
 
     let (status, body, cookies) = post(
         &router,
@@ -101,7 +105,7 @@ async fn registration_requires_a_valid_invite() {
 
 #[tokio::test]
 async fn a_valid_invite_registers_and_logs_in() {
-    let (db, router) = harness().await;
+    let (db, _dir, router) = harness().await;
     let code = db::create_invite(&db.pool, None, 1, None).await.unwrap();
 
     let (status, _, cookies) = post(
@@ -135,7 +139,7 @@ async fn a_valid_invite_registers_and_logs_in() {
 
 #[tokio::test]
 async fn an_invite_cannot_be_used_twice() {
-    let (db, router) = harness().await;
+    let (db, _dir, router) = harness().await;
     let code = db::create_invite(&db.pool, None, 1, None).await.unwrap();
 
     let (first, _, _) = post(
@@ -167,7 +171,7 @@ async fn an_invite_cannot_be_used_twice() {
 
 #[tokio::test]
 async fn a_rejected_username_does_not_consume_the_invite() {
-    let (db, router) = harness().await;
+    let (db, _dir, router) = harness().await;
     let code = db::create_invite(&db.pool, None, 1, None).await.unwrap();
 
     // "Alice" is invalid: usernames become subdomains.
@@ -195,7 +199,7 @@ async fn a_rejected_username_does_not_consume_the_invite() {
 
 #[tokio::test]
 async fn login_succeeds_and_sets_a_session() {
-    let (db, router) = harness().await;
+    let (db, _dir, router) = harness().await;
     db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
         .await
         .unwrap();
@@ -222,7 +226,7 @@ async fn login_succeeds_and_sets_a_session() {
 
 #[tokio::test]
 async fn a_wrong_password_reveals_nothing_about_the_account() {
-    let (db, router) = harness().await;
+    let (db, _dir, router) = harness().await;
     db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
         .await
         .unwrap();
@@ -243,7 +247,7 @@ async fn a_wrong_password_reveals_nothing_about_the_account() {
 
 #[tokio::test]
 async fn a_short_password_is_refused_before_the_invite_is_spent() {
-    let (db, router) = harness().await;
+    let (db, _dir, router) = harness().await;
     let code = db::create_invite(&db.pool, None, 1, None).await.unwrap();
 
     let (status, body, _) = post(
@@ -266,7 +270,7 @@ async fn a_short_password_is_refused_before_the_invite_is_spent() {
 
 #[tokio::test]
 async fn logout_revokes_the_session_server_side() {
-    let (db, router) = harness().await;
+    let (db, _dir, router) = harness().await;
     db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
         .await
         .unwrap();
@@ -308,7 +312,7 @@ async fn logout_revokes_the_session_server_side() {
 
 #[tokio::test]
 async fn logout_is_not_reachable_by_get() {
-    let (_db, router) = harness().await;
+    let (_db, _dir, router) = harness().await;
     let (status, _) = get(&router, "/logout").await;
     assert_eq!(
         status,

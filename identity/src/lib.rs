@@ -16,6 +16,7 @@
 pub mod consent;
 pub mod db;
 pub mod did;
+pub mod extract;
 pub mod oauth;
 pub mod routing;
 pub mod subject;

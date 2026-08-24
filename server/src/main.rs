@@ -25,10 +25,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::PgPool::connect(&database_url).await?;
     brolly_identity::db::MIGRATOR.run(&pool).await?;
 
+    let data_dir = std::env::var("BROLLY_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let stores = brolly_store::StoreManager::open(
+        &data_dir,
+        // Working-set estimate, to be revised from a hit-rate metric — an LRU
+        // miss costs ~8ms against ~0.5us for a hit (ADR 0006).
+        500, 3600,
+    )?;
+
     let state = brolly_server::AppState {
         pool,
         base_domain: std::env::var("BROLLY_BASE_DOMAIN")
             .unwrap_or_else(|_| "brolly.test".to_string()),
+        stores: std::sync::Arc::new(stores),
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

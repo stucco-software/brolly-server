@@ -15,6 +15,7 @@ use tower_http::services::ServeDir;
 
 pub mod auth;
 pub mod consent;
+pub mod pod;
 pub mod views;
 
 /// Everything a handler needs. Composed here because `server` is the only crate
@@ -23,6 +24,7 @@ pub mod views;
 pub struct AppState {
     pub pool: PgPool,
     pub base_domain: String,
+    pub stores: std::sync::Arc<brolly_store::StoreManager>,
 }
 
 /// Build the application router.
@@ -41,7 +43,26 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         )
         // POST so a prefetch or a cross-site <img> cannot log someone out.
         .route("/logout", post(auth::logout))
+        // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
+        // shadow a protocol endpoint — that is the whole point of the prefix.
+        .route(
+            "/~/{*path}",
+            get(pod::get)
+                .put(pod::put)
+                .post(pod::post)
+                .patch(pod::patch)
+                .delete(pod::delete)
+                .options(pod::options),
+        )
+        .route(
+            "/~/",
+            get(pod::get_root)
+                .post(pod::post_root)
+                .options(pod::options),
+        )
         .nest_service("/static", ServeDir::new(static_dir))
+        // Default-deny on subdomains. No LDP fallback (ADR 0010).
+        .fallback(pod::subdomain_fallback)
         .with_state(state)
 }
 

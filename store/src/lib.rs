@@ -20,4 +20,8 @@ pub mod manager;
 pub mod write;
 
 pub use manager::{StoreError, StoreManager};
+/// Re-exported so adapters and the server can name a store without taking a
+/// direct oxigraph dependency — the engine stays an implementation detail of
+/// this crate.
+pub use oxigraph::store::Store;
 pub use write::{insert_quads, insert_record};
