@@ -13,6 +13,7 @@ brolly-authz.workspace = true
 brolly-identity.workspace = true
 oxigraph = "0.5.9"
 uuid = { version = "1.25.0", features = ["v4"] }
+oxttl = "0.2.3"
 
 [lints]
 workspace = true

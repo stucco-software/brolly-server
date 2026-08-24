@@ -10,6 +10,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod ldp;
+pub mod patch;
 pub mod storage;
 
 pub use ldp::{LdpError, LdpOutcome};

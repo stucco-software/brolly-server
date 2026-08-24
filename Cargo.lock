@@ -853,6 +853,7 @@ dependencies = [
  "brolly-identity",
  "brolly-store",
  "oxigraph",
+ "oxttl",
  "tempfile",
  "uuid",
 ]
