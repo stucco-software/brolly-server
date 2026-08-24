@@ -783,6 +783,7 @@ name = "brolly-domain"
 version = "0.1.0"
 dependencies = [
  "oxrdf",
+ "oxrdfio",
  "proptest",
  "serde_json",
 ]
@@ -851,6 +852,9 @@ dependencies = [
  "brolly-domain",
  "brolly-identity",
  "brolly-store",
+ "oxigraph",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -4897,9 +4901,9 @@ checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
 
 [[package]]
 name = "uuid"
-version = "1.24.1"
+version = "1.25.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cefc03fd367c0c6d4305de1b312cf00248c4114f4a0418ce6a6af769e3b0bd9"
+checksum = "f053576934f05a761a402421fbbe3d425d9366f75f978806a037b3ca481abecc"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",

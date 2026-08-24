@@ -1,7 +1,15 @@
-//! Solid: LDP-RS/-NR/-BC, N3 Patch, SPARQL Update PATCH, Solid-OIDC.
+//! Solid: LDP under `/~/`, WAC on every read, N3 Patch and SPARQL Update.
 //!
-//! Solid LDP is **generic CRUD** (decision D9). A write is a publication only
-//! when it has the right shape (`rdf:type as:Note`) in the right place (a typed
-//! publication container). Everywhere else is private storage.
+//! User content lives under the storage root (ADR 0010), advertised as
+//! `space:storage` in the WebID profile so clients discover it. Everything
+//! outside `/~/` on a subdomain is an explicit protocol resource or a 404, so
+//! the catch-all here cannot shadow a protocol endpoint.
+//!
+//! See `docs/greenfield-implementation-plan.md` §3 Phase 4.
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+
+pub mod ldp;
+pub mod storage;
+
+pub use ldp::{LdpError, LdpOutcome};

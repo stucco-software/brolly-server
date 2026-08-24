@@ -11,6 +11,11 @@ brolly-domain.workspace = true
 brolly-store.workspace = true
 brolly-authz.workspace = true
 brolly-identity.workspace = true
+oxigraph = "0.5.9"
+uuid = { version = "1.25.0", features = ["v4"] }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"

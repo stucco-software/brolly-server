@@ -22,4 +22,5 @@ pub mod faithful;
 pub mod iri;
 pub mod nsid;
 pub mod ports;
+pub mod syntax;
 pub mod vocab;

@@ -8,6 +8,7 @@ description = "Canonical vocabulary, quad model, projections, IRI canonicalizati
 
 [dependencies]
 oxrdf = "0.3.3"
+oxrdfio = "0.2.5"
 serde_json = "1.0.151"
 
 [lints]
