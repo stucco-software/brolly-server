@@ -42,6 +42,7 @@ Keep them to a screen or two.
 | [0009](0009-reserved-paths-on-user-subdomains.md) | Reserved paths on user subdomains | Superseded by 0010 |
 | [0010](0010-user-storage-root.md) | All user LDP content under `/~/` | Accepted |
 | [0011](0011-consent-scope-vocabulary.md) | One consent vocabulary across three protocols | Accepted |
+| [0012](0012-publication-surface.md) | The publication surface is the AS2 outbox | Accepted |
 
 ## When to write one
 
