@@ -116,6 +116,27 @@ pub fn forget_note(store: &Store, note: &NamedNode) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// How many notes the index knows about.
+///
+/// Counted here rather than by opening every pod — this is exactly the
+/// cross-user question the server agent exists to answer (ADR 0005 R8), and it
+/// is the only number NodeInfo publishes beyond the member count.
+///
+/// Counts rows, not triples: `P_AUTHOR` appears exactly once per note, where a
+/// bare graph count would inflate by however many optional predicates each row
+/// happened to carry.
+pub fn count_notes(store: &Store) -> Result<i64, StoreError> {
+    Ok(store
+        .quads_for_pattern(
+            None,
+            Some(iri(P_AUTHOR).as_ref()),
+            None,
+            Some(GraphNameRef::NamedNode(iri(PUBLIC_TIMELINE).as_ref())),
+        )
+        .filter_map(Result::ok)
+        .count() as i64)
+}
+
 /// Wipe the index. The first half of a rebuild.
 pub fn clear(store: &Store) -> Result<(), StoreError> {
     store.clear_graph(GraphNameRef::NamedNode(iri(PUBLIC_TIMELINE).as_ref()))?;

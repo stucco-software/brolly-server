@@ -6,6 +6,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod actor;
 pub mod federation;
 pub mod keys;
 

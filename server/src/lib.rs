@@ -14,6 +14,7 @@ use sqlx::PgPool;
 use tower_http::services::ServeDir;
 
 pub mod account;
+pub mod activitypub;
 pub mod auth;
 pub mod consent;
 pub mod pod;
@@ -97,6 +98,17 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             "/account/delete",
             get(account::delete_form).post(account::delete_account),
         )
+        // ActivityPub discovery. `/actor` is served on both the apex and
+        // member subdomains and means a different actor on each — one route
+        // with a host branch, because a route matches before the host is
+        // looked at and two would shadow each other.
+        .route("/actor", get(activitypub::actor_document))
+        .route("/.well-known/webfinger", get(activitypub::webfinger))
+        .route(
+            "/.well-known/nodeinfo",
+            get(activitypub::nodeinfo_discovery),
+        )
+        .route("/nodeinfo/2.1", get(activitypub::nodeinfo))
         .merge(oauth)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.

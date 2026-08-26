@@ -216,3 +216,40 @@ fn dangling_rows_sweep_and_the_index_rebuilds() {
         "replay reproduces the index"
     );
 }
+
+#[test]
+fn the_index_can_count_its_notes_without_opening_a_pod() {
+    // ADR 0005 R8: NodeInfo's post count is a cross-user aggregate, which is
+    // precisely what the server agent exists for.
+    let dir = tempfile::tempdir().unwrap();
+    let manager = brolly_store::StoreManager::open(dir.path(), 4, 60).unwrap();
+    let index = manager.instance();
+
+    assert_eq!(brolly_store::index::count_notes(index).unwrap(), 0);
+
+    for n in 1..=3 {
+        brolly_store::index::record_note(
+            index,
+            &brolly_store::index::NotePointer {
+                note: oxigraph::model::NamedNode::new_unchecked(format!(
+                    "https://alice.brolly.test/~/notes/{n}"
+                )),
+                author: oxigraph::model::NamedNode::new_unchecked(
+                    "https://alice.brolly.test/actor",
+                ),
+                published: format!("2026-08-26T0{n}:00:00Z"),
+                audience: oxigraph::model::NamedNode::new_unchecked(
+                    "https://www.w3.org/ns/activitystreams#Public",
+                ),
+                // A reply carries an extra predicate; the count must not move
+                // with the number of triples a row happens to have.
+                in_reply_to: (n == 2).then(|| {
+                    oxigraph::model::NamedNode::new_unchecked("https://alice.brolly.test/~/notes/1")
+                }),
+            },
+        )
+        .unwrap();
+    }
+
+    assert_eq!(brolly_store::index::count_notes(index).unwrap(), 3);
+}
