@@ -313,3 +313,75 @@ pub async fn load_key(
     .fetch_optional(pool)
     .await?)
 }
+
+// --- account management ----------------------------------------------------
+
+/// Change a password, verifying the current one first.
+///
+/// Verification happens here rather than in the handler so there is no way to
+/// reach the update without it.
+pub async fn change_password(
+    pool: &PgPool,
+    user_id: Uuid,
+    current: &str,
+    new: &str,
+) -> Result<(), DbError> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    let Some((hash,)) = row else {
+        return Err(DbError::BadCredentials);
+    };
+    if !verify_password(current, &hash) {
+        return Err(DbError::BadCredentials);
+    }
+
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(hash_password(new)?)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// How many sessions are currently live for a user.
+pub async fn count_sessions(pool: &PgPool, user_id: Uuid) -> Result<i64, DbError> {
+    let (count,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM sessions WHERE user_id = $1 AND expires_at > now()")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(count)
+}
+
+/// End every session except the one making the request.
+///
+/// Someone changing their password is often doing it because they believe
+/// another session is not theirs, so the change has to end those sessions —
+/// but not the one they are using, or they are logged out mid-task.
+pub async fn revoke_other_sessions(
+    pool: &PgPool,
+    user_id: Uuid,
+    keep_token: &str,
+) -> Result<u64, DbError> {
+    let result = sqlx::query("DELETE FROM sessions WHERE user_id = $1 AND token_hash <> $2")
+        .bind(user_id)
+        .bind(hash_secret(keep_token))
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// Delete a user outright.
+///
+/// Sessions, invites, keys and OAuth grants cascade. The pod is a separate
+/// `rm -rf` the caller performs — content lives in exactly one place (D2), and
+/// it is not this one.
+pub async fn delete_user(pool: &PgPool, user_id: Uuid) -> Result<(), DbError> {
+    sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}

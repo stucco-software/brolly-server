@@ -185,19 +185,47 @@ fn every_template_has_one_h1_and_a_main_landmark() {
         "base.html must provide a skip link"
     );
 
-    for entry in std::fs::read_dir(&templates)
-        .expect("read templates")
-        .flatten()
-    {
-        let path = entry.path();
-        if path.file_name().is_some_and(|n| n == "base.html") {
-            continue;
-        }
+    // Recursive: templates live in subdirectories once a surface has more than
+    // one page, and a check that only reads the top level silently stops
+    // covering everything added after that.
+    let mut pages = Vec::new();
+    collect_templates(&templates, &mut pages);
+    assert!(
+        pages.len() > 3,
+        "expected to find the page templates, found {pages:?}"
+    );
+
+    for path in pages {
         let text = std::fs::read_to_string(&path).expect("read template");
         assert_eq!(
             text.matches("<h1").count(),
             1,
             "{path:?} must contain exactly one <h1>"
         );
+    }
+}
+
+/// Every template that renders a whole page.
+///
+/// `base.html` provides the shell and has no heading of its own, and a leading
+/// underscore marks a partial that is included into a page rather than being
+/// one — neither should be held to the one-`<h1>` rule, which is about pages.
+fn collect_templates(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_templates(&path, out);
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name == "base.html" || name.starts_with('_') || !name.ends_with(".html") {
+            continue;
+        }
+        out.push(path);
     }
 }

@@ -207,3 +207,50 @@ pub async fn revoke_all_for_user(pool: &PgPool, user_id: Uuid) -> Result<u64, Db
     .await?;
     Ok(result.rows_affected())
 }
+
+/// An app a member has authorised, as the dashboard lists it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AuthorisedApp {
+    pub client_id: String,
+    pub client_name: Option<String>,
+    pub scope: String,
+}
+
+/// Apps holding a live grant for this user.
+///
+/// A grant is "live" when it still has an unexpired, unrevoked refresh token:
+/// that is what an app can actually still use, so it is what the member should
+/// see. One row per client, not per token, because rotation means a long-lived
+/// grant has issued many.
+pub async fn apps_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<AuthorisedApp>, DbError> {
+    Ok(sqlx::query_as::<_, AuthorisedApp>(
+        "SELECT DISTINCT c.client_id, c.client_name, r.scope
+           FROM solid_refresh_tokens r
+           JOIN solid_clients c ON c.client_id = r.client_id
+          WHERE r.user_id = $1 AND r.revoked_at IS NULL AND r.expires_at > now()
+          ORDER BY c.client_name NULLS LAST",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Withdraw one app's access for one member.
+///
+/// Scoped by both, so a member revoking an app cannot touch anyone else's
+/// grant to it.
+pub async fn revoke_app_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    client_id: &str,
+) -> Result<u64, DbError> {
+    let result = sqlx::query(
+        "UPDATE solid_refresh_tokens SET revoked_at = now()
+         WHERE user_id = $1 AND client_id = $2 AND revoked_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(client_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}

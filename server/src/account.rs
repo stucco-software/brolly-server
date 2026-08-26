@@ -1,0 +1,511 @@
+//! The member dashboard: overview, profile, security, apps, export, delete.
+//!
+//! Plan §4.4 puts this in Phase 4. §4.1 describes this audience as needing to
+//! "understand what is theirs and how to leave with it", which is why export
+//! and delete are surfaces here and not a support request — a pod you cannot
+//! leave with is not yours.
+//!
+//! Server-rendered, every form a real `<form method="post">` (§4.2). Nothing
+//! here needs JavaScript.
+
+use askama::Template;
+use axum::Form;
+use axum::extract::State;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Redirect, Response};
+use axum_extra::extract::CookieJar;
+use axum_extra::extract::cookie::Cookie;
+use brolly_identity::db::{self, DbError, User};
+use brolly_identity::{routing, webid};
+use brolly_solid::oidc::store as oidc_store;
+use brolly_solid::profile::{self, Profile};
+use serde::Deserialize;
+
+use crate::auth::SESSION_COOKIE;
+use crate::{AppState, render};
+
+/// One tab in the dashboard.
+pub struct Tab {
+    pub href: &'static str,
+    pub label: &'static str,
+    pub current: bool,
+}
+
+fn tabs(current: &str) -> Vec<Tab> {
+    [
+        ("/account", "Overview"),
+        ("/account/profile", "Profile"),
+        ("/account/security", "Security"),
+        ("/account/apps", "Apps"),
+        ("/account/export", "Export"),
+        ("/account/delete", "Delete"),
+    ]
+    .into_iter()
+    .map(|(href, label)| Tab {
+        href,
+        label,
+        current: href == current,
+    })
+    .collect()
+}
+
+/// The session behind a dashboard request.
+///
+/// Both the user and the raw token: "log out everywhere else" needs to know
+/// which session to keep.
+struct Session {
+    user: User,
+    token: String,
+}
+
+/// Resolve the session, or send an anonymous visitor to log in and back.
+async fn require_session(
+    state: &AppState,
+    jar: &CookieJar,
+    path: &str,
+) -> Result<Session, Response> {
+    let redirect = || {
+        let query: String = form_urlencoded::Serializer::new(String::new())
+            .append_pair("next", path)
+            .finish();
+        Redirect::to(&format!("/login?{query}")).into_response()
+    };
+
+    let Some(cookie) = jar.get(SESSION_COOKIE) else {
+        return Err(redirect());
+    };
+    match db::user_for_session(&state.pool, cookie.value()).await {
+        Ok(Some(user)) if user.is_active() => Ok(Session {
+            user,
+            token: cookie.value().to_string(),
+        }),
+        Ok(_) => Err(redirect()),
+        Err(e) => {
+            tracing::error!(error = %e, "session lookup failed");
+            Err(server_error())
+        }
+    }
+}
+
+fn server_error() -> Response {
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "Something went wrong. Try again.",
+    )
+        .into_response()
+}
+
+// --- overview ---------------------------------------------------------------
+
+#[derive(Template)]
+#[template(path = "account/overview.html")]
+struct Overview<'a> {
+    instance_name: &'a str,
+    tabs: Vec<Tab>,
+    username: &'a str,
+    webid: String,
+    storage_root: String,
+    did: Option<&'a str>,
+    pod_bytes: u64,
+}
+
+/// `GET /account`
+pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let session = match require_session(&state, &jar, "/account").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+
+    render(&Overview {
+        instance_name: "Brolly",
+        tabs: tabs("/account"),
+        username: &session.user.username,
+        webid: webid::webid(&session.user.username, &state.base_domain),
+        storage_root: routing::storage_root(&session.user.username, &state.base_domain),
+        did: session.user.did_plc.as_deref(),
+        pod_bytes: state.stores.pod_bytes(session.user.id).unwrap_or(0),
+    })
+}
+
+// --- profile ----------------------------------------------------------------
+
+#[derive(Template)]
+#[template(path = "account/profile.html")]
+struct ProfilePage<'a> {
+    instance_name: &'a str,
+    tabs: Vec<Tab>,
+    webid: String,
+    display_name: String,
+    bio: String,
+    saved: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ProfileForm {
+    display_name: String,
+    bio: String,
+}
+
+#[derive(Deserialize, Default)]
+pub struct Saved {
+    #[serde(default)]
+    saved: bool,
+}
+
+/// `GET /account/profile`
+pub async fn profile_form(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    axum::extract::Query(query): axum::extract::Query<Saved>,
+) -> Response {
+    let session = match require_session(&state, &jar, "/account/profile").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+
+    let Ok(pod) = state.stores.pod(session.user.id) else {
+        return server_error();
+    };
+    let id = webid::webid(&session.user.username, &state.base_domain);
+    let document = webid::profile_document(&session.user.username, &state.base_domain);
+    let current = profile::read(&pod, &id, &document);
+
+    render(&ProfilePage {
+        instance_name: "Brolly",
+        tabs: tabs("/account/profile"),
+        webid: id,
+        display_name: current.display_name,
+        bio: current.bio,
+        saved: query.saved,
+    })
+}
+
+/// `POST /account/profile`
+///
+/// Writes into the pod, never into Postgres. The predecessor migrated display
+/// names out of the users table on principle and added a column back seven
+/// weeks later; the read that forced it belongs to the server-agent index.
+pub async fn profile_submit(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Form(form): Form<ProfileForm>,
+) -> Response {
+    let session = match require_session(&state, &jar, "/account/profile").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+
+    let Ok(pod) = state.stores.pod(session.user.id) else {
+        return server_error();
+    };
+    let id = webid::webid(&session.user.username, &state.base_domain);
+    let document = webid::profile_document(&session.user.username, &state.base_domain);
+
+    match profile::write(
+        &pod,
+        &id,
+        &document,
+        &Profile {
+            display_name: form.display_name,
+            bio: form.bio,
+        },
+    ) {
+        Ok(()) => Redirect::to("/account/profile?saved=true").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "profile write failed");
+            server_error()
+        }
+    }
+}
+
+// --- security ---------------------------------------------------------------
+
+#[derive(Template)]
+#[template(path = "account/security.html")]
+struct Security<'a> {
+    instance_name: &'a str,
+    tabs: Vec<Tab>,
+    sessions: i64,
+    error: Option<&'a str>,
+    saved: bool,
+}
+
+fn security_page<'a>(error: Option<&'a str>, sessions: i64, saved: bool) -> Security<'a> {
+    Security {
+        instance_name: "Brolly",
+        tabs: tabs("/account/security"),
+        sessions,
+        error,
+        saved,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct PasswordForm {
+    current_password: String,
+    new_password: String,
+}
+
+/// `GET /account/security`
+pub async fn security(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    axum::extract::Query(query): axum::extract::Query<Saved>,
+) -> Response {
+    let session = match require_session(&state, &jar, "/account/security").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    let sessions = db::count_sessions(&state.pool, session.user.id)
+        .await
+        .unwrap_or(0);
+    render(&security_page(None, sessions, query.saved))
+}
+
+/// `POST /account/security` — change password.
+///
+/// Succeeding also ends every *other* session: someone changing their password
+/// is often doing it because they think another session is not theirs.
+pub async fn change_password(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Form(form): Form<PasswordForm>,
+) -> Response {
+    let session = match require_session(&state, &jar, "/account/security").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    let sessions = db::count_sessions(&state.pool, session.user.id)
+        .await
+        .unwrap_or(0);
+
+    if form.new_password.chars().count() < 12 {
+        return (
+            StatusCode::BAD_REQUEST,
+            render(&security_page(
+                Some("Use at least 12 characters. Length beats punctuation."),
+                sessions,
+                false,
+            )),
+        )
+            .into_response();
+    }
+
+    match db::change_password(
+        &state.pool,
+        session.user.id,
+        &form.current_password,
+        &form.new_password,
+    )
+    .await
+    {
+        Ok(()) => {
+            if let Err(e) =
+                db::revoke_other_sessions(&state.pool, session.user.id, &session.token).await
+            {
+                tracing::error!(error = %e, "revoking other sessions failed after a password change");
+            }
+            Redirect::to("/account/security?saved=true").into_response()
+        }
+        Err(DbError::BadCredentials) => (
+            StatusCode::UNAUTHORIZED,
+            render(&security_page(
+                Some("That is not your current password."),
+                sessions,
+                false,
+            )),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "password change failed");
+            server_error()
+        }
+    }
+}
+
+// --- apps -------------------------------------------------------------------
+
+#[derive(Template)]
+#[template(path = "account/apps.html")]
+struct Apps<'a> {
+    instance_name: &'a str,
+    tabs: Vec<Tab>,
+    apps: Vec<oidc_store::AuthorisedApp>,
+}
+
+/// `GET /account/apps`
+pub async fn apps(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let session = match require_session(&state, &jar, "/account/apps").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+
+    let apps = match oidc_store::apps_for_user(&state.pool, session.user.id).await {
+        Ok(apps) => apps,
+        Err(e) => {
+            tracing::error!(error = %e, "listing authorised apps failed");
+            return server_error();
+        }
+    };
+
+    render(&Apps {
+        instance_name: "Brolly",
+        tabs: tabs("/account/apps"),
+        apps,
+    })
+}
+
+#[derive(Deserialize)]
+pub struct RevokeForm {
+    client_id: String,
+}
+
+/// `POST /account/apps` — withdraw one app's access.
+///
+/// This is the promise the consent screen makes: "you can revoke this at any
+/// time from your account settings."
+pub async fn revoke_app(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Form(form): Form<RevokeForm>,
+) -> Response {
+    let session = match require_session(&state, &jar, "/account/apps").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+
+    // Scoped by user *and* client, so a member cannot revoke anyone else's
+    // grant to an app they happen to share.
+    match oidc_store::revoke_app_for_user(&state.pool, session.user.id, &form.client_id).await {
+        Ok(revoked) => {
+            tracing::info!(user = %session.user.id, client = %form.client_id, revoked, "app access withdrawn");
+            Redirect::to("/account/apps").into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "revoking an app failed");
+            server_error()
+        }
+    }
+}
+
+// --- export -----------------------------------------------------------------
+
+/// `GET /account/export`
+///
+/// The whole pod as N-Quads. Complete, because D7's promise is that export is
+/// complete — and N-Quads because it is the syntax that carries named graphs,
+/// and the graphs are what make the dump re-importable rather than a pile of
+/// triples with their resource identity lost.
+pub async fn export(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let session = match require_session(&state, &jar, "/account/export").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+
+    let Ok(pod) = state.stores.pod(session.user.id) else {
+        return server_error();
+    };
+    let quads: Vec<_> = pod
+        .quads_for_pattern(None, None, None, None)
+        .filter_map(Result::ok)
+        .collect();
+
+    let body = match brolly_domain::syntax::serialize(
+        &quads,
+        brolly_domain::syntax::WriteFormat::NQuads,
+    ) {
+        Ok(body) => body,
+        Err(e) => {
+            tracing::error!(error = %e, "export serialization failed");
+            return server_error();
+        }
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, "application/n-quads".to_string()),
+            (
+                header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"{}-pod.nq\"", session.user.username),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+// --- delete -----------------------------------------------------------------
+
+#[derive(Template)]
+#[template(path = "account/delete.html")]
+struct Delete<'a> {
+    instance_name: &'a str,
+    tabs: Vec<Tab>,
+    username: &'a str,
+    error: Option<&'a str>,
+}
+
+#[derive(Deserialize)]
+pub struct DeleteForm {
+    confirm: String,
+}
+
+/// `GET /account/delete`
+pub async fn delete_form(State(state): State<AppState>, jar: CookieJar) -> Response {
+    let session = match require_session(&state, &jar, "/account/delete").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    render(&Delete {
+        instance_name: "Brolly",
+        tabs: tabs("/account/delete"),
+        username: &session.user.username,
+        error: None,
+    })
+}
+
+/// `POST /account/delete`
+///
+/// The pod goes first. If the user row went first and the `rm -rf` then failed,
+/// the bytes would be left with nothing pointing at them and no account able to
+/// ask for them again.
+pub async fn delete_account(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Form(form): Form<DeleteForm>,
+) -> Response {
+    let session = match require_session(&state, &jar, "/account/delete").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+
+    // Typing the username is not ceremony: this is the one irreversible action
+    // in the product, and it is reached from a nav tab.
+    if form.confirm.trim() != session.user.username {
+        return (
+            StatusCode::BAD_REQUEST,
+            render(&Delete {
+                instance_name: "Brolly",
+                tabs: tabs("/account/delete"),
+                username: &session.user.username,
+                error: Some("That did not match your username. Nothing has been deleted."),
+            }),
+        )
+            .into_response();
+    }
+
+    if let Err(e) = state.stores.delete_pod(session.user.id) {
+        tracing::error!(error = %e, user = %session.user.id, "deleting the pod failed");
+        return server_error();
+    }
+    if let Err(e) = db::delete_user(&state.pool, session.user.id).await {
+        tracing::error!(error = %e, user = %session.user.id, "deleting the user failed");
+        return server_error();
+    }
+    tracing::info!(user = %session.user.id, "account deleted");
+
+    // Sessions cascade with the user row; clearing the cookie stops the browser
+    // presenting a token that no longer resolves.
+    (jar.remove(Cookie::from(SESSION_COOKIE)), Redirect::to("/")).into_response()
+}

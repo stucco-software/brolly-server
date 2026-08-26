@@ -12,6 +12,7 @@
 pub mod ldp;
 pub mod oidc;
 pub mod patch;
+pub mod profile;
 pub mod storage;
 
 pub use ldp::{LdpError, LdpOutcome};

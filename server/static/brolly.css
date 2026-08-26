@@ -192,3 +192,89 @@ a { color: var(--primary); }
   padding-top: var(--sp-1);
   border-top: 1px solid var(--border-subtle);
 }
+
+/* --- member dashboard --------------------------------------------------- */
+.dashboard { max-width: var(--grid-max-width); }
+
+.dashboard-tabs { margin-top: var(--sp-0); border-bottom: 1px solid var(--border); }
+.dashboard-tabs ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp--1);
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.dashboard-tabs a {
+  display: block;
+  padding: var(--sp--2) var(--sp--1);
+  color: var(--muted-fg);
+  text-decoration: none;
+  border-bottom: 2px solid transparent;
+}
+.dashboard-tabs a:hover { color: var(--foreground); background: var(--hover); }
+/* aria-current carries the state, so the styling has one source of truth and
+   cannot disagree with what a screen reader announces. */
+.dashboard-tabs a[aria-current="page"] {
+  color: var(--foreground);
+  border-bottom-color: var(--primary);
+}
+
+.dashboard-panel { margin-top: var(--sp-1); max-width: var(--measure); }
+
+.facts { display: grid; gap: var(--sp--1); margin-top: var(--sp-1); }
+.facts dt {
+  font-size: var(--txt--1);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--muted-fg);
+}
+.facts dd { margin: 0 0 var(--sp--1) 0; overflow-wrap: anywhere; }
+
+.hint { font-size: var(--txt--1); color: var(--muted-fg); margin-top: var(--sp--2); }
+.notice {
+  padding: var(--sp--1);
+  border-radius: var(--radius-sm);
+  background: var(--secondary);
+  color: var(--secondary-fg);
+}
+
+.app-list { list-style: none; padding: 0; margin-top: var(--sp-1); }
+.app {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--sp--1);
+  align-items: center;
+  justify-content: space-between;
+  padding: var(--sp--1) 0;
+  border-bottom: 1px solid var(--border-subtle);
+}
+.app:last-child { border-bottom: 0; }
+.app-identity { display: flex; flex-direction: column; gap: var(--sp--2); }
+.app-id { overflow-wrap: anywhere; }
+
+.button-danger { background: var(--destructive); color: var(--background); }
+
+/* A logout control has to be a POST, so it is a form in the nav. Strip the
+   form's block layout so it sits inline with the links beside it. */
+.nav-form { display: inline; margin: 0; }
+.button-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+textarea {
+  width: 100%;
+  font: inherit;
+  padding: var(--sp--2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--foreground);
+}
+textarea:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }

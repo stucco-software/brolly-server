@@ -13,6 +13,7 @@ use axum::routing::{get, post};
 use sqlx::PgPool;
 use tower_http::services::ServeDir;
 
+pub mod account;
 pub mod auth;
 pub mod consent;
 pub mod pod;
@@ -71,6 +72,26 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         )
         // POST so a prefetch or a cross-site <img> cannot log someone out.
         .route("/logout", post(auth::logout))
+        // The member dashboard (plan §4.4). Apex-only in practice because a
+        // subdomain's `/account` is a pod path, not this.
+        .route("/account", get(account::overview))
+        .route(
+            "/account/profile",
+            get(account::profile_form).post(account::profile_submit),
+        )
+        .route(
+            "/account/security",
+            get(account::security).post(account::change_password),
+        )
+        .route(
+            "/account/apps",
+            get(account::apps).post(account::revoke_app),
+        )
+        .route("/account/export", get(account::export))
+        .route(
+            "/account/delete",
+            get(account::delete_form).post(account::delete_account),
+        )
         .merge(oauth)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Apps — {{ instance_name }}{% endblock %}
+
+{% block nav %}{% include "account/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+  <h1>Apps</h1>
+  {% include "account/_tabs.html" %}
+  <section class="dashboard-panel">
+    <p class="lede">Applications you have given access to your pod.</p>
+
+    {% if apps.is_empty() %}
+    <p class="hint">You have not authorised any applications yet.</p>
+    {% else %}
+    <ul class="app-list">
+      {% for app in apps %}
+      <li class="app">
+        <div class="app-identity">
+          <strong>{{ app.client_name.as_deref().unwrap_or("An application") }}</strong>
+          <span class="mono app-id">{{ app.client_id }}</span>
+          <span class="hint">Granted: {{ app.scope }}</span>
+        </div>
+        <form method="post" action="/account/apps">
+          <input type="hidden" name="client_id" value="{{ app.client_id }}">
+          <button type="submit" class="button">Revoke</button>
+        </form>
+      </li>
+      {% endfor %}
+    </ul>
+    {% endif %}
+  </section>
+</div>
+{% endblock %}

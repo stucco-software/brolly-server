@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}Security — {{ instance_name }}{% endblock %}
+
+{% block nav %}{% include "account/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+  <h1>Security</h1>
+  {% include "account/_tabs.html" %}
+  <section class="dashboard-panel">
+    {% if saved %}
+    <p class="notice" role="status">Password changed. Other sessions have been signed out.</p>
+    {% endif %}
+    {% if let Some(message) = error %}
+    <p class="error" role="alert">{{ message }}</p>
+    {% endif %}
+
+    <p class="lede">You have <strong>{{ sessions }}</strong> active session(s).</p>
+
+    <form method="post" action="/account/security" class="stack-form">
+      <div class="field">
+        <label for="current_password">Current password</label>
+        <input type="password" id="current_password" name="current_password" required autocomplete="current-password">
+      </div>
+      <div class="field">
+        <label for="new_password">New password</label>
+        <input type="password" id="new_password" name="new_password" required autocomplete="new-password">
+      </div>
+      <p class="hint">Changing your password signs out every other session.</p>
+      <button type="submit" class="button button-primary">Change password</button>
+    </form>
+  </section>
+</div>
+{% endblock %}

@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+
+{% block title %}Delete account — {{ instance_name }}{% endblock %}
+
+{% block nav %}{% include "account/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="dashboard">
+  <h1>Delete account</h1>
+  {% include "account/_tabs.html" %}
+  <section class="dashboard-panel">
+    {% if let Some(message) = error %}
+    <p class="error" role="alert">{{ message }}</p>
+    {% endif %}
+
+    <p class="lede">
+      This deletes your pod and everything in it. It cannot be undone, and we
+      cannot recover it for you.
+    </p>
+    <p class="hint">
+      Take your data with you first — <a href="/account/export">export your pod</a>.
+    </p>
+
+    <form method="post" action="/account/delete" class="stack-form">
+      <div class="field">
+        <label for="confirm">Type <strong>{{ username }}</strong> to confirm</label>
+        <input type="text" id="confirm" name="confirm" required autocomplete="off">
+      </div>
+      <button type="submit" class="button button-danger">Delete my account</button>
+    </form>
+  </section>
+</div>
+{% endblock %}
