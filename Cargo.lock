@@ -757,10 +757,17 @@ dependencies = [
 name = "brolly-activitypub"
 version = "0.1.0"
 dependencies = [
+ "activitypub_federation",
+ "async-trait",
  "brolly-authz",
  "brolly-domain",
  "brolly-identity",
  "brolly-store",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tracing",
+ "url",
 ]
 
 [[package]]

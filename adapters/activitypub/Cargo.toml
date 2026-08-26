@@ -11,6 +11,20 @@ brolly-domain.workspace = true
 brolly-store.workspace = true
 brolly-authz.workspace = true
 brolly-identity.workspace = true
+# ADR 0003: adopted deliberately, and the licence is the intended posture
+# rather than a cost. 0.7.0-beta.11 is the newest release and the only one that
+# unifies on axum 0.8; stable 0.6.5 pins axum 0.7 against our 0.8.
+#
+# `default-features = false`: the default set pulls actix-web *and* axum. We
+# serve on axum, so the actix half is a whole second HTTP stack compiled and
+# audited for nothing.
+activitypub_federation = { version = "0.7.0-beta.11", default-features = false, features = ["axum"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+url = "2.5.8"
+chrono = "0.4.45"
+async-trait = "0.1.92"
+tracing.workspace = true
 
 [lints]
 workspace = true
