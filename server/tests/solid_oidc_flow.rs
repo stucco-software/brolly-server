@@ -41,6 +41,11 @@ async fn harness() -> Harness {
             brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),
         ),
         provider_key: std::sync::Arc::new(key),
+        instance_actor: std::sync::Arc::new(
+            brolly_identity::instance::load_or_create(&db.pool, brolly_activitypub::keys::generate)
+                .await
+                .expect("instance actor"),
+        ),
     };
     let router = app(state, "server/static");
     Harness {

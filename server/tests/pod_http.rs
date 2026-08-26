@@ -85,6 +85,14 @@ async fn harness() -> Harness {
                     .await
                     .expect("provider key"),
             ),
+            instance_actor: std::sync::Arc::new(
+                brolly_identity::instance::load_or_create(
+                    &db.pool,
+                    brolly_activitypub::keys::generate,
+                )
+                .await
+                .expect("instance actor"),
+            ),
         },
         "server/static",
     );

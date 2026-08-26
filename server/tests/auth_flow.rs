@@ -26,6 +26,11 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
                 .await
                 .expect("provider key"),
         ),
+        instance_actor: std::sync::Arc::new(
+            brolly_identity::instance::load_or_create(&db.pool, brolly_activitypub::keys::generate)
+                .await
+                .expect("instance actor"),
+        ),
     };
     let router = app(state, "server/static");
     (db, dir, router)

@@ -7,5 +7,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod federation;
+pub mod keys;
 
 pub use federation::{FEDERATION_ENABLED, is_local, should_deliver};

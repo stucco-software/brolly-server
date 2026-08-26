@@ -33,6 +33,11 @@ pub struct AppState {
     /// on every token operation, and re-reading it from Postgres each time
     /// would put a round trip in the middle of every authenticated request.
     pub provider_key: std::sync::Arc<brolly_solid::oidc::keys::ProviderKey>,
+    /// The instance's own actor identity (D4).
+    ///
+    /// Signs outbound delivery on the instance's behalf and backs the shared
+    /// inbox. Loaded once at startup for the same reason as `provider_key`.
+    pub instance_actor: std::sync::Arc<brolly_identity::instance::ActorKeys>,
 }
 
 /// Build the application router.

@@ -38,12 +38,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // it would invalidate every live access token.
     let provider_key = brolly_solid::oidc::store::load_or_create_key(&pool).await?;
 
+    // The instance is an agent (D4): it owns the shared inbox and the
+    // cross-user index, and it signs its own outbound delivery. Created on
+    // first start and never regenerated — the public key is published in the
+    // actor document and cached by every instance that has seen us.
+    let instance_actor =
+        brolly_identity::instance::load_or_create(&pool, brolly_activitypub::keys::generate)
+            .await?;
+
     let state = brolly_server::AppState {
         pool,
         base_domain: std::env::var("BROLLY_BASE_DOMAIN")
             .unwrap_or_else(|_| "brolly.test".to_string()),
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),
+        instance_actor: std::sync::Arc::new(instance_actor),
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
