@@ -37,9 +37,10 @@ pub const P_IN_REPLY_TO: &str = "https://brolly.id/ns#inReplyTo";
 
 /// Every predicate the index is permitted to use.
 ///
-/// `tests/index_holds_no_content.rs` asserts the stored graph uses nothing
-/// else, so "pointers and filter keys only" is a build failure rather than a
-/// convention.
+/// `tests/storage_invariants.rs` asserts the stored graph uses nothing else,
+/// so "pointers and filter keys only" is a build failure rather than a
+/// convention. The ActivityPub processor is checked separately, since it is the
+/// only thing that writes here.
 pub const ALLOWED_PREDICATES: &[&str] = &[P_AUTHOR, P_PUBLISHED, P_AUDIENCE, P_IN_REPLY_TO];
 
 /// One timeline row. Note the absence of any content field — that is the point.
