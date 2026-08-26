@@ -12,6 +12,7 @@ use brolly_identity::db::{self, User};
 use brolly_identity::routing::{SubdomainRoute, subdomain_route};
 use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
 use brolly_solid::ldp::{self, LdpError};
+use brolly_solid::oidc::tokens;
 use brolly_solid::patch;
 use std::sync::Arc;
 
@@ -30,7 +31,12 @@ pub struct PodRequest {
 ///
 /// Handlers never see a header. This is the only path from an HTTP request to a
 /// `Subject` on the pod surface.
-async fn resolve(state: &AppState, headers: &HeaderMap) -> Result<PodRequest, Response> {
+async fn resolve(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    path: &str,
+) -> Result<PodRequest, Response> {
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -57,10 +63,11 @@ async fn resolve(state: &AppState, headers: &HeaderMap) -> Result<PodRequest, Re
         }
     };
 
-    let subject = subject_for(state, headers).await;
+    let base = format!("https://{username}.{}", state.base_domain);
+    let subject = subject_for(state, headers, method, &format!("{base}{path}")).await;
     Ok(PodRequest {
-        base: format!("https://{username}.{}", state.base_domain),
         storage_root: routing::storage_root(&username, &state.base_domain),
+        base,
         user,
         subject,
         store,
@@ -71,7 +78,7 @@ async fn resolve(state: &AppState, headers: &HeaderMap) -> Result<PodRequest, Re
 ///
 /// An unauthenticated request is anonymous rather than rejected: WAC decides
 /// whether anonymous is enough, so public resources work without a credential.
-async fn subject_for(state: &AppState, headers: &HeaderMap) -> Subject {
+async fn subject_for(state: &AppState, headers: &HeaderMap, method: &str, url: &str) -> Subject {
     let anonymous = Subject {
         user_id: None,
         did: None,
@@ -88,6 +95,9 @@ async fn subject_for(state: &AppState, headers: &HeaderMap) -> Subject {
     let Some(credential) = extract::credential(authorization, cookie) else {
         return anonymous;
     };
+    // The proof travels in its own header, so it is attached separately.
+    let proof = headers.get("dpop").and_then(|h| h.to_str().ok());
+    let credential = extract::with_proof(credential, proof);
 
     match credential {
         Credential::Session(token) => match db::user_for_session(&state.pool, &token).await {
@@ -100,11 +110,54 @@ async fn subject_for(state: &AppState, headers: &HeaderMap) -> Subject {
             ),
             _ => anonymous,
         },
-        // Bearer and DPoP resolve against OAuth token storage, which arrives
-        // with the Solid-OIDC provider. Until then they are not accepted —
-        // failing closed rather than honouring an unverified token.
-        Credential::Bearer(_) | Credential::Dpop { .. } => anonymous,
+        Credential::Dpop { token, proof } => {
+            // Token and proof are verified together or not at all: a token whose
+            // `cnf.jkt` does not match the proof was not presented by its holder,
+            // and a bound token with no proof is refused rather than downgraded
+            // to bearer semantics.
+            let proof = (!proof.is_empty()).then_some(proof);
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            match tokens::verify_access(
+                &state.provider_key,
+                &token,
+                proof.as_deref(),
+                method,
+                url,
+                now,
+            ) {
+                Ok(claims) => solid_subject(state, claims).await.unwrap_or(anonymous),
+                Err(e) => {
+                    tracing::debug!(error = %e, "Solid access token rejected");
+                    anonymous
+                }
+            }
+        }
+        // Mastodon's plain bearer tokens arrive with Phase 6. A Solid token
+        // presented as a bearer is refused rather than accepted unproven —
+        // honouring it here is what would make the binding decorative.
+        Credential::Bearer(_) => anonymous,
     }
+}
+
+/// Turn verified Solid-OIDC claims into a `Subject`.
+///
+/// The WebID in the token decides who is calling, not the subdomain being
+/// visited: an app holding Bob's token is Bob wherever it reads.
+async fn solid_subject(state: &AppState, claims: tokens::AccessClaims) -> Option<Subject> {
+    let username = webid::local_username(&claims.webid, &state.base_domain)?;
+    let user = db::find_by_username(&state.pool, &username)
+        .await
+        .ok()
+        .flatten()
+        .filter(User::is_active)?;
+
+    Some(Subject::local(
+        user.id,
+        user.did_plc.clone().unwrap_or_default(),
+        claims.webid,
+        Scope::parse(&claims.scope),
+        Via::SolidDpop,
+    ))
 }
 
 fn ldp_error(error: LdpError) -> Response {
@@ -146,11 +199,11 @@ pub async fn get(
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
-    let request = match resolve(&state, &headers).await {
+    let path = format!("/~/{path}");
+    let request = match resolve(&state, &headers, "GET", &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
-    let path = format!("/~/{path}");
     let accept = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
 
     match ldp::read(
@@ -187,7 +240,8 @@ pub async fn put(
     Path(path): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    let request = match resolve(&state, &headers).await {
+    let path = format!("/~/{path}");
+    let request = match resolve(&state, &headers, "PUT", &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -199,7 +253,7 @@ pub async fn put(
     match ldp::put(
         &request.store,
         &request.base,
-        &format!("/~/{path}"),
+        &path,
         &request.subject,
         &body,
         content_type,
@@ -217,7 +271,8 @@ pub async fn post(
     Path(path): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    let request = match resolve(&state, &headers).await {
+    let path = format!("/~/{path}");
+    let request = match resolve(&state, &headers, "POST", &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -229,7 +284,7 @@ pub async fn post(
     match ldp::append(
         &request.store,
         &request.base,
-        &format!("/~/{path}"),
+        &path,
         &request.subject,
         &body,
         content_type,
@@ -247,22 +302,18 @@ pub async fn patch(
     Path(path): Path<String>,
     body: axum::body::Bytes,
 ) -> Response {
-    let request = match resolve(&state, &headers).await {
+    let path = format!("/~/{path}");
+    let request = match resolve(&state, &headers, "PATCH", &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
-    let resource = format!("{}/~/{path}", request.base);
+    let resource = format!("{}{path}", request.base);
     if !resource.starts_with(&request.storage_root) {
         return ldp_error(LdpError::OutsideStorage);
     }
 
     // A patch mutates, so it needs Write.
-    match ldp::may_write(
-        &request.store,
-        &request.base,
-        &format!("/~/{path}"),
-        &request.subject,
-    ) {
+    match ldp::may_write(&request.store, &request.base, &path, &request.subject) {
         Ok(true) => {}
         Ok(false) => return ldp_error(LdpError::Forbidden),
         Err(e) => return ldp_error(e),
@@ -314,14 +365,15 @@ pub async fn delete(
     headers: HeaderMap,
     Path(path): Path<String>,
 ) -> Response {
-    let request = match resolve(&state, &headers).await {
+    let path = format!("/~/{path}");
+    let request = match resolve(&state, &headers, "DELETE", &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
     match ldp::delete(
         &request.store,
         &request.base,
-        &format!("/~/{path}"),
+        &path,
         &request.subject,
         &request.storage_root,
     ) {
