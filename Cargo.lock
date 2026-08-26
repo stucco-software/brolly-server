@@ -861,6 +861,7 @@ dependencies = [
  "brolly-domain",
  "brolly-identity",
  "brolly-store",
+ "brolly-test-support",
  "oxigraph",
  "oxttl",
  "p256 0.14.0",
@@ -868,8 +869,10 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "tempfile",
  "time",
+ "tokio",
  "uuid",
 ]
 
