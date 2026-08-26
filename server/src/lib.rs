@@ -16,6 +16,7 @@ use tower_http::services::ServeDir;
 pub mod auth;
 pub mod consent;
 pub mod pod;
+pub mod solid_oidc;
 pub mod views;
 
 /// Everything a handler needs. Composed here because `server` is the only crate
@@ -25,6 +26,12 @@ pub struct AppState {
     pub pool: PgPool,
     pub base_domain: String,
     pub stores: std::sync::Arc<brolly_store::StoreManager>,
+    /// The Solid-OIDC provider's signing key, loaded once at startup.
+    ///
+    /// Instance state rather than a per-request lookup: it signs and verifies
+    /// on every token operation, and re-reading it from Postgres each time
+    /// would put a round trip in the middle of every authenticated request.
+    pub provider_key: std::sync::Arc<brolly_solid::oidc::keys::ProviderKey>,
 }
 
 /// Build the application router.
@@ -32,6 +39,27 @@ pub struct AppState {
 /// Adapters contribute their own routers here. Nothing else in the workspace
 /// constructs a `Router` at the top level.
 pub fn app(state: AppState, static_dir: &str) -> Router {
+    // Solid-OIDC (ADR 0008). Its own router so `apex_only` can wrap the whole
+    // surface: the guard has to run before extraction, or a wrong method or an
+    // unparseable body answers on a user subdomain with 405/415 instead of the
+    // 404 the ADR requires.
+    let oauth = Router::new()
+        .route(
+            "/.well-known/openid-configuration",
+            get(solid_oidc::discovery),
+        )
+        .route("/oauth/solid/jwks", get(solid_oidc::jwks))
+        .route("/oauth/solid/register", post(solid_oidc::register))
+        .route(
+            "/oauth/solid/authorize",
+            get(solid_oidc::authorize).post(solid_oidc::decide),
+        )
+        .route("/oauth/solid/token", post(solid_oidc::token))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            solid_oidc::apex_only,
+        ));
+
     Router::new()
         .route("/", get(views::landing))
         .route("/health", get(health))
@@ -43,6 +71,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         )
         // POST so a prefetch or a cross-site <img> cannot log someone out.
         .route("/logout", post(auth::logout))
+        .merge(oauth)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.
         .route(

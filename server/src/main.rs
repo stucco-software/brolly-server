@@ -33,11 +33,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         500, 3600,
     )?;
 
+    // Loaded once, not per request: it signs and verifies on every token
+    // operation. Generated on first start and reused forever after — rotating
+    // it would invalidate every live access token.
+    let provider_key = brolly_solid::oidc::store::load_or_create_key(&pool).await?;
+
     let state = brolly_server::AppState {
         pool,
         base_domain: std::env::var("BROLLY_BASE_DOMAIN")
             .unwrap_or_else(|_| "brolly.test".to_string()),
         stores: std::sync::Arc::new(stores),
+        provider_key: std::sync::Arc::new(provider_key),
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

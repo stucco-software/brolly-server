@@ -13,7 +13,7 @@
 
 use askama::Template;
 use axum::Form;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
@@ -95,13 +95,40 @@ struct AuthPage<'a> {
     alternate: Option<Alternate>,
 }
 
-fn login_page<'a>(error: Option<&'a str>, username: &str) -> AuthPage<'a> {
+/// Where to send someone after login.
+///
+/// Only a path on this host, never an absolute URL: `next` arrives in a query
+/// parameter, so honouring `https://elsewhere.example` would turn the login
+/// page into an open redirect that phishing can point at.
+fn safe_next(next: Option<&str>) -> Option<&str> {
+    let next = next?;
+    let looks_local = next.starts_with('/')
+        && !next.starts_with("//")
+        // `/\evil.example` is a scheme-relative URL to some browsers.
+        && !next.starts_with("/\\");
+    looks_local.then_some(next)
+}
+
+/// The form action, carrying `next` through the POST.
+fn login_action(next: Option<&str>) -> String {
+    match safe_next(next) {
+        Some(next) => {
+            let query: String = form_urlencoded::Serializer::new(String::new())
+                .append_pair("next", next)
+                .finish();
+            format!("/login?{query}")
+        }
+        None => "/login".to_string(),
+    }
+}
+
+fn login_page<'a>(error: Option<&'a str>, username: &str, action: &'a str) -> AuthPage<'a> {
     AuthPage {
         instance_name: "Brolly",
         heading: "Log in",
         intro: None,
         error,
-        action: "/login",
+        action,
         submit: "Log in",
         fields: vec![
             Field::text("username", "Username", "username").keep(username),
@@ -137,9 +164,20 @@ fn register_page<'a>(error: Option<&'a str>, username: &str, invite: &str) -> Au
     }
 }
 
+/// `next` — where an interrupted flow wants to resume.
+///
+/// An OAuth authorize request that arrives without a session sends the member
+/// here and expects them back; without this they log in and land on the
+/// homepage while the app that sent them waits forever.
+#[derive(Deserialize, Default)]
+pub struct Next {
+    next: Option<String>,
+}
+
 /// `GET /login`
-pub async fn login_form() -> Response {
-    render(&login_page(None, ""))
+pub async fn login_form(Query(query): Query<Next>) -> Response {
+    let action = login_action(query.next.as_deref());
+    render(&login_page(None, "", &action))
 }
 
 #[derive(Deserialize)]
@@ -151,13 +189,18 @@ pub struct LoginForm {
 /// `POST /login`
 pub async fn login_submit(
     State(state): State<AppState>,
+    Query(query): Query<Next>,
     jar: CookieJar,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    let action = login_action(query.next.as_deref());
     match db::authenticate(&state.pool, &form.username, &form.password).await {
         Ok(user) => {
             match db::create_session(&state.pool, user.id, time::Duration::days(30), None).await {
-                Ok(token) => (jar.add(session_cookie(token)), Redirect::to("/")).into_response(),
+                Ok(token) => {
+                    let destination = safe_next(query.next.as_deref()).unwrap_or("/");
+                    (jar.add(session_cookie(token)), Redirect::to(destination)).into_response()
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "session creation failed");
                     server_error()
@@ -171,6 +214,7 @@ pub async fn login_submit(
             render(&login_page(
                 Some("Incorrect username or password."),
                 &form.username,
+                &action,
             )),
         )
             .into_response(),

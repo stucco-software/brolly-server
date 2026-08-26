@@ -21,6 +21,11 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
         stores: std::sync::Arc::new(
             brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),
         ),
+        provider_key: std::sync::Arc::new(
+            brolly_solid::oidc::store::load_or_create_key(&db.pool)
+                .await
+                .expect("provider key"),
+        ),
     };
     let router = app(state, "server/static");
     (db, dir, router)

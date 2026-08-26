@@ -169,7 +169,7 @@ pub fn discovery_document(issuer: &str) -> serde_json::Value {
         "authorization_endpoint": endpoint("authorize"),
         "token_endpoint": endpoint("token"),
         "registration_endpoint": endpoint("register"),
-        "jwks_uri": format!("{issuer}/oauth/solid/jwks"),
+        "jwks_uri": endpoint("jwks"),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "subject_types_supported": ["public"],

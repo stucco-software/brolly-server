@@ -31,6 +31,7 @@ pub const ENDPOINTS: &[(&str, Protocol)] = &[
     ("/oauth/solid/authorize", Protocol::SolidOidc),
     ("/oauth/solid/token", Protocol::SolidOidc),
     ("/oauth/solid/register", Protocol::SolidOidc),
+    ("/oauth/solid/jwks", Protocol::SolidOidc),
 ];
 
 pub fn owner_of(path: &str) -> Option<Protocol> {

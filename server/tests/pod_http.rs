@@ -80,6 +80,11 @@ async fn harness() -> Harness {
             pool: db.pool.clone(),
             base_domain: "brolly.test".into(),
             stores,
+            provider_key: std::sync::Arc::new(
+                brolly_solid::oidc::store::load_or_create_key(&db.pool)
+                    .await
+                    .expect("provider key"),
+            ),
         },
         "server/static",
     );

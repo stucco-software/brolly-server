@@ -829,6 +829,7 @@ dependencies = [
  "askama",
  "axum",
  "axum-extra",
+ "base64 0.23.1",
  "brolly-activitypub",
  "brolly-atproto",
  "brolly-authz",
@@ -838,9 +839,13 @@ dependencies = [
  "brolly-solid",
  "brolly-store",
  "brolly-test-support",
+ "form_urlencoded",
  "http-body-util",
  "oxigraph",
+ "p256 0.14.0",
  "serde",
+ "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tempfile",
  "time",
@@ -850,6 +855,7 @@ dependencies = [
  "tower-http 0.7.0",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
