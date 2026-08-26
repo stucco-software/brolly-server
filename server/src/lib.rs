@@ -17,6 +17,7 @@ pub mod account;
 pub mod activitypub;
 pub mod auth;
 pub mod consent;
+pub mod outbox;
 pub mod pod;
 pub mod solid_oidc;
 pub mod views;
@@ -103,6 +104,9 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // with a host branch, because a route matches before the host is
         // looked at and two would shadow each other.
         .route("/actor", get(activitypub::actor_document))
+        // The publication surface (ADR 0012): a write here is a post,
+        // the same write anywhere in the pod is private CRUD.
+        .route("/outbox", post(outbox::publish))
         .route("/.well-known/webfinger", get(activitypub::webfinger))
         .route(
             "/.well-known/nodeinfo",

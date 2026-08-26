@@ -8,6 +8,7 @@
 
 pub mod actor;
 pub mod federation;
+pub mod follows;
 pub mod inbox;
 pub mod keys;
 pub mod processor;

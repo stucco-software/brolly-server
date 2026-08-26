@@ -44,6 +44,7 @@ Keep them to a screen or two.
 | [0011](0011-consent-scope-vocabulary.md) | One consent vocabulary across three protocols | Accepted |
 | [0012](0012-publication-surface.md) | The publication surface is the AS2 outbox | Accepted |
 | [0013](0013-binary-resources-as-content-addressed-blobs.md) | Binary resources are content-addressed blobs beside the graph | Accepted |
+| [0014](0014-local-delivery-is-in-process.md) | Local delivery is in-process; outbound signing stays dormant | Accepted |
 
 ## When to write one
 
