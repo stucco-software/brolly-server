@@ -8,6 +8,7 @@
 
 pub mod actor;
 pub mod federation;
+pub mod inbox;
 pub mod keys;
 
 pub use federation::{FEDERATION_ENABLED, is_local, should_deliver};
