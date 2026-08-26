@@ -10,7 +10,7 @@
 //! the predecessor shipped 500/1h defaults that were never validated against a
 //! number.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use moka::sync::Cache;
@@ -90,12 +90,24 @@ impl StoreManager {
         self.base.join("users").join(user.to_string())
     }
 
+    /// The user's blob directory, creating it on first use.
+    ///
+    /// Under the pod directory, so `delete_pod` takes the bytes with it and
+    /// `pod_bytes` counts them — media has to sit inside the same quota and the
+    /// same delete as the triples, or neither number means anything.
+    pub fn blobs(&self, user: Uuid) -> Result<crate::blobs::BlobStore, StoreError> {
+        crate::blobs::BlobStore::open(self.pod_dir(user).join("blobs"))
+    }
+
     /// The user's pod, opening it if necessary. Creates on first use.
     pub fn pod(&self, user: Uuid) -> Result<Arc<Store>, StoreError> {
         if let Some(store) = self.pods.get(&user) {
             return Ok(store);
         }
-        let dir = self.pod_dir(user);
+        // The graph lives in its own subdirectory: Oxigraph owns that
+        // directory's layout, and `blobs/` alongside it would be a stray
+        // directory inside a database it manages.
+        let dir = self.pod_dir(user).join("rdf");
         std::fs::create_dir_all(&dir)?;
         let store = Arc::new(Store::open(&dir)?);
         self.pods.insert(user, Arc::clone(&store));
@@ -136,21 +148,6 @@ impl StoreManager {
     /// Bytes on disk for one user, for quota accounting. Cheap because pods are
     /// physically separate — the property that per-user isolation buys.
     pub fn pod_bytes(&self, user: Uuid) -> std::io::Result<u64> {
-        dir_bytes(&self.pod_dir(user))
+        crate::blobs::dir_bytes(&self.pod_dir(user))
     }
-}
-
-fn dir_bytes(path: &Path) -> std::io::Result<u64> {
-    if !path.exists() {
-        return Ok(0);
-    }
-    let meta = std::fs::symlink_metadata(path)?;
-    if !meta.is_dir() {
-        return Ok(meta.len());
-    }
-    let mut total = 0;
-    for entry in std::fs::read_dir(path)? {
-        total += dir_bytes(&entry?.path())?;
-    }
-    Ok(total)
 }

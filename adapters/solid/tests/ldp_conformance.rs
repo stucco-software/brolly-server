@@ -97,9 +97,19 @@ const NOTE: &[u8] = br#"<> <https://example.org/title> "First note" ."#;
 #[test]
 fn put_then_get_round_trips() {
     let (_m, _d, store) = pod();
-    ldp::put(&store, BASE, "/~/note", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
 
-    let out = ldp::read(&store, BASE, "/~/note", &alice(), Some("text/turtle")).unwrap();
+    let out = ldp::read(&store, None, BASE, "/~/note", &alice(), Some("text/turtle")).unwrap();
     let body = String::from_utf8(out.body).unwrap();
     assert!(body.contains("First note"), "got: {body}");
     assert_eq!(out.media_type, "text/turtle");
@@ -112,6 +122,7 @@ fn rdf_xml_is_refused_on_write_and_not_stored_as_a_blob() {
     let (_m, _d, store) = pod();
     let err = ldp::put(
         &store,
+        None,
         BASE,
         "/~/note",
         &alice(),
@@ -131,7 +142,17 @@ fn rdf_xml_is_refused_on_write_and_not_stored_as_a_blob() {
 #[test]
 fn content_negotiation_serves_what_was_asked_for() {
     let (_m, _d, store) = pod();
-    ldp::put(&store, BASE, "/~/note", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
 
     for (accept, expected) in [
         ("application/n-triples", "application/n-triples"),
@@ -139,7 +160,7 @@ fn content_negotiation_serves_what_was_asked_for() {
         // Serving RDF/XML is fine; only parsing it is refused.
         ("application/rdf+xml", "application/rdf+xml"),
     ] {
-        let out = ldp::read(&store, BASE, "/~/note", &alice(), Some(accept)).unwrap();
+        let out = ldp::read(&store, None, BASE, "/~/note", &alice(), Some(accept)).unwrap();
         assert_eq!(out.media_type, expected);
         assert!(!out.body.is_empty());
     }
@@ -150,6 +171,7 @@ fn an_unauthorized_reader_cannot_tell_the_resource_exists() {
     let (_m, _d, store) = pod();
     ldp::put(
         &store,
+        None,
         BASE,
         "/~/secret",
         &alice(),
@@ -159,8 +181,8 @@ fn an_unauthorized_reader_cannot_tell_the_resource_exists() {
     )
     .unwrap();
 
-    let missing = ldp::read(&store, BASE, "/~/does-not-exist", &stranger(), None);
-    let forbidden = ldp::read(&store, BASE, "/~/secret", &stranger(), None);
+    let missing = ldp::read(&store, None, BASE, "/~/does-not-exist", &stranger(), None);
+    let forbidden = ldp::read(&store, None, BASE, "/~/secret", &stranger(), None);
 
     // Identical responses, so probing cannot enumerate a pod.
     assert!(matches!(missing, Err(LdpError::NotFound)));
@@ -172,6 +194,7 @@ fn anonymous_writes_are_refused() {
     let (_m, _d, store) = pod();
     let err = ldp::put(
         &store,
+        None,
         BASE,
         "/~/note",
         &anonymous(),
@@ -188,7 +211,17 @@ fn writes_cannot_escape_the_storage_root() {
     // ADR 0010's guarantee, checked at the operation rather than only the router.
     let (_m, _d, store) = pod();
     for path in ["/profile", "/oauth/token", "/actor"] {
-        let err = ldp::put(&store, BASE, path, &alice(), NOTE, "text/turtle", ROOT).unwrap_err();
+        let err = ldp::put(
+            &store,
+            None,
+            BASE,
+            path,
+            &alice(),
+            NOTE,
+            "text/turtle",
+            ROOT,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, LdpError::OutsideStorage),
             "{path} should be outside storage, got {err:?}"
@@ -204,6 +237,7 @@ fn a_body_cannot_write_into_another_resources_graph() {
         br#"<https://alice.brolly.id/~/other> { <https://a.example/s> <https://a.example/p> "x" }"#;
     ldp::put(
         &store,
+        None,
         BASE,
         "/~/note",
         &alice(),
@@ -225,6 +259,7 @@ fn containment_is_maintained_up_the_tree() {
     let (_m, _d, store) = pod();
     ldp::put(
         &store,
+        None,
         BASE,
         "/~/a/b/c",
         &alice(),
@@ -242,7 +277,17 @@ fn containment_is_maintained_up_the_tree() {
 #[test]
 fn posting_to_a_container_mints_a_member() {
     let (_m, _d, store) = pod();
-    let created = ldp::append(&store, BASE, "/~/", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    let created = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
 
     assert!(created.starts_with(ROOT));
     assert!(storage::members(&store, ROOT).contains(&created));
@@ -251,10 +296,20 @@ fn posting_to_a_container_mints_a_member() {
 #[test]
 fn delete_removes_the_resource_and_its_containment() {
     let (_m, _d, store) = pod();
-    ldp::put(&store, BASE, "/~/note", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
     assert!(storage::exists(&store, &format!("{ROOT}note")));
 
-    ldp::delete(&store, BASE, "/~/note", &alice(), ROOT).unwrap();
+    ldp::delete(&store, None, BASE, "/~/note", &alice(), ROOT).unwrap();
     assert!(!storage::exists(&store, &format!("{ROOT}note")));
     assert!(!storage::members(&store, ROOT).contains(&format!("{ROOT}note")));
 }
@@ -262,9 +317,19 @@ fn delete_removes_the_resource_and_its_containment() {
 #[test]
 fn a_non_empty_container_cannot_be_deleted() {
     let (_m, _d, store) = pod();
-    ldp::put(&store, BASE, "/~/a/b", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/a/b",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
 
-    let err = ldp::delete(&store, BASE, "/~/a/", &alice(), ROOT).unwrap_err();
+    let err = ldp::delete(&store, None, BASE, "/~/a/", &alice(), ROOT).unwrap_err();
     assert!(
         matches!(err, LdpError::Forbidden),
         "deleting a populated container would orphan its subtree"
@@ -302,12 +367,31 @@ fn append_permission_does_not_confer_replace() {
     );
 
     assert!(
-        ldp::append(&store, BASE, "/~/inbox/", &bob, NOTE, "text/turtle", ROOT).is_ok(),
+        ldp::append(
+            &store,
+            None,
+            BASE,
+            "/~/inbox/",
+            &bob,
+            NOTE,
+            "text/turtle",
+            ROOT
+        )
+        .is_ok(),
         "Append should permit POST"
     );
     assert!(
         matches!(
-            ldp::put(&store, BASE, "/~/note", &bob, NOTE, "text/turtle", ROOT),
+            ldp::put(
+                &store,
+                None,
+                BASE,
+                "/~/note",
+                &bob,
+                NOTE,
+                "text/turtle",
+                ROOT
+            ),
             Err(LdpError::Forbidden)
         ),
         "Append must not permit PUT — replacing is not adding"
@@ -319,6 +403,7 @@ fn public_read_works_for_anonymous_callers() {
     let (_m, _d, store) = pod();
     ldp::put(
         &store,
+        None,
         BASE,
         "/~/public",
         &alice(),
@@ -340,7 +425,7 @@ fn public_read_works_for_anonymous_callers() {
     )
     .unwrap();
 
-    let out = ldp::read(&store, BASE, "/~/public", &anonymous(), None).unwrap();
+    let out = ldp::read(&store, None, BASE, "/~/public", &anonymous(), None).unwrap();
     assert!(!out.body.is_empty());
     assert_eq!(out.granted, vec![AccessMode::Read], "public read only");
 }
@@ -348,7 +433,7 @@ fn public_read_works_for_anonymous_callers() {
 #[test]
 fn the_storage_root_is_typed_as_a_pod_root() {
     let (_m, _d, store) = pod();
-    let out = ldp::read(&store, BASE, "/~/", &alice(), Some("text/turtle")).unwrap();
+    let out = ldp::read(&store, None, BASE, "/~/", &alice(), Some("text/turtle")).unwrap();
     let body = String::from_utf8(out.body).unwrap();
 
     assert!(out.is_container);

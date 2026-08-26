@@ -23,6 +23,8 @@ pub struct PodRequest {
     pub user: User,
     pub subject: Subject,
     pub store: Arc<brolly_store::Store>,
+    /// This pod's binary storage, for LDP-NR.
+    pub blobs: brolly_store::BlobStore,
     pub base: String,
     pub storage_root: String,
 }
@@ -63,6 +65,14 @@ async fn resolve(
         }
     };
 
+    let blobs = match state.stores.blobs(user.id) {
+        Ok(blobs) => blobs,
+        Err(e) => {
+            tracing::error!(error = %e, user = %user.id, "pod blob store unavailable");
+            return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
+        }
+    };
+
     let base = format!("https://{username}.{}", state.base_domain);
     let subject = subject_for(state, headers, method, &format!("{base}{path}")).await;
     Ok(PodRequest {
@@ -71,6 +81,7 @@ async fn resolve(
         user,
         subject,
         store,
+        blobs,
     })
 }
 
@@ -208,6 +219,7 @@ pub async fn get(
 
     match ldp::read(
         &request.store,
+        Some(&request.blobs),
         &request.base,
         &path,
         &request.subject,
@@ -216,7 +228,7 @@ pub async fn get(
         Ok(outcome) => (
             StatusCode::OK,
             [
-                (header::CONTENT_TYPE, outcome.media_type.to_string()),
+                (header::CONTENT_TYPE, outcome.media_type.clone()),
                 (
                     header::HeaderName::from_static("wac-allow"),
                     wac_allow(&outcome.granted),
@@ -252,6 +264,7 @@ pub async fn put(
 
     match ldp::put(
         &request.store,
+        Some(&request.blobs),
         &request.base,
         &path,
         &request.subject,
@@ -283,6 +296,7 @@ pub async fn post(
 
     match ldp::append(
         &request.store,
+        Some(&request.blobs),
         &request.base,
         &path,
         &request.subject,
@@ -372,6 +386,7 @@ pub async fn delete(
     };
     match ldp::delete(
         &request.store,
+        Some(&request.blobs),
         &request.base,
         &path,
         &request.subject,

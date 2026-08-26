@@ -316,3 +316,73 @@ async fn an_unknown_pod_is_not_found() {
     let response = h.router.clone().oneshot(request).await.unwrap();
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+// --- LDP-NR over HTTP -------------------------------------------------------
+
+/// A PDF header is a real binary signature that is still valid UTF-8, so the
+/// `&str`-bodied helper above can carry it.
+const PDF: &str = "%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
+
+#[tokio::test]
+async fn a_binary_put_and_got_over_http_keeps_its_bytes_and_its_type() {
+    let h = harness().await;
+
+    let (status, _, _) = h
+        .send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body, headers) = h.send("GET", "/~/paper.pdf", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, PDF, "the bytes must come back unchanged");
+    assert_eq!(headers[header::CONTENT_TYPE], "application/pdf");
+    // WAC still applies, so the header a client reads for edit affordances is
+    // present on a binary too.
+    assert!(headers["wac-allow"].to_str().unwrap().contains("write"));
+}
+
+#[tokio::test]
+async fn a_binary_is_invisible_to_a_caller_without_read() {
+    // The failure mode this guards: media served off disk without an ACL check,
+    // so a private image is public to anyone holding the URL.
+    let h = harness().await;
+    h.send(
+        "PUT",
+        "/~/private.pdf",
+        Some(("application/pdf", PDF)),
+        true,
+    )
+    .await;
+
+    let (status, _, _) = h.send("GET", "/~/private.pdf", None, false).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_binary_can_be_deleted_over_http() {
+    let h = harness().await;
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+
+    let (status, _, _) = h.send("DELETE", "/~/paper.pdf", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _, _) = h.send("GET", "/~/paper.pdf", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn rdf_xml_is_refused_over_http_rather_than_stored_as_a_blob() {
+    // ADR 0007 through the full stack: the 415 must survive the addition of a
+    // blob path that would otherwise happily accept it as opaque bytes.
+    let h = harness().await;
+    let (status, _, _) = h
+        .send(
+            "PUT",
+            "/~/doc.rdf",
+            Some(("application/rdf+xml", "<rdf:RDF/>")),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}

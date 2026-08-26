@@ -113,6 +113,7 @@ fn storing_a_note_anywhere_in_the_pod_publishes_nothing() {
     ] {
         ldp::put(
             &f.pod,
+            None,
             BASE,
             path,
             &alice(),
@@ -134,6 +135,7 @@ fn a_container_named_outbox_inside_the_pod_is_just_a_container() {
     let f = fixture();
     let created = ldp::append(
         &f.pod,
+        None,
         BASE,
         "/~/outbox/",
         &alice(),
@@ -158,6 +160,7 @@ fn the_real_outbox_is_outside_the_pod_and_unreachable_from_ldp() {
     let f = fixture();
     let err = ldp::put(
         &f.pod,
+        None,
         BASE,
         "/outbox",
         &alice(),
@@ -178,6 +181,7 @@ fn deleting_pod_content_also_publishes_nothing() {
     let f = fixture();
     ldp::put(
         &f.pod,
+        None,
         BASE,
         "/~/note",
         &alice(),
@@ -186,7 +190,7 @@ fn deleting_pod_content_also_publishes_nothing() {
         ROOT,
     )
     .unwrap();
-    ldp::delete(&f.pod, BASE, "/~/note", &alice(), ROOT).unwrap();
+    ldp::delete(&f.pod, None, BASE, "/~/note", &alice(), ROOT).unwrap();
 
     assert!(
         index_is_empty(&f.manager),

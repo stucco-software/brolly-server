@@ -15,10 +15,12 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod blobs;
 pub mod index;
 pub mod manager;
 pub mod write;
 
+pub use blobs::BlobStore;
 pub use manager::{StoreError, StoreManager};
 /// Re-exported so adapters and the server can name a store without taking a
 /// direct oxigraph dependency — the engine stays an implementation detail of
