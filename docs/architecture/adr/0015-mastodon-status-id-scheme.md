@@ -1,7 +1,7 @@
-# 0015 — Mastodon status IDs: what an opaque ID has to carry
+# 0015 — Mastodon status IDs must be sortable, not numeric
 
-**Status:** Proposed (2026-08-26)
-**Opens:** open decision O4. Must be Accepted before Phase 6 mints its first ID.
+**Status:** Accepted (2026-08-26)
+**Closes:** open decision O4.
 
 ## Context
 
@@ -11,103 +11,99 @@ and no routing — the host *is* the answer. ADR 0005 leans on this: R2 "may not
 need an index at all".
 
 Mastodon's API breaks that. `GET /api/v1/statuses/:id` takes an opaque
-identifier that carries no author, and clients hold those IDs for a long time —
-in caches, in `max_id` pagination cursors, in local databases. Whatever we mint
-is public, permanent, and effectively un-migratable: reissuing IDs invalidates
-every client's stored state.
+identifier carrying no author, and clients hold those IDs for a long time — in
+caches, in `max_id` pagination cursors, in local databases. Whatever we mint is
+public, permanent and effectively un-migratable, so it has to be right before
+the first ID exists.
 
-So this has to be right before the first ID is minted, not after. The plan
-records a preference — "prefer minting Mastodon-facing IDs that encode the
-owning user; fall back to a pure routing table only if that proves impractical"
-— and this ADR exists to test that preference rather than inherit it.
+An earlier draft of this ADR framed the open question as *"do clients sort
+status IDs locally, or pass them back as opaque cursors?"* — on the theory that
+if ordering were purely server-side we could encode the note IRI directly and
+need no index at all.
 
-The constraint that makes it interesting is **pagination**. Mastodon's docs say
-an ID is an opaque string, but `max_id`/`since_id`/`min_id` are ranges, and the
-question is whether ordering has to live *in* the ID or can live in the server
-that interprets it.
+**That question was wrong, and researching it produced a better answer.**
 
-## Options
+## What the ecosystem actually requires
 
-### A — Owner-encoding snowflake
+Mastodon's guidelines say "always treat IDs as opaque strings" and "clients
+generally do not need to sort IDs; the server is responsible for sorting". If
+that were the whole story, a non-sortable ID would be fine.
 
-64 bits, so it still parses as an `i64`: milliseconds, a compact owner number,
-a sequence. Lookup stays O(1) with no index, exactly like an IRI.
+But the same page then publishes a client-side sorting recipe:
 
-The bit budget is tight at D16's scale. Roughly 41 bits of millisecond
-timestamp (~69 years), 14 bits of owner (16,384 members — "thousands, under ten
-thousand" leaves little headroom), 9 bits of sequence (512 statuses per
-millisecond instance-wide). Workable, but every field is sized against a
-guess, and the timestamp field is the one that ages.
+> Sort by length. Newer statuses will have longer IDs. Sort lexically. Newer
+> statuses will have at least one digit that is higher when compared
+> positionally.
 
-It also needs something we do not have: a **compact integer per member**. Users
-are UUIDs, so this means a new serial column, and that column becomes
-load-bearing forever — it is baked into every ID ever issued.
+A recipe that exists because clients do sort. And every implementation that
+departed from Mastodon's numeric IDs kept that recipe working:
 
-### B — Routing table
+| Implementation | ID format | Numeric? | Lexically sortable? |
+|---|---|---|---|
+| Mastodon | 64-bit snowflake | yes | yes |
+| Pleroma / Akkoma | 128-bit FlakeID | **no** | **yes** — docs call it out explicitly |
+| GoToSocial | ULID | **no** | **yes** |
 
-Mint a ULID (or snowflake) and keep `⟨status ID → note IRI⟩` in the server
-index. ADR 0005 already sanctions this as "an address, not a copy", and lists
-R2 among the derived entries that `instance-reindex` must rebuild.
+Pleroma's documentation states its IDs are twice Mastodon's width and then
+notes "just like Mastodon's ids, they are lexically sortable strings". That is
+a property they went out of their way to preserve. GoToSocial ships ULIDs and
+its FAQ reports no ID-format compatibility problems, naming Tusky, Pinafore and
+Feditext as well-supported.
 
-No bit budget, no collision risk, no new column, and the ID scheme can change
-later because the table absorbs it.
+Upstream issue [mastodon#25244] proposes relaxing the "string representations of
+numbers" wording precisely because ULIDs work — and its argument is that the
+documented sort "works for any ASCII strings with characters 0-9 and a-z/A-Z".
+The proposal rests on sortability, not on numerics.
 
-The cost is a row per status **including private ones** — R1 only indexes
-public posts, so this is strictly more index than the instance carries today,
-and it grows without bound rather than with the public timeline.
+So:
 
-### C — Encode the IRI itself
+- **Non-numeric is proven safe.** Three independent implementations ship it.
+- **Non-sortable has never been attempted by anyone**, and its failure mode is
+  the bad one: the documented client recipe would happily mis-sort a base64
+  blob and produce a silently scrambled timeline rather than an error.
 
-The ID *is* the note IRI, base64url-encoded. Self-describing, so lookup is O(1)
-with no index, no new column and no bit budget. Nothing to migrate because
-nothing is allocated.
+## Decision
 
-The ID is then neither numeric nor chronologically sortable. GoToSocial ships
-ULIDs and Pleroma ships FlakeIDs against the same clients, so non-numeric is
-demonstrably fine — but both are still *sortable*, and this is not.
+**Mint fixed-width, lexically sortable, self-describing status IDs.**
 
-## The question this ADR exists to settle
+A timestamp prefix followed by enough encoded identity to reconstruct the note
+IRI, in an alphabet that sorts correctly (Crockford base32: `0-9A-Z`, no
+ambiguous characters). Concretely: the note's own local identifier becomes a
+ULID, and the status ID is that ULID followed by the owning user's UUID in
+base32.
 
-**Does any Mastodon client we care about sort status IDs locally, rather than
-passing them back as opaque cursors?**
+This keeps what made the discarded option attractive — resolving a status ID is
+a decode plus a primary-key lookup on `users`, with **no new index and no new
+column** — while satisfying the constraint the ecosystem actually has.
 
-If ordering is purely server-side — the client sends `max_id`, we decode it,
-resolve the note, and page by its stored timestamp — then C is strictly better
-than both A and B: same O(1) lookup as A, none of A's bit budget or new column,
-none of B's unbounded index.
+**Fixed width is load-bearing, not tidiness.** The documented recipe sorts by
+*length first*. Variable-length IDs — which is what encoding a 2-to-32-character
+username directly would produce — would make a member with a longer name sort
+as permanently newer. Every field is padded to constant width so that clause
+degenerates to a plain lexical sort, which the ULID prefix then dominates.
 
-If any target client sorts IDs itself, C is unshippable and the choice is
-between A's permanent bit budget and B's permanent index row.
+## Consequences
 
-This is empirical and cheap to answer. Phase 6's exit criterion is already
-"Phanpy works end to end against a private instance", so the check is: mint
-non-sortable IDs behind a module constant, point Phanpy, Ivory and Tusky at it,
-and watch whether timelines assemble in the right order.
+- **R2 stays un-indexed.** ADR 0005 guessed it "may not need an index at all";
+  it does not. `instance-reindex` gains nothing to rebuild.
+- **The Mastodon crate needs no store access to resolve an ID**, which is what
+  Phase 6's "projection only, a dependency lint forbids writing to any store"
+  wants anyway.
+- **IDs are long** — roughly 52 characters against Mastodon's ~18. They are
+  opaque strings, GoToSocial's 26-character ULIDs already establish that
+  non-numeric lengths are tolerated, and no part of the API constrains length.
+  This is the accepted cost.
+- **The plan's stated preference is overturned.** It preferred an
+  owner-encoding 64-bit snowflake. At D16's scale that budget is tight —
+  ~14 bits of owner is 16,384 members against a target of "under ten thousand"
+  — it needs a compact per-member integer we do not have, and a field sized
+  wrong now is still wrong when the instance outgrows it, with every issued ID
+  depending on it. Sortable-and-self-describing gets the same O(1) resolution
+  with no fixed budget to get wrong.
+- **What was verified and what was not.** The ID formats, the sorting recipe and
+  the upstream proposal are documented and quoted above. Individual client
+  source was *not* inspected — the conclusion does not rest on knowing which
+  clients sort, only on the fact that the documented contract permits sorting
+  and every shipped implementation honours it.
 
-## Recommendation
-
-**Try C, with B as the fallback**, and treat A as a last resort.
-
-C is the only option that adds no permanent structure — no column, no index, no
-bit budget — and it is the one most consistent with how every other identifier
-in the system already works: the identifier names its owner, so nothing has to
-be looked up. If the client check fails, B is boring, reversible and already
-sanctioned by ADR 0005.
-
-A is last because it is the only option whose mistakes are permanent. A field
-sized wrong in 2026 is a field that is still wrong when the instance has more
-members than the owner field can name, and by then every issued ID depends on
-it.
-
-## Consequences if accepted as recommended
-
-- **Phase 6 gains a verification step before it mints anything**: point real
-  clients at non-sortable IDs and confirm ordering survives.
-- **`instance-reindex` stays unchanged** unless the fallback is taken. If B is
-  taken, R2 becomes a derived entry it must rebuild, and ADR 0005's rebuild
-  section already covers that.
-- **The status ID becomes a decode, not a lookup**, so the Mastodon crate needs
-  no store access to resolve one — which is what Phase 6's "projection only, a
-  dependency lint forbids writing to any store" requires anyway.
-- **If the check fails, nothing is lost.** No IDs have been issued, so falling
-  back to B costs a table and no migration.
+[mastodon#25244]: https://github.com/mastodon/mastodon/issues/25244
