@@ -13,8 +13,16 @@
 use atrium_crypto::keypair::{Did as DidKey, Export, Secp256k1Keypair};
 use brolly_identity::db::DbError;
 
-/// Purpose tag in `user_keys`.
+/// Purpose tag in `user_keys` for the key that signs repo commits.
 pub const ATPROTO_SIGNING: &str = "atproto_signing";
+
+/// Purpose tag for the key that authorizes PLC operations.
+///
+/// Deliberately a different key from the signing one. The signing key is used
+/// on every commit and is the likelier of the two to leak; recovery means
+/// rotating it with a key that was never in that path, so a single key serving
+/// both purposes would make a compromise unrecoverable.
+pub const ATPROTO_ROTATION: &str = "atproto_rotation";
 
 /// A member's repo signing key.
 pub struct SigningKey {

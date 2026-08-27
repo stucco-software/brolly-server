@@ -47,6 +47,7 @@ async fn harness() -> Harness {
                 .expect("instance actor"),
         ),
         commits: tokio::sync::broadcast::channel(64).0,
+        plc_client: None,
     };
     let router = app(state, "server/static");
     Harness {

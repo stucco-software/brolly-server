@@ -53,6 +53,15 @@ pub struct AppState {
     /// than allowed to grow unbounded; it reconnects with its cursor and
     /// backfills, which is the path that already exists.
     pub commits: tokio::sync::broadcast::Sender<brolly_atproto::firehose::CommitEvent>,
+    /// Used to register `did:plc` operations with the directory.
+    ///
+    /// `None` disables submission without disabling identity: keys, DID and
+    /// repo are still created, and the operation waits in
+    /// `identity::unsubmitted`. That is the right shape for local development
+    /// and for a first boot behind a firewall — a member who cannot be
+    /// published yet is very different from a member who was never given an
+    /// identity at all (ADR 0016).
+    pub plc_client: Option<reqwest::Client>,
 }
 
 /// Build the application router.

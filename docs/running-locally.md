@@ -251,11 +251,16 @@ publish through an apex endpoint. **This is a design decision, not a bug fix.**
 Invite-only is enforced, and nothing mints codes. A `tools/` command would make
 the first five minutes of local setup much less strange.
 
-**3. There is no way to provision an ATProtocol repo except code.**
-Registration creates the pod and its ACL, but not the secp256k1 signing key,
-the `did:plc`, or the genesis commit — so XRPC writes fail on a freshly
-registered member. Every piece exists (`adapters/atproto/src/keys.rs`,
-`plc.rs`, `repo.rs`, `identity.rs`); nothing calls them at signup.
+**3. ~~No way to provision an ATProtocol repo except code.~~ Fixed.**
+Registration now mints the signing and rotation keys, derives the `did:plc`
+from a signed genesis operation, and creates the repository — so a member can
+make an XRPC write immediately after signing up.
+
+PLC *submission* is off unless `BROLLY_PLC_SUBMIT=1`, so a local instance does
+not publish test identities to the real directory. The genesis operation waits
+in `identity::unsubmitted` until it does, which is the normal local state: a
+member who cannot be published yet is very different from one who was never
+given an identity (ADR 0016).
 
 **4. No `docker-compose.yml`.** Tests bring their own Postgres via
 testcontainers, so nothing needed one, but running the server does.

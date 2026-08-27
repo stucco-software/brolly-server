@@ -920,6 +920,7 @@ dependencies = [
  "oxigraph",
  "oxrdf",
  "p256 0.14.0",
+ "reqwest",
  "rs-car-sync",
  "serde",
  "serde_json",

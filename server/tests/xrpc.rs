@@ -50,6 +50,7 @@ async fn harness() -> Harness {
                 .expect("instance actor"),
             ),
             commits: tokio::sync::broadcast::channel(64).0,
+            plc_client: None,
         },
         "server/static",
     );
@@ -651,4 +652,212 @@ async fn the_firehose_is_apex_only() {
         tokio_tungstenite::connect_async(request).await.is_err(),
         "the firehose must not serve on a member subdomain"
     );
+}
+
+// --- provisioning ---------------------------------------------------------------------
+
+/// Register through the front door, exactly as a person would.
+async fn a_registered_member(h: &Harness, username: &str) -> String {
+    let invite = db::create_invite(&h.db.pool, None, 1, None)
+        .await
+        .expect("invite");
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/register")
+                .header(header::HOST, BASE)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(format!(
+                    "invite={invite}&username={username}&email=&password=correct-horse-battery"
+                )))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "registration should succeed"
+    );
+
+    response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("brolly_session"))
+        .map(|c| c.split(';').next().unwrap().to_string())
+        .expect("a session cookie")
+}
+
+#[tokio::test]
+async fn registering_provisions_a_usable_atproto_identity() {
+    // The gap this closes: registration created the pod and its ACL but not the
+    // signing key, the DID or the genesis commit, so the *first XRPC write* was
+    // what discovered there was no repository. Every piece existed; nothing
+    // called them at signup.
+    let h = harness().await;
+    let cookie = a_registered_member(&h, "alice").await;
+
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "straight after signing up"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+
+    assert_eq!(
+        created.status,
+        StatusCode::OK,
+        "a member who just registered must be able to write: {}",
+        created.text()
+    );
+    // The AT-URI names the DID, not the handle (D11).
+    let uri = created.json()["uri"].as_str().unwrap().to_string();
+    assert!(uri.starts_with("at://did:plc:"), "got {uri}");
+}
+
+#[tokio::test]
+async fn registration_mints_a_did_two_keys_and_a_repo() {
+    // All three or none. A member with a key and no repo, or a DID and no key,
+    // has an account that looks provisioned and cannot participate.
+    let h = harness().await;
+    a_registered_member(&h, "alice").await;
+
+    let user = db::find_by_username(&h.db.pool, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert!(
+        user.did_plc
+            .as_deref()
+            .is_some_and(|d| d.starts_with("did:plc:")),
+        "no DID was minted: {:?}",
+        user.did_plc
+    );
+
+    for purpose in [
+        brolly_atproto::keys::ATPROTO_SIGNING,
+        brolly_atproto::keys::ATPROTO_ROTATION,
+    ] {
+        assert!(
+            db::load_key(&h.db.pool, user.id, purpose)
+                .await
+                .unwrap()
+                .is_some(),
+            "{purpose} was not stored"
+        );
+    }
+
+    assert!(
+        brolly_atproto::state::load(&h.db.pool, user.id)
+            .await
+            .unwrap()
+            .is_some(),
+        "no repository was created"
+    );
+}
+
+#[tokio::test]
+async fn the_rotation_key_is_not_the_signing_key() {
+    // Storing one key under both purposes would make a compromise
+    // unrecoverable while looking, from the schema, exactly like doing it
+    // properly.
+    let h = harness().await;
+    a_registered_member(&h, "alice").await;
+    let user = db::find_by_username(&h.db.pool, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+
+    let (signing, _) = db::load_key(&h.db.pool, user.id, brolly_atproto::keys::ATPROTO_SIGNING)
+        .await
+        .unwrap()
+        .unwrap();
+    let (rotation, _) = db::load_key(&h.db.pool, user.id, brolly_atproto::keys::ATPROTO_ROTATION)
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_ne!(signing, rotation, "one key is serving both purposes");
+}
+
+#[tokio::test]
+async fn an_unregistered_did_is_visible_for_retry_rather_than_lost() {
+    // With no PLC client configured — the local-development and
+    // first-boot-behind-a-firewall case — the member is fully provisioned and
+    // the genesis operation waits in the queue. A member who cannot be
+    // published yet is very different from one who was never given an identity
+    // (ADR 0016).
+    let h = harness().await;
+    a_registered_member(&h, "alice").await;
+
+    let pending = brolly_atproto::identity::unsubmitted(&h.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(pending.len(), 1, "the genesis operation should be queued");
+    assert!(!pending[0].submitted);
+    assert!(pending[0].did.starts_with("did:plc:"));
+}
+
+#[tokio::test]
+async fn two_members_get_distinct_identities() {
+    let h = harness().await;
+    a_registered_member(&h, "alice").await;
+    a_registered_member(&h, "bob").await;
+
+    let alice = db::find_by_username(&h.db.pool, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let bob = db::find_by_username(&h.db.pool, "bob")
+        .await
+        .unwrap()
+        .unwrap();
+
+    assert_ne!(alice.did_plc, bob.did_plc, "two members share a DID");
+    assert_ne!(
+        brolly_atproto::state::load(&h.db.pool, alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .root_cid,
+        brolly_atproto::state::load(&h.db.pool, bob.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .root_cid,
+        "two members share a repository root"
+    );
+}
+
+#[tokio::test]
+async fn the_new_members_repo_resolves_by_did() {
+    // The DID is what every AT-URI names, so resolving by it is the path that
+    // actually gets exercised.
+    let h = harness().await;
+    a_registered_member(&h, "alice").await;
+    let user = db::find_by_username(&h.db.pool, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let did = user.did_plc.unwrap();
+
+    let reply = get(
+        &h,
+        &format!("/xrpc/com.atproto.repo.describeRepo?repo={did}"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["did"], did);
+    assert_eq!(reply.json()["handle"], format!("alice.{BASE}"));
 }

@@ -299,6 +299,35 @@ pub async fn register_submit(
                 }
             }
 
+            // An ATProtocol identity, in the same breath. Deferring it to
+            // "first use" means the first XRPC write is what discovers there is
+            // no key, no DID and no repository — and an account that works in
+            // three protocols and not the fourth reads as a bug in the fourth.
+            match crate::provision::atproto_identity(
+                &state.pool,
+                &state.stores,
+                user.id,
+                &user.username,
+                &state.base_domain,
+                state.plc_client.as_ref(),
+            )
+            .await
+            {
+                Ok(identity) => tracing::info!(
+                    user = %user.id,
+                    did = %identity.did,
+                    registered = identity.registered,
+                    "atproto identity provisioned"
+                ),
+                Err(e) => {
+                    // Local provisioning failing is a real failure — the
+                    // account would be permanently half-built. Network failure
+                    // is not, and is handled inside as `registered: false`.
+                    tracing::error!(error = %e, user = %user.id, "atproto provisioning failed");
+                    return server_error();
+                }
+            }
+
             match db::create_session(&state.pool, user.id, time::Duration::days(30), None).await {
                 Ok(token) => (jar.add(session_cookie(token)), Redirect::to("/")).into_response(),
                 Err(e) => {

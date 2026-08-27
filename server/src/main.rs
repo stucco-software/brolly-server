@@ -60,6 +60,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             1024,
         )
         .0,
+        // Absent unless asked for, so a local instance does not try to publish
+        // test identities to the real PLC directory.
+        plc_client: std::env::var("BROLLY_PLC_SUBMIT")
+            .is_ok_and(|v| v == "1" || v == "true")
+            .then(reqwest::Client::new),
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));
