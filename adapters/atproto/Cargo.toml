@@ -26,9 +26,12 @@ sha2 = "0.11.0"
 rand = "0.8"
 tokio = { version = "1.53.1", features = ["rt", "macros", "sync"] }
 tracing.workspace = true
+uuid = { version = "1.25.0", features = ["v4"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "time"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+brolly-test-support.workspace = true
 uuid = { version = "1.25.0", features = ["v4"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 
