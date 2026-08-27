@@ -25,13 +25,18 @@ serde_json = "1.0.151"
 sha2 = "0.11.0"
 oxigraph = "0.5.9"
 rand = "0.8"
-tokio = { version = "1.53.1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "io-util"] }
 tracing.workspace = true
 uuid = { version = "1.25.0", features = ["v4"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "time"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"
+# Phase 7 exit criterion: the CAR must validate against an implementation that
+# is **not** atrium, or the test only proves atrium agrees with itself.
+rs-car-sync = "0.5.1"
+atrium-repo = "0.1.8"
+sha2 = "0.11.0"
 brolly-test-support.workspace = true
 uuid = { version = "1.25.0", features = ["v4"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }

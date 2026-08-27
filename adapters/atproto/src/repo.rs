@@ -148,6 +148,121 @@ pub async fn delete_record(
     Ok(commit.finalize(signature).await?)
 }
 
+/// Export the repo as a CARv1 archive.
+///
+/// The archive is what `com.atproto.sync.getRepo` serves and what a member's
+/// data export is: every block reachable from the root, framed with the root as
+/// the CAR's single root. atrium writes it (D14) — CAR framing is exactly the
+/// kind of structural detail that is easy to get subtly wrong and impossible to
+/// notice locally, because a malformed archive still reads back with the same
+/// code that wrote it.
+pub async fn export_car(blocks: PodBlocks, root: Cid) -> Result<Vec<u8>, RepoError> {
+    use atrium_repo::blockstore::CarStore;
+
+    let mut repo = Repository::open(blocks, root).await?;
+
+    // `CarStore` keeps its storage private, so the buffer is shared rather than
+    // recovered afterwards.
+    let buffer = SharedBuffer::default();
+    let mut car = CarStore::create_with_roots(buffer.clone(), [root])
+        .await
+        .map_err(|e| RepoError::Repo(e.to_string()))?;
+
+    repo.export_into(&mut car).await?;
+    Ok(buffer.take())
+}
+
+/// An in-memory file the CAR writer can seek around in.
+///
+/// CAR writing seeks — it revisits offsets as it frames blocks — so a plain
+/// `Vec` is not enough and the whole archive is built before anything is
+/// returned. That is fine at a member's repo size and wrong at a large one;
+/// when export needs to stream, this is the piece that changes.
+#[derive(Clone, Default)]
+struct SharedBuffer {
+    inner: std::sync::Arc<std::sync::Mutex<std::io::Cursor<Vec<u8>>>>,
+}
+
+impl SharedBuffer {
+    fn take(&self) -> Vec<u8> {
+        self.lock().get_ref().clone()
+    }
+
+    /// Poisoning is recovered from rather than panicked on.
+    ///
+    /// A poisoned lock here means an earlier export panicked while holding it.
+    /// The cursor is still a structurally valid buffer, the export that failed
+    /// is already an error on its own path, and panicking a second time in a
+    /// library crate would turn a failed export into a downed server.
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::io::Cursor<Vec<u8>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn with<T>(&self, f: impl FnOnce(&mut std::io::Cursor<Vec<u8>>) -> T) -> T {
+        f(&mut self.lock())
+    }
+}
+
+impl tokio::io::AsyncRead for SharedBuffer {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        use std::io::Read;
+        std::task::Poll::Ready(self.with(|cursor| {
+            let read = cursor.read(buf.initialize_unfilled())?;
+            buf.advance(read);
+            Ok(())
+        }))
+    }
+}
+
+impl tokio::io::AsyncWrite for SharedBuffer {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        data: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        use std::io::Write;
+        std::task::Poll::Ready(self.with(|cursor| cursor.write(data)))
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl tokio::io::AsyncSeek for SharedBuffer {
+    fn start_seek(
+        self: std::pin::Pin<&mut Self>,
+        position: std::io::SeekFrom,
+    ) -> std::io::Result<()> {
+        use std::io::Seek;
+        self.with(|cursor| cursor.seek(position)).map(|_| ())
+    }
+
+    fn poll_complete(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<u64>> {
+        use std::io::Seek;
+        std::task::Poll::Ready(self.with(|cursor| cursor.stream_position()))
+    }
+}
+
 /// Every CID reachable from the root — the block set a CAR export carries.
 pub async fn reachable(blocks: PodBlocks, root: Cid) -> Result<Vec<Cid>, RepoError> {
     let mut repo = Repository::open(blocks, root).await?;
