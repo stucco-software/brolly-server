@@ -163,14 +163,13 @@ pub fn create(
     Ok((signed, did))
 }
 
-/// Where a signed operation is submitted.
+/// The PLC directory entry for a DID.
 ///
-/// Submission is deliberately *not* done here. It is a network call to a
-/// directory outside this instance, so it belongs behind the federation switch
-/// (D12) with everything else that leaves the host — and a DID registered
-/// before the instance is ready to federate is a public claim we cannot yet
-/// honour. The operation and the DID are produced now, exercised locally, and
-/// submitted when Phase 8 flips.
+/// Submission is **not** gated by the federation switch (ADR 0016). That switch
+/// governs ActivityPub's outbound *delivery*, where suppressing it costs a
+/// member nothing local. ATProtocol has no equivalent: a member without a
+/// registered `did:plc` has no ATProtocol identity at all — not a degraded one,
+/// none — and cannot later take elsewhere the DID that was never created.
 pub fn directory_url(did: &str) -> String {
     format!("https://plc.directory/{did}")
 }

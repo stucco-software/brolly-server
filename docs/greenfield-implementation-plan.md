@@ -25,7 +25,7 @@ supersedes this section.
 | D9 | **Solid LDP is generic CRUD.** Publication = shape + location | A typed publication container, not a sync flag |
 | D10 | **No automatic cross-protocol collapse.** Bridging is an explicit per-write user decision | Display across surfaces is fine; delivery is opt-in |
 | D11 | **`did:plc` in every wire format** from the first commit; `did:web` for routing only | No AT-URI migration later |
-| D12 | **Federation off by default**; all federation code paths still exercised locally | Ship dormant, flip in a one-line commit |
+| D12 | **Federation off by default**; all federation code paths still exercised locally. **Scoped to ActivityPub by ADR 0016** — ATProtocol is always on, because a PDS hosts rather than pushes and a member without a `did:plc` has no identity at all | Ship dormant, flip in a one-line commit |
 | D13 | **Drop `com.mycorriza.rdf.resource`** | Nothing publishes arbitrary Solid RDF outward |
 | D14 | **Adopt `atrium-*` from commit one** | No hand-rolled MST, CAR, or service-auth JWT |
 | D15 | **Trunk-based**, every commit deployable | Risky work ships behind a module constant |
