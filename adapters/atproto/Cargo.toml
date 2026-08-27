@@ -11,6 +11,26 @@ brolly-domain.workspace = true
 brolly-store.workspace = true
 brolly-authz.workspace = true
 brolly-identity.workspace = true
+# ADR 0002, at the versions its spike actually exercised. No hand-rolled MST,
+# CAR, commit signing or did:key (D14) — the predecessor's was the single
+# largest source of "works until it meets a real client".
+atrium-api = "0.25.8"
+atrium-common = "0.1.4"
+atrium-crypto = "0.1.3"
+atrium-identity = "0.1.9"
+atrium-repo = "0.1.8"
+atrium-xrpc = "0.12.4"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+rand = "0.8"
+tokio = { version = "1.53.1", features = ["rt", "macros", "sync"] }
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile = "3.27.0"
+uuid = { version = "1.25.0", features = ["v4"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 
 [lints]
 workspace = true

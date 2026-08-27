@@ -99,6 +99,16 @@ impl StoreManager {
         crate::blobs::BlobStore::open(self.pod_dir(user).join("blobs"))
     }
 
+    /// Content-addressed storage for the member's ATProtocol repo blocks.
+    ///
+    /// Separate from `blobs` even though both are content-addressed immutable
+    /// bytes: media and repo blocks have different lifecycles — a blob is
+    /// deleted when its last resource goes, a repo block is history — and
+    /// mixing them would make either sweep reason about the other.
+    pub fn repo_blocks(&self, user: Uuid) -> Result<crate::blobs::BlobStore, StoreError> {
+        crate::blobs::BlobStore::open(self.pod_dir(user).join("repo"))
+    }
+
     /// The user's pod, opening it if necessary. Creates on first use.
     pub fn pod(&self, user: Uuid) -> Result<Arc<Store>, StoreError> {
         if let Some(store) = self.pods.get(&user) {

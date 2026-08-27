@@ -778,10 +778,24 @@ dependencies = [
 name = "brolly-atproto"
 version = "0.1.0"
 dependencies = [
+ "atrium-api",
+ "atrium-common",
+ "atrium-crypto",
+ "atrium-identity",
+ "atrium-repo",
+ "atrium-xrpc",
  "brolly-authz",
  "brolly-domain",
  "brolly-identity",
  "brolly-store",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]
