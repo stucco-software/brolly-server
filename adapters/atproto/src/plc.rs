@@ -163,6 +163,72 @@ pub fn create(
     Ok((signed, did))
 }
 
+/// The CID a PLC operation is referenced by in its successor's `prev`.
+///
+/// The DAG-CBOR of the *signed* operation, as a CIDv1 with the DAG-CBOR codec —
+/// the same content addressing the repo uses, so an operation log is a chain
+/// each link of which names its predecessor by content.
+pub fn operation_cid(signed: &Operation) -> Result<String, PlcError> {
+    use sha2::Digest;
+    let bytes = serde_ipld_dagcbor::to_vec(signed).map_err(|e| PlcError::Encode(e.to_string()))?;
+    let digest = Sha256::digest(&bytes);
+    let mh =
+        atrium_repo::Multihash::wrap(0x12, &digest).map_err(|e| PlcError::Encode(e.to_string()))?;
+    Ok(atrium_repo::Cid::new_v1(0x71, mh).to_string())
+}
+
+/// Build an operation that rotates the repo signing key.
+///
+/// Rotation is the reason rotation keys are separate from the signing key at
+/// all. The repo key signs every commit, so it is the one likeliest to leak;
+/// recovery means replacing it using a key that was never in that path.
+///
+/// The new operation:
+///
+/// * names its predecessor in `prev`, so the log is a chain rather than a set
+///   and a directory can reject an operation that forks it;
+/// * is signed by a **current** rotation key, not by either signing key — the
+///   compromised key must not be able to authorize its own replacement;
+/// * keeps the DID unchanged, because the DID was derived from the *genesis*
+///   operation and is deliberately not a function of the current keys. That is
+///   what makes it survive rotation at all.
+pub fn rotate_signing_key(
+    previous: &Operation,
+    previous_cid: &str,
+    new_signing_key: &SigningKey,
+    rotation_key: &SigningKey,
+) -> Result<Operation, PlcError> {
+    let mut next = Operation {
+        prev: Some(previous_cid.to_string()),
+        sig: None,
+        ..previous.clone()
+    };
+    next.verification_methods
+        .insert("atproto".to_string(), new_signing_key.did_key());
+
+    sign(&next, rotation_key)
+}
+
+/// Build an operation that replaces the rotation keys themselves.
+///
+/// Signed by one of the *outgoing* keys, which is the only thing that could
+/// authorize it — and the reason more than one rotation key is published: if
+/// the only one is lost, nothing can ever sign again and the DID is frozen.
+pub fn rotate_rotation_keys(
+    previous: &Operation,
+    previous_cid: &str,
+    new_rotation_keys: &[String],
+    signing_with: &SigningKey,
+) -> Result<Operation, PlcError> {
+    let next = Operation {
+        prev: Some(previous_cid.to_string()),
+        rotation_keys: new_rotation_keys.to_vec(),
+        sig: None,
+        ..previous.clone()
+    };
+    sign(&next, signing_with)
+}
+
 /// The PLC directory entry for a DID.
 ///
 /// Submission is **not** gated by the federation switch (ADR 0016). That switch
@@ -353,5 +419,149 @@ mod tests {
         let bytes = serde_ipld_dagcbor::to_vec(&signed).unwrap();
         let decoded: Operation = serde_ipld_dagcbor::from_slice(&bytes).unwrap();
         assert_eq!(decoded, signed);
+    }
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    const HANDLE: &str = "alice.brolly.test";
+    const PDS: &str = "https://brolly.test";
+
+    fn a_genesis() -> (Operation, String, SigningKey, SigningKey) {
+        let signing = SigningKey::generate();
+        let rotation = SigningKey::generate();
+        let (signed, did) = create(&signing, &rotation, HANDLE, PDS).expect("genesis");
+        (signed, did, signing, rotation)
+    }
+
+    #[test]
+    fn rotating_the_signing_key_keeps_the_did() {
+        // The whole point of deriving the DID from the *genesis* operation: it
+        // is not a function of the current keys, so it survives rotation. A DID
+        // that changed when a key was replaced would make recovery
+        // indistinguishable from starting over.
+        let (genesis, did, _, rotation) = a_genesis();
+        let cid = operation_cid(&genesis).expect("cid");
+        let replacement = SigningKey::generate();
+
+        let rotated = rotate_signing_key(&genesis, &cid, &replacement, &rotation).expect("rotate");
+
+        assert_eq!(
+            rotated.verification_methods.get("atproto"),
+            Some(&replacement.did_key()),
+            "the new key must be the published one"
+        );
+        // The DID is unchanged because it was never derived from this.
+        assert_eq!(did_for(&genesis).unwrap(), did);
+    }
+
+    #[test]
+    fn a_rotation_names_its_predecessor() {
+        // So the log is a chain rather than a set, and a directory can reject
+        // an operation that forks it.
+        let (genesis, _, _, rotation) = a_genesis();
+        let cid = operation_cid(&genesis).unwrap();
+
+        let rotated =
+            rotate_signing_key(&genesis, &cid, &SigningKey::generate(), &rotation).unwrap();
+
+        assert_eq!(rotated.prev.as_deref(), Some(cid.as_str()));
+        assert_ne!(rotated.prev, genesis.prev, "genesis follows nothing");
+    }
+
+    #[test]
+    fn a_rotation_is_signed_by_the_rotation_key_not_the_signing_key() {
+        // The compromised key must not be able to authorize its own
+        // replacement — that would make rotation useless in the only scenario
+        // it exists for.
+        let (genesis, _, signing, rotation) = a_genesis();
+        let cid = operation_cid(&genesis).unwrap();
+        let rotated =
+            rotate_signing_key(&genesis, &cid, &SigningKey::generate(), &rotation).unwrap();
+
+        let payload = signing_payload(&rotated).unwrap();
+        let signature = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            rotated.sig.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            atrium_crypto::verify::verify_signature(&rotation.did_key(), &payload, &signature)
+                .is_ok(),
+            "must verify against the rotation key"
+        );
+        assert!(
+            atrium_crypto::verify::verify_signature(&signing.did_key(), &payload, &signature)
+                .is_err(),
+            "must not verify against the signing key it is replacing"
+        );
+    }
+
+    #[test]
+    fn a_compromised_signing_key_cannot_sign_its_own_rotation() {
+        // Stated from the attacker's side: holding the leaked repo key gets
+        // you an operation the directory will not accept, because it is not
+        // signed by a rotation key.
+        let (genesis, _, leaked, rotation) = a_genesis();
+        let cid = operation_cid(&genesis).unwrap();
+
+        let attempt = rotate_signing_key(&genesis, &cid, &SigningKey::generate(), &leaked).unwrap();
+        let payload = signing_payload(&attempt).unwrap();
+        let signature = base64::Engine::decode(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+            attempt.sig.as_ref().unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            atrium_crypto::verify::verify_signature(&rotation.did_key(), &payload, &signature)
+                .is_err(),
+            "an operation signed by the leaked key must not verify as a rotation"
+        );
+    }
+
+    #[test]
+    fn rotation_keys_can_themselves_be_replaced() {
+        let (genesis, _, _, rotation) = a_genesis();
+        let cid = operation_cid(&genesis).unwrap();
+        let replacement = SigningKey::generate();
+
+        let rotated = rotate_rotation_keys(&genesis, &cid, &[replacement.did_key()], &rotation)
+            .expect("rotate rotation keys");
+
+        assert_eq!(rotated.rotation_keys, vec![replacement.did_key()]);
+        assert_eq!(rotated.prev.as_deref(), Some(cid.as_str()));
+    }
+
+    #[test]
+    fn each_operation_has_its_own_cid() {
+        // Otherwise `prev` could not distinguish links in the chain.
+        let (genesis, _, _, rotation) = a_genesis();
+        let cid = operation_cid(&genesis).unwrap();
+        let rotated =
+            rotate_signing_key(&genesis, &cid, &SigningKey::generate(), &rotation).unwrap();
+
+        assert_ne!(operation_cid(&rotated).unwrap(), cid);
+        assert!(
+            cid.starts_with("bafyre"),
+            "expected a DAG-CBOR CIDv1: {cid}"
+        );
+    }
+
+    #[test]
+    fn the_handle_and_pds_survive_a_signing_key_rotation() {
+        // Rotation replaces one field. Losing the handle or the service
+        // endpoint would make the member unreachable in a different way.
+        let (genesis, _, _, rotation) = a_genesis();
+        let cid = operation_cid(&genesis).unwrap();
+        let rotated =
+            rotate_signing_key(&genesis, &cid, &SigningKey::generate(), &rotation).unwrap();
+
+        assert_eq!(rotated.also_known_as, genesis.also_known_as);
+        assert_eq!(rotated.services, genesis.services);
+        assert_eq!(rotated.rotation_keys, genesis.rotation_keys);
     }
 }
