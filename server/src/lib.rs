@@ -17,6 +17,7 @@ pub mod account;
 pub mod activitypub;
 pub mod auth;
 pub mod consent;
+pub mod mastodon_api;
 pub mod mastodon_oauth;
 pub mod outbox;
 pub mod pod;
@@ -124,6 +125,10 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         )
         .route("/oauth/token", post(mastodon_oauth::token))
         .route("/oauth/revoke", post(mastodon_oauth::revoke))
+        // The Client API. Everything under /api/ answers JSON, including its
+        // 404s — the predecessor let unmatched paths fall through to the LDP
+        // router and hand clients RDF they cannot parse.
+        .merge(mastodon_api::routes())
         .merge(oauth)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.

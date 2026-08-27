@@ -117,6 +117,28 @@ pub fn forget_note(store: &Store, note: &NamedNode) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The AS2 public collection — the audience a public post is addressed to.
+pub const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public";
+
+/// Note IRIs on the public timeline, newest first.
+///
+/// A convenience over [`public_timeline`] that takes and returns plain strings,
+/// so a caller can page the public timeline without depending on oxigraph. The
+/// engine stays an implementation detail of this crate, which is the same
+/// reason `Store` is re-exported rather than imported everywhere.
+pub fn public_note_iris(
+    store: &Store,
+    limit: usize,
+    before: Option<&str>,
+) -> Result<Vec<String>, StoreError> {
+    Ok(
+        public_timeline(store, &iri(PUBLIC_AUDIENCE), limit, before)?
+            .into_iter()
+            .map(|pointer| pointer.note.as_str().to_string())
+            .collect(),
+    )
+}
+
 /// How many notes the index knows about.
 ///
 /// Counted here rather than by opening every pod — this is exactly the
