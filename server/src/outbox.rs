@@ -47,7 +47,15 @@ fn as_activity(body: &Value, actor: &str, base: &str, now: &str) -> Value {
 
     // A bare object: give it its own IRI in the author's pod, then wrap it.
     let mut object = body.clone();
-    let object_id = format!("{base}/~/notes/{}", uuid::Uuid::new_v4());
+    // A ULID, not a UUIDv4, and the reason lives one protocol over: ADR 0015
+    // builds Mastodon's status ID out of this identifier, and Mastodon clients
+    // are permitted to sort IDs lexically. A v4 local part would claim an
+    // ordering it does not have. Nothing else about publication cares, which is
+    // why this is the only line that mentions it.
+    let object_id = format!(
+        "{base}/~/notes/{}",
+        brolly_mastodon::status_id::mint_note_id()
+    );
     object["id"] = json!(object_id);
     object["attributedTo"] = json!(actor);
     if object.get("published").is_none() {
