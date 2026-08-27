@@ -282,8 +282,11 @@ mod tests {
 
     #[test]
     fn the_window_is_short_because_these_are_minted_per_call() {
+        // `black_box` so the comparison is not folded away — the same trap
+        // the federation tripwire hit. A budget assertion that optimizes to
+        // nothing is worse than no assertion, because it reads as covered.
         assert!(
-            TTL_SECONDS <= 60,
+            std::hint::black_box(TTL_SECONDS) <= 60,
             "a long-lived service token is replay surface with no benefit"
         );
     }
