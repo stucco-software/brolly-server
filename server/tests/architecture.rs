@@ -223,3 +223,76 @@ fn app_is_defined_only_in_the_server_crate() {
          This is the rule that keeps the dependency graph acyclic."
     );
 }
+
+/// Mastodon is a **projection**. It reads from stores and writes to none.
+///
+/// Phase 6's exit criterion states it outright: "`mastodon/` has no write path
+/// to a store." The rule matters because the Mastodon API is the surface most
+/// under pressure to denormalize — the predecessor's admin list could not open
+/// 500 Oxigraph stores to render a table, so display names went back into
+/// Postgres with a backfill job. When a projection is allowed to write, the
+/// thing it writes becomes a second source of truth that nothing can retire.
+///
+/// A pure lint rather than a type-level guarantee: the store API takes `&Store`
+/// everywhere, so there is no `&mut` to withhold. Checking the call names is
+/// what is actually available.
+#[test]
+fn the_mastodon_crate_never_writes_to_a_store() {
+    /// Every mutation entry point in `brolly-store`, plus the raw oxigraph
+    /// calls that would bypass it. Kept in sync by hand — but a *new* store
+    /// mutator that this list misses is a `brolly-store` review question, and
+    /// `store::write`'s own docs say there is exactly one insert.
+    const MUTATORS: [&str; 11] = [
+        // brolly-store's write path.
+        "insert_quads",
+        "insert_record",
+        "replace_graph",
+        "record_note",
+        "forget_note",
+        "index::clear",
+        // Raw oxigraph, which would sidestep canonicalization entirely.
+        ".insert(",
+        ".remove(",
+        "clear_graph",
+        ".transaction(",
+        "bulk_loader",
+    ];
+
+    let mastodon_sources: Vec<_> = source_files()
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("/mastodon/"))
+        .collect();
+
+    assert!(
+        !mastodon_sources.is_empty(),
+        "no mastodon sources found — this lint would pass vacuously"
+    );
+
+    let mut offenders = Vec::new();
+    for path in mastodon_sources {
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        for line in text.lines() {
+            // `.insert(` is also how a HashMap is filled, which a translation
+            // layer does constantly. Only flag it when the receiver is a store.
+            let store_shaped = !line.contains(".insert(")
+                || line.contains("store.insert(")
+                || line.contains("Store.insert(");
+            if !store_shaped {
+                continue;
+            }
+            if let Some(found) = MUTATORS.iter().find(|m| line.contains(**m)) {
+                offenders.push(format!("{}: {}", path.display(), found));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "brolly-mastodon writes to a store in {offenders:#?}. \
+         It is a projection: read from pods and the index, return JSON, own \
+         nothing. If a Mastodon read needs data that does not exist yet, the \
+         write belongs in the adapter that owns it — see plan §3 Phase 6."
+    );
+}
