@@ -892,6 +892,7 @@ name = "brolly-server"
 version = "0.1.0"
 dependencies = [
  "askama",
+ "atrium-repo",
  "axum",
  "axum-extra",
  "base64 0.23.1",
@@ -909,6 +910,7 @@ dependencies = [
  "oxigraph",
  "oxrdf",
  "p256 0.14.0",
+ "rs-car-sync",
  "serde",
  "serde_json",
  "serde_urlencoded",

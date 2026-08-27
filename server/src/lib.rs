@@ -24,6 +24,7 @@ pub mod pod;
 pub mod provision;
 pub mod solid_oidc;
 pub mod views;
+pub mod xrpc;
 
 /// Everything a handler needs. Composed here because `server` is the only crate
 /// permitted to depend on more than one adapter.
@@ -130,6 +131,9 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // 404s — the predecessor let unmatched paths fall through to the LDP
         // router and hand clients RDF they cannot parse.
         .merge(mastodon_api::routes())
+        // XRPC on the apex, with the repo named by parameter — the shape a PDS
+        // has and the endpoint the PLC document advertises.
+        .merge(xrpc::routes())
         .merge(oauth)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.
