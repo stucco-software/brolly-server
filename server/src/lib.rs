@@ -21,6 +21,7 @@ pub mod mastodon_api;
 pub mod mastodon_oauth;
 pub mod outbox;
 pub mod pod;
+pub mod provision;
 pub mod solid_oidc;
 pub mod views;
 

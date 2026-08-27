@@ -330,3 +330,56 @@ async fn logout_is_not_reachable_by_get() {
         "a prefetch or cross-site <img> must not be able to log someone out"
     );
 }
+
+#[tokio::test]
+async fn registering_provisions_a_pod_the_member_can_write_to() {
+    // WAC grants nothing by default — a missing ACL meaning "allow" is how
+    // authorization bugs become data leaks — so the owner's grant has to be
+    // created, and account creation is the only moment that is certainly
+    // right. Without it the first write any new member attempts is refused,
+    // while the pod looks perfectly fine from the outside.
+    let (db, _dir, router) = harness().await;
+    let invite = db::create_invite(&db.pool, None, 1, None)
+        .await
+        .expect("invite");
+
+    let (status, _, cookies) = post(
+        &router,
+        "/register",
+        &format!("invite={invite}&username=alice&email=&password=correct-horse-battery"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "registration should succeed");
+    let cookie = cookies
+        .first()
+        .expect("a session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    // Asserted over HTTP rather than against the store directly: this is the
+    // path a member actually takes, and it evaluates the ACL that was written.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/~/notes/first")
+                .header(header::HOST, "alice.brolly.test")
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "text/turtle")
+                .body(Body::from(
+                    "<https://alice.brolly.test/~/notes/first> <https://brolly.id/ns#note> \"hi\" .",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "a newly registered member cannot write to their own pod"
+    );
+}

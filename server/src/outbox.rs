@@ -144,7 +144,14 @@ async fn session_user(state: &AppState, jar: &CookieJar) -> Option<User> {
 }
 
 /// Store the activity in the author's pod, then deliver it.
-async fn deliver(
+/// Publish an activity: store the author's copy, then fan out.
+///
+/// Exposed to the Mastodon composer so that `POST /api/v1/statuses` goes
+/// through the *same* delivery path as `POST /outbox`. The predecessor had a
+/// second fan-out for the Mastodon side that queried a table a migration had
+/// dropped, and the error was swallowed — so statuses were delivered to nobody,
+/// silently. One path, or the second one rots.
+pub(crate) async fn deliver(
     state: &AppState,
     author: &User,
     actor: &str,

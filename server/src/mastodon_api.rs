@@ -15,12 +15,12 @@
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use brolly_identity::db::{self, User};
 use brolly_identity::{extract, webid};
 use brolly_mastodon::oauth::Grant;
-use brolly_mastodon::{instance, oauth, status_id, timeline, translate};
+use brolly_mastodon::{compose, instance, oauth, status_id, timeline, translate};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -411,6 +411,397 @@ pub async fn status(
     }
 }
 
+// --- media ---------------------------------------------------------------------
+
+/// Where a member's uploads live inside their pod.
+fn media_iri(username: &str, base_domain: &str, id: &str) -> String {
+    format!("https://{username}.{base_domain}/~/media/{id}")
+}
+
+/// Alt text, stored on the media resource itself.
+///
+/// It has to live somewhere the resource can be read back from *before* it is
+/// attached, because `PUT /api/v1/media/{id}` is how clients set a description
+/// while the composer is still open.
+const ALT_TEXT: &str = "https://brolly.id/ns#altText";
+
+/// The `Subject` a member's own API call acts as.
+///
+/// Built so media writes go through the same WAC evaluation as every other
+/// write (§2.8: one authorization layer under every protocol). Bypassing it
+/// here would make the Mastodon surface the one place authorization is not
+/// checked, which is exactly the shape of the predecessor's problem.
+fn subject_for(state: &AppState, user: &User, grant: &Grant) -> brolly_identity::Subject {
+    brolly_identity::Subject::local(
+        user.id,
+        user.did_plc.clone().unwrap_or_default(),
+        webid::webid(&user.username, &state.base_domain),
+        brolly_identity::Scope::parse(&grant.scopes),
+        brolly_identity::Via::MastodonBearer,
+    )
+}
+
+fn media_json(id: &str, url: &str, media_type: &str, description: Option<&str>) -> Value {
+    let kind = match media_type.split('/').next().unwrap_or_default() {
+        "image" => "image",
+        "video" => "video",
+        "audio" => "audio",
+        _ => "unknown",
+    };
+    json!({
+        "id": id,
+        "type": kind,
+        "url": url,
+        "preview_url": url,
+        "remote_url": Value::Null,
+        "description": description,
+        "blurhash": Value::Null,
+        "meta": json!({}),
+    })
+}
+
+/// `POST /api/v1/media` and `/api/v2/media`
+pub async fn upload_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: axum::extract::Multipart,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    let Some((user, grant)) = authenticated(&state, &headers).await else {
+        return unauthorized();
+    };
+    if !oauth::has_scope(&grant.scopes, "write:media") {
+        return error(StatusCode::FORBIDDEN, "This action requires write scope");
+    }
+
+    let mut bytes: Option<Vec<u8>> = None;
+    let mut media_type = String::new();
+    let mut description: Option<String> = None;
+
+    while let Ok(Some(field)) = multipart.next_field().await {
+        match field.name().unwrap_or_default() {
+            "file" => {
+                media_type = field
+                    .content_type()
+                    .unwrap_or("application/octet-stream")
+                    .to_string();
+                bytes = field.bytes().await.ok().map(|b| b.to_vec());
+            }
+            "description" => description = field.text().await.ok(),
+            _ => {}
+        }
+    }
+
+    let Some(bytes) = bytes.filter(|b| !b.is_empty()) else {
+        return error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "Validation failed: File can't be blank",
+        );
+    };
+
+    let id = status_id::mint_note_id();
+    let path = format!("/~/media/{id}");
+    let base = format!("https://{}.{}", user.username, state.base_domain);
+
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
+    };
+    let blobs = state.stores.blobs(user.id).ok();
+
+    if let Err(e) = brolly_solid::ldp::put(
+        &pod,
+        blobs.as_ref(),
+        &base,
+        &path,
+        &subject_for(&state, &user, &grant),
+        &bytes,
+        &media_type,
+        &brolly_identity::routing::storage_root(&user.username, &state.base_domain),
+    ) {
+        tracing::error!(error = %e, "media upload failed");
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Upload failed");
+    }
+
+    let iri = media_iri(&user.username, &state.base_domain, &id);
+    if let Some(text) = description.as_deref().filter(|d| !d.trim().is_empty()) {
+        set_alt_text(&pod, &iri, text);
+    }
+
+    let media_id = status_id::encode(&id, user.id).unwrap_or(id);
+    (
+        StatusCode::OK,
+        Json(media_json(
+            &media_id,
+            &iri,
+            &media_type,
+            description.as_deref(),
+        )),
+    )
+        .into_response()
+}
+
+fn set_alt_text(pod: &brolly_store::Store, iri: &str, text: &str) {
+    use oxigraph_model::{Literal, NamedNode, NamedOrBlankNode, Quad, Term};
+    let node = NamedNode::new_unchecked(iri);
+    let quad = Quad::new(
+        NamedOrBlankNode::NamedNode(node.clone()),
+        NamedNode::new_unchecked(ALT_TEXT),
+        Term::Literal(Literal::new_simple_literal(text)),
+        oxigraph_model::GraphName::NamedNode(node),
+    );
+    if let Err(e) = brolly_store::insert_quads(pod, &[quad]) {
+        tracing::warn!(error = %e, "storing alt text failed");
+    }
+}
+
+fn alt_text(pod: &brolly_store::Store, iri: &str) -> Option<String> {
+    brolly_store::collection::literal(pod, iri, ALT_TEXT)
+}
+
+/// `PUT /api/v1/media/{id}` — set or change alt text.
+///
+/// Works before *and* after the media is attached, because a client keeps the
+/// composer open while the member types a description.
+pub async fn update_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    let Some((user, grant)) = authenticated(&state, &headers).await else {
+        return unauthorized();
+    };
+    if !oauth::has_scope(&grant.scopes, "write:media") {
+        return error(StatusCode::FORBIDDEN, "This action requires write scope");
+    }
+
+    let Some((local_id, owner)) = status_id::decode(&id) else {
+        return not_found();
+    };
+    // Mastodon's semantics: someone else's attachment is *not found*, not
+    // forbidden — a 403 would confirm it exists.
+    if owner != user.id {
+        return not_found();
+    }
+
+    #[derive(Deserialize, Default)]
+    struct Update {
+        description: Option<String>,
+    }
+    let update: Update = serde_urlencoded::from_bytes(&body)
+        .or_else(|_| serde_json::from_slice(&body))
+        .unwrap_or_default();
+
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
+    };
+    let iri = media_iri(&user.username, &state.base_domain, &local_id);
+    if brolly_solid::ldp::blob_digest(&pod, &iri).is_none() {
+        return not_found();
+    }
+
+    if let Some(text) = update.description.as_deref() {
+        set_alt_text(&pod, &iri, text);
+    }
+
+    let media_type =
+        brolly_store::collection::literal(&pod, &iri, brolly_solid::ldp::BLOB_MEDIA_TYPE)
+            .unwrap_or_else(|| "application/octet-stream".into());
+    Json(media_json(
+        &id,
+        &iri,
+        &media_type,
+        alt_text(&pod, &iri).as_deref(),
+    ))
+    .into_response()
+}
+
+/// `GET /api/v1/media/{id}` — clients poll this for processing state.
+pub async fn get_media(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    let Some((user, _)) = authenticated(&state, &headers).await else {
+        return unauthorized();
+    };
+    let Some((local_id, owner)) = status_id::decode(&id) else {
+        return not_found();
+    };
+    if owner != user.id {
+        return not_found();
+    }
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return not_found();
+    };
+    let iri = media_iri(&user.username, &state.base_domain, &local_id);
+    if brolly_solid::ldp::blob_digest(&pod, &iri).is_none() {
+        return not_found();
+    }
+    let media_type =
+        brolly_store::collection::literal(&pod, &iri, brolly_solid::ldp::BLOB_MEDIA_TYPE)
+            .unwrap_or_else(|| "application/octet-stream".into());
+    Json(media_json(
+        &id,
+        &iri,
+        &media_type,
+        alt_text(&pod, &iri).as_deref(),
+    ))
+    .into_response()
+}
+
+// --- composition -----------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct StatusForm {
+    status: Option<String>,
+    spoiler_text: Option<String>,
+    sensitive: Option<bool>,
+    language: Option<String>,
+    visibility: Option<String>,
+    in_reply_to_id: Option<String>,
+}
+
+/// `POST /api/v1/statuses`
+///
+/// Publishes through the *same* delivery path as the outbox. The predecessor
+/// had a second fan-out here that queried a table a migration had dropped, and
+/// swallowed the error — so statuses were delivered to nobody, silently.
+pub async fn create_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    let Some((user, grant)) = authenticated(&state, &headers).await else {
+        return unauthorized();
+    };
+    if !oauth::has_scope(&grant.scopes, "write:statuses") {
+        return error(StatusCode::FORBIDDEN, "This action requires write scope");
+    }
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let form: StatusForm = if content_type.contains("json") {
+        serde_json::from_slice(&body).unwrap_or_default()
+    } else {
+        serde_urlencoded::from_bytes(&body).unwrap_or_default()
+    };
+    let media_ids = repeated(std::str::from_utf8(&body).ok(), "media_ids");
+
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
+    };
+
+    // Resolve each media id, and refuse any that is not this member's. An
+    // attachment silently dropped here is the exact defect being closed.
+    let mut attachments = Vec::new();
+    for media_id in &media_ids {
+        let Some((local_id, owner)) = status_id::decode(media_id) else {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Validation failed: Media attachment not found",
+            );
+        };
+        if owner != user.id {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Validation failed: Media attachment not found",
+            );
+        }
+        let iri = media_iri(&user.username, &state.base_domain, &local_id);
+        let Some(_) = brolly_solid::ldp::blob_digest(&pod, &iri) else {
+            return error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "Validation failed: Media attachment not found",
+            );
+        };
+        attachments.push(compose::Attachment {
+            media_type: brolly_store::collection::literal(
+                &pod,
+                &iri,
+                brolly_solid::ldp::BLOB_MEDIA_TYPE,
+            )
+            .unwrap_or_else(|| "application/octet-stream".into()),
+            description: alt_text(&pod, &iri),
+            url: iri,
+        });
+    }
+
+    let in_reply_to = form.in_reply_to_id.as_deref().and_then(|id| {
+        let (note, owner) = status_id::decode(id)?;
+        Some((note, owner))
+    });
+    let in_reply_to_iri = match in_reply_to {
+        Some((note, owner)) => match db::find_by_id(&state.pool, owner).await {
+            Ok(Some(parent)) => Some(status_id::note_iri(
+                &note,
+                &parent.username,
+                &state.base_domain,
+            )),
+            _ => None,
+        },
+        None => None,
+    };
+
+    let composition = compose::Composition {
+        text: form.status.unwrap_or_default(),
+        spoiler_text: form.spoiler_text.unwrap_or_default(),
+        sensitive: form.sensitive.unwrap_or(false),
+        language: form.language,
+        visibility: form.visibility.unwrap_or_else(|| "public".into()),
+        in_reply_to: in_reply_to_iri,
+        attachments,
+    };
+
+    if let Err(e) = compose::validate(&composition) {
+        return error(StatusCode::UNPROCESSABLE_ENTITY, &e.to_string());
+    }
+
+    let actor = webid::actor(&user.username, &state.base_domain);
+    let followers = webid::followers(&user.username, &state.base_domain);
+    let published = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+
+    let mut note = compose::note(&composition, &actor, &followers, &published);
+    let base = format!("https://{}.{}", user.username, state.base_domain);
+    let note_id = status_id::mint_note_id();
+    note["id"] = json!(format!("{base}/~/notes/{note_id}"));
+
+    let activity = json!({
+        "type": "Create",
+        "id": format!("{base}/~/activities/{}", uuid::Uuid::new_v4()),
+        "actor": actor,
+        "published": published,
+        "to": note["to"].clone(),
+        "cc": note["cc"].clone(),
+        "object": note.clone(),
+    });
+
+    if let Err(response) = crate::outbox::deliver(&state, &user, &actor, &activity).await {
+        return response;
+    }
+
+    let author = author_for(&state, &user).await;
+    match translate::try_status(&note, &author, &state.base_domain) {
+        Some(status) => (StatusCode::OK, Json(status)).into_response(),
+        None => error(StatusCode::INTERNAL_SERVER_ERROR, "Could not render status"),
+    }
+}
+
 // --- stubs and the catch-all -----------------------------------------------------
 
 /// Endpoints that exist, are empty, and say so in JSON.
@@ -445,7 +836,11 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/accounts/{id}", get(account))
         .route("/api/v1/timelines/home", get(home_timeline))
         .route("/api/v1/timelines/public", get(public_timeline))
-        .route("/api/v1/statuses/{id}", get(status));
+        .route("/api/v1/statuses/{id}", get(status))
+        .route("/api/v1/statuses", post(create_status))
+        .route("/api/v1/media", post(upload_media))
+        .route("/api/v2/media", post(upload_media))
+        .route("/api/v1/media/{id}", get(get_media).put(update_media));
 
     // Empty reads. Behind auth, matching Mastodon — except the public ones,
     // which clients fetch before login.

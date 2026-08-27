@@ -7,6 +7,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod compose;
 pub mod instance;
 pub mod oauth;
 pub mod status_id;

@@ -282,6 +282,23 @@ pub async fn register_submit(
     let email = (!form.email.trim().is_empty()).then(|| form.email.trim());
     match db::create_user(&state.pool, &form.username, email, &form.password, "member").await {
         Ok(user) => {
+            // Give them a pod they can write to. WAC grants nothing by
+            // default, so without this the first write any new member attempts
+            // is refused — and the pod looks fine from the outside.
+            match state.stores.pod(user.id) {
+                Ok(pod) => {
+                    if let Err(e) = crate::provision::pod(&pod, &user.username, &state.base_domain)
+                    {
+                        tracing::error!(error = %e, user = %user.id, "pod provisioning failed");
+                        return server_error();
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, user = %user.id, "pod unavailable at registration");
+                    return server_error();
+                }
+            }
+
             match db::create_session(&state.pool, user.id, time::Duration::days(30), None).await {
                 Ok(token) => (jar.add(session_cookie(token)), Redirect::to("/")).into_response(),
                 Err(e) => {

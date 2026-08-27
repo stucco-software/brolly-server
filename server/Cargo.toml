@@ -25,7 +25,7 @@ brolly-activitypub.workspace = true
 brolly-mastodon.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["multipart"] }
 tokio = { version = "1.53.1", features = ["full"] }
 askama = "0.14"
 tower-http = { version = "0.7.0", features = ["fs"] }
@@ -36,6 +36,8 @@ sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio
 serde_json = "1.0.151"
 form_urlencoded = "1.2"
 serde_urlencoded = "0.7"
+# Only for the alt-text triple; the engine otherwise stays inside brolly-store.
+oxigraph_model = { package = "oxrdf", version = "0.3" }
 url = "2.5.8"
 sha2 = "0.11.0"
 base64 = "0.23.1"

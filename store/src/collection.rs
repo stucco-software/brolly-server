@@ -82,6 +82,27 @@ pub fn received_at(store: &Store, collection: &str, activity: &str) -> Option<St
         })
 }
 
+/// One literal object, for a subject and predicate in the subject's own graph.
+///
+/// The small read that sits under "what media type is this blob" and "what is
+/// this attachment's alt text" — both of which are single triples on a resource
+/// rather than records to decode.
+pub fn literal(store: &Store, subject: &str, predicate: &str) -> Option<String> {
+    let node = iri(subject);
+    store
+        .quads_for_pattern(
+            Some((&NamedOrBlankNode::NamedNode(node.clone())).into()),
+            Some(iri(predicate).as_ref()),
+            None,
+            Some(GraphNameRef::NamedNode(node.as_ref())),
+        )
+        .filter_map(Result::ok)
+        .find_map(|q| match q.object {
+            Term::Literal(l) => Some(l.value().to_string()),
+            _ => None,
+        })
+}
+
 /// Read a stored record back as the wire format it arrived in.
 pub fn read_record(store: &Store, id: &str) -> Option<Value> {
     let node = iri(id);
