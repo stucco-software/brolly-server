@@ -789,6 +789,7 @@ dependencies = [
  "brolly-identity",
  "brolly-store",
  "brolly-test-support",
+ "oxigraph",
  "rand 0.8.7",
  "serde",
  "serde_json",

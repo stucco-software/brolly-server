@@ -82,6 +82,26 @@ pub fn received_at(store: &Store, collection: &str, activity: &str) -> Option<St
         })
 }
 
+/// One literal object, for a subject and predicate in a named graph.
+///
+/// The explicit-graph form. A profile triple lives in the *profile document's*
+/// graph while its subject is the WebID, so the two differ and the caller has
+/// to say which it means.
+pub fn literal_in(store: &Store, subject: &str, predicate: &str, graph: &str) -> Option<String> {
+    store
+        .quads_for_pattern(
+            Some((&NamedOrBlankNode::NamedNode(iri(subject))).into()),
+            Some(iri(predicate).as_ref()),
+            None,
+            Some(GraphNameRef::NamedNode(iri(graph).as_ref())),
+        )
+        .filter_map(Result::ok)
+        .find_map(|q| match q.object {
+            Term::Literal(l) => Some(l.value().to_string()),
+            _ => None,
+        })
+}
+
 /// One literal object, for a subject and predicate in the subject's own graph.
 ///
 /// The small read that sits under "what media type is this blob" and "what is

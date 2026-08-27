@@ -46,6 +46,7 @@ uuid = { version = "1.25.0", features = ["v4"] }
 [dev-dependencies]
 brolly-solid.workspace = true
 brolly-mastodon.workspace = true
+brolly-atproto.workspace = true
 brolly-activitypub.workspace = true
 brolly-identity.workspace = true
 brolly-store.workspace = true
