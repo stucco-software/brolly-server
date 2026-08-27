@@ -37,6 +37,17 @@ pub const XSD_INTEGER: &str = "http://www.w3.org/2001/XMLSchema#integer";
 pub const XSD_DOUBLE: &str = "http://www.w3.org/2001/XMLSchema#double";
 pub const XSD_BOOLEAN: &str = "http://www.w3.org/2001/XMLSchema#boolean";
 
+/// Whether follows need approval. AS2's own term, and the one Mastodon reads
+/// to render a lock on a profile — so it federates without translation.
+pub const AS2_MANUALLY_APPROVES: &str =
+    "https://www.w3.org/ns/activitystreams#manuallyApprovesFollowers";
+
+/// Mastodon's own extensions, in their namespace rather than ours. Inventing
+/// private terms for things the ecosystem already names is how a profile stops
+/// round-tripping.
+pub const MASTODON_DISCOVERABLE: &str = "http://joinmastodon.org/ns#discoverable";
+pub const MASTODON_BOT: &str = "http://joinmastodon.org/ns#bot";
+
 // --- canonical-layer predicates we actually map onto -----------------------
 pub const FOAF_NAME: &str = "http://xmlns.com/foaf/0.1/name";
 pub const FOAF_DEPICTION: &str = "http://xmlns.com/foaf/0.1/depiction";

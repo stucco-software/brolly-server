@@ -288,12 +288,26 @@ async fn deliver_locally(
     };
 
     // A Follow arriving establishes the relationship in the recipient's pod,
-    // which is what delivery reads to resolve recipients next time.
+    // which is what delivery reads to resolve recipients next time — *unless*
+    // the account is locked, in which case it waits for approval instead.
+    //
+    // This is the whole of what "locked" means, and the predecessor recorded
+    // the follow unconditionally, so the flag did nothing. It did nothing
+    // invisibly, too: the profile still rendered the lock.
     if activity["type"] == "Follow"
         && let Some(target) = activity["object"].as_str()
         && let Some(follower) = activity["actor"].as_str()
     {
-        let _ = follows::record(&pod, follower, target);
+        let profile = brolly_solid::profile::read(
+            &pod,
+            &webid::webid(&user.username, &state.base_domain),
+            &webid::profile_document(&user.username, &state.base_domain),
+        );
+        let _ = if profile.locked {
+            follows::record_request(&pod, follower, target)
+        } else {
+            follows::record(&pod, follower, target)
+        };
     }
 
     if let Err(e) = processor::process(&pod, Recipient::Member { inbox }, activity, received) {

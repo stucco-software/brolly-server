@@ -26,6 +26,10 @@ fn iri(s: &str) -> NamedNode {
 ///
 /// Derived from the actor IRI rather than being a fixed name, so two actors'
 /// relationships cannot end up in one graph if a pod ever holds both.
+/// Ours: AS2 has no term for a follow that has been asked for and not yet
+/// granted. `as:Follow` is the activity, not the pending state.
+const PENDING: &str = "https://brolly.id/ns#pendingFollower";
+
 fn graph_for(actor: &str) -> NamedNode {
     iri(&format!("{actor}#social"))
 }
@@ -60,6 +64,59 @@ pub fn record_following(store: &Store, follower: &str, followee: &str) -> Result
             GraphName::NamedNode(graph),
         )],
     )?;
+    Ok(())
+}
+
+/// A follow waiting for its subject to decide.
+///
+/// A locked account's Follow lands here instead of in `followers`, which is the
+/// whole of what "locked" means. The predecessor accepted the flag and then
+/// recorded the follow unconditionally, so locking an account did nothing —
+/// and did nothing *invisibly*, since the profile still showed the lock.
+pub fn record_request(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
+    let graph = graph_for(followee);
+    insert_quads(
+        store,
+        &[Quad::new(
+            NamedOrBlankNode::NamedNode(iri(followee)),
+            iri(PENDING),
+            Term::NamedNode(iri(follower)),
+            GraphName::NamedNode(graph),
+        )],
+    )?;
+    Ok(())
+}
+
+/// Everyone waiting on `actor` to approve them.
+pub fn pending(store: &Store, actor: &str) -> Vec<String> {
+    objects(store, actor, PENDING)
+}
+
+/// Approve a pending follow: it stops being pending and becomes a follow.
+///
+/// Both halves in one call, because a request left pending *and* followed shows
+/// up twice in the UI, and one that is neither has silently vanished.
+pub fn approve(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
+    drop_request(store, follower, followee)?;
+    record(store, follower, followee)
+}
+
+/// Refuse a pending follow. The follower is not recorded.
+pub fn reject(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
+    drop_request(store, follower, followee)
+}
+
+fn drop_request(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
+    let graph = graph_for(followee);
+    let quad = Quad::new(
+        NamedOrBlankNode::NamedNode(iri(followee)),
+        iri(PENDING),
+        Term::NamedNode(iri(follower)),
+        GraphName::NamedNode(graph),
+    );
+    store
+        .remove(&quad)
+        .map_err(brolly_store::StoreError::from)?;
     Ok(())
 }
 

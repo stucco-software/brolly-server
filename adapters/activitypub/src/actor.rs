@@ -18,6 +18,9 @@ fn context() -> Value {
     json!([
         "https://www.w3.org/ns/activitystreams",
         "https://w3id.org/security/v1",
+        // `discoverable` is Mastodon's term, so its namespace has to be in
+        // scope or a strict JSON-LD processor drops it.
+        {"toot": "http://joinmastodon.org/ns#", "discoverable": "toot:discoverable"},
     ])
 }
 
@@ -38,6 +41,17 @@ fn public_key(actor: &str, public_key_pem: &str) -> Value {
     })
 }
 
+/// The profile flags that change how a remote instance treats an actor.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Flags {
+    /// Follows need approval. Remote instances read this to know whether to
+    /// expect an `Accept`; an actor that lies here strands every follow it
+    /// receives, because the sender waits forever for a reply that never comes.
+    pub locked: bool,
+    pub bot: bool,
+    pub discoverable: bool,
+}
+
 /// A member's actor document.
 ///
 /// Every collection is on the member's own host. An `inbox` on the apex would
@@ -49,13 +63,18 @@ pub fn person(
     public_key_pem: &str,
     name: &str,
     summary: &str,
+    flags: Flags,
 ) -> Value {
     use brolly_identity::webid;
     let actor = webid::actor(username, base_domain);
 
     let mut document = json!({
         "@context": context(),
-        "type": "Person",
+        // `Service` is how the fediverse marks an automated account; clients
+        // badge it and some filter on it.
+        "type": if flags.bot { "Service" } else { "Person" },
+        "manuallyApprovesFollowers": flags.locked,
+        "discoverable": flags.discoverable,
         "id": actor,
         "preferredUsername": username,
         "inbox": webid::inbox(username, base_domain),
@@ -199,7 +218,7 @@ mod tests {
 
     #[test]
     fn a_persons_collections_are_all_on_their_own_host() {
-        let actor = person("alice", BASE, PEM, "", "");
+        let actor = person("alice", BASE, PEM, "", "", Flags::default());
         for field in ["id", "inbox", "outbox", "followers", "following"] {
             let value = actor[field].as_str().expect(field);
             assert!(
@@ -211,7 +230,7 @@ mod tests {
 
     #[test]
     fn the_shared_inbox_is_the_instances_and_the_personal_one_is_not() {
-        let actor = person("alice", BASE, PEM, "", "");
+        let actor = person("alice", BASE, PEM, "", "", Flags::default());
         assert_eq!(actor["inbox"], "https://alice.brolly.id/inbox");
         assert_eq!(
             actor["endpoints"]["sharedInbox"], "https://brolly.id/inbox",
@@ -223,18 +242,25 @@ mod tests {
     fn an_empty_name_is_omitted_rather_than_blank() {
         // `"name": ""` renders as an empty display name; a missing one falls
         // back to the username.
-        let actor = person("alice", BASE, PEM, "", "");
+        let actor = person("alice", BASE, PEM, "", "", Flags::default());
         assert!(actor.get("name").is_none());
         assert!(actor.get("summary").is_none());
 
-        let named = person("alice", BASE, PEM, "Alice Example", "Hello");
+        let named = person(
+            "alice",
+            BASE,
+            PEM,
+            "Alice Example",
+            "Hello",
+            Flags::default(),
+        );
         assert_eq!(named["name"], "Alice Example");
         assert_eq!(named["summary"], "Hello");
     }
 
     #[test]
     fn the_security_context_is_present_so_the_key_survives_processing() {
-        let actor = person("alice", BASE, PEM, "", "");
+        let actor = person("alice", BASE, PEM, "", "", Flags::default());
         let context = actor["@context"].to_string();
         assert!(context.contains("activitystreams"));
         assert!(
@@ -245,12 +271,49 @@ mod tests {
 
     #[test]
     fn the_key_id_is_the_actor_with_a_main_key_fragment() {
-        let actor = person("alice", BASE, PEM, "", "");
+        let actor = person("alice", BASE, PEM, "", "", Flags::default());
         assert_eq!(
             actor["publicKey"]["id"],
             "https://alice.brolly.id/actor#main-key"
         );
         assert_eq!(actor["publicKey"]["owner"], actor["id"]);
+    }
+
+    #[test]
+    fn a_locked_actor_says_so_where_remote_instances_look() {
+        // An actor that does not advertise the lock strands every follow: the
+        // sender waits for an Accept that is never coming.
+        let actor = person(
+            "alice",
+            BASE,
+            PEM,
+            "",
+            "",
+            Flags {
+                locked: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(actor["manuallyApprovesFollowers"], true);
+    }
+
+    #[test]
+    fn a_bot_is_typed_as_a_service() {
+        let actor = person(
+            "alice",
+            BASE,
+            PEM,
+            "",
+            "",
+            Flags {
+                bot: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            actor["type"], "Service",
+            "clients badge automated accounts off the type"
+        );
     }
 
     #[test]

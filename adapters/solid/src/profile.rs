@@ -23,6 +23,27 @@ fn iri(s: &str) -> NamedNode {
 pub struct Profile {
     pub display_name: String,
     pub bio: String,
+    /// Follows need approval. The predecessor accepted this and ignored it, so
+    /// locking an account did nothing at all.
+    pub locked: bool,
+    pub bot: bool,
+    pub discoverable: bool,
+}
+
+impl Profile {
+    /// A profile with no triples yet.
+    ///
+    /// `discoverable` defaults **true** and `locked` defaults **false**,
+    /// matching Mastodon — but note these are opposite defaults, and both are
+    /// the permissive one. That is deliberate: it is what a member who has
+    /// never opened the settings page expects, and every other reading would
+    /// surprise somebody. Anyone who wants otherwise sets it explicitly.
+    pub fn blank() -> Self {
+        Self {
+            discoverable: true,
+            ..Default::default()
+        }
+    }
 }
 
 /// Read the profile triples for `webid` out of `document`.
@@ -30,6 +51,24 @@ pub fn read(store: &Store, webid: &str, document: &str) -> Profile {
     Profile {
         display_name: literal(store, webid, document, vocab::FOAF_NAME),
         bio: literal(store, webid, document, vocab::VCARD_NOTE),
+        locked: flag(store, webid, document, vocab::AS2_MANUALLY_APPROVES).unwrap_or(false),
+        bot: flag(store, webid, document, vocab::MASTODON_BOT).unwrap_or(false),
+        // Absent means discoverable, matching Mastodon's default.
+        discoverable: flag(store, webid, document, vocab::MASTODON_DISCOVERABLE).unwrap_or(true),
+    }
+}
+
+/// Read a boolean flag, distinguishing "absent" from "false".
+///
+/// The distinction matters: `discoverable` defaults true when absent, so
+/// collapsing absent into false would quietly de-list every member who has
+/// never touched their settings.
+fn flag(store: &Store, webid: &str, document: &str, predicate: &str) -> Option<bool> {
+    let raw = literal(store, webid, document, predicate);
+    match raw.as_str() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
     }
 }
 
@@ -64,7 +103,13 @@ pub fn write(
     let graph = iri(document);
     let subject = NamedOrBlankNode::NamedNode(iri(webid));
 
-    for predicate in [vocab::FOAF_NAME, vocab::VCARD_NOTE] {
+    for predicate in [
+        vocab::FOAF_NAME,
+        vocab::VCARD_NOTE,
+        vocab::AS2_MANUALLY_APPROVES,
+        vocab::MASTODON_BOT,
+        vocab::MASTODON_DISCOVERABLE,
+    ] {
         let existing: Vec<Quad> = store
             .quads_for_pattern(
                 Some((&subject).into()),
@@ -98,6 +143,25 @@ pub fn write(
             GraphName::NamedNode(graph.clone()),
         ));
     }
+    // Flags are written always, including when false. Unlike a name, absence
+    // is meaningful here — `discoverable` absent means *true* — so omitting a
+    // false value would read back as the opposite of what was set.
+    for (predicate, value) in [
+        (vocab::AS2_MANUALLY_APPROVES, profile.locked),
+        (vocab::MASTODON_BOT, profile.bot),
+        (vocab::MASTODON_DISCOVERABLE, profile.discoverable),
+    ] {
+        quads.push(Quad::new(
+            subject.clone(),
+            iri(predicate),
+            Term::Literal(Literal::new_typed_literal(
+                if value { "true" } else { "false" },
+                iri(vocab::XSD_BOOLEAN),
+            )),
+            GraphName::NamedNode(graph.clone()),
+        ));
+    }
+
     if !quads.is_empty() {
         insert_quads(store, &quads)?;
     }

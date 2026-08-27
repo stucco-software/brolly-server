@@ -201,6 +201,12 @@ pub async fn profile_submit(
     let id = webid::webid(&session.user.username, &state.base_domain);
     let document = webid::profile_document(&session.user.username, &state.base_domain);
 
+    // Read before writing, so this form edits only the two fields it owns.
+    // `profile::write` replaces every predicate it manages, so passing defaults
+    // for the flags would silently unlock a locked account from a page that
+    // never mentions locking.
+    let existing = profile::read(&pod, &id, &document);
+
     match profile::write(
         &pod,
         &id,
@@ -208,6 +214,7 @@ pub async fn profile_submit(
         &Profile {
             display_name: form.display_name,
             bio: form.bio,
+            ..existing
         },
     ) {
         Ok(()) => Redirect::to("/account/profile?saved=true").into_response(),

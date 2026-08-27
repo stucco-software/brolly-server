@@ -88,16 +88,19 @@ async fn author_for(state: &AppState, user: &User) -> translate::Author {
             &webid::webid(&user.username, &state.base_domain),
             &webid::profile_document(&user.username, &state.base_domain),
         ),
-        Err(_) => brolly_solid::profile::Profile::default(),
+        Err(_) => brolly_solid::profile::Profile::blank(),
     };
     translate::Author {
         user_id: user.id,
         username: user.username.clone(),
         display_name: profile.display_name,
         bio: profile.bio,
-        locked: false,
-        bot: false,
-        discoverable: true,
+        // Read, not hardcoded. These were accepted and ignored before, so an
+        // account that said it was locked rendered as locked and behaved as
+        // open.
+        locked: profile.locked,
+        bot: profile.bot,
+        discoverable: profile.discoverable,
         created_at: String::new(),
     }
 }
@@ -802,6 +805,184 @@ pub async fn create_status(
     }
 }
 
+// --- profile flags and follow requests ---------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct CredentialsUpdate {
+    display_name: Option<String>,
+    note: Option<String>,
+    locked: Option<bool>,
+    bot: Option<bool>,
+    discoverable: Option<bool>,
+}
+
+/// `PATCH /api/v1/accounts/update_credentials`
+///
+/// Every field is optional and absent means *unchanged* — a client sending only
+/// `locked` must not blank the display name it did not mention.
+pub async fn update_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    let Some((user, grant)) = authenticated(&state, &headers).await else {
+        return unauthorized();
+    };
+    if !oauth::has_scope(&grant.scopes, "write:accounts") {
+        return error(StatusCode::FORBIDDEN, "This action requires write scope");
+    }
+
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let update: CredentialsUpdate = if content_type.contains("json") {
+        serde_json::from_slice(&body).unwrap_or_default()
+    } else {
+        serde_urlencoded::from_bytes(&body).unwrap_or_default()
+    };
+
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
+    };
+    let id = webid::webid(&user.username, &state.base_domain);
+    let document = webid::profile_document(&user.username, &state.base_domain);
+
+    // Merge onto what is stored, so an absent field is untouched rather than
+    // reset. The predecessor's version of this is where `locked` went to die.
+    let mut profile = brolly_solid::profile::read(&pod, &id, &document);
+    if let Some(name) = update.display_name {
+        profile.display_name = name;
+    }
+    if let Some(note) = update.note {
+        profile.bio = note;
+    }
+    if let Some(locked) = update.locked {
+        profile.locked = locked;
+    }
+    if let Some(bot) = update.bot {
+        profile.bot = bot;
+    }
+    if let Some(discoverable) = update.discoverable {
+        profile.discoverable = discoverable;
+    }
+
+    if let Err(e) = brolly_solid::profile::write(&pod, &id, &document, &profile) {
+        tracing::error!(error = %e, "profile update failed");
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Update failed");
+    }
+
+    let author = author_for(&state, &user).await;
+    Json(translate::account(&author, &state.base_domain)).into_response()
+}
+
+/// `GET /api/v1/follow_requests`
+pub async fn follow_requests(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    let Some((user, _)) = authenticated(&state, &headers).await else {
+        return unauthorized();
+    };
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
+    };
+
+    let actor = webid::actor(&user.username, &state.base_domain);
+    let mut accounts = Vec::new();
+    for follower in brolly_activitypub::follows::pending(&pod, &actor) {
+        if let Some(author) = local_author(&state, &follower).await {
+            accounts.push(translate::account(&author, &state.base_domain));
+        }
+    }
+    Json(accounts).into_response()
+}
+
+/// `POST /api/v1/follow_requests/{id}/authorize` and `/reject`.
+async fn resolve_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    id: &str,
+    approve: bool,
+) -> Response {
+    let Some((user, grant)) = authenticated(state, headers).await else {
+        return unauthorized();
+    };
+    if !oauth::has_scope(&grant.scopes, "write:follows") {
+        return error(StatusCode::FORBIDDEN, "This action requires follow scope");
+    }
+    let Some(requester_id) = translate::account_id_to_uuid(id) else {
+        return not_found();
+    };
+    let Ok(Some(requester)) = db::find_by_id(&state.pool, requester_id).await else {
+        return not_found();
+    };
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
+    };
+
+    let actor = webid::actor(&user.username, &state.base_domain);
+    let follower = webid::actor(&requester.username, &state.base_domain);
+
+    // Only a *pending* request can be resolved. Approving something nobody
+    // asked for would manufacture a follower.
+    if !brolly_activitypub::follows::pending(&pod, &actor).contains(&follower) {
+        return not_found();
+    }
+
+    let outcome = if approve {
+        brolly_activitypub::follows::approve(&pod, &follower, &actor)
+    } else {
+        brolly_activitypub::follows::reject(&pod, &follower, &actor)
+    };
+    if let Err(e) = outcome {
+        tracing::error!(error = %e, "resolving a follow request failed");
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Update failed");
+    }
+
+    Json(json!({
+        "id": id,
+        "following": false,
+        "followed_by": approve,
+        "requested": false,
+        "showing_reblogs": false,
+        "notifying": false,
+        "blocking": false,
+        "blocked_by": false,
+        "muting": false,
+        "muting_notifications": false,
+        "domain_blocking": false,
+        "endorsed": false,
+        "note": "",
+    }))
+    .into_response()
+}
+
+pub async fn authorize_follow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    resolve_request(&state, &headers, &id, true).await
+}
+
+pub async fn reject_follow(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    resolve_request(&state, &headers, &id, false).await
+}
+
 // --- stubs and the catch-all -----------------------------------------------------
 
 /// Endpoints that exist, are empty, and say so in JSON.
@@ -840,7 +1021,17 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/statuses", post(create_status))
         .route("/api/v1/media", post(upload_media))
         .route("/api/v2/media", post(upload_media))
-        .route("/api/v1/media/{id}", get(get_media).put(update_media));
+        .route("/api/v1/media/{id}", get(get_media).put(update_media))
+        .route(
+            "/api/v1/accounts/update_credentials",
+            axum::routing::patch(update_credentials),
+        )
+        .route("/api/v1/follow_requests", get(follow_requests))
+        .route(
+            "/api/v1/follow_requests/{id}/authorize",
+            post(authorize_follow),
+        )
+        .route("/api/v1/follow_requests/{id}/reject", post(reject_follow));
 
     // Empty reads. Behind auth, matching Mastodon — except the public ones,
     // which clients fetch before login.

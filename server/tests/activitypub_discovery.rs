@@ -194,6 +194,7 @@ async fn the_actor_name_comes_from_the_pod() {
         &brolly_solid::profile::Profile {
             display_name: "Alice Example".into(),
             bio: "Testing in production".into(),
+            ..brolly_solid::profile::Profile::blank()
         },
     )
     .unwrap();

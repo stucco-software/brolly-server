@@ -107,7 +107,7 @@ async fn member_actor(state: &AppState, username: &str) -> Response {
         ),
         Err(e) => {
             tracing::warn!(error = %e, user = %user.id, "pod unavailable; serving actor without profile");
-            brolly_solid::profile::Profile::default()
+            brolly_solid::profile::Profile::blank()
         }
     };
 
@@ -119,6 +119,11 @@ async fn member_actor(state: &AppState, username: &str) -> Response {
             &keys.public_key_pem,
             &profile.display_name,
             &profile.bio,
+            actor::Flags {
+                locked: profile.locked,
+                bot: profile.bot,
+                discoverable: profile.discoverable,
+            },
         ),
     )
 }
