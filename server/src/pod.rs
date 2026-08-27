@@ -143,10 +143,30 @@ async fn subject_for(state: &AppState, headers: &HeaderMap, method: &str, url: &
                 }
             }
         }
-        // Mastodon's plain bearer tokens arrive with Phase 6. A Solid token
-        // presented as a bearer is refused rather than accepted unproven —
-        // honouring it here is what would make the binding decorative.
-        Credential::Bearer(_) => anonymous,
+        // Mastodon's bearer tokens. Note what is *not* happening here: a
+        // Solid access token presented as a bearer does not resolve, because
+        // this looks the token up in Mastodon's own table rather than trying
+        // to verify it as a JWT. Accepting a DPoP-bound token without its
+        // proof is what would make the binding decorative.
+        Credential::Bearer(token) => {
+            match brolly_mastodon::oauth::verify_token(&state.pool, &token).await {
+                Ok(Some(grant)) => match db::find_by_id(&state.pool, grant.user_id).await {
+                    Ok(Some(user)) if user.is_active() => Subject::local(
+                        user.id,
+                        user.did_plc.clone().unwrap_or_default(),
+                        webid::webid(&user.username, &state.base_domain),
+                        Scope::parse(&grant.scopes),
+                        Via::MastodonBearer,
+                    ),
+                    _ => anonymous,
+                },
+                Ok(None) => anonymous,
+                Err(e) => {
+                    tracing::error!(error = %e, "bearer token lookup failed");
+                    anonymous
+                }
+            }
+        }
     }
 }
 

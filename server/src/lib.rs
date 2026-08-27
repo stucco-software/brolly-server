@@ -17,6 +17,7 @@ pub mod account;
 pub mod activitypub;
 pub mod auth;
 pub mod consent;
+pub mod mastodon_oauth;
 pub mod outbox;
 pub mod pod;
 pub mod solid_oidc;
@@ -113,6 +114,16 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             get(activitypub::nodeinfo_discovery),
         )
         .route("/nodeinfo/2.1", get(activitypub::nodeinfo))
+        // Mastodon owns the bare OAuth paths, because its clients hardcode
+        // them and it is the only protocol with no discovery document to be
+        // told otherwise (ADR 0008).
+        .route("/api/v1/apps", post(mastodon_oauth::register_app))
+        .route(
+            "/oauth/authorize",
+            get(mastodon_oauth::authorize).post(mastodon_oauth::decide),
+        )
+        .route("/oauth/token", post(mastodon_oauth::token))
+        .route("/oauth/revoke", post(mastodon_oauth::revoke))
         .merge(oauth)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.

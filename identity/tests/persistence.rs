@@ -346,3 +346,29 @@ async fn did_plc_is_recorded_after_registration() {
     // D11: this is the identifier every wire format reads.
     assert!(brolly_identity::did::for_wire(found.did_plc.as_deref().unwrap()).is_ok());
 }
+
+#[tokio::test]
+async fn a_member_is_findable_by_their_primary_key() {
+    // The second half of resolving a Mastodon status id (ADR 0015): the id
+    // decodes to a UUID and this turns it into a member, which is what lets
+    // that scheme work with no routing table and no index.
+    let (_db, pool) = fresh().await;
+    let created = db::create_user(&pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+
+    let found = db::find_by_id(&pool, created.id)
+        .await
+        .unwrap()
+        .expect("the member should be found");
+    assert_eq!(found.username, "alice");
+    assert_eq!(found.id, created.id);
+
+    assert!(
+        db::find_by_id(&pool, uuid::Uuid::nil())
+            .await
+            .unwrap()
+            .is_none(),
+        "an id we never issued must not resolve to anyone"
+    );
+}

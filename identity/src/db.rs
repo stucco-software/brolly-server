@@ -138,6 +138,22 @@ pub async fn find_by_username(pool: &PgPool, username: &str) -> Result<Option<Us
     .await?)
 }
 
+/// Look a member up by their primary key.
+///
+/// This is the second half of resolving a Mastodon status or account id
+/// (ADR 0015): the id decodes to a UUID, and this turns it into the member —
+/// which is what lets that whole scheme work with no routing table and no
+/// index.
+pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(
+        "SELECT id, username, email, email_verified, did_plc, role, status
+         FROM users WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// Verify a username/password pair.
 ///
 /// Returns [`DbError::BadCredentials`] for an unknown user, a wrong password,
