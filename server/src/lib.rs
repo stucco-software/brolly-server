@@ -15,6 +15,7 @@ use tower_http::services::ServeDir;
 
 pub mod account;
 pub mod activitypub;
+pub mod atproto_oauth;
 pub mod auth;
 pub mod consent;
 pub mod mastodon_api;
@@ -134,6 +135,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // XRPC on the apex, with the repo named by parameter — the shape a PDS
         // has and the endpoint the PLC document advertises.
         .merge(xrpc::routes())
+        .merge(atproto_oauth::routes())
         .merge(oauth)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.

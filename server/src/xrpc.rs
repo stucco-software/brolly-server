@@ -58,9 +58,62 @@ fn wrong_host(state: &AppState, headers: &HeaderMap) -> bool {
     extract::subdomain_user(host, &state.base_domain).is_some()
 }
 
-async fn session_user(state: &AppState, jar: &CookieJar) -> Option<User> {
+/// Who is making this call.
+///
+/// A **DPoP-bound ATProtocol token** first, because that is what a real client
+/// presents; a session cookie second, so the browser dashboard and tests can
+/// drive the same endpoints. Session-only auth was a placeholder — it is
+/// useless to any client that is not a browser on this origin.
+///
+/// The proof is verified against the presented token, not merely present: a
+/// bound token accepted without its proof is a bearer token wearing a costume.
+async fn caller(state: &AppState, headers: &HeaderMap, jar: &CookieJar) -> Option<User> {
+    if let Some(user) = token_caller(state, headers).await {
+        return Some(user);
+    }
     let cookie = jar.get(SESSION_COOKIE)?;
     db::user_for_session(&state.pool, cookie.value())
+        .await
+        .ok()
+        .flatten()
+        .filter(User::is_active)
+}
+
+async fn token_caller(state: &AppState, headers: &HeaderMap) -> Option<User> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())?;
+    let credential = extract::credential(Some(authorization), None)?;
+    let brolly_identity::Credential::Dpop { token, .. } = credential else {
+        // A plain `Bearer` here is not an ATProtocol credential. Honouring one
+        // would accept a token whose binding was never checked.
+        return None;
+    };
+
+    let grant = brolly_atproto::oauth::verify_token(&state.pool, "access", &token)
+        .await
+        .ok()
+        .flatten()?;
+
+    // The proof must be for this request and must name the key the token was
+    // issued to.
+    let proof = headers.get("dpop").and_then(|h| h.to_str().ok())?;
+    let url = format!("https://{}/xrpc/", state.base_domain);
+    let method = "POST";
+    let verified = brolly_identity::dpop::verify(
+        proof,
+        method,
+        &url,
+        Some(&token),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
+    .ok()?;
+    if verified.thumbprint != grant.dpop_jkt {
+        tracing::warn!("an ATProtocol token was presented by a key it was not issued to");
+        return None;
+    }
+
+    db::find_by_id(&state.pool, grant.user_id)
         .await
         .ok()
         .flatten()
@@ -346,7 +399,7 @@ pub async fn create_record(
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(user) = session_user(&state, &jar).await else {
+    let Some(user) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
     let Ok(input) = serde_json::from_slice::<WriteRecord>(&body) else {
@@ -445,7 +498,7 @@ pub async fn delete_record(
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(user) = session_user(&state, &jar).await else {
+    let Some(user) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
     let Ok(input) = serde_json::from_slice::<DeleteRecord>(&body) else {

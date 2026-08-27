@@ -9,6 +9,7 @@
 pub mod blocks;
 pub mod ingest;
 pub mod keys;
+pub mod oauth;
 pub mod plc;
 pub mod repo;
 pub mod state;
