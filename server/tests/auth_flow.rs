@@ -31,6 +31,7 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
                 .await
                 .expect("instance actor"),
         ),
+        commits: tokio::sync::broadcast::channel(64).0,
     };
     let router = app(state, "server/static");
     (db, dir, router)

@@ -25,7 +25,7 @@ brolly-activitypub.workspace = true
 brolly-mastodon.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-axum = { version = "0.8.9", features = ["multipart"] }
+axum = { version = "0.8.9", features = ["multipart", "ws"] }
 tokio = { version = "1.53.1", features = ["full"] }
 askama = "0.14"
 tower-http = { version = "0.7.0", features = ["fs"] }
@@ -49,6 +49,10 @@ brolly-solid.workspace = true
 brolly-mastodon.workspace = true
 brolly-atproto.workspace = true
 rs-car-sync = "0.5.1"
+# A real websocket client: `oneshot` cannot complete an upgrade, so the
+# firehose has to be driven over an actual socket to be tested at all.
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 brolly-activitypub.workspace = true
 brolly-identity.workspace = true
 brolly-store.workspace = true

@@ -48,6 +48,7 @@ async fn harness() -> Harness {
                 .await
                 .expect("instance actor"),
             ),
+            commits: tokio::sync::broadcast::channel(64).0,
         },
         "server/static",
     );

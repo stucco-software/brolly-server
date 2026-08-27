@@ -455,14 +455,29 @@ pub async fn create_record(
         Err(e) => return invalid_request(&e.to_string()),
     };
 
-    if let Err(e) = state::advance(&state.pool, user.id, &new_root.to_string()).await {
-        tracing::error!(error = %e, "advancing the repo failed after a write");
-        return xrpc_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "InternalServerError",
-            "the record was written but the repo pointer did not move",
-        );
-    }
+    let rev = match state::advance(&state.pool, user.id, &new_root.to_string()).await {
+        Ok(rev) => rev,
+        Err(e) => {
+            tracing::error!(error = %e, "advancing the repo failed after a write");
+            return xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "the record was written but the repo pointer did not move",
+            );
+        }
+    };
+
+    announce(
+        &state,
+        &did_of(&user, &state),
+        &new_root.to_string(),
+        Some(&handle.root.to_string()),
+        rev,
+        brolly_atproto::firehose::Action::Create,
+        &format!("{}/{rkey}", input.collection),
+        Some(&record_cid.to_string()),
+    )
+    .await;
 
     // And into the pod, faithfully, so the other protocols can see it.
     let uri = ingest::at_uri(&did_of(&user, &state), &input.collection, &rkey);
@@ -539,8 +554,21 @@ pub async fn delete_record(
         Err(e) => return invalid_request(&e.to_string()),
     };
 
-    if let Err(e) = state::advance(&state.pool, user.id, &new_root.to_string()).await {
-        tracing::error!(error = %e, "advancing the repo failed after a delete");
+    match state::advance(&state.pool, user.id, &new_root.to_string()).await {
+        Ok(rev) => {
+            announce(
+                &state,
+                &did_of(&user, &state),
+                &new_root.to_string(),
+                Some(&handle.root.to_string()),
+                rev,
+                brolly_atproto::firehose::Action::Delete,
+                &format!("{}/{}", input.collection, input.rkey),
+                None,
+            )
+            .await;
+        }
+        Err(e) => tracing::error!(error = %e, "advancing the repo failed after a delete"),
     }
 
     Json(json!({})).into_response()
@@ -561,6 +589,143 @@ pub async fn describe_server(State(state): State<AppState>, headers: HeaderMap) 
     .into_response()
 }
 
+/// Record a commit on the firehose and hand it to attached consumers.
+///
+/// The durable write comes first and the broadcast second, deliberately: a
+/// consumer that misses the broadcast resumes from the log, but an event that
+/// was broadcast and never logged is invisible to anyone who reconnects.
+///
+/// A failure here does not fail the write. The record is already committed to
+/// the repo, and refusing a successful write because its announcement failed
+/// would be the worse outcome — the log is repairable, a rejected write the
+/// client believes failed is not.
+#[allow(clippy::too_many_arguments)]
+async fn announce(
+    state: &AppState,
+    did: &str,
+    commit_cid: &str,
+    prev_cid: Option<&str>,
+    rev: i64,
+    action: brolly_atproto::firehose::Action,
+    path: &str,
+    record_cid: Option<&str>,
+) {
+    match brolly_atproto::firehose::record(
+        &state.pool,
+        did,
+        commit_cid,
+        prev_cid,
+        rev,
+        action,
+        path,
+        record_cid,
+    )
+    .await
+    {
+        Ok(event) => {
+            // `send` fails only when nobody is listening, which is normal.
+            let _ = state.commits.send(event);
+        }
+        Err(e) => tracing::error!(error = %e, "recording a firehose event failed"),
+    }
+}
+
+// --- firehose ---------------------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct SubscribeQuery {
+    /// Where to resume from. Absent means "only what happens next".
+    cursor: Option<i64>,
+}
+
+/// `com.atproto.sync.subscribeRepos` — the commit stream.
+///
+/// Backfill from the cursor first, then live. Ungated (ADR 0016): consumers
+/// connect *to* us, so there is nothing outbound to suppress, and a PDS nobody
+/// can subscribe to is one nobody can read.
+///
+/// The backfill happens **before** the socket goes live, in sequence order, so
+/// a consumer never sees a newer commit before an older one — which would make
+/// `prev` unverifiable on its side.
+/// Note the extractor ordering hazard here, which bit twice already in this
+/// codebase (`Form` on the Mastodon consent decision and on revoke): extractors
+/// run **before** the handler body, so `WebSocketUpgrade` answers 400 to a
+/// non-websocket request before `wrong_host` can answer 404.
+///
+/// That is tolerable *only* because the 400 is identical on the apex and on a
+/// subdomain, so it distinguishes nothing — unlike the `Form` case, where the
+/// rejection revealed that a path existed where it should not. A real
+/// handshake reaches the body and is refused there, and the test drives it that
+/// way rather than with a bare GET.
+pub async fn subscribe_repos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SubscribeQuery>,
+    ws: axum::extract::ws::WebSocketUpgrade,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    ws.on_upgrade(move |socket| stream_commits(state, query.cursor, socket))
+}
+
+async fn stream_commits(
+    state: AppState,
+    cursor: Option<i64>,
+    mut socket: axum::extract::ws::WebSocket,
+) {
+    use axum::extract::ws::Message;
+    use brolly_atproto::firehose;
+
+    // How much history one page of backfill carries. A consumer far behind
+    // makes several passes rather than one unbounded query.
+    const PAGE: i64 = 500;
+
+    let mut position = cursor;
+    loop {
+        let events = match firehose::since(&state.pool, position, PAGE).await {
+            Ok(events) => events,
+            Err(e) => {
+                tracing::error!(error = %e, "firehose backfill failed");
+                return;
+            }
+        };
+        if events.is_empty() {
+            break;
+        }
+        for event in &events {
+            let Ok(frame) = firehose::frame(event) else {
+                tracing::error!(seq = event.seq, "could not frame a commit event");
+                continue;
+            };
+            if socket.send(Message::Binary(frame.into())).await.is_err() {
+                // The consumer went away mid-backfill. It has its cursor and
+                // will resume; nothing to clean up.
+                return;
+            }
+            position = Some(event.seq);
+        }
+    }
+
+    // Live tail. A consumer that stays connected keeps receiving; one that
+    // drops resumes from the log, which is why the log exists.
+    let mut live = state.commits.subscribe();
+    while let Ok(event) = live.recv().await {
+        if position.is_some_and(|seen| event.seq <= seen) {
+            // Already delivered during backfill — the overlap window between
+            // draining the table and attaching to the channel.
+            continue;
+        }
+        let Ok(frame) = firehose::frame(&event) else {
+            continue;
+        };
+        if socket.send(Message::Binary(frame.into())).await.is_err() {
+            return;
+        }
+        position = Some(event.seq);
+    }
+}
+
 /// Anything under `/xrpc/` we do not implement.
 ///
 /// XRPC names an unimplemented method specifically, so a client can tell "this
@@ -578,6 +743,10 @@ pub fn routes() -> Router<AppState> {
         .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
         .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
+        .route(
+            "/xrpc/com.atproto.sync.subscribeRepos",
+            get(subscribe_repos),
+        )
         .route(
             "/xrpc/com.atproto.server.describeServer",
             get(describe_server),

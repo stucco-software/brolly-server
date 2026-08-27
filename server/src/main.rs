@@ -53,6 +53,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),
         instance_actor: std::sync::Arc::new(instance_actor),
+        commits: tokio::sync::broadcast::channel(
+            // Bounded: a consumer that falls this far behind is dropped and
+            // reconnects with its cursor, which is cheaper than letting one
+            // slow reader grow the buffer without limit.
+            1024,
+        )
+        .0,
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

@@ -45,6 +45,14 @@ pub struct AppState {
     /// Signs outbound delivery on the instance's behalf and backs the shared
     /// inbox. Loaded once at startup for the same reason as `provider_key`.
     pub instance_actor: std::sync::Arc<brolly_identity::instance::ActorKeys>,
+    /// Live commit events, for consumers already attached to the firehose.
+    ///
+    /// A broadcast channel and *not* the durable record — the log in Postgres
+    /// is what lets a consumer that drops resume. This only saves attached
+    /// consumers a poll. A lagging receiver is dropped by the channel rather
+    /// than allowed to grow unbounded; it reconnects with its cursor and
+    /// backfills, which is the path that already exists.
+    pub commits: tokio::sync::broadcast::Sender<brolly_atproto::firehose::CommitEvent>,
 }
 
 /// Build the application router.

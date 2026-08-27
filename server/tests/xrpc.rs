@@ -14,6 +14,7 @@ use brolly_identity::db;
 use brolly_server::{AppState, app};
 use http_body_util::BodyExt;
 use serde_json::json;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 
 const BASE: &str = "brolly.test";
@@ -48,6 +49,7 @@ async fn harness() -> Harness {
                 .await
                 .expect("instance actor"),
             ),
+            commits: tokio::sync::broadcast::channel(64).0,
         },
         "server/static",
     );
@@ -454,4 +456,199 @@ async fn xrpc_is_apex_only() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND);
+}
+
+// --- firehose -------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_write_is_announced_on_the_firehose() {
+    // The commit stream is how a relay learns anything changed without polling
+    // every repo. A write that does not appear here is invisible to the network.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "announced"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
+        .await
+        .expect("firehose");
+    assert_eq!(events.len(), 1, "the write was not announced");
+    assert_eq!(events[0].action, brolly_atproto::firehose::Action::Create);
+    assert_eq!(events[0].path, "app.bsky.feed.post/3kaaaaaaaaaaa");
+    assert!(events[0].commit_cid.starts_with("bafy"));
+}
+
+#[tokio::test]
+async fn a_delete_is_announced_too() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "gone soon"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    post_json(
+        &h,
+        "/xrpc/com.atproto.repo.deleteRecord",
+        json!({"collection": "app.bsky.feed.post", "rkey": "3kaaaaaaaaaaa"}),
+        Some(&cookie),
+    )
+    .await;
+
+    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1].action, brolly_atproto::firehose::Action::Delete);
+    assert_eq!(
+        events[1].record_cid, None,
+        "a delete announces no record CID"
+    );
+}
+
+#[tokio::test]
+async fn the_announcement_chains_to_the_previous_commit() {
+    // A consumer verifies `prev` against what it already has; an event that
+    // does not name its predecessor cannot be checked.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    for n in 1..=2 {
+        post_json(
+            &h,
+            "/xrpc/com.atproto.repo.createRecord",
+            json!({
+                "collection": "app.bsky.feed.post",
+                "rkey": format!("3k{n}"),
+                "record": {"$type": "app.bsky.feed.post", "text": format!("post {n}")},
+            }),
+            Some(&cookie),
+        )
+        .await;
+    }
+
+    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[1].prev_cid.as_deref(),
+        Some(events[0].commit_cid.as_str()),
+        "the second commit must name the first"
+    );
+    assert!(events[1].rev > events[0].rev, "revisions must advance");
+}
+
+#[tokio::test]
+async fn the_firehose_endpoint_is_mounted() {
+    // A plain GET is refused by the upgrade extractor, which is itself proof
+    // the route exists — falling through to the catch-all would answer 501.
+    let h = harness().await;
+    let reply = get(&h, "/xrpc/com.atproto.sync.subscribeRepos").await;
+    assert_ne!(
+        reply.status,
+        StatusCode::NOT_IMPLEMENTED,
+        "subscribeRepos fell through to the unimplemented catch-all"
+    );
+}
+
+/// Serve the router on a real port.
+///
+/// `oneshot` cannot complete a websocket upgrade — there is no hyper upgrade
+/// state behind it — so the firehose is unverifiable through the harness the
+/// other tests use. A real listener is the only way to assert it streams at
+/// all, which is the entire point of the endpoint.
+async fn serve(router: axum::Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn a_relay_receives_backfill_from_its_cursor() {
+    // The property the durable log exists for: a consumer that was away comes
+    // back with a cursor and receives exactly what it missed.
+    use futures_util::StreamExt;
+
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    for n in 1..=3 {
+        post_json(
+            &h,
+            "/xrpc/com.atproto.repo.createRecord",
+            json!({
+                "collection": "app.bsky.feed.post",
+                "rkey": format!("3k{n}"),
+                "record": {"$type": "app.bsky.feed.post", "text": format!("post {n}")},
+            }),
+            Some(&cookie),
+        )
+        .await;
+    }
+
+    let addr = serve(h.router.clone()).await;
+    let (mut socket, response) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=1"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+
+    // Two events remain after cursor=1, and they arrive as binary frames.
+    let mut received = 0;
+    while received < 2 {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("the stream should not stall")
+            .expect("the stream should not end")
+            .expect("a readable frame");
+
+        if let tokio_tungstenite::tungstenite::Message::Binary(frame) = message {
+            assert!(!frame.is_empty(), "an empty frame carries nothing");
+            received += 1;
+        }
+    }
+    assert_eq!(received, 2, "backfill delivered the wrong number of events");
+}
+
+#[tokio::test]
+async fn the_firehose_is_apex_only() {
+    // Over a real socket, so the upgrade succeeds and the host check is what
+    // answers. Through `oneshot` this is untestable — the upgrade extractor
+    // rejects first and both hosts look identical.
+    let h = harness().await;
+    let addr = serve(h.router.clone()).await;
+
+    let mut request = format!("ws://{addr}/xrpc/com.atproto.sync.subscribeRepos")
+        .into_client_request()
+        .unwrap();
+    request
+        .headers_mut()
+        .insert(header::HOST, format!("alice.{BASE}").parse().unwrap());
+
+    assert!(
+        tokio_tungstenite::connect_async(request).await.is_err(),
+        "the firehose must not serve on a member subdomain"
+    );
 }

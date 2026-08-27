@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod blocks;
+pub mod firehose;
 pub mod identity;
 pub mod ingest;
 pub mod keys;
