@@ -115,6 +115,19 @@ pub fn decode(status_id: &str) -> Option<(String, Uuid)> {
     Some((note.to_string(), Uuid::from_bytes(decode_128(owner)?)))
 }
 
+/// Encode a UUID as a fixed-width opaque id.
+///
+/// Used for account ids, which are opaque strings clients sort and paginate on
+/// just like status ids — so they get the same fixed width for the same reason.
+pub fn encode_uuid(id: Uuid) -> String {
+    encode_128(*id.as_bytes())
+}
+
+/// Recover a UUID from [`encode_uuid`].
+pub fn decode_uuid(text: &str) -> Option<Uuid> {
+    Some(Uuid::from_bytes(decode_128(text)?))
+}
+
 /// Rebuild the note's IRI, given the username the owner UUID resolved to.
 ///
 /// The IRI already names its owner, which is the property that makes the whole
