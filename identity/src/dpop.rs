@@ -1,5 +1,12 @@
 //! DPoP proof verification (RFC 9449).
 //!
+//! Lives in `identity` rather than beside one protocol because **two** of them
+//! bind tokens this way: Solid-OIDC and ATProtocol. Adapters may not depend on
+//! each other (`server/tests/architecture.rs`), so the alternative was a second
+//! copy — and a second copy of a verifier is how one of them quietly stops
+//! matching the other, which is the exact failure the AS2 namespace split
+//! produced in the predecessor.
+//!
 //! A DPoP proof binds a request to a key the client holds, so a stolen access
 //! token is useless on its own. The proof is a JWT signed by the client's
 //! private key, carrying its public key in the header.

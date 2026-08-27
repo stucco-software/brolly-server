@@ -853,12 +853,16 @@ name = "brolly-identity"
 version = "0.1.0"
 dependencies = [
  "argon2",
+ "base64 0.23.1",
  "brolly-authz",
  "brolly-domain",
  "brolly-store",
  "brolly-test-support",
  "hex",
+ "p256 0.14.0",
  "rand 0.10.2",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "sqlx",
  "time",
