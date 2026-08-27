@@ -17,6 +17,16 @@ use brolly_store::write::{WriteError, insert_quads};
 use oxigraph::model::{GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde_json::Value;
 
+/// The collection readers moved to `brolly-store` so the Mastodon adapter can
+/// use them without depending on this crate — see `store::collection`. They are
+/// re-exported here because delivery and reading are one story from the inbox's
+/// point of view, and a caller should not have to know which crate holds which
+/// half.
+pub use brolly_store::collection::{
+    Entry, LDP_CONTAINS, RECEIVED_AT, members, read_record as read_activity, received_at,
+    record_type, timeline,
+};
+
 /// The lexicon marker naming AS2's term space in the faithful layer.
 ///
 /// Faithful quads land on `at://as2#<field>`, *not* on the canonical AS2
@@ -26,16 +36,6 @@ use serde_json::Value;
 /// table. Anything reading stored activities back has to use this space or it
 /// matches nothing.
 const AS2: &str = "as2";
-
-/// LDP containment, reused rather than invented: an inbox is a collection, and
-/// `ldp:contains` is what the Solid side already walks.
-pub const LDP_CONTAINS: &str = "http://www.w3.org/ns/ldp#contains";
-
-/// When *this recipient* received the activity.
-///
-/// Ours, and deliberately not `as:published`: publication is a claim the sender
-/// makes, receipt is a fact we observed.
-pub const RECEIVED_AT: &str = "https://brolly.id/ns#receivedAt";
 
 #[derive(Debug)]
 pub enum InboxError {
@@ -72,15 +72,6 @@ impl From<oxigraph::store::StorageError> for InboxError {
 
 fn iri(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
-}
-
-/// One row of a timeline.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Entry {
-    pub activity: String,
-    pub activity_type: String,
-    /// The cursor. Receipt time, not claimed publication.
-    pub received_at: String,
 }
 
 /// Store an activity in the recipient's inbox.
@@ -164,121 +155,6 @@ fn clear_received_at(store: &Store, inbox: &str, activity: &str) -> Result<(), I
         store.remove(quad)?;
     }
     Ok(())
-}
-
-/// Everything in this inbox.
-pub fn members(store: &Store, inbox: &str) -> Vec<String> {
-    let node = iri(inbox);
-    store
-        .quads_for_pattern(
-            Some((&NamedOrBlankNode::NamedNode(node.clone())).into()),
-            Some(iri(LDP_CONTAINS).as_ref()),
-            None,
-            Some(GraphNameRef::NamedNode(node.as_ref())),
-        )
-        .filter_map(Result::ok)
-        .filter_map(|q| match q.object {
-            Term::NamedNode(n) => Some(n.as_str().to_string()),
-            _ => None,
-        })
-        .collect()
-}
-
-/// When this inbox received an activity.
-pub fn received_at(store: &Store, inbox: &str, activity: &str) -> Option<String> {
-    store
-        .quads_for_pattern(
-            Some((&NamedOrBlankNode::NamedNode(iri(activity))).into()),
-            Some(iri(RECEIVED_AT).as_ref()),
-            None,
-            Some(GraphNameRef::NamedNode(iri(inbox).as_ref())),
-        )
-        .filter_map(Result::ok)
-        .find_map(|q| match q.object {
-            Term::Literal(l) => Some(l.value().to_string()),
-            _ => None,
-        })
-}
-
-/// Read a stored record back as the wire format it arrived in.
-pub fn read_activity(store: &Store, id: &str) -> Option<Value> {
-    let node = iri(id);
-    let quads: Vec<Quad> = store
-        .quads_for_pattern(
-            None,
-            None,
-            None,
-            Some(GraphNameRef::NamedNode(node.as_ref())),
-        )
-        .filter_map(Result::ok)
-        .collect();
-    if quads.is_empty() {
-        return None;
-    }
-    faithful::decode(&quads, &node).ok()
-}
-
-/// The recipient's timeline: their own inbox, filtered, newest first.
-///
-/// One store, no fan-out, and correct for remote authors. Sorted by **receipt**
-/// rather than by the `published` the sender claimed — `published` is
-/// attacker-controlled, and sorting on it lets one instance pin itself to the
-/// top of every timeline forever.
-///
-/// `before` is an exclusive cursor: passing the last row of a page returns the
-/// next one without repeating the boundary.
-pub fn timeline(
-    store: &Store,
-    inbox: &str,
-    types: &[&str],
-    limit: usize,
-    before: Option<&str>,
-) -> Vec<Entry> {
-    let mut entries: Vec<Entry> = members(store, inbox)
-        .into_iter()
-        .filter_map(|activity| {
-            let received_at = received_at(store, inbox, &activity)?;
-            if before.is_some_and(|cursor| received_at.as_str() >= cursor) {
-                return None;
-            }
-            let activity_type = activity_type(store, &activity)?;
-            types.contains(&activity_type.as_str()).then_some(Entry {
-                activity,
-                activity_type,
-                received_at,
-            })
-        })
-        .collect();
-
-    entries.sort_by(|a, b| b.received_at.cmp(&a.received_at));
-    entries.truncate(limit);
-    entries
-}
-
-/// The AS2 `type` of a stored activity.
-///
-/// Read from the **faithful** layer's term space (`at://as2#type`), not the
-/// canonical AS2 namespace. Those are different by design (D7): faithful quads
-/// are emitted for everything and keep each protocol's fields in their own
-/// space, while canonical triples are asserted only for the entities in the
-/// mapping table. Filtering on the canonical predicate would silently match
-/// nothing for every activity type that is not mapped.
-fn activity_type(store: &Store, activity: &str) -> Option<String> {
-    let node = iri(activity);
-    let predicate = iri(&brolly_domain::nsid::predicate(AS2, "type"));
-    store
-        .quads_for_pattern(
-            Some((&NamedOrBlankNode::NamedNode(node.clone())).into()),
-            Some(predicate.as_ref()),
-            None,
-            Some(GraphNameRef::NamedNode(node.as_ref())),
-        )
-        .filter_map(Result::ok)
-        .find_map(|q| match q.object {
-            Term::Literal(l) => Some(l.value().to_string()),
-            Term::NamedNode(n) => Some(n.as_str().to_string()),
-            _ => None,
-        })
 }
 
 /// Drop an activity from an inbox, graph and all.

@@ -8,4 +8,5 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod status_id;
+pub mod timeline;
 pub mod translate;

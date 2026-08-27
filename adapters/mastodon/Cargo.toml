@@ -20,6 +20,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 tempfile = "3.27.0"
+brolly-activitypub.workspace = true
 
 [lints]
 workspace = true

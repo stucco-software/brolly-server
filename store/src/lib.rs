@@ -16,6 +16,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 pub mod blobs;
+pub mod collection;
 pub mod index;
 pub mod manager;
 pub mod write;
