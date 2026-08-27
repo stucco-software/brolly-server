@@ -28,12 +28,17 @@ oxigraph = "0.5.9"
 # encoder atrium uses is the one that has to produce it.
 serde_ipld_dagcbor = "0.6"
 base32 = "0.5"
+time = "0.3.55"
 base64 = "0.23.1"
+# 0.13 rather than a third version: the tree already carries 0.13 (via the
+# ActivityPub stack) and 0.14. `multiple-versions` is a warning, not a licence
+# to keep adding.
+reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
 rand = "0.8"
 tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "io-util"] }
 tracing.workspace = true
 uuid = { version = "1.25.0", features = ["v4"] }
-sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "time"] }
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "time", "json"] }
 
 [dev-dependencies]
 tempfile = "3.27.0"

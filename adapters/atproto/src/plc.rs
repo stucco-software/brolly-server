@@ -565,3 +565,102 @@ mod rotation_tests {
         assert_eq!(rotated.rotation_keys, genesis.rotation_keys);
     }
 }
+
+// --- submission ------------------------------------------------------------------
+
+/// Submit a signed operation to the PLC directory.
+///
+/// **Not gated by the federation switch** (ADR 0016). That switch governs
+/// ActivityPub's outbound delivery, where suppression costs a member nothing
+/// local. Here it would cost them their entire ATProtocol identity: without a
+/// registered DID they cannot be resolved, cannot be followed, and cannot later
+/// take elsewhere a DID that was never created.
+///
+/// Failure is returned, never swallowed. A DID that exists locally and not in
+/// the directory is a real and recoverable state — but only if something knows
+/// it happened.
+pub async fn submit(
+    client: &reqwest::Client,
+    did: &str,
+    signed: &Operation,
+) -> Result<(), SubmitError> {
+    let response = client
+        .post(directory_url(did))
+        .json(signed)
+        .send()
+        .await
+        .map_err(|e| SubmitError::Unreachable(e.to_string()))?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(());
+    }
+
+    let body = response.text().await.unwrap_or_default();
+    // A 4xx means the directory rejected the operation itself — a bad
+    // signature, a `prev` that does not match its head. Retrying verbatim will
+    // never help, and the distinction is what tells an operator whether to
+    // wait or to look.
+    if status.is_client_error() {
+        Err(SubmitError::Rejected {
+            status: status.as_u16(),
+            body,
+        })
+    } else {
+        Err(SubmitError::Unreachable(format!("{status}: {body}")))
+    }
+}
+
+#[derive(Debug)]
+pub enum SubmitError {
+    /// The directory could not be reached, or answered 5xx. Retryable.
+    Unreachable(String),
+    /// The directory refused the operation. Retrying it unchanged will not help.
+    Rejected { status: u16, body: String },
+}
+
+impl SubmitError {
+    /// Is retrying this operation, unchanged, worth doing?
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, SubmitError::Unreachable(_))
+    }
+}
+
+impl std::fmt::Display for SubmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SubmitError::Unreachable(e) => write!(f, "PLC directory unreachable: {e}"),
+            SubmitError::Rejected { status, body } => {
+                write!(f, "PLC directory rejected the operation ({status}): {body}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SubmitError {}
+
+#[cfg(test)]
+mod submit_tests {
+    use super::*;
+
+    #[test]
+    fn a_rejection_is_not_retryable_but_an_outage_is() {
+        // The distinction an operator acts on: wait, or go and look.
+        assert!(SubmitError::Unreachable("timed out".into()).is_retryable());
+        assert!(
+            !SubmitError::Rejected {
+                status: 400,
+                body: "bad signature".into()
+            }
+            .is_retryable()
+        );
+    }
+
+    #[test]
+    fn the_directory_url_names_the_did() {
+        assert_eq!(
+            directory_url("did:plc:abc"),
+            "https://plc.directory/did:plc:abc"
+        );
+    }
+}
