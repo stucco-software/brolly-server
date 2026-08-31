@@ -1,0 +1,14 @@
+{
+	auto_https off
+	admin off
+}
+
+# `header_up Host {host}` is load-bearing, not tidiness. The router branches on
+# `Host` to tell the apex from a member subdomain, so a proxy that rewrites it
+# makes every member's pod resolve to the instance.
+:443 {
+	tls /tls/cert.pem /tls/key.pem
+	reverse_proxy host.docker.internal:3000 {
+		header_up Host {host}
+	}
+}

@@ -14,6 +14,12 @@ path = "src/lib.rs"
 name = "brolly-server"
 path = "src/main.rs"
 
+# Operational commands. A separate binary rather than a subcommand of the
+# server, so running one cannot accidentally start the other.
+[[bin]]
+name = "brolly-admin"
+path = "src/bin/admin.rs"
+
 [dependencies]
 brolly-domain.workspace = true
 brolly-store.workspace = true

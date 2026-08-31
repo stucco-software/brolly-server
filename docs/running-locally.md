@@ -27,19 +27,26 @@ So local work splits in two:
 
 ---
 
-## 1. Postgres
+## 0. Do not run the test suite at the same time
 
-There is no `docker-compose.yml` in this repo. The test suite provisions its
-own Postgres through testcontainers, so nothing needed one until now.
+The suite provisions its own Postgres through testcontainers, and on a
+constrained machine it competes with the dev stack for the Docker daemon. The
+failure looks exactly like a real one — nine tests failing with
+`WaitContainer(StartupTimeout)` — and it is not.
 
 ```bash
-docker run -d --name brolly-dev-pg \
-  -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=brolly \
-  -p 5544:5432 postgres:16
+docker compose down   # before `cargo test --workspace`
 ```
 
-Port 5544 to stay clear of anything already on 5432. Migrations run on boot, so
-there is no separate migrate step.
+## 1. Postgres
+
+```bash
+docker compose up -d postgres
+```
+
+Port 5544, not 5432: a developer machine usually already has a Postgres, and
+silently connecting to the wrong one is a bad afternoon. Migrations run when
+the server boots, so there is no separate migrate step.
 
 ## 2. The server
 
@@ -76,44 +83,49 @@ curl -s -H "Host: brolly.test" http://localhost:3000/api/v1/zzz
 
 ## 4. Make an invite
 
-The instance is invite-only and **there is no CLI to mint an invite**. Codes
-are stored as `sha256` hex, so this goes in by hand:
-
 ```bash
-HASH=$(printf 'devinvite' | shasum -a 256 | cut -d' ' -f1)
-docker exec brolly-dev-pg psql -U postgres -d brolly \
-  -c "INSERT INTO invites (code_hash, max_uses) VALUES ('$HASH', 10)"
+export DATABASE_URL="postgres://postgres:postgres@localhost:5544/brolly"
+CODE=$(cargo run --quiet --bin brolly-admin -- invite --uses 5 --expires-days 7)
 ```
 
-The code is then `devinvite`. See *Rough edges* below.
+The code is the only thing on stdout, so it pipes; the explanation goes to
+stderr. It is shown once — only its hash is stored.
+
+`brolly-admin` also has:
+
+```bash
+brolly-admin whoami alice        # what a member's identity resolves to
+brolly-admin plc-retry --dry-run # PLC operations the directory has not accepted
+brolly-admin plc-retry           # submit them
+```
+
+`whoami` is the fastest way to see whether a member is fully provisioned:
+
+```
+did        did:plc:5mhv4o7jzdag6sdqquhl46ch
+repo       bafyreigklgoswhxv6sxw6uxgsl2boj6rvzeaw2hke47ahobirdz5l6nx6a (rev 0)
+plc        pending — run `brolly-admin plc-retry`
+```
+
+`plc pending` is the normal local state: submission is off unless
+`BROLLY_PLC_SUBMIT=1`, so a development instance does not publish test
+identities to the real directory.
 
 ## 5. TLS, for everything else
 
 `mkcert` issues a locally-trusted wildcard; Caddy terminates and forwards to
 the server with the original `Host` preserved — which the router depends on.
 
+The `Caddyfile` is in `tls/`; only the certificates are missing, and they are
+gitignored because a private key is a private key.
+
 ```bash
-mkdir -p /tmp/brolly-tls && cd /tmp/brolly-tls
-mkcert -cert-file cert.pem -key-file key.pem "brolly.test" "*.brolly.test"
-
-cat > Caddyfile <<'EOF'
-{
-	auto_https off
-	admin off
-}
-:443 {
-	tls /tls/cert.pem /tls/key.pem
-	reverse_proxy host.docker.internal:3000 {
-		header_up Host {host}
-	}
-}
-EOF
-
-docker run -d --name brolly-dev-tls -p 8443:443 \
-  -v /tmp/brolly-tls:/tls:ro \
-  -v /tmp/brolly-tls/Caddyfile:/etc/caddy/Caddyfile:ro \
-  caddy:2
+mkcert -cert-file tls/cert.pem -key-file tls/key.pem "brolly.test" "*.brolly.test"
+docker compose --profile tls up -d caddy
 ```
+
+Caddy is behind a profile so `docker compose up` works before the certificates
+exist.
 
 `header_up Host {host}` is not optional. Without it the proxy rewrites the
 `Host` and every member subdomain resolves to the apex.
@@ -217,9 +229,12 @@ wss://brolly.test:8443/xrpc/com.atproto.sync.subscribeRepos?cursor=0
 ## 9. Tear down
 
 ```bash
-docker rm -f brolly-dev-pg brolly-dev-tls
-rm -rf /tmp/brolly-dev-data /tmp/brolly-tls
+docker compose --profile tls down -v
+rm -rf /tmp/brolly-dev-data
 ```
+
+`-v` drops the Postgres volume too. The data directory holds every pod, its
+blobs and its repo blocks.
 
 The data directory holds every pod, its blobs and its repo blocks. Deleting it
 is the whole reset.
@@ -247,9 +262,8 @@ subdomains are usually treated as separate origins. The likelier answers are to
 accept a token at `/outbox` (it already accepts Solid DPoP elsewhere), or to
 publish through an apex endpoint. **This is a design decision, not a bug fix.**
 
-**2. There is no way to create an invite except SQL.**
-Invite-only is enforced, and nothing mints codes. A `tools/` command would make
-the first five minutes of local setup much less strange.
+**2. ~~No way to create an invite except SQL.~~ Fixed.**
+`brolly-admin invite`. See step 4.
 
 **3. ~~No way to provision an ATProtocol repo except code.~~ Fixed.**
 Registration now mints the signing and rotation keys, derives the `did:plc`
@@ -262,8 +276,9 @@ in `identity::unsubmitted` until it does, which is the normal local state: a
 member who cannot be published yet is very different from one who was never
 given an identity (ADR 0016).
 
-**4. No `docker-compose.yml`.** Tests bring their own Postgres via
-testcontainers, so nothing needed one, but running the server does.
+**4. ~~No `docker-compose.yml`.~~ Fixed**, with the testcontainers
+contention documented in step 0 — it is the one interaction between the two
+that produces convincing false failures.
 
 **5. `target/` reached 96 GB** before a `cargo clean`. `Cargo.toml`'s
 `[profile.dev.package."*"] debug = false` only strips dependency debug info;
