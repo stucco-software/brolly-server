@@ -1,0 +1,6 @@
+# 96 GB of build artefacts is not build context.
+target
+.git
+tls/cert.pem
+tls/key.pem
+docs

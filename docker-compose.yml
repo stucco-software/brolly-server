@@ -1,13 +1,20 @@
-# Local development dependencies.
+# The whole stack, on OrbStack's HTTPS domains.
 #
-# The test suite does **not** use this — it provisions its own Postgres through
-# testcontainers so a clean clone needs no setup. This is for running the
-# server, which needs a database that outlives a single `cargo test`.
+# OrbStack issues a trusted certificate for a container's declared domains —
+# **including wildcards** — and proxies to it with the `Host` header intact.
+# That last part is what makes it work here at all: brolly's router branches on
+# `Host` to tell the instance from a member's pod, so a proxy that rewrote it
+# would collapse every member onto the apex.
 #
-# One consequence worth knowing: testcontainers competes with these for the
-# Docker daemon. On a constrained machine, running the suite while this stack is
-# up produces `WaitContainer(StartupTimeout)` failures that look exactly like
-# real test failures. `docker compose down` before a full test run.
+# It also removes three steps that used to be required: mkcert, a Caddy
+# terminator, and `/etc/hosts` entries per member. Nothing is generated and
+# nothing is installed into a system trust store beyond what OrbStack already
+# did.
+#
+# One interaction to know about: the test suite provisions its own Postgres
+# through testcontainers and competes with this stack for the daemon. On a
+# constrained machine that produces `WaitContainer(StartupTimeout)` failures
+# that read exactly like real ones. `docker compose down` before a full run.
 
 services:
   postgres:
@@ -15,7 +22,8 @@ services:
     environment:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: brolly
-    # 5544, not 5432: a developer machine usually already has a Postgres, and
+    # Published on 5544 so `brolly-admin` and psql can reach it from the host.
+    # Not 5432: a developer machine usually already has a Postgres, and
     # silently connecting to the wrong one is a bad afternoon.
     ports:
       - "5544:5432"
@@ -25,27 +33,34 @@ services:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 2s
       timeout: 3s
-      retries: 15
+      retries: 30
 
-  # TLS termination. The authenticated surface cannot be exercised over plain
-  # HTTP — the session cookie is `Secure` and every URL the server builds is
-  # `https://`, including the `htu` a DPoP proof is checked against.
-  #
-  # Requires certificates first:
-  #   mkcert -cert-file tls/cert.pem -key-file tls/key.pem "brolly.test" "*.brolly.test"
-  #
-  # Started only with `--profile tls`, so `docker compose up` works before the
-  # certificates exist.
-  caddy:
-    image: caddy:2
-    profiles: ["tls"]
-    ports:
-      - "8443:443"
+  brolly:
+    build:
+      context: .
+    labels:
+      # The apex and every member subdomain. The wildcard is not a convenience:
+      # each member lives on their own host, so without it only the instance
+      # itself would be reachable.
+      dev.orbstack.domains: "brolly.local,*.brolly.local"
+    environment:
+      DATABASE_URL: "postgres://postgres:postgres@postgres:5432/brolly"
+      # Must match the domains above. Every WebID, actor IRI, OAuth issuer and
+      # DPoP `htu` is built from it, so a mismatch fails every proof and every
+      # identity while the server otherwise looks healthy.
+      BROLLY_BASE_DOMAIN: "brolly.local"
+      RUST_LOG: "info"
+      # PLC submission stays off: a development instance should not publish
+      # test identities to the real directory. Identities are still minted
+      # locally and wait in `brolly-admin plc-retry` (ADR 0016).
+      BROLLY_PLC_SUBMIT: "0"
     volumes:
-      - ./tls:/tls:ro
-      - ./tls/Caddyfile:/etc/caddy/Caddyfile:ro
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      - brolly-data:/var/lib/brolly
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   brolly-pg:
+  brolly-data:
