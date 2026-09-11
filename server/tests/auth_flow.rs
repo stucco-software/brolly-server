@@ -18,6 +18,8 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
     let state = AppState {
         pool: db.pool.clone(),
         base_domain: "brolly.test".into(),
+        instance_name: "brolly.test".to_string(),
+        instance_description: "A private community server.".to_string(),
         stores: std::sync::Arc::new(
             brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),
         ),
@@ -65,15 +67,44 @@ async fn post(router: &axum::Router, path: &str, body: &str) -> (StatusCode, Str
 }
 
 async fn get(router: &axum::Router, path: &str) -> (StatusCode, String) {
+    get_as(router, path, None).await
+}
+
+async fn get_as(router: &axum::Router, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
+    let mut request = Request::builder().uri(path);
+    if let Some(cookie) = cookie {
+        request = request.header(header::COOKIE, cookie);
+    }
     let response = router
         .clone()
-        .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+        .oneshot(request.body(Body::empty()).unwrap())
         .await
         .unwrap();
     let status = response.status();
     let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
         .to_string();
     (status, body)
+}
+
+/// Register `alice` and return her session cookie, `name=value` only.
+async fn register_alice(db: &brolly_test_support::TestDb, router: &axum::Router) -> String {
+    let code = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
+    let (_, _, cookies) = post(
+        router,
+        "/register",
+        &format!("invite={code}&username=alice&email=&password=correct-horse-battery"),
+    )
+    .await;
+    cookies
+        .iter()
+        .find(|c| c.starts_with("brolly_session="))
+        .expect("a session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string()
 }
 
 #[tokio::test]
@@ -118,7 +149,9 @@ async fn registration_requires_a_valid_invite() {
 #[tokio::test]
 async fn a_valid_invite_registers_and_logs_in() {
     let (db, _dir, router) = harness().await;
-    let code = db::create_invite(&db.pool, None, 1, None).await.unwrap();
+    let code = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
 
     let (status, _, cookies) = post(
         &router,
@@ -152,7 +185,9 @@ async fn a_valid_invite_registers_and_logs_in() {
 #[tokio::test]
 async fn an_invite_cannot_be_used_twice() {
     let (db, _dir, router) = harness().await;
-    let code = db::create_invite(&db.pool, None, 1, None).await.unwrap();
+    let code = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
 
     let (first, _, _) = post(
         &router,
@@ -184,7 +219,9 @@ async fn an_invite_cannot_be_used_twice() {
 #[tokio::test]
 async fn a_rejected_username_does_not_consume_the_invite() {
     let (db, _dir, router) = harness().await;
-    let code = db::create_invite(&db.pool, None, 1, None).await.unwrap();
+    let code = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
 
     // "Alice" is invalid: usernames become subdomains.
     let (status, _, _) = post(
@@ -260,7 +297,9 @@ async fn a_wrong_password_reveals_nothing_about_the_account() {
 #[tokio::test]
 async fn a_short_password_is_refused_before_the_invite_is_spent() {
     let (db, _dir, router) = harness().await;
-    let code = db::create_invite(&db.pool, None, 1, None).await.unwrap();
+    let code = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
 
     let (status, body, _) = post(
         &router,
@@ -341,7 +380,7 @@ async fn registering_provisions_a_pod_the_member_can_write_to() {
     // right. Without it the first write any new member attempts is refused,
     // while the pod looks perfectly fine from the outside.
     let (db, _dir, router) = harness().await;
-    let invite = db::create_invite(&db.pool, None, 1, None)
+    let invite = db::create_invite(&db.pool, None, 1, None, None)
         .await
         .expect("invite");
 
@@ -384,4 +423,57 @@ async fn registering_provisions_a_pod_the_member_can_write_to() {
         StatusCode::NO_CONTENT,
         "a newly registered member cannot write to their own pod"
     );
+}
+
+// --- the front door, once you are through it --------------------------------
+
+#[tokio::test]
+async fn the_landing_page_knows_you_are_signed_in() {
+    let (db, _dir, router) = harness().await;
+    let cookie = register_alice(&db, &router).await;
+
+    let (status, body) = get_as(&router, "/", Some(&cookie)).await;
+
+    assert_eq!(status, StatusCode::OK);
+    // Login redirects to `/`. When `/` renders the anonymous nav regardless,
+    // a successful login is indistinguishable from a failed one, and members
+    // retry until they conclude the server is broken.
+    assert!(
+        body.contains("Log out"),
+        "a signed-in member must be able to sign out from the front door, got: {body}"
+    );
+    assert!(
+        body.contains("alice"),
+        "the front door must name who is signed in, got: {body}"
+    );
+    assert!(
+        !body.contains(r#"href="/login""#),
+        "a signed-in member must not be invited to log in again, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn the_landing_page_still_invites_anonymous_visitors_in() {
+    let (_db, _dir, router) = harness().await;
+
+    let (status, body) = get(&router, "/").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"href="/login""#), "got: {body}");
+    assert!(body.contains(r#"href="/register""#), "got: {body}");
+    assert!(
+        !body.contains("Log out"),
+        "an anonymous visitor has nothing to sign out of, got: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_session_cookie_falls_back_to_the_anonymous_front_door() {
+    let (_db, _dir, router) = harness().await;
+
+    let (status, body) = get_as(&router, "/", Some("brolly_session=not-a-real-token")).await;
+
+    assert_eq!(status, StatusCode::OK, "a bad cookie must not 500");
+    assert!(body.contains(r#"href="/login""#), "got: {body}");
+    assert!(!body.contains("Log out"), "got: {body}");
 }

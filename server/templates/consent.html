@@ -3,40 +3,42 @@
 {% block title %}Authorise {{ app_name }} — {{ instance_name }}{% endblock %}
 
 {% block content %}
-<div class="auth-card consent">
-  <h1>Authorise {{ app_name }}</h1>
-  <p class="lede">
-    <strong>{{ app_name }}</strong> wants access to your account
-    <strong>@{{ username }}</strong>.
-  </p>
-  <p class="consent-origin">
-    Requested by <span class="mono">{{ client_id }}</span> via {{ protocol_label }}.
-  </p>
+<div class="wrap">
+  <div class="auth-card consent">
+    <h1>Authorise {{ app_name }}</h1>
+    <p class="lede">
+      <strong>{{ app_name }}</strong> wants access to your account
+      <strong>@{{ username }}</strong>.
+    </p>
+    <p class="consent-origin">
+      Requested by <span class="mono">{{ client_id }}</span> via {{ protocol_label }}.
+    </p>
 
-  {% for section in sections %}
-  <section class="consent-group{% if section.attention %} consent-group-attention{% endif %}">
-    <h2>{{ section.heading }}</h2>
-    <ul class="consent-list">
-      {% for cap in section.capabilities %}
-      <li{% if cap.needs_attention() %} class="consent-attention"{% endif %}>
-        <span class="consent-summary">{{ cap.summary }}</span>
-        <span class="mono consent-raw">{{ cap.raw }}</span>
-      </li>
-      {% endfor %}
-    </ul>
-  </section>
-  {% endfor %}
+    {% for section in sections %}
+    <section class="consent-group{% if section.attention %} consent-group-attention{% endif %}">
+      <h2>{{ section.heading }}</h2>
+      <ul class="consent-list">
+        {% for cap in section.capabilities %}
+        <li{% if cap.needs_attention() %} class="consent-attention"{% endif %}>
+          <span class="consent-summary">{{ cap.summary }}</span>
+          <span class="mono consent-raw">{{ cap.raw }}</span>
+        </li>
+        {% endfor %}
+      </ul>
+    </section>
+    {% endfor %}
 
-  <form method="post" action="{{ action }}" class="consent-actions">
-    <input type="hidden" name="request" value="{{ request_token }}">
-    <button type="submit" name="decision" value="deny" class="button">Cancel</button>
-    <button type="submit" name="decision" value="allow" class="button button-primary">
-      Authorise
-    </button>
-  </form>
+    <form method="post" action="{{ action }}" class="consent-actions">
+      <input type="hidden" name="request" value="{{ request_token }}">
+      <button type="submit" name="decision" value="deny" class="button">Cancel</button>
+      <button type="submit" name="decision" value="allow" class="button button-primary">
+        Authorise
+      </button>
+    </form>
 
-  <p class="auth-alt">
-    You can revoke this at any time from your account settings.
-  </p>
+    <p class="auth-alt">
+      You can revoke this at any time from your account settings.
+    </p>
+  </div>
 </div>
 {% endblock %}

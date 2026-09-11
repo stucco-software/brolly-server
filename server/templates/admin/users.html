@@ -1,0 +1,46 @@
+{% extends "base.html" %}
+
+{% block title %}Members — {{ instance_name }}{% endblock %}
+
+{% block nav %}{% include "admin/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="dashboard dashboard-wide">
+    <h1>Members</h1>
+    {% include "admin/_tabs.html" %}
+    <section class="dashboard-panel dashboard-panel-wide">
+      <p class="lede">{{ members.len() }} account(s) on this instance.</p>
+
+      <table class="table">
+        <thead>
+          <tr>
+            <th scope="col">Member</th>
+            <th scope="col">Role</th>
+            <th scope="col">Status</th>
+            <th scope="col">Joined</th>
+            <th scope="col">Federation identity</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for member in members %}
+          <tr>
+            <th scope="row">@{{ member.username }}</th>
+            <td>{{ member.role }}</td>
+            <td>{{ member.status }}</td>
+            <td>{{ member.created }}</td>
+            <td>
+              {% if let Some(did) = member.did %}
+              <span class="mono did">{{ did }}</span>
+              {% else %}
+              <span class="hint">none yet</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </section>
+  </div>
+</div>
+{% endblock %}

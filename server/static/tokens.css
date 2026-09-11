@@ -5,21 +5,32 @@
 /* Palette */
 :root {
   --ink-white: #ffffff;
-  --ink-lightest: #fbfbfa;
-  --ink-lighter: #f1f0ee;
-  --ink-light: #e3e2df;
-  --ink-DEFAULT: #a4a29c;
-  --ink-mid: #7d7c77;
-  --ink-dark: #5c5b57;
-  --ink-darker: #333336;
-  --ink-darkest: #1c1c1e;
-  --ink-black: #131314;
-  --signal-light: #b9ccff;
-  --signal-DEFAULT: #2a5cdc;
-  --signal-dark: #1c3f9c;
-  --alert-light: #f2b8b5;
-  --alert-DEFAULT: #b3261e;
-  --alert-dark: #8c1d18;
+  --ink-lightest: #fbfbfb;
+  --ink-lighter: #f0f0f0;
+  --ink-light: #dcdcdc;
+  --ink-DEFAULT: #b0b0b0;
+  --ink-mid: #8a8a8a;
+  --ink-dark: #5a5a5a;
+  --ink-darker: #3d3d3d;
+  --ink-darkest: #2e2e2e;
+  --ink-black: #1a1a1a;
+  --blue-light: #b3d4ec;
+  --blue-DEFAULT: #8cbcdf;
+  --blue-mid: #5e9ed6;
+  --blue-dark: #4a7fa5;
+  --blue-darker: #1f3d54;
+  --yellow-light: #fde34a;
+  --yellow-DEFAULT: #fcd501;
+  --yellow-dark: #846f00;
+  --green-light: #7aaa7d;
+  --green-DEFAULT: #548057;
+  --green-dark: #3d5e3f;
+  --pink-light: #f0c8d9;
+  --pink-DEFAULT: #e4a5bf;
+  --pink-dark: #a85f7c;
+  --red-light: #ffb3ae;
+  --red-DEFAULT: #f43b31;
+  --red-dark: #b01a12;
 }
 
 /* Themes */
@@ -28,24 +39,34 @@
   --foreground: var(--ink-darkest);
   --surface: var(--ink-white);
   --surface-raised: var(--ink-lighter);
-  --primary: var(--signal-DEFAULT);
-  --primary-fg: var(--ink-white);
-  --secondary: var(--ink-lighter);
+  --primary: var(--ink-darkest);
+  --primary-fg: var(--ink-lightest);
+  --secondary: var(--ink-white);
   --secondary-fg: var(--ink-darkest);
   --muted: var(--ink-lighter);
   --muted-fg: var(--ink-dark);
-  --accent: var(--signal-DEFAULT);
-  --accent-fg: var(--ink-white);
-  --border: var(--ink-mid);
+  --accent: var(--blue-DEFAULT);
+  --accent-fg: var(--ink-darkest);
+  --border: var(--ink-darkest);
   --border-subtle: var(--ink-light);
-  --ring: var(--signal-DEFAULT);
-  --destructive: var(--alert-DEFAULT);
+  --ring: var(--blue-dark);
+  --destructive: var(--red-dark);
   --destructive-fg: var(--ink-white);
-  --hover: rgba(0, 0, 0, 0.04);
-  --active: rgba(0, 0, 0, 0.08);
-  --radius: 0.5rem;
-  --shadow: 0 1px 2px 0 rgb(0 0 0 / 0.06);
-  --shadow-elevated: 0 2px 8px -2px rgb(0 0 0 / 0.08);
+  --hover: rgba(0, 0, 0, 0.05);
+  --active: rgba(0, 0, 0, 0.09);
+  --radius: 0.25rem;
+  --shadow: 1px 2px 2px rgb(0 0 0 / 0.08), 2px 4px 4px rgb(0 0 0 / 0.06);
+  --shadow-elevated: 1px 2px 2px rgb(0 0 0 / 0.1), 2px 4px 4px rgb(0 0 0 / 0.1), 4px 8px 8px rgb(0 0 0 / 0.1), 8px 16px 16px rgb(0 0 0 / 0.1);
+  --wash: var(--blue-DEFAULT);
+  --wash-fg: var(--ink-darkest);
+  --wash-quiet: var(--ink-lighter);
+  --wash-quiet-fg: var(--ink-darkest);
+  --wash-feature: var(--yellow-DEFAULT);
+  --wash-feature-fg: var(--ink-darkest);
+  --wash-invite: var(--green-dark);
+  --wash-invite-fg: var(--ink-lightest);
+  --illustration-blend: multiply;
+  --illustration-filter: none;
 }
 
 [data-theme="natt"] {
@@ -53,50 +74,60 @@
   --foreground: var(--ink-lighter);
   --surface: var(--ink-darkest);
   --surface-raised: var(--ink-darker);
-  --primary: var(--signal-light);
+  --primary: var(--ink-lightest);
   --primary-fg: var(--ink-black);
   --secondary: var(--ink-darker);
   --secondary-fg: var(--ink-lighter);
   --muted: var(--ink-darker);
   --muted-fg: var(--ink-DEFAULT);
-  --accent: var(--signal-light);
+  --accent: var(--blue-DEFAULT);
   --accent-fg: var(--ink-black);
-  --border: var(--ink-mid);
-  --border-subtle: var(--ink-darker);
-  --ring: var(--signal-light);
-  --destructive: var(--alert-light);
+  --border: var(--ink-DEFAULT);
+  --border-subtle: var(--ink-dark);
+  --ring: var(--blue-mid);
+  --destructive: var(--red-light);
   --destructive-fg: var(--ink-black);
-  --hover: rgba(255, 255, 255, 0.05);
-  --active: rgba(255, 255, 255, 0.09);
-  --radius: 0.5rem;
-  --shadow: 0 1px 2px 0 rgb(0 0 0 / 0.5);
-  --shadow-elevated: 0 2px 8px -2px rgb(0 0 0 / 0.55);
+  --hover: rgba(255, 255, 255, 0.06);
+  --active: rgba(255, 255, 255, 0.1);
+  --radius: 0.25rem;
+  --shadow: 1px 2px 2px rgb(0 0 0 / 0.5), 2px 4px 4px rgb(0 0 0 / 0.4);
+  --shadow-elevated: 1px 2px 2px rgb(0 0 0 / 0.5), 2px 4px 4px rgb(0 0 0 / 0.5), 4px 8px 8px rgb(0 0 0 / 0.5), 8px 16px 16px rgb(0 0 0 / 0.5);
+  --wash: var(--blue-darker);
+  --wash-fg: var(--ink-lighter);
+  --wash-quiet: var(--ink-darkest);
+  --wash-quiet-fg: var(--ink-lighter);
+  --wash-feature: var(--yellow-dark);
+  --wash-feature-fg: var(--ink-lightest);
+  --wash-invite: var(--green-dark);
+  --wash-invite-fg: var(--ink-lightest);
+  --illustration-blend: screen;
+  --illustration-filter: invert(1);
 }
 
 /* Fluid type & space */
 :root {
-  --txt-4: clamp(1.6018rem, 1.2989rem + 1.2924vw, 2.3328rem);
-  --txt-3: clamp(1.4238rem, 1.2083rem + 0.9196vw, 1.944rem);
-  --txt-2: clamp(1.2656rem, 1.1188rem + 0.6265vw, 1.62rem);
-  --txt-1: clamp(1.125rem, 1.0318rem + 0.3978vw, 1.35rem);
-  --txt-0: clamp(1rem, 0.9482rem + 0.221vw, 1.125rem);
-  --txt--1: clamp(0.8889rem, 0.8687rem + 0.0859vw, 0.9375rem);
-  --txt--2: clamp(0.7813rem, 0.7938rem + -0.0157vw, 0.7901rem);
-  --sp--2: clamp(0.5rem, 0.4741rem + 0.1105vw, 0.5625rem);
-  --sp--1: clamp(0.75rem, 0.6982rem + 0.221vw, 0.875rem);
-  --sp-0: clamp(1rem, 0.9482rem + 0.221vw, 1.125rem);
-  --sp-1: clamp(1.5rem, 1.4223rem + 0.3315vw, 1.6875rem);
-  --sp-2: clamp(2rem, 1.8964rem + 0.442vw, 2.25rem);
-  --sp-3: clamp(3rem, 2.8446rem + 0.663vw, 3.375rem);
-  --sp-4: clamp(4rem, 3.7928rem + 0.884vw, 4.5rem);
-  --sp-5: clamp(6rem, 5.6892rem + 1.326vw, 6.75rem);
-  --sp--2-1: clamp(0.5rem, 0.3446rem + 0.663vw, 0.875rem);
-  --sp--1-0: clamp(0.75rem, 0.5946rem + 0.663vw, 1.125rem);
-  --sp-0-1: clamp(1rem, 0.7151rem + 1.2155vw, 1.6875rem);
-  --sp-1-2: clamp(1.5rem, 1.1892rem + 1.326vw, 2.25rem);
-  --sp-2-3: clamp(2rem, 1.4302rem + 2.4309vw, 3.375rem);
-  --sp-3-4: clamp(3rem, 2.3785rem + 2.6519vw, 4.5rem);
-  --sp-4-5: clamp(4rem, 2.8605rem + 4.8619vw, 6.75rem);
+  --txt-4: clamp(3.552rem, 2.8756rem + 3.382vw, 5.4967rem);
+  --txt-3: clamp(2.6647rem, 2.2394rem + 2.1264vw, 3.8873rem);
+  --txt-2: clamp(1.999rem, 1.7381rem + 1.3046vw, 2.7492rem);
+  --txt-1: clamp(1.4996rem, 1.345rem + 0.7733vw, 1.9443rem);
+  --txt-0: clamp(1.125rem, 1.038rem + 0.4348vw, 1.375rem);
+  --txt--1: clamp(0.844rem, 0.7993rem + 0.2234vw, 0.9724rem);
+  --txt--2: clamp(0.6331rem, 0.6141rem + 0.0949vw, 0.6877rem);
+  --sp--2: clamp(0.5rem, 0.4565rem + 0.2174vw, 0.625rem);
+  --sp--1: clamp(0.75rem, 0.6848rem + 0.3261vw, 0.9375rem);
+  --sp-0: clamp(1rem, 0.913rem + 0.4348vw, 1.25rem);
+  --sp-1: clamp(1.5rem, 1.3696rem + 0.6522vw, 1.875rem);
+  --sp-2: clamp(2rem, 1.8261rem + 0.8696vw, 2.5rem);
+  --sp-3: clamp(3rem, 2.7391rem + 1.3043vw, 3.75rem);
+  --sp-4: clamp(4rem, 3.6522rem + 1.7391vw, 5rem);
+  --sp-5: clamp(6rem, 5.4783rem + 2.6087vw, 7.5rem);
+  --sp--2-1: clamp(0.5rem, 0.3478rem + 0.7609vw, 0.9375rem);
+  --sp--1-0: clamp(0.75rem, 0.5761rem + 0.8696vw, 1.25rem);
+  --sp-0-1: clamp(1rem, 0.6957rem + 1.5217vw, 1.875rem);
+  --sp-1-2: clamp(1.5rem, 1.1522rem + 1.7391vw, 2.5rem);
+  --sp-2-3: clamp(2rem, 1.3913rem + 3.0435vw, 3.75rem);
+  --sp-3-4: clamp(3rem, 2.3043rem + 3.4783vw, 5rem);
+  --sp-4-5: clamp(4rem, 2.7826rem + 6.087vw, 7.5rem);
 }
 
 /* Static micro-spacing */
@@ -153,19 +184,24 @@
 
 /* Scale aliases */
 :root {
-  --measure: 68ch;
-  --grid-max-width: 60rem;
-  --lead: 1.55;
-  --lead-tight: 1.15;
+  --measure: 62ch;
+  --grid-max-width: 72rem;
+  --lead: 1.65;
+  --lead-tight: 1.05;
+  --border-width: 3px;
+  --hairline: 1px;
+  --tracking: 0.025em;
+  --tracking-tight: 0;
 }
 
 /* Typography */
 :root {
-  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-serif: 'Serrif', 'Iowan Old Style', Georgia, 'Times New Roman', serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "avenir next", avenir, "segoe ui", "helvetica neue", helvetica, Cantarell, Ubuntu, roboto, noto, arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
-  --family-body: var(--font-sans);
-  --family-heading: var(--font-sans);
-  --family-label: var(--font-sans);
+  --family-body: var(--font-serif);
+  --family-heading: var(--font-serif);
+  --family-label: var(--font-serif);
   --family-code: var(--font-mono);
 }
 
@@ -227,33 +263,81 @@
     display: none !important;
   }
 }
+/* Default theme — appended by tools/gen-tokens.sh.
+ * batklubb emits [data-theme] blocks only, and nothing sets that
+ * attribute server-side. Without this, a visitor who has expressed no
+ * preference gets no theme at all. */
+:root:not([data-theme]) {
+  --background: var(--ink-lightest);
+  --foreground: var(--ink-darkest);
+  --surface: var(--ink-white);
+  --surface-raised: var(--ink-lighter);
+  --primary: var(--ink-darkest);
+  --primary-fg: var(--ink-lightest);
+  --secondary: var(--ink-white);
+  --secondary-fg: var(--ink-darkest);
+  --muted: var(--ink-lighter);
+  --muted-fg: var(--ink-dark);
+  --accent: var(--blue-DEFAULT);
+  --accent-fg: var(--ink-darkest);
+  --border: var(--ink-darkest);
+  --border-subtle: var(--ink-light);
+  --ring: var(--blue-dark);
+  --destructive: var(--red-dark);
+  --destructive-fg: var(--ink-white);
+  --hover: rgba(0, 0, 0, 0.05);
+  --active: rgba(0, 0, 0, 0.09);
+  --radius: 0.25rem;
+  --shadow: 1px 2px 2px rgb(0 0 0 / 0.08), 2px 4px 4px rgb(0 0 0 / 0.06);
+  --shadow-elevated: 1px 2px 2px rgb(0 0 0 / 0.1), 2px 4px 4px rgb(0 0 0 / 0.1), 4px 8px 8px rgb(0 0 0 / 0.1), 8px 16px 16px rgb(0 0 0 / 0.1);
+  --wash: var(--blue-DEFAULT);
+  --wash-fg: var(--ink-darkest);
+  --wash-quiet: var(--ink-lighter);
+  --wash-quiet-fg: var(--ink-darkest);
+  --wash-feature: var(--yellow-DEFAULT);
+  --wash-feature-fg: var(--ink-darkest);
+  --wash-invite: var(--green-dark);
+  --wash-invite-fg: var(--ink-lightest);
+  --illustration-blend: multiply;
+  --illustration-filter: none;
+}
+
 /* OS colour-scheme bridge — appended by tools/gen-tokens.sh.
- * batklubb emits [data-theme] blocks only; this applies the night theme
- * when the visitor prefers dark and has not chosen explicitly. An explicit
- * data-theme always wins. */
+ * Applies the night theme when the visitor prefers dark and has not
+ * chosen explicitly. An explicit data-theme always wins. */
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="dag"]) {
   --background: var(--ink-black);
   --foreground: var(--ink-lighter);
   --surface: var(--ink-darkest);
   --surface-raised: var(--ink-darker);
-  --primary: var(--signal-light);
+  --primary: var(--ink-lightest);
   --primary-fg: var(--ink-black);
   --secondary: var(--ink-darker);
   --secondary-fg: var(--ink-lighter);
   --muted: var(--ink-darker);
   --muted-fg: var(--ink-DEFAULT);
-  --accent: var(--signal-light);
+  --accent: var(--blue-DEFAULT);
   --accent-fg: var(--ink-black);
-  --border: var(--ink-mid);
-  --border-subtle: var(--ink-darker);
-  --ring: var(--signal-light);
-  --destructive: var(--alert-light);
+  --border: var(--ink-DEFAULT);
+  --border-subtle: var(--ink-dark);
+  --ring: var(--blue-mid);
+  --destructive: var(--red-light);
   --destructive-fg: var(--ink-black);
-  --hover: rgba(255, 255, 255, 0.05);
-  --active: rgba(255, 255, 255, 0.09);
-  --radius: 0.5rem;
-  --shadow: 0 1px 2px 0 rgb(0 0 0 / 0.5);
-  --shadow-elevated: 0 2px 8px -2px rgb(0 0 0 / 0.55);
+  --hover: rgba(255, 255, 255, 0.06);
+  --active: rgba(255, 255, 255, 0.1);
+  --radius: 0.25rem;
+  --shadow: 1px 2px 2px rgb(0 0 0 / 0.5), 2px 4px 4px rgb(0 0 0 / 0.4);
+  --shadow-elevated: 1px 2px 2px rgb(0 0 0 / 0.5), 2px 4px 4px rgb(0 0 0 / 0.5), 4px 8px 8px rgb(0 0 0 / 0.5), 8px 16px 16px rgb(0 0 0 / 0.5);
+  --wash: var(--blue-darker);
+  --wash-fg: var(--ink-lighter);
+  --wash-quiet: var(--ink-darkest);
+  --wash-quiet-fg: var(--ink-lighter);
+  --wash-feature: var(--yellow-dark);
+  --wash-feature-fg: var(--ink-lightest);
+  --wash-invite: var(--green-dark);
+  --wash-invite-fg: var(--ink-lightest);
+  --illustration-blend: screen;
+  --illustration-filter: invert(1);
   }
 }

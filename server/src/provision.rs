@@ -84,7 +84,7 @@ pub struct AtprotoIdentity {
     /// False is a normal outcome locally and on first boot behind a firewall.
     /// It is recorded rather than retried inline so the member exists either
     /// way and `identity::unsubmitted` can pick it up later.
-    pub registered: bool,
+    pub plc_registered: bool,
 }
 
 /// Give a member an ATProtocol identity: keys, a DID, and a repository.
@@ -163,7 +163,7 @@ pub async fn atproto_identity(
     state::create(pool, user_id, &root.to_string()).await?;
 
     // Best effort, and explicitly so.
-    let registered = match plc_client {
+    let plc_registered = match plc_client {
         Some(client) => match plc::submit(client, &did, &operation).await {
             Ok(()) => {
                 identity::mark_submitted(pool, &operation_cid).await?;
@@ -189,6 +189,6 @@ pub async fn atproto_identity(
         did,
         operation_cid,
         root_cid: root.to_string(),
-        registered,
+        plc_registered,
     })
 }

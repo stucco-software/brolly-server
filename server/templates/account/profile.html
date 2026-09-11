@@ -5,29 +5,31 @@
 {% block nav %}{% include "account/_nav.html" %}{% endblock %}
 
 {% block content %}
-<div class="dashboard">
-  <h1>Profile</h1>
-  {% include "account/_tabs.html" %}
-  <section class="dashboard-panel">
-    {% if saved %}<p class="notice" role="status">Profile saved.</p>{% endif %}
+<div class="wrap">
+  <div class="dashboard">
+    <h1>Profile</h1>
+    {% include "account/_tabs.html" %}
+    <section class="dashboard-panel">
+      {% if saved %}<p class="notice" role="status">Profile saved.</p>{% endif %}
 
-    <p class="lede">
-      This is stored in your pod and asserted onto
-      <span class="mono">{{ webid }}</span> — the same node every protocol reads,
-      so it is what people see on Solid, ActivityPub and Bluesky alike.
-    </p>
+      <p class="lede">
+        This is stored in your pod and asserted onto
+        <span class="mono">{{ webid }}</span> — the same node every protocol reads,
+        so it is what people see on Solid, ActivityPub and Bluesky alike.
+      </p>
 
-    <form method="post" action="/account/profile" class="stack-form">
-      <div class="field">
-        <label for="display_name">Display name</label>
-        <input type="text" id="display_name" name="display_name" value="{{ display_name }}" autocomplete="name">
-      </div>
-      <div class="field">
-        <label for="bio">Bio</label>
-        <textarea id="bio" name="bio" rows="4">{{ bio }}</textarea>
-      </div>
-      <button type="submit" class="button button-primary">Save profile</button>
-    </form>
-  </section>
+      <form method="post" action="/account/profile" class="stack-form">
+        <div class="field">
+          <label for="display_name">Display name</label>
+          <input type="text" id="display_name" name="display_name" value="{{ display_name }}" autocomplete="name">
+        </div>
+        <div class="field">
+          <label for="bio">Bio</label>
+          <textarea id="bio" name="bio" rows="4">{{ bio }}</textarea>
+        </div>
+        <button type="submit" class="button button-primary">Save profile</button>
+      </form>
+    </section>
+  </div>
 </div>
 {% endblock %}

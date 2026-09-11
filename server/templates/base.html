@@ -6,20 +6,28 @@
   <title>{% block title %}{{ instance_name }}{% endblock %}</title>
   <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/brolly.css">
+  <link rel="icon" type="image/png" sizes="96x96" href="/static/favicon/favicon-96x96.png">
+  <link rel="shortcut icon" href="/static/favicon/favicon.ico">
+  <link rel="apple-touch-icon" sizes="180x180" href="/static/favicon/apple-touch-icon.png">
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
   <header class="shell-header">
-    <a class="brand" href="/">{{ instance_name }}</a>
-    <nav class="shell-nav" aria-label="Primary">
-      {% block nav %}{% endblock %}
-    </nav>
+    <div class="wrap shell-header-inner">
+      <a class="brand" href="/">{{ instance_name }}</a>
+      <nav class="shell-nav" aria-label="Primary">
+        {% block nav %}{% endblock %}
+      </nav>
+    </div>
   </header>
   <main id="main" class="shell-main">
     {% block content %}{% endblock %}
   </main>
   <footer class="shell-footer">
-    <p>Running <a href="https://github.com/">Brolly</a> — a Solid pod, an ATProto PDS, and an ActivityPub server over one triplestore.</p>
+    <div class="wrap">
+      <p>Running <a href="https://github.com/">Brolly</a> — a Solid pod, an ATProto PDS, and an ActivityPub server over one triplestore.</p>
+      <p class="footer-fine">Your data lives in your pod. Take it with you whenever you like.</p>
+    </div>
   </footer>
 </body>
 </html>

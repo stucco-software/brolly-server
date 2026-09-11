@@ -22,7 +22,7 @@ use brolly_identity::{extract, webid};
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::auth::SESSION_COOKIE;
+use crate::auth::session_user;
 
 /// Wrap a bare object in the `Create` that publishes it.
 ///
@@ -132,15 +132,6 @@ pub async fn publish(
             .into_response(),
         Err(response) => response,
     }
-}
-
-async fn session_user(state: &AppState, jar: &CookieJar) -> Option<User> {
-    let cookie = jar.get(SESSION_COOKIE)?;
-    db::user_for_session(&state.pool, cookie.value())
-        .await
-        .ok()
-        .flatten()
-        .filter(User::is_active)
 }
 
 /// Store the activity in the author's pod, then deliver it.

@@ -232,7 +232,7 @@ async fn disabling_a_user_invalidates_their_live_sessions() {
 #[tokio::test]
 async fn an_invite_can_be_used_exactly_its_allowance() {
     let (_db, pool) = fresh().await;
-    let code = db::create_invite(&pool, None, 2, None).await.unwrap();
+    let code = db::create_invite(&pool, None, 2, None, None).await.unwrap();
 
     db::redeem_invite(&pool, &code).await.unwrap();
     db::redeem_invite(&pool, &code).await.unwrap();
@@ -246,14 +246,14 @@ async fn an_invite_can_be_used_exactly_its_allowance() {
 async fn revoked_expired_and_unknown_invites_are_all_refused() {
     let (_db, pool) = fresh().await;
 
-    let revoked = db::create_invite(&pool, None, 1, None).await.unwrap();
+    let revoked = db::create_invite(&pool, None, 1, None, None).await.unwrap();
     db::revoke_invite(&pool, &revoked).await.unwrap();
     assert!(matches!(
         db::redeem_invite(&pool, &revoked).await,
         Err(DbError::InviteInvalid)
     ));
 
-    let expired = db::create_invite(&pool, None, 1, Some(time::Duration::seconds(-1)))
+    let expired = db::create_invite(&pool, None, 1, Some(time::Duration::seconds(-1)), None)
         .await
         .unwrap();
     assert!(matches!(

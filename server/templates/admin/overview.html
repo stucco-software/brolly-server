@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+
+{% block title %}Admin — {{ instance_name }}{% endblock %}
+
+{% block nav %}{% include "admin/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="dashboard">
+    <h1>Admin</h1>
+    {% include "admin/_tabs.html" %}
+    <section class="dashboard-panel">
+      <p class="lede">
+        <strong>{{ instance_name }}</strong> serves
+        <span class="mono">{{ base_domain }}</span> and every member subdomain
+        under it.
+      </p>
+
+      <dl class="facts">
+        <dt>Accounts</dt>
+        <dd>{{ members }} member(s), {{ admins }} admin(s)</dd>
+
+        {# The posture an operator most needs and could least easily find. #}
+        <dt>Federation</dt>
+        <dd>
+          {% if federation %}
+          Delivering to remote inboxes.
+          {% else %}
+          <strong>Off.</strong>
+          <p class="hint">
+            Local delivery works and every member has a full identity. Nothing
+            leaves this instance until the switch is flipped and redeployed.
+          </p>
+          {% endif %}
+        </dd>
+
+        <dt>PLC directory</dt>
+        <dd>
+          {% if plc_submit %}
+          Submitting. Members resolve across the ATProtocol network.
+          {% else %}
+          <strong>Not submitting.</strong>
+          <p class="hint">
+            Identities are minted and held locally. Run
+            <span class="mono">brolly-admin plc-retry</span> once this instance
+            can reach the directory.
+          </p>
+          {% endif %}
+        </dd>
+      </dl>
+    </section>
+  </div>
+</div>
+{% endblock %}

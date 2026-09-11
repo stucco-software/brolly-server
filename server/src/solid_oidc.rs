@@ -21,7 +21,7 @@ use axum::{Form, Json};
 use axum_extra::extract::CookieJar;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
-use brolly_identity::db::{self, User};
+use brolly_identity::db::User;
 use brolly_identity::oauth::Protocol;
 use brolly_identity::{extract, webid};
 use brolly_solid::oidc::{dpop, store, tokens};
@@ -29,7 +29,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::auth::SESSION_COOKIE;
+use crate::auth::session_user;
 use crate::{AppState, consent};
 
 /// How long a member has to answer the consent screen.
@@ -207,15 +207,6 @@ fn authorize_target(params: &AuthorizeParams) -> String {
 }
 
 /// Who is at the keyboard, from the session cookie.
-async fn session_user(state: &AppState, jar: &CookieJar) -> Option<User> {
-    let cookie = jar.get(SESSION_COOKIE)?;
-    db::user_for_session(&state.pool, cookie.value())
-        .await
-        .ok()
-        .flatten()
-        .filter(User::is_active)
-}
-
 /// `GET /oauth/solid/authorize`
 pub async fn authorize(
     State(state): State<AppState>,
@@ -282,7 +273,7 @@ pub async fn authorize(
     };
 
     consent::render_consent(
-        "Brolly",
+        &state.instance_name,
         Protocol::SolidOidc,
         client.client_name.as_deref().unwrap_or("An application"),
         &user.username,

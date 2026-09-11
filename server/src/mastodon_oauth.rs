@@ -17,14 +17,13 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
-use brolly_identity::db::{self, User};
 use brolly_identity::oauth::{Protocol, RequestShape, detect_misrouted};
 use brolly_identity::{extract, oauth as oauth_layout};
 use brolly_mastodon::oauth;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::SESSION_COOKIE;
+use crate::auth::session_user;
 use crate::{AppState, consent};
 
 /// The out-of-band redirect. A client with no callback URL — a terminal tool,
@@ -63,15 +62,6 @@ fn host_of(headers: &HeaderMap) -> &str {
 /// send credentials.
 fn wrong_host(state: &AppState, headers: &HeaderMap) -> bool {
     extract::subdomain_user(host_of(headers), &state.base_domain).is_some()
-}
-
-async fn session_user(state: &AppState, jar: &CookieJar) -> Option<User> {
-    let cookie = jar.get(SESSION_COOKIE)?;
-    db::user_for_session(&state.pool, cookie.value())
-        .await
-        .ok()
-        .flatten()
-        .filter(User::is_active)
 }
 
 // --- app registration --------------------------------------------------------
@@ -315,7 +305,7 @@ pub async fn authorize(
     // The same screen all three protocols render (ADR 0011). Nobody compares
     // consent wording across three screens, so there is only one.
     consent::render_consent(
-        "Brolly",
+        &state.instance_name,
         Protocol::Mastodon,
         &app.name,
         &user.username,

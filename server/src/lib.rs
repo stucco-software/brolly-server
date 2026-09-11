@@ -15,6 +15,7 @@ use tower_http::services::ServeDir;
 
 pub mod account;
 pub mod activitypub;
+pub mod admin;
 pub mod atproto_oauth;
 pub mod auth;
 pub mod consent;
@@ -33,6 +34,19 @@ pub mod xrpc;
 pub struct AppState {
     pub pool: PgPool,
     pub base_domain: String,
+    /// What this instance calls itself, in page titles and headings.
+    ///
+    /// One image serves many deployments — brolly.id, a Solid provider on
+    /// someone else's domain, a community on a subdomain — and each of them is
+    /// a different thing to the people using it. Hardcoding "Brolly" made every
+    /// instance claim to be the flagship. Defaults to `base_domain`, which is
+    /// never wrong even when nobody sets it.
+    pub instance_name: String,
+    /// One line describing this instance, shown by Mastodon clients.
+    ///
+    /// Configurable for the same reason as the name: every deployment is
+    /// somebody else's community.
+    pub instance_description: String,
     pub stores: std::sync::Arc<brolly_store::StoreManager>,
     /// The Solid-OIDC provider's signing key, loaded once at startup.
     ///
@@ -121,6 +135,11 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             "/account/delete",
             get(account::delete_form).post(account::delete_account),
         )
+        // The admin console (plan §4.4). Apex-only for the same reason as
+        // `/account`, and `/admin/*` is already a reserved path on member
+        // subdomains by ADR 0009.
+        .route("/admin", get(admin::overview))
+        .route("/admin/users", get(admin::users))
         // ActivityPub discovery. `/actor` is served on both the apex and
         // member subdomains and means a different actor on each — one route
         // with a host branch, because a route matches before the host is

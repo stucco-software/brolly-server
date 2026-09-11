@@ -107,6 +107,12 @@ struct Overview<'a> {
     storage_root: String,
     did: Option<&'a str>,
     pod_bytes: u64,
+    /// Whether to offer a way into the admin console.
+    ///
+    /// The console has no other entry point, and guessing `/admin` answers 404
+    /// for a member — so without this an admin has no way to discover the
+    /// surface they are responsible for.
+    is_admin: bool,
 }
 
 /// `GET /account`
@@ -117,13 +123,14 @@ pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response
     };
 
     render(&Overview {
-        instance_name: "Brolly",
+        instance_name: &state.instance_name,
         tabs: tabs("/account"),
         username: &session.user.username,
         webid: webid::webid(&session.user.username, &state.base_domain),
         storage_root: routing::storage_root(&session.user.username, &state.base_domain),
         did: session.user.did_plc.as_deref(),
         pod_bytes: state.stores.pod_bytes(session.user.id).unwrap_or(0),
+        is_admin: session.user.is_admin(),
     })
 }
 
@@ -171,7 +178,7 @@ pub async fn profile_form(
     let current = profile::read(&pod, &id, &document);
 
     render(&ProfilePage {
-        instance_name: "Brolly",
+        instance_name: &state.instance_name,
         tabs: tabs("/account/profile"),
         webid: id,
         display_name: current.display_name,
@@ -237,9 +244,14 @@ struct Security<'a> {
     saved: bool,
 }
 
-fn security_page<'a>(error: Option<&'a str>, sessions: i64, saved: bool) -> Security<'a> {
+fn security_page<'a>(
+    instance_name: &'a str,
+    error: Option<&'a str>,
+    sessions: i64,
+    saved: bool,
+) -> Security<'a> {
     Security {
-        instance_name: "Brolly",
+        instance_name,
         tabs: tabs("/account/security"),
         sessions,
         error,
@@ -266,7 +278,12 @@ pub async fn security(
     let sessions = db::count_sessions(&state.pool, session.user.id)
         .await
         .unwrap_or(0);
-    render(&security_page(None, sessions, query.saved))
+    render(&security_page(
+        &state.instance_name,
+        None,
+        sessions,
+        query.saved,
+    ))
 }
 
 /// `POST /account/security` — change password.
@@ -290,6 +307,7 @@ pub async fn change_password(
         return (
             StatusCode::BAD_REQUEST,
             render(&security_page(
+                &state.instance_name,
                 Some("Use at least 12 characters. Length beats punctuation."),
                 sessions,
                 false,
@@ -317,6 +335,7 @@ pub async fn change_password(
         Err(DbError::BadCredentials) => (
             StatusCode::UNAUTHORIZED,
             render(&security_page(
+                &state.instance_name,
                 Some("That is not your current password."),
                 sessions,
                 false,
@@ -356,7 +375,7 @@ pub async fn apps(State(state): State<AppState>, jar: CookieJar) -> Response {
     };
 
     render(&Apps {
-        instance_name: "Brolly",
+        instance_name: &state.instance_name,
         tabs: tabs("/account/apps"),
         apps,
     })
@@ -465,7 +484,7 @@ pub async fn delete_form(State(state): State<AppState>, jar: CookieJar) -> Respo
         Err(response) => return response,
     };
     render(&Delete {
-        instance_name: "Brolly",
+        instance_name: &state.instance_name,
         tabs: tabs("/account/delete"),
         username: &session.user.username,
         error: None,
@@ -493,7 +512,7 @@ pub async fn delete_account(
         return (
             StatusCode::BAD_REQUEST,
             render(&Delete {
-                instance_name: "Brolly",
+                instance_name: &state.instance_name,
                 tabs: tabs("/account/delete"),
                 username: &session.user.username,
                 error: Some("That did not match your username. Nothing has been deleted."),

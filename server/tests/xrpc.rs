@@ -35,6 +35,8 @@ async fn harness() -> Harness {
         AppState {
             pool: db.pool.clone(),
             base_domain: BASE.into(),
+            instance_name: BASE.to_string(),
+            instance_description: "A private community server.".to_string(),
             stores: std::sync::Arc::clone(&stores),
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)
@@ -658,7 +660,7 @@ async fn the_firehose_is_apex_only() {
 
 /// Register through the front door, exactly as a person would.
 async fn a_registered_member(h: &Harness, username: &str) -> String {
-    let invite = db::create_invite(&h.db.pool, None, 1, None)
+    let invite = db::create_invite(&h.db.pool, None, 1, None, None)
         .await
         .expect("invite");
     let response = h

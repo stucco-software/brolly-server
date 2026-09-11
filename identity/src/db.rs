@@ -241,21 +241,28 @@ pub async fn revoke_session(pool: &PgPool, token: &str) -> Result<(), DbError> {
 // --- invites ---------------------------------------------------------------
 
 /// Mint an invite, returning the plaintext code.
+/// Mint an invite code.
+///
+/// `grants_role` is the role the redeemer receives. `None` means the default,
+/// which is what an ordinary invite does; `Some("admin")` is how an instance is
+/// handed to someone who should not also be handed the database password.
 pub async fn create_invite(
     pool: &PgPool,
     created_by: Option<Uuid>,
     max_uses: i32,
     expires_in: Option<time::Duration>,
+    grants_role: Option<&str>,
 ) -> Result<String, DbError> {
     let code = generate_secret();
     sqlx::query(
-        "INSERT INTO invites (code_hash, created_by, max_uses, expires_at)
-         VALUES ($1, $2, $3, $4)",
+        "INSERT INTO invites (code_hash, created_by, max_uses, expires_at, grants_role)
+         VALUES ($1, $2, $3, $4, $5)",
     )
     .bind(hash_secret(&code))
     .bind(created_by)
     .bind(max_uses)
     .bind(expires_in.map(|d| time::OffsetDateTime::now_utc() + d))
+    .bind(grants_role)
     .execute(pool)
     .await?;
     Ok(code)
@@ -265,22 +272,30 @@ pub async fn create_invite(
 ///
 /// The check and the increment are a single statement, so two simultaneous
 /// registrations cannot both claim the last use of a one-use invite.
-pub async fn redeem_invite(pool: &PgPool, code: &str) -> Result<(), DbError> {
-    let updated = sqlx::query(
+/// Consume one use of an invite, returning the role it grants.
+///
+/// The check and the increment are a single statement, so two simultaneous
+/// registrations cannot both claim the last use of a one-use invite. The
+/// granted role comes back from the same statement for the same reason: reading
+/// it separately would let a revoke land in between and grant a role from an
+/// invite that no longer exists.
+pub async fn redeem_invite(pool: &PgPool, code: &str) -> Result<Option<String>, DbError> {
+    let granted: Option<(Option<String>,)> = sqlx::query_as(
         "UPDATE invites SET uses = uses + 1
          WHERE code_hash = $1
            AND revoked_at IS NULL
            AND (expires_at IS NULL OR expires_at > now())
-           AND uses < max_uses",
+           AND uses < max_uses
+         RETURNING grants_role",
     )
     .bind(hash_secret(code))
-    .execute(pool)
+    .fetch_optional(pool)
     .await?;
 
-    if updated.rows_affected() == 0 {
-        return Err(DbError::InviteInvalid);
+    match granted {
+        Some((role,)) => Ok(role),
+        None => Err(DbError::InviteInvalid),
     }
-    Ok(())
 }
 
 pub async fn revoke_invite(pool: &PgPool, code: &str) -> Result<(), DbError> {
@@ -394,6 +409,74 @@ pub async fn revoke_other_sessions(
 /// Sessions, invites, keys and OAuth grants cascade. The pod is a separate
 /// `rm -rf` the caller performs — content lives in exactly one place (D2), and
 /// it is not this one.
+/// How many accounts exist at all.
+///
+/// The bootstrap depends on this: an instance with none has nobody who could
+/// have granted the first role, so the first one has to come from somewhere
+/// else (see `brolly_server::admin::bootstrap`).
+pub async fn count_users(pool: &PgPool) -> Result<i64, DbError> {
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM users")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+/// How many *active* admins there are.
+///
+/// Disabled accounts do not count, because a disabled admin cannot log in to
+/// undo anything — treating them as cover would let the last usable admin be
+/// demoted.
+pub async fn count_admins(pool: &PgPool) -> Result<i64, DbError> {
+    let (n,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM users WHERE role = 'admin' AND status = 'active'")
+            .fetch_one(pool)
+            .await?;
+    Ok(n)
+}
+
+/// Set a member's role.
+///
+/// Deliberately not "promote"/"demote": the caller decides, and the guard
+/// against removing the last admin lives with the caller that can explain it
+/// to a human, not down here.
+pub async fn set_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), DbError> {
+    sqlx::query("UPDATE users SET role = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(role)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// One row of the admin user list (ADR 0005, R5).
+///
+/// Postgres answers this alone. `display_name` is deliberately absent: it lives
+/// in each member's pod, and opening one store per row to render a table is the
+/// exact mistake ADR 0005 exists to prevent. It arrives with the actor index.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct UserRow {
+    pub id: Uuid,
+    pub username: String,
+    pub role: String,
+    pub status: String,
+    pub did_plc: Option<String>,
+    pub created_at: time::OffsetDateTime,
+}
+
+/// Every account, newest first.
+///
+/// Unpaginated, and that is a decision with a shelf life: it is correct for the
+/// instance sizes this serves today and wrong for a large one. The list is
+/// pointers only, so the fix is a LIMIT and a cursor rather than a new store.
+pub async fn list_users(pool: &PgPool) -> Result<Vec<UserRow>, DbError> {
+    Ok(sqlx::query_as::<_, UserRow>(
+        "SELECT id, username, role, status, did_plc, created_at
+         FROM users ORDER BY created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 pub async fn delete_user(pool: &PgPool, user_id: Uuid) -> Result<(), DbError> {
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user_id)

@@ -137,8 +137,8 @@ pub async fn instance_v1(State(state): State<AppState>, headers: HeaderMap) -> R
     let (users, posts) = counts(&state).await;
     Json(instance::instance_v1(
         &state.base_domain,
-        "Brolly",
-        "A private community server.",
+        &state.instance_name,
+        &state.instance_description,
         users,
         posts,
     ))
@@ -152,8 +152,8 @@ pub async fn instance_v2(State(state): State<AppState>, headers: HeaderMap) -> R
     let (users, posts) = counts(&state).await;
     Json(instance::instance_v2(
         &state.base_domain,
-        "Brolly",
-        "A private community server.",
+        &state.instance_name,
+        &state.instance_description,
         users,
         posts,
     ))

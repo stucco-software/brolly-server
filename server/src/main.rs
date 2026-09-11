@@ -25,6 +25,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::PgPool::connect(&database_url).await?;
     brolly_identity::db::MIGRATOR.run(&pool).await?;
 
+    // An instance with no accounts has no way to make one: registration needs
+    // an invite and invites need an admin. This breaks that cycle, and is a
+    // no-op on every start after the first person registers.
+    brolly_server::admin::bootstrap(&pool).await?;
+
     let data_dir = std::env::var("BROLLY_DATA_DIR").unwrap_or_else(|_| "data".to_string());
     let stores = brolly_store::StoreManager::open(
         &data_dir,
@@ -46,10 +51,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         brolly_identity::instance::load_or_create(&pool, brolly_activitypub::keys::generate)
             .await?;
 
+    let base_domain =
+        std::env::var("BROLLY_BASE_DOMAIN").unwrap_or_else(|_| "brolly.test".to_string());
+
     let state = brolly_server::AppState {
         pool,
-        base_domain: std::env::var("BROLLY_BASE_DOMAIN")
-            .unwrap_or_else(|_| "brolly.test".to_string()),
+        base_domain: base_domain.clone(),
+        // Falls back to the domain rather than to a brand: an operator who
+        // never sets this gets an instance that names itself honestly.
+        instance_name: std::env::var("BROLLY_INSTANCE_NAME")
+            .ok()
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or(base_domain),
+        instance_description: std::env::var("BROLLY_INSTANCE_DESCRIPTION")
+            .ok()
+            .filter(|d| !d.trim().is_empty())
+            .unwrap_or_else(|| "A private community server.".to_string()),
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),
         instance_actor: std::sync::Arc::new(instance_actor),

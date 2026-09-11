@@ -147,6 +147,14 @@ fn the_token_file_is_never_hand_edited() {
         "the OS colour-scheme bridge must survive regeneration — batklubb emits \
          [data-theme] blocks only, so tools/gen-tokens.sh appends it"
     );
+    // Nothing sets data-theme server-side, so without the unattributed default
+    // every semantic var is unset and the whole design silently degrades to
+    // the browser's own styles. It renders — it just isn't Brolly.
+    assert!(
+        tokens.contains(":root:not([data-theme]) {"),
+        "the default (day) theme must survive regeneration — batklubb emits \
+         [data-theme] blocks only, so tools/gen-tokens.sh appends it"
+    );
 }
 
 #[test]
@@ -203,6 +211,59 @@ fn every_template_has_one_h1_and_a_main_landmark() {
             "{path:?} must contain exactly one <h1>"
         );
     }
+}
+
+/// Every page template must put its content inside the page container.
+///
+/// `base.html` hands `<main>` to the page full-bleed, so a band of colour can
+/// reach the viewport edge the way brolly.id's sections do. The cost of that
+/// freedom is that a page can forget the container entirely and render its
+/// prose edge-to-edge, which looks like a bug because it is one. `.wrap` is the
+/// measure; every page carries it.
+#[test]
+fn every_page_template_uses_the_page_container() {
+    let mut pages = Vec::new();
+    collect_templates(&workspace_root().join("server/templates"), &mut pages);
+
+    for path in pages {
+        let text = std::fs::read_to_string(&path).expect("read template");
+        assert!(
+            text.contains("class=\"wrap") || text.contains(" wrap\""),
+            "{path:?} renders outside the page container. Wrap its content in \
+             <div class=\"wrap\">, or put a .wrap inside each full-bleed .band."
+        );
+    }
+}
+
+/// Every asset the stylesheet asks for is actually shipped.
+///
+/// The fonts and the umbrella are referenced by path from a stylesheet no
+/// compiler reads, so a rename or a missed `cp` degrades silently to a
+/// fallback typeface and a broken image — exactly the kind of regression the
+/// rest of this file exists to make loud.
+#[test]
+fn every_stylesheet_url_resolves_to_a_shipped_file() {
+    let root = workspace_root();
+    let css = std::fs::read_to_string(root.join("server/static/brolly.css")).expect("read css");
+
+    const OPEN: &str = "url(\"";
+    let mut missing = Vec::new();
+    for (at, _) in css.match_indices(OPEN) {
+        let Some(url) = css[at + OPEN.len()..].split('"').next() else {
+            continue;
+        };
+        let relative = url
+            .strip_prefix("/static/")
+            .unwrap_or_else(|| panic!("stylesheet URL {url:?} must be absolute under /static/"));
+        if !root.join("server/static").join(relative).exists() {
+            missing.push(url.to_owned());
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "brolly.css references files that are not in server/static: {missing:?}"
+    );
 }
 
 /// Every template that renders a whole page.

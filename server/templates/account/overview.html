@@ -5,34 +5,42 @@
 {% block nav %}{% include "account/_nav.html" %}{% endblock %}
 
 {% block content %}
-<div class="dashboard">
-  <h1>Account</h1>
-  {% include "account/_tabs.html" %}
-  <section class="dashboard-panel">
-    <p class="lede">Signed in as <strong>@{{ username }}</strong>.</p>
+<div class="wrap">
+  <div class="dashboard">
+    <h1>Account</h1>
+    {% include "account/_tabs.html" %}
+    <section class="dashboard-panel">
+      <p class="lede">Signed in as <strong>@{{ username }}</strong>.</p>
 
-    <dl class="facts">
-      <dt>WebID</dt>
-      <dd><span class="mono">{{ webid }}</span></dd>
+      <dl class="facts">
+        <dt>WebID</dt>
+        <dd><span class="mono">{{ webid }}</span></dd>
 
-      <dt>Storage</dt>
-      <dd>
-        <span class="mono">{{ storage_root }}</span>
-        <p class="hint">Point a Solid app here. Everything you store lives under it.</p>
-      </dd>
+        <dt>Storage</dt>
+        <dd>
+          <span class="mono">{{ storage_root }}</span>
+          <p class="hint">Point a Solid app here. Everything you store lives under it.</p>
+        </dd>
 
-      <dt>Federation identity</dt>
-      <dd>
-        {% if let Some(did) = did %}
-        <span class="mono">{{ did }}</span>
-        {% else %}
-        <span class="hint">Not registered yet.</span>
-        {% endif %}
-      </dd>
+        <dt>Federation identity</dt>
+        <dd>
+          {% if let Some(did) = did %}
+          <span class="mono">{{ did }}</span>
+          {% else %}
+          <span class="hint">Not registered yet.</span>
+          {% endif %}
+        </dd>
 
-      <dt>Data stored</dt>
-      <dd>{{ pod_bytes }} bytes</dd>
-    </dl>
-  </section>
+        <dt>Data stored</dt>
+        <dd>{{ pod_bytes }} bytes</dd>
+      </dl>
+
+      {% if is_admin %}
+      <p class="actions">
+        <a class="button" href="/admin">Admin console</a>
+      </p>
+      {% endif %}
+    </section>
+  </div>
 </div>
 {% endblock %}

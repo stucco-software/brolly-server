@@ -18,7 +18,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
-use brolly_identity::db::{self, DbError};
+use brolly_identity::db::{self, DbError, User};
 use serde::Deserialize;
 
 use crate::{AppState, render};
@@ -122,9 +122,14 @@ fn login_action(next: Option<&str>) -> String {
     }
 }
 
-fn login_page<'a>(error: Option<&'a str>, username: &str, action: &'a str) -> AuthPage<'a> {
+fn login_page<'a>(
+    instance_name: &'a str,
+    error: Option<&'a str>,
+    username: &str,
+    action: &'a str,
+) -> AuthPage<'a> {
     AuthPage {
-        instance_name: "Brolly",
+        instance_name,
         heading: "Log in",
         intro: None,
         error,
@@ -142,9 +147,14 @@ fn login_page<'a>(error: Option<&'a str>, username: &str, action: &'a str) -> Au
     }
 }
 
-fn register_page<'a>(error: Option<&'a str>, username: &str, invite: &str) -> AuthPage<'a> {
+fn register_page<'a>(
+    instance_name: &'a str,
+    error: Option<&'a str>,
+    username: &str,
+    invite: &str,
+) -> AuthPage<'a> {
     AuthPage {
-        instance_name: "Brolly",
+        instance_name,
         heading: "Create an account",
         intro: Some("This server is invite-only. Your data lives in your own pod."),
         error,
@@ -175,9 +185,9 @@ pub struct Next {
 }
 
 /// `GET /login`
-pub async fn login_form(Query(query): Query<Next>) -> Response {
+pub async fn login_form(State(state): State<AppState>, Query(query): Query<Next>) -> Response {
     let action = login_action(query.next.as_deref());
-    render(&login_page(None, "", &action))
+    render(&login_page(&state.instance_name, None, "", &action))
 }
 
 #[derive(Deserialize)]
@@ -212,6 +222,7 @@ pub async fn login_submit(
             // One message for every failure mode, matching db::authenticate —
             // the page must not reveal whether the account exists.
             render(&login_page(
+                &state.instance_name,
                 Some("Incorrect username or password."),
                 &form.username,
                 &action,
@@ -234,8 +245,8 @@ pub struct RegisterForm {
 }
 
 /// `GET /register`
-pub async fn register_form() -> Response {
-    render(&register_page(None, "", ""))
+pub async fn register_form(State(state): State<AppState>) -> Response {
+    render(&register_page(&state.instance_name, None, "", ""))
 }
 
 /// `POST /register`
@@ -251,7 +262,12 @@ pub async fn register_submit(
     if let Err(message) = validate_username(&form.username) {
         return (
             StatusCode::BAD_REQUEST,
-            render(&register_page(Some(message), &form.username, &form.invite)),
+            render(&register_page(
+                &state.instance_name,
+                Some(message),
+                &form.username,
+                &form.invite,
+            )),
         )
             .into_response();
     }
@@ -259,6 +275,7 @@ pub async fn register_submit(
         return (
             StatusCode::BAD_REQUEST,
             render(&register_page(
+                &state.instance_name,
                 Some("Use at least 12 characters. Length beats punctuation."),
                 &form.username,
                 &form.invite,
@@ -267,20 +284,29 @@ pub async fn register_submit(
             .into_response();
     }
 
-    if db::redeem_invite(&state.pool, &form.invite).await.is_err() {
-        return (
-            StatusCode::BAD_REQUEST,
-            render(&register_page(
-                Some("That invite is not valid, has expired, or has been used up."),
-                &form.username,
-                "",
-            )),
-        )
-            .into_response();
-    }
+    // The invite says what the account becomes. An ordinary one grants
+    // nothing and the redeemer is a member; the bootstrap invite an empty
+    // instance mints for itself grants admin, which is the only way a first
+    // admin exists at all (`admin::bootstrap`).
+    let granted = match db::redeem_invite(&state.pool, &form.invite).await {
+        Ok(role) => role,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                render(&register_page(
+                    &state.instance_name,
+                    Some("That invite is not valid, has expired, or has been used up."),
+                    &form.username,
+                    "",
+                )),
+            )
+                .into_response();
+        }
+    };
+    let role = granted.as_deref().unwrap_or(crate::admin::MEMBER);
 
     let email = (!form.email.trim().is_empty()).then(|| form.email.trim());
-    match db::create_user(&state.pool, &form.username, email, &form.password, "member").await {
+    match db::create_user(&state.pool, &form.username, email, &form.password, role).await {
         Ok(user) => {
             // Give them a pod they can write to. WAC grants nothing by
             // default, so without this the first write any new member attempts
@@ -316,13 +342,13 @@ pub async fn register_submit(
                 Ok(identity) => tracing::info!(
                     user = %user.id,
                     did = %identity.did,
-                    registered = identity.registered,
+                    plc_registered = identity.plc_registered,
                     "atproto identity provisioned"
                 ),
                 Err(e) => {
                     // Local provisioning failing is a real failure — the
                     // account would be permanently half-built. Network failure
-                    // is not, and is handled inside as `registered: false`.
+                    // is not, and is handled inside as `plc_registered: false`.
                     tracing::error!(error = %e, user = %user.id, "atproto provisioning failed");
                     return server_error();
                 }
@@ -339,6 +365,7 @@ pub async fn register_submit(
         Err(DbError::UsernameTaken) => (
             StatusCode::CONFLICT,
             render(&register_page(
+                &state.instance_name,
                 Some("That username is taken."),
                 &form.username,
                 &form.invite,
@@ -364,6 +391,23 @@ pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
     }
     let jar = jar.remove(Cookie::from(SESSION_COOKIE));
     (jar, Redirect::to("/")).into_response()
+}
+
+/// The signed-in member, if there is one.
+///
+/// The permissive half of session handling: callers that can render or serve
+/// something useful to an anonymous visitor use this, and callers that cannot
+/// use `account::require_session`, which redirects to the login form instead.
+/// A malformed, expired, or revoked cookie is indistinguishable from no cookie
+/// here — deliberately, so a stale session degrades to logged-out rather than
+/// to an error page.
+pub(crate) async fn session_user(state: &AppState, jar: &CookieJar) -> Option<User> {
+    let cookie = jar.get(SESSION_COOKIE)?;
+    db::user_for_session(&state.pool, cookie.value())
+        .await
+        .ok()
+        .flatten()
+        .filter(User::is_active)
 }
 
 fn session_cookie(token: String) -> Cookie<'static> {

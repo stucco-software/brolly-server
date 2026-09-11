@@ -79,6 +79,8 @@ async fn harness() -> Harness {
         AppState {
             pool: db.pool.clone(),
             base_domain: "brolly.test".into(),
+            instance_name: "brolly.test".to_string(),
+            instance_description: "A private community server.".to_string(),
             stores,
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)

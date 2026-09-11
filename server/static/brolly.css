@@ -6,16 +6,81 @@
  * ADR 0004).
  *
  * A new feature extends the tokens or the components here. It does not add a
- * third stylesheet; server/tests/ui_invariants.rs enforces that.
+ * third stylesheet; server/tests/ui_invariants.rs enforces that. That rule is
+ * also why the @font-face block lives here rather than in a fonts.css beside
+ * it.
+ *
+ * The visual language is brolly.id's: Serrif Condensed on warm paper, a heavy
+ * black rule instead of a shadow, and flat washes of colour for the surfaces
+ * that carry a message rather than a control.
  */
 
-*, *::before, *::after { box-sizing: border-box; }
-body, h1, h2, h3, p, figure, blockquote, ul, ol { margin: 0; }
+/* --- typeface ---------------------------------------------------------- */
+/* Serrif Condensed, self-hosted. Only the weights the components actually
+   ask for are shipped; the browser synthesises the rest. */
+@font-face {
+  font-family: "Serrif";
+  src: url("/static/fonts/SerrifCondensed-TRIAL-Light.woff2") format("woff2");
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Serrif";
+  src: url("/static/fonts/SerrifCondensed-TRIAL-Regular.woff2") format("woff2");
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Serrif";
+  src: url("/static/fonts/SerrifCondensed-TRIAL-RegularItalic.woff2") format("woff2");
+  font-weight: 400;
+  font-style: italic;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Serrif";
+  src: url("/static/fonts/SerrifCondensed-TRIAL-Medium.woff2") format("woff2");
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Serrif";
+  src: url("/static/fonts/SerrifCondensed-TRIAL-SemiBold.woff2") format("woff2");
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Serrif";
+  src: url("/static/fonts/SerrifCondensed-TRIAL-Bold.woff2") format("woff2");
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+@font-face {
+  font-family: "Serrif";
+  src: url("/static/fonts/SerrifCondensed-TRIAL-Heavy.woff2") format("woff2");
+  font-weight: 900;
+  font-style: normal;
+  font-display: swap;
+}
 
+/* --- reset ------------------------------------------------------------- */
+*, *::before, *::after { box-sizing: border-box; }
+body, h1, h2, h3, h4, p, figure, blockquote, dl, dd, ul, ol { margin: 0; }
+img, picture { max-width: 100%; display: block; }
+html { -moz-text-size-adjust: none; text-size-adjust: none; }
+
+/* --- base -------------------------------------------------------------- */
 body {
-  font-family: var(--font-sans);
+  font-family: var(--family-body);
   font-size: var(--txt-0);
+  font-weight: 300;
   line-height: var(--lead);
+  letter-spacing: var(--tracking);
   color: var(--foreground);
   background: var(--background);
   min-height: 100vh;
@@ -23,77 +88,176 @@ body {
   flex-direction: column;
 }
 
-a { color: var(--primary); }
+h1, h2, h3, h4 {
+  font-family: var(--family-heading);
+  font-weight: 400;
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--lead-tight);
+  text-wrap: balance;
+}
+h1 { font-size: var(--txt-2); font-weight: 700; }
+h2 { font-size: var(--txt-1); font-weight: 700; }
+h3 { font-size: var(--txt-0); font-weight: 600; }
+h4 { font-size: var(--txt-0); font-weight: 600; }
 
+b, strong { font-weight: 500; }
+
+a { color: inherit; text-decoration-thickness: from-font; text-underline-offset: 0.15em; }
+a:visited { color: inherit; }
+
+/* brolly.id draws the focus ring in its own blue rather than the platform
+   default, at the same weight as the rule around a control. */
 :focus-visible {
-  outline: 2px solid var(--ring);
-  outline-offset: 2px;
+  outline: var(--border-width) solid var(--ring);
+  outline-offset: 1px;
   border-radius: var(--radius-sm);
 }
+
+/* Inside a flat field of colour the brand blue is only 2.1:1 against the wash,
+   so a keyboard user tabbing into the hero would barely see where they are.
+   Each wash already pairs with a foreground that clears AA against it, so the
+   ring borrows that instead of the token — one rule that stays correct for
+   every wash, in both themes. */
+.band :focus-visible,
+.card-feature :focus-visible,
+.notice :focus-visible {
+  outline-color: currentColor;
+}
+
+:target { scroll-margin-block: 5ex; }
 
 .skip-link { position: absolute; left: -9999px; }
 .skip-link:focus {
   left: var(--sp-0);
   top: var(--sp-0);
-  z-index: 10;
+  z-index: 200;
   padding: var(--sp--1) var(--sp-0);
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
 }
 
 /* --- shell ------------------------------------------------------------- */
-.shell-header {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: var(--sp-1);
-  padding: var(--sp--1) var(--sp-1);
-  background: var(--surface);
-  border-bottom: 1px solid var(--border-subtle);
-}
-.brand { font-weight: 650; text-decoration: none; color: var(--foreground); }
-.shell-nav { display: flex; gap: var(--sp-0); margin-left: auto; }
-.shell-nav a { color: var(--muted-fg); text-decoration: none; }
-.shell-nav a:hover { color: var(--foreground); }
-
-.shell-main {
-  flex: 1;
+/* `.wrap` is the measure of the page — brolly.id's `.container`. Every band
+   of colour is full-bleed and puts a `.wrap` inside it, so the wash reaches
+   the viewport edge while the type stays on the grid. */
+.wrap {
   width: 100%;
   max-width: var(--grid-max-width);
   margin-inline: auto;
-  padding: var(--sp-2) var(--sp-1);
+  padding-inline: var(--sp-0-1);
 }
 
+.shell-header {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: var(--surface);
+  border-block-end: var(--hairline) solid var(--border-subtle);
+}
+.shell-header-inner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp--1) var(--sp-0);
+  padding-block: var(--sp--2);
+}
+.brand {
+  font-size: var(--txt-1);
+  font-weight: 700;
+  letter-spacing: var(--tracking-tight);
+  text-decoration: none;
+  flex-shrink: 0;
+}
+.shell-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--sp-0);
+  margin-inline-start: auto;
+}
+.shell-nav a { text-decoration: none; }
+.shell-nav a:hover { text-decoration: underline; }
+
+/* A column, so a page shorter than the window can hand its slack to the last
+   band instead of leaving a strip of bare paper above the footer. */
+.shell-main { flex: 1; width: 100%; display: flex; flex-direction: column; }
+/* The band that closes a page takes that slack and centres itself in it, so it
+   reads as a deliberate full-bleed panel at any window height. */
+.shell-main > .band:last-child {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+}
+/* A page that is not a full-bleed band gets its breathing room here, so a
+   band can still sit flush under the header. */
+.shell-main > .wrap { padding-block: var(--sp-2) var(--sp-3); }
+
 .shell-footer {
-  padding: var(--sp-1);
-  border-top: 1px solid var(--border-subtle);
-  color: var(--muted-fg);
+  margin-block-start: var(--sp-3);
+  padding-block: var(--sp-1) var(--sp-2);
+  border-block-start: var(--hairline) solid var(--border-subtle);
   font-size: var(--txt--1);
   text-align: center;
 }
+.shell-footer a { text-decoration: none; border-block-end: 1px solid currentColor; }
+.shell-footer p + p { margin-block-start: var(--sp--1); }
+.footer-fine { color: var(--muted-fg); }
 
-/* --- components -------------------------------------------------------- */
-.stack-lg > * + * { margin-top: var(--sp-2); }
+/* --- bands ------------------------------------------------------------- */
+/* Flat, full-bleed fields of colour. brolly.id's whole page rhythm is these
+   alternating with plain paper. */
+.band { padding-block: var(--sp-3); background: var(--wash-quiet); color: var(--wash-quiet-fg); }
+.band-hero { background: var(--wash); color: var(--wash-fg); }
+.band-invite { background: var(--wash-invite); color: var(--wash-invite-fg); }
+/* A band that ends the page runs into the footer, the way brolly.id stacks its
+   sections — otherwise the footer's own top margin leaves a strip of paper
+   between the colour and the rule. A browser without :has() just gets the
+   strip, which is untidy rather than broken. */
+.shell-main:has(> .band:last-child) + .shell-footer { margin-block-start: 0; }
 
-.hero h1 { font-size: var(--txt-4); line-height: var(--lead-tight); }
-.lede {
-  font-size: var(--txt-1);
-  color: var(--muted-fg);
-  max-width: var(--measure);
-  margin-top: var(--sp--1);
+/* --- hero -------------------------------------------------------------- */
+.hero { display: grid; gap: var(--sp-1-2); align-items: center; }
+@media (min-width: 44rem) {
+  .hero { grid-template-columns: minmax(0, 1fr) auto; }
 }
-.actions { display: flex; flex-wrap: wrap; gap: var(--sp--1); margin-top: var(--sp-1); }
+.hero h1 {
+  font-size: var(--txt-3);
+  font-weight: 900;
+  max-width: 18ch;
+}
+.hero .lede { font-size: var(--txt-1); line-height: 1.2; max-width: 34rem; }
+.hero-figure { margin: 0; justify-self: center; }
+.hero-figure img {
+  width: 15rem;
+  height: auto;
+  max-width: 100%;
+  margin-inline: auto;
+  mix-blend-mode: var(--illustration-blend);
+  filter: var(--illustration-filter);
+}
 
+.lede { font-size: var(--txt-0); max-width: var(--measure); margin-block-start: var(--sp--1); }
+.actions { display: flex; flex-wrap: wrap; gap: var(--sp--1); margin-block-start: var(--sp-1); }
+
+/* --- rhythm ------------------------------------------------------------ */
+section > h2 + * { margin-block-start: var(--sp-0); }
+
+/* --- buttons ----------------------------------------------------------- */
 .button {
   display: inline-block;
-  padding: var(--sp--1) var(--sp-0);
-  border: 1px solid var(--border);
+  padding: var(--sp--2) var(--sp-0);
+  border: var(--border-width) solid var(--border);
   border-radius: var(--radius);
   background: var(--secondary);
   color: var(--secondary-fg);
-  text-decoration: none;
+  font-family: var(--family-label);
   font-size: var(--txt-0);
+  font-weight: 500;
+  letter-spacing: var(--tracking-tight);
+  line-height: var(--lead-tight);
+  text-decoration: none;
   cursor: pointer;
 }
 .button:hover { background: var(--hover); }
@@ -102,101 +266,140 @@ a { color: var(--primary); }
   border-color: var(--primary);
   color: var(--primary-fg);
 }
+.button-primary:hover { background: var(--primary); opacity: 0.88; }
+.button-danger {
+  background: var(--destructive);
+  border-color: var(--destructive);
+  color: var(--destructive-fg);
+}
+.button-danger:hover { background: var(--destructive); opacity: 0.88; }
+/* The nav CTA is the same object at label size — brolly.id's `.nav-cta`. */
+.button-compact { padding: var(--space-1) var(--space-3); font-size: var(--txt--1); }
 
+/* A logout control has to be a POST, so it is a form in the nav. Strip the
+   form's block layout so it sits inline with the links beside it. */
+.nav-form { display: inline; margin: 0; }
+.button-link {
+  background: none;
+  border: 0;
+  padding: 0;
+  font: inherit;
+  letter-spacing: inherit;
+  color: inherit;
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+/* --- cards ------------------------------------------------------------- */
 .card-grid {
   display: grid;
-  gap: var(--sp-0);
+  gap: var(--sp-1);
   grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
 }
 .card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp--1);
   padding: var(--sp-1);
   background: var(--surface);
-  border: 1px solid var(--border-subtle);
+  border: var(--border-width) solid var(--border);
   border-radius: var(--radius);
-  box-shadow: var(--shadow);
 }
 .card h2 { font-size: var(--txt-1); }
-.card p { color: var(--muted-fg); margin-top: var(--sp--1); }
+.card p { flex: 1; margin: 0; }
+/* One card in a set may carry the yellow — brolly.id's `.way-featured`. */
+.card-feature { background: var(--wash-feature); color: var(--wash-feature-fg); }
 
 /* --- forms ------------------------------------------------------------- */
 .field { display: flex; flex-direction: column; gap: var(--sp--2); }
-.field label { font-size: var(--txt--1); color: var(--muted-fg); }
-.field input, .field textarea, .field select {
-  padding: var(--sp--1) var(--sp-0);
-  border: 1px solid var(--border);
+.field label { font-family: var(--family-label); font-size: var(--txt--1); }
+.field input, .field textarea, .field select, textarea {
+  padding: var(--sp--2) var(--sp--1);
+  border: var(--border-width) solid var(--border);
   border-radius: var(--radius);
   background: var(--surface);
   color: var(--foreground);
   font: inherit;
+  letter-spacing: var(--tracking-tight);
 }
+textarea { width: 100%; }
 .error { color: var(--destructive); }
 
 /* --- auth surfaces ----------------------------------------------------- */
 .auth-card {
-  max-width: 26rem;
+  max-width: 28rem;
   margin-inline: auto;
-  padding: var(--sp-1);
+  padding: var(--sp-1-2);
   background: var(--surface);
-  border: 1px solid var(--border-subtle);
+  border: var(--border-width) solid var(--border);
   border-radius: var(--radius);
-  box-shadow: var(--shadow);
 }
-.auth-card h1 { font-size: var(--txt-2); }
-.auth-card .lede { font-size: var(--txt-0); margin-bottom: var(--sp-0); }
-.stack-form { display: flex; flex-direction: column; gap: var(--sp-0); margin-top: var(--sp-1); }
+.auth-card h1 { font-size: var(--txt-1); }
+.auth-card .lede { font-size: var(--txt-0); }
+.stack-form { display: flex; flex-direction: column; gap: var(--sp-0); margin-block-start: var(--sp-1); }
 .stack-form button { align-self: flex-start; }
-.auth-alt { margin-top: var(--sp-1); font-size: var(--txt--1); color: var(--muted-fg); }
+.auth-alt { margin-block-start: var(--sp-1); font-size: var(--txt--1); color: var(--muted-fg); }
 [role="alert"] {
-  padding: var(--sp--1) var(--sp-0);
-  border: 1px solid var(--destructive);
-  border-radius: var(--radius-sm);
-  margin-top: var(--sp-0);
+  padding: var(--sp--2) var(--sp--1);
+  border: var(--border-width) solid var(--destructive);
+  border-radius: var(--radius);
+  margin-block-start: var(--sp-0);
 }
 
 /* --- consent screen ---------------------------------------------------- */
-.consent { max-width: 32rem; }
-.consent-origin { font-size: var(--txt--1); color: var(--muted-fg); margin-top: var(--sp--1); }
-.mono { font-family: var(--font-mono); font-size: var(--txt--1); }
+.consent { max-width: 34rem; }
+.consent-origin { font-size: var(--txt--1); color: var(--muted-fg); margin-block-start: var(--sp--1); }
+.mono {
+  font-family: var(--family-code);
+  font-size: var(--txt--1);
+  letter-spacing: var(--tracking-tight);
+}
 
-.consent-group { margin-top: var(--sp-1); }
+.consent-group { margin-block-start: var(--sp-1); }
 .consent-group h2 {
   font-size: var(--txt--1);
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.08em;
   color: var(--muted-fg);
 }
 .consent-group-attention h2 { color: var(--destructive); }
 
-.consent-list { list-style: none; padding: 0; margin-top: var(--sp--1); }
+.consent-list { list-style: none; padding: 0; margin-block-start: var(--sp--1); }
 .consent-list li {
   display: flex;
   flex-direction: column;
   gap: var(--sp--2);
-  padding: var(--sp--1) 0;
-  border-bottom: 1px solid var(--border-subtle);
+  padding-block: var(--sp--1);
+  border-block-end: var(--hairline) solid var(--border-subtle);
 }
-.consent-list li:last-child { border-bottom: 0; }
+.consent-list li:last-child { border-block-end: 0; }
 .consent-summary { color: var(--foreground); }
 .consent-raw { color: var(--muted-fg); }
 
 .consent-attention {
-  border-left: 3px solid var(--destructive);
-  padding-left: var(--sp--1);
+  border-inline-start: var(--border-width) solid var(--destructive);
+  padding-inline-start: var(--sp--1);
 }
 .consent-attention .consent-summary { color: var(--destructive); }
 
 .consent-actions {
   display: flex;
   gap: var(--sp--1);
-  margin-top: var(--sp-1);
-  padding-top: var(--sp-1);
-  border-top: 1px solid var(--border-subtle);
+  margin-block-start: var(--sp-1);
+  padding-block-start: var(--sp-1);
+  border-block-start: var(--hairline) solid var(--border-subtle);
 }
 
 /* --- member dashboard --------------------------------------------------- */
 .dashboard { max-width: var(--grid-max-width); }
 
-.dashboard-tabs { margin-top: var(--sp-0); border-bottom: 1px solid var(--border); }
+/* A hairline under the whole strip, so the current tab's heavy rule is the
+   thing that reads — the same weight brolly.id gives its other underlines. */
+.dashboard-tabs {
+  margin-block-start: var(--sp-0);
+  border-block-end: var(--hairline) solid var(--border-subtle);
+}
 .dashboard-tabs ul {
   display: flex;
   flex-wrap: wrap;
@@ -207,74 +410,88 @@ a { color: var(--primary); }
 }
 .dashboard-tabs a {
   display: block;
-  padding: var(--sp--2) var(--sp--1);
+  padding: var(--space-1) var(--space-3);
   color: var(--muted-fg);
   text-decoration: none;
-  border-bottom: 2px solid transparent;
+  margin-block-end: calc(-1 * var(--hairline));
+  border-block-end: var(--border-width) solid transparent;
 }
 .dashboard-tabs a:hover { color: var(--foreground); background: var(--hover); }
 /* aria-current carries the state, so the styling has one source of truth and
    cannot disagree with what a screen reader announces. */
 .dashboard-tabs a[aria-current="page"] {
   color: var(--foreground);
-  border-bottom-color: var(--primary);
+  font-weight: 500;
+  border-block-end-color: var(--border);
 }
 
-.dashboard-panel { margin-top: var(--sp-1); max-width: var(--measure); }
+.dashboard-panel { margin-block-start: var(--sp-1); max-width: var(--measure); }
 
-.facts { display: grid; gap: var(--sp--1); margin-top: var(--sp-1); }
-.facts dt {
+/* A table is not prose and does not want the reading measure. The console's
+   member list is the only surface so far that needs the full grid. */
+.dashboard-wide { max-width: none; }
+.dashboard-panel-wide { max-width: none; }
+
+/* --- tables ------------------------------------------------------------ */
+/* Rules, not zebra stripes: the same hairline that separates rows inside a
+   panel everywhere else, so a table reads as part of the same system. */
+.table {
+  width: 100%;
+  margin-block-start: var(--sp-1);
+  border-collapse: collapse;
+  text-align: start;
+}
+.table th, .table td {
+  padding: var(--cell-padding-block) var(--cell-padding-inline);
+  border-block-end: var(--hairline) solid var(--border-subtle);
+  text-align: start;
+  vertical-align: baseline;
+}
+.table thead th {
+  font-family: var(--family-label);
   font-size: var(--txt--1);
+  font-weight: 600;
   text-transform: uppercase;
-  letter-spacing: 0.04em;
+  letter-spacing: 0.08em;
+  color: var(--muted-fg);
+  border-block-end: var(--border-width) solid var(--border);
+}
+.table tbody tr:last-child th,
+.table tbody tr:last-child td { border-block-end: 0; }
+.table tbody th { font-weight: 500; }
+/* A DID is long, opaque, and never worth widening the table for. */
+.did { font-size: var(--txt--2); overflow-wrap: anywhere; }
+
+.facts { display: grid; gap: var(--sp--2); margin-block-start: var(--sp-1); }
+.facts dt {
+  font-family: var(--family-label);
+  font-size: var(--txt--1);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
   color: var(--muted-fg);
 }
 .facts dd { margin: 0 0 var(--sp--1) 0; overflow-wrap: anywhere; }
 
-.hint { font-size: var(--txt--1); color: var(--muted-fg); margin-top: var(--sp--2); }
+.hint { font-size: var(--txt--1); color: var(--muted-fg); margin-block-start: var(--sp--2); }
 .notice {
-  padding: var(--sp--1);
-  border-radius: var(--radius-sm);
-  background: var(--secondary);
-  color: var(--secondary-fg);
+  padding: var(--sp--2) var(--sp--1);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--wash-feature);
+  color: var(--wash-feature-fg);
 }
 
-.app-list { list-style: none; padding: 0; margin-top: var(--sp-1); }
+.app-list { list-style: none; padding: 0; margin-block-start: var(--sp-1); }
 .app {
   display: flex;
   flex-wrap: wrap;
   gap: var(--sp--1);
   align-items: center;
   justify-content: space-between;
-  padding: var(--sp--1) 0;
-  border-bottom: 1px solid var(--border-subtle);
+  padding-block: var(--sp--1);
+  border-block-end: var(--hairline) solid var(--border-subtle);
 }
-.app:last-child { border-bottom: 0; }
+.app:last-child { border-block-end: 0; }
 .app-identity { display: flex; flex-direction: column; gap: var(--sp--2); }
 .app-id { overflow-wrap: anywhere; }
-
-.button-danger { background: var(--destructive); color: var(--background); }
-
-/* A logout control has to be a POST, so it is a form in the nav. Strip the
-   form's block layout so it sits inline with the links beside it. */
-.nav-form { display: inline; margin: 0; }
-.button-link {
-  background: none;
-  border: 0;
-  padding: 0;
-  font: inherit;
-  color: inherit;
-  cursor: pointer;
-  text-decoration: underline;
-}
-
-textarea {
-  width: 100%;
-  font: inherit;
-  padding: var(--sp--2);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--surface);
-  color: var(--foreground);
-}
-textarea:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; }

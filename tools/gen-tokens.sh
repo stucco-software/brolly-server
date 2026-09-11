@@ -26,17 +26,33 @@ import re, sys
 src, dst = sys.argv[1], sys.argv[2]
 css = open(src).read()
 
-m = re.search(r'\[data-theme="natt"\]\s*\{(.*?)\n\}', css, re.S)
-if not m:
-    sys.exit('could not find the natt theme block')
+def theme(name):
+    m = re.search(r'\[data-theme="%s"\]\s*\{(.*?)\n\}' % name, css, re.S)
+    if not m:
+        sys.exit(f'could not find the {name} theme block')
+    return m.group(1)
 
+# batklubb emits themes ONLY as [data-theme="..."]. We are server-rendered with
+# no JavaScript and no theme switcher, so the html element carries no such
+# attribute and *neither* theme would apply — every semantic var would be
+# unset and every component would fall back to the browser default. Both
+# blocks below close that gap.
+#
+# :not([data-theme]) is (0,2,0) — above the (0,1,0) [data-theme] blocks above
+# it — so these apply only in the absence of an explicit choice, and an
+# explicit choice always wins regardless of source order. The night bridge is
+# last, so between two equally specific matches in dark mode it takes it.
 bridge = (
+    '\n/* Default theme — appended by tools/gen-tokens.sh.\n'
+    ' * batklubb emits [data-theme] blocks only, and nothing sets that\n'
+    ' * attribute server-side. Without this, a visitor who has expressed no\n'
+    ' * preference gets no theme at all. */\n'
+    ':root:not([data-theme]) {' + theme('dag') + '\n}\n'
     '\n/* OS colour-scheme bridge — appended by tools/gen-tokens.sh.\n'
-    ' * batklubb emits [data-theme] blocks only; this applies the night theme\n'
-    ' * when the visitor prefers dark and has not chosen explicitly. An explicit\n'
-    ' * data-theme always wins. */\n'
+    ' * Applies the night theme when the visitor prefers dark and has not\n'
+    ' * chosen explicitly. An explicit data-theme always wins. */\n'
     '@media (prefers-color-scheme: dark) {\n'
-    '  :root:not([data-theme="dag"]) {' + m.group(1) + '\n  }\n}\n'
+    '  :root:not([data-theme="dag"]) {' + theme('natt') + '\n  }\n}\n'
 )
 
 header = (

@@ -29,7 +29,7 @@ use brolly_identity::{dpop, extract};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::SESSION_COOKIE;
+use crate::auth::session_user;
 use crate::{AppState, consent};
 
 const CONSENT_TTL: i64 = 600;
@@ -56,15 +56,6 @@ fn wrong_host(state: &AppState, headers: &HeaderMap) -> bool {
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
-}
-
-async fn session_user(state: &AppState, jar: &CookieJar) -> Option<User> {
-    let cookie = jar.get(SESSION_COOKIE)?;
-    db::user_for_session(&state.pool, cookie.value())
-        .await
-        .ok()
-        .flatten()
-        .filter(User::is_active)
 }
 
 /// Verify the DPoP proof on a request to one of these endpoints.
@@ -306,7 +297,7 @@ pub async fn authorize(
 
     // The third protocol through one screen (ADR 0011).
     consent::render_consent(
-        "Brolly",
+        &state.instance_name,
         Protocol::Atproto,
         &client_id,
         &user.username,
