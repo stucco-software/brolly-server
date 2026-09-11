@@ -43,7 +43,12 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
     (db, dir, router)
 }
 
-async fn post(router: &axum::Router, path: &str, body: &str) -> (StatusCode, String, Vec<String>) {
+/// Returns `Location` too: several flows assert where a successful POST lands.
+async fn post(
+    router: &axum::Router,
+    path: &str,
+    body: &str,
+) -> (StatusCode, String, Vec<String>, Option<String>) {
     let response = router
         .clone()
         .oneshot(
@@ -64,16 +69,28 @@ async fn post(router: &axum::Router, path: &str, body: &str) -> (StatusCode, Str
         .iter()
         .filter_map(|v| v.to_str().ok().map(str::to_string))
         .collect();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
         .to_string();
-    (status, body, cookies)
+    (status, body, cookies, location)
 }
 
 async fn get(router: &axum::Router, path: &str) -> (StatusCode, String) {
-    get_as(router, path, None).await
+    let (status, body, _) = get_as(router, path, None).await;
+    (status, body)
 }
 
-async fn get_as(router: &axum::Router, path: &str, cookie: Option<&str>) -> (StatusCode, String) {
+/// Returns `Location` as well as status and body, because the door's whole
+/// behaviour for a signed-in visitor is a redirect.
+async fn get_as(
+    router: &axum::Router,
+    path: &str,
+    cookie: Option<&str>,
+) -> (StatusCode, String, Option<String>) {
     let mut request = Request::builder().uri(path);
     if let Some(cookie) = cookie {
         request = request.header(header::COOKIE, cookie);
@@ -84,9 +101,14 @@ async fn get_as(router: &axum::Router, path: &str, cookie: Option<&str>) -> (Sta
         .await
         .unwrap();
     let status = response.status();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
         .to_string();
-    (status, body)
+    (status, body, location)
 }
 
 /// Register `alice` and return her session cookie, `name=value` only.
@@ -94,7 +116,7 @@ async fn register_alice(db: &brolly_test_support::TestDb, router: &axum::Router)
     let code = db::create_invite(&db.pool, None, 1, None, None)
         .await
         .unwrap();
-    let (_, _, cookies) = post(
+    let (_, _, cookies, _) = post(
         router,
         "/register",
         &format!("invite={code}&username=alice&email=&password=correct-horse-battery"),
@@ -134,7 +156,7 @@ async fn the_login_page_renders_a_real_form() {
 async fn registration_requires_a_valid_invite() {
     let (_db, _dir, router) = harness().await;
 
-    let (status, body, cookies) = post(
+    let (status, body, cookies, _) = post(
         &router,
         "/register",
         "invite=nonsense&username=alice&email=&password=correct-horse-battery",
@@ -156,7 +178,7 @@ async fn a_valid_invite_registers_and_logs_in() {
         .await
         .unwrap();
 
-    let (status, _, cookies) = post(
+    let (status, _, cookies, _) = post(
         &router,
         "/register",
         &format!("invite={code}&username=alice&email=&password=correct-horse-battery"),
@@ -192,7 +214,7 @@ async fn an_invite_cannot_be_used_twice() {
         .await
         .unwrap();
 
-    let (first, _, _) = post(
+    let (first, _, _, _) = post(
         &router,
         "/register",
         &format!("invite={code}&username=alice&email=&password=correct-horse-battery"),
@@ -200,7 +222,7 @@ async fn an_invite_cannot_be_used_twice() {
     .await;
     assert_eq!(first, StatusCode::SEE_OTHER);
 
-    let (second, body, _) = post(
+    let (second, body, _, _) = post(
         &router,
         "/register",
         &format!("invite={code}&username=bob&email=&password=correct-horse-battery"),
@@ -227,7 +249,7 @@ async fn a_rejected_username_does_not_consume_the_invite() {
         .unwrap();
 
     // "Alice" is invalid: usernames become subdomains.
-    let (status, _, _) = post(
+    let (status, _, _, _) = post(
         &router,
         "/register",
         &format!("invite={code}&username=Alice&email=&password=correct-horse-battery"),
@@ -236,7 +258,7 @@ async fn a_rejected_username_does_not_consume_the_invite() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
     // The invite must still work — validation happens before redemption.
-    let (retry, _, _) = post(
+    let (retry, _, _, _) = post(
         &router,
         "/register",
         &format!("invite={code}&username=alice&email=&password=correct-horse-battery"),
@@ -256,7 +278,7 @@ async fn login_succeeds_and_sets_a_session() {
         .await
         .unwrap();
 
-    let (status, _, cookies) = post(
+    let (status, _, cookies, _) = post(
         &router,
         "/login",
         "username=alice&password=correct-horse-battery",
@@ -283,9 +305,9 @@ async fn a_wrong_password_reveals_nothing_about_the_account() {
         .await
         .unwrap();
 
-    let (existing_status, existing_body, cookies) =
+    let (existing_status, existing_body, cookies, _) =
         post(&router, "/login", "username=alice&password=wrong").await;
-    let (missing_status, missing_body, _) =
+    let (missing_status, missing_body, _, _) =
         post(&router, "/login", "username=mallory&password=wrong").await;
 
     assert_eq!(existing_status, StatusCode::UNAUTHORIZED);
@@ -304,7 +326,7 @@ async fn a_short_password_is_refused_before_the_invite_is_spent() {
         .await
         .unwrap();
 
-    let (status, body, _) = post(
+    let (status, body, _, _) = post(
         &router,
         "/register",
         &format!("invite={code}&username=alice&email=&password=short"),
@@ -313,7 +335,7 @@ async fn a_short_password_is_refused_before_the_invite_is_spent() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("12 characters"), "got: {body}");
 
-    let (retry, _, _) = post(
+    let (retry, _, _, _) = post(
         &router,
         "/register",
         &format!("invite={code}&username=alice&email=&password=correct-horse-battery"),
@@ -328,7 +350,7 @@ async fn logout_revokes_the_session_server_side() {
     db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
         .await
         .unwrap();
-    let (_, _, cookies) = post(
+    let (_, _, cookies, _) = post(
         &router,
         "/login",
         "username=alice&password=correct-horse-battery",
@@ -387,7 +409,7 @@ async fn registering_provisions_a_pod_the_member_can_write_to() {
         .await
         .expect("invite");
 
-    let (status, _, cookies) = post(
+    let (status, _, cookies, _) = post(
         &router,
         "/register",
         &format!("invite={invite}&username=alice&email=&password=correct-horse-battery"),
@@ -435,7 +457,7 @@ async fn the_landing_page_knows_you_are_signed_in() {
     let (db, _dir, router) = harness().await;
     let cookie = register_alice(&db, &router).await;
 
-    let (status, body) = get_as(&router, "/", Some(&cookie)).await;
+    let (status, body, _) = get_as(&router, "/", Some(&cookie)).await;
 
     assert_eq!(status, StatusCode::OK);
     // Login redirects to `/`. When `/` renders the anonymous nav regardless,
@@ -474,7 +496,7 @@ async fn the_landing_page_still_invites_anonymous_visitors_in() {
 async fn a_stale_session_cookie_falls_back_to_the_anonymous_front_door() {
     let (_db, _dir, router) = harness().await;
 
-    let (status, body) = get_as(&router, "/", Some("brolly_session=not-a-real-token")).await;
+    let (status, body, _) = get_as(&router, "/", Some("brolly_session=not-a-real-token")).await;
 
     assert_eq!(status, StatusCode::OK, "a bad cookie must not 500");
     assert!(body.contains(r#"href="/login""#), "got: {body}");
