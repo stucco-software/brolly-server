@@ -185,7 +185,18 @@ pub struct Next {
 }
 
 /// `GET /login`
-pub async fn login_form(State(state): State<AppState>, Query(query): Query<Next>) -> Response {
+///
+/// A signed-in visitor is bounced to their dashboard rather than shown a form
+/// they have no use for. `session_user` filters on `is_active`, so a disabled
+/// member's stale cookie falls through to the form instead of looping.
+pub async fn login_form(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Query(query): Query<Next>,
+) -> Response {
+    if session_user(&state, &jar).await.is_some() {
+        return Redirect::to("/account").into_response();
+    }
     let action = login_action(query.next.as_deref());
     render(&login_page(&state, None, "", &action))
 }
@@ -208,7 +219,7 @@ pub async fn login_submit(
         Ok(user) => {
             match db::create_session(&state.pool, user.id, time::Duration::days(30), None).await {
                 Ok(token) => {
-                    let destination = safe_next(query.next.as_deref()).unwrap_or("/");
+                    let destination = safe_next(query.next.as_deref()).unwrap_or("/account");
                     (jar.add(session_cookie(token)), Redirect::to(destination)).into_response()
                 }
                 Err(e) => {
@@ -245,7 +256,12 @@ pub struct RegisterForm {
 }
 
 /// `GET /register`
-pub async fn register_form(State(state): State<AppState>) -> Response {
+///
+/// Bounced for the same reason as `login_form`.
+pub async fn register_form(State(state): State<AppState>, jar: CookieJar) -> Response {
+    if session_user(&state, &jar).await.is_some() {
+        return Redirect::to("/account").into_response();
+    }
     render(&register_page(&state, None, "", ""))
 }
 
@@ -355,7 +371,9 @@ pub async fn register_submit(
             }
 
             match db::create_session(&state.pool, user.id, time::Duration::days(30), None).await {
-                Ok(token) => (jar.add(session_cookie(token)), Redirect::to("/")).into_response(),
+                Ok(token) => {
+                    (jar.add(session_cookie(token)), Redirect::to("/account")).into_response()
+                }
                 Err(e) => {
                     tracing::error!(error = %e, "session creation failed after registration");
                     server_error()

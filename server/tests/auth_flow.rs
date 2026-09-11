@@ -519,3 +519,53 @@ async fn the_fine_print_is_configuration() {
     assert!(!body.contains(">Terms<"), "unset terms renders no link");
     assert!(!body.contains(">Privacy<"), "unset privacy renders no link");
 }
+
+// --- the door bounces people who are already in ------------------------------
+
+/// A login form is not an answer to a request from somebody already logged in.
+#[tokio::test]
+async fn a_signed_in_visitor_is_sent_to_their_account() {
+    let (db, _dir, router) = harness().await;
+    let cookie = register_alice(&db, &router).await;
+
+    for path in ["/login", "/register"] {
+        let (status, _, location) = get_as(&router, path, Some(&cookie)).await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "{path} should redirect");
+        assert_eq!(location.as_deref(), Some("/account"), "{path}");
+    }
+}
+
+/// ...but an anonymous one still gets the form, and a stale cookie counts as
+/// anonymous rather than bouncing into a loop.
+#[tokio::test]
+async fn an_anonymous_visitor_still_gets_the_form() {
+    let (_db, _dir, router) = harness().await;
+
+    let (status, body, _) = get_as(&router, "/login", None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("name=\"password\""));
+
+    let (status, _, _) = get_as(&router, "/login", Some("brolly_session=nonsense")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "a stale cookie is not a redirect loop"
+    );
+}
+
+/// Logging in lands on the dashboard, not on a door that would immediately
+/// bounce them to the dashboard.
+#[tokio::test]
+async fn a_successful_login_lands_on_the_account() {
+    let (db, _dir, router) = harness().await;
+    let _ = register_alice(&db, &router).await;
+
+    let (status, _, _, location) = post(
+        &router,
+        "/login",
+        "username=alice&password=correct-horse-battery",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/account"));
+}

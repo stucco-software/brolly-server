@@ -15,7 +15,9 @@
   {% block header %}
   <header class="shell-header">
     <div class="wrap shell-header-inner">
-      <a class="brand" href="/">{{ chrome.instance_name }}</a>
+      {# /account, not /: once the door bounces signed-in visitors, every click
+         of the instance name from the dashboard would be a double hop. #}
+      <a class="brand" href="/account">{{ chrome.instance_name }}</a>
       <nav class="shell-nav" aria-label="Primary">
         {% block nav %}{% endblock %}
       </nav>
