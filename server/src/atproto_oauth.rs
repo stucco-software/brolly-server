@@ -297,7 +297,7 @@ pub async fn authorize(
 
     // The third protocol through one screen (ADR 0011).
     consent::render_consent(
-        &state.instance_name,
+        &state,
         Protocol::Atproto,
         &client_id,
         &user.username,

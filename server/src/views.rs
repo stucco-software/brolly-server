@@ -8,14 +8,13 @@ use axum::extract::State;
 use axum::response::Response;
 use axum_extra::extract::CookieJar;
 
-use crate::AppState;
 use crate::auth::session_user;
-use crate::render;
+use crate::{AppState, Chrome, render};
 
 #[derive(Template)]
 #[template(path = "landing.html")]
 struct Landing<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     /// `Some` when a member is signed in. The front door is the default
     /// post-login destination, so rendering it anonymously makes a successful
     /// login look like a failed one.
@@ -33,7 +32,7 @@ struct Landing<'a> {
 /// an absent or stale cookie renders the anonymous page rather than an error.
 pub async fn landing(State(state): State<AppState>, jar: CookieJar) -> Response {
     render(&Landing {
-        instance_name: &state.instance_name,
+        chrome: state.chrome(),
         username: session_user(&state, &jar).await.map(|user| user.username),
     })
 }

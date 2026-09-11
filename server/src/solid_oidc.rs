@@ -273,7 +273,7 @@ pub async fn authorize(
     };
 
     consent::render_consent(
-        &state.instance_name,
+        &state,
         Protocol::SolidOidc,
         client.client_name.as_deref().unwrap_or("An application"),
         &user.username,

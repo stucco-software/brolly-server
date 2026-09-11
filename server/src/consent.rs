@@ -14,7 +14,7 @@ use axum::response::Response;
 use brolly_identity::consent::{Capability, describe};
 use brolly_identity::oauth::Protocol;
 
-use crate::render;
+use crate::{AppState, Chrome, render};
 
 /// Capabilities sharing a resource group, rendered as one block.
 pub struct Section {
@@ -28,7 +28,7 @@ pub struct Section {
 #[derive(Template)]
 #[template(path = "consent.html")]
 struct ConsentPage<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     app_name: &'a str,
     username: &'a str,
     client_id: &'a str,
@@ -76,7 +76,7 @@ pub fn sections_for(protocol: Protocol, scopes: &str) -> Vec<Section> {
 /// their separate flows (ADR 0008) while sharing this surface.
 #[allow(clippy::too_many_arguments)]
 pub fn render_consent(
-    instance_name: &str,
+    state: &AppState,
     protocol: Protocol,
     app_name: &str,
     username: &str,
@@ -86,7 +86,7 @@ pub fn render_consent(
     request_token: &str,
 ) -> Response {
     render(&ConsentPage {
-        instance_name,
+        chrome: state.chrome(),
         app_name,
         username,
         client_id,

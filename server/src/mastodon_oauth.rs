@@ -305,7 +305,7 @@ pub async fn authorize(
     // The same screen all three protocols render (ADR 0011). Nobody compares
     // consent wording across three screens, so there is only one.
     consent::render_consent(
-        &state.instance_name,
+        &state,
         Protocol::Mastodon,
         &app.name,
         &user.username,

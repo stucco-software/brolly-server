@@ -22,7 +22,7 @@ use brolly_solid::profile::{self, Profile};
 use serde::Deserialize;
 
 use crate::auth::SESSION_COOKIE;
-use crate::{AppState, render};
+use crate::{AppState, Chrome, render};
 
 /// One tab in the dashboard.
 pub struct Tab {
@@ -100,7 +100,7 @@ fn server_error() -> Response {
 #[derive(Template)]
 #[template(path = "account/overview.html")]
 struct Overview<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     tabs: Vec<Tab>,
     username: &'a str,
     webid: String,
@@ -123,7 +123,7 @@ pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response
     };
 
     render(&Overview {
-        instance_name: &state.instance_name,
+        chrome: state.chrome(),
         tabs: tabs("/account"),
         username: &session.user.username,
         webid: webid::webid(&session.user.username, &state.base_domain),
@@ -139,7 +139,7 @@ pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response
 #[derive(Template)]
 #[template(path = "account/profile.html")]
 struct ProfilePage<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     tabs: Vec<Tab>,
     webid: String,
     display_name: String,
@@ -178,7 +178,7 @@ pub async fn profile_form(
     let current = profile::read(&pod, &id, &document);
 
     render(&ProfilePage {
-        instance_name: &state.instance_name,
+        chrome: state.chrome(),
         tabs: tabs("/account/profile"),
         webid: id,
         display_name: current.display_name,
@@ -237,7 +237,7 @@ pub async fn profile_submit(
 #[derive(Template)]
 #[template(path = "account/security.html")]
 struct Security<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     tabs: Vec<Tab>,
     sessions: i64,
     error: Option<&'a str>,
@@ -245,13 +245,13 @@ struct Security<'a> {
 }
 
 fn security_page<'a>(
-    instance_name: &'a str,
+    state: &'a AppState,
     error: Option<&'a str>,
     sessions: i64,
     saved: bool,
 ) -> Security<'a> {
     Security {
-        instance_name,
+        chrome: state.chrome(),
         tabs: tabs("/account/security"),
         sessions,
         error,
@@ -278,12 +278,7 @@ pub async fn security(
     let sessions = db::count_sessions(&state.pool, session.user.id)
         .await
         .unwrap_or(0);
-    render(&security_page(
-        &state.instance_name,
-        None,
-        sessions,
-        query.saved,
-    ))
+    render(&security_page(&state, None, sessions, query.saved))
 }
 
 /// `POST /account/security` — change password.
@@ -307,7 +302,7 @@ pub async fn change_password(
         return (
             StatusCode::BAD_REQUEST,
             render(&security_page(
-                &state.instance_name,
+                &state,
                 Some("Use at least 12 characters. Length beats punctuation."),
                 sessions,
                 false,
@@ -335,7 +330,7 @@ pub async fn change_password(
         Err(DbError::BadCredentials) => (
             StatusCode::UNAUTHORIZED,
             render(&security_page(
-                &state.instance_name,
+                &state,
                 Some("That is not your current password."),
                 sessions,
                 false,
@@ -354,7 +349,7 @@ pub async fn change_password(
 #[derive(Template)]
 #[template(path = "account/apps.html")]
 struct Apps<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     tabs: Vec<Tab>,
     apps: Vec<oidc_store::AuthorisedApp>,
 }
@@ -375,7 +370,7 @@ pub async fn apps(State(state): State<AppState>, jar: CookieJar) -> Response {
     };
 
     render(&Apps {
-        instance_name: &state.instance_name,
+        chrome: state.chrome(),
         tabs: tabs("/account/apps"),
         apps,
     })
@@ -466,7 +461,7 @@ pub async fn export(State(state): State<AppState>, jar: CookieJar) -> Response {
 #[derive(Template)]
 #[template(path = "account/delete.html")]
 struct Delete<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     tabs: Vec<Tab>,
     username: &'a str,
     error: Option<&'a str>,
@@ -484,7 +479,7 @@ pub async fn delete_form(State(state): State<AppState>, jar: CookieJar) -> Respo
         Err(response) => return response,
     };
     render(&Delete {
-        instance_name: &state.instance_name,
+        chrome: state.chrome(),
         tabs: tabs("/account/delete"),
         username: &session.user.username,
         error: None,
@@ -512,7 +507,7 @@ pub async fn delete_account(
         return (
             StatusCode::BAD_REQUEST,
             render(&Delete {
-                instance_name: &state.instance_name,
+                chrome: state.chrome(),
                 tabs: tabs("/account/delete"),
                 username: &session.user.username,
                 error: Some("That did not match your username. Nothing has been deleted."),

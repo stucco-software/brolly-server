@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{% block title %}{{ instance_name }}{% endblock %}</title>
+  <title>{% block title %}{{ chrome.instance_name }}{% endblock %}</title>
   <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/brolly.css">
   <link rel="icon" type="image/png" sizes="96x96" href="/static/favicon/favicon-96x96.png">
@@ -12,14 +12,16 @@
 </head>
 <body>
   <a class="skip-link" href="#main">Skip to content</a>
+  {% block header %}
   <header class="shell-header">
     <div class="wrap shell-header-inner">
-      <a class="brand" href="/">{{ instance_name }}</a>
+      <a class="brand" href="/">{{ chrome.instance_name }}</a>
       <nav class="shell-nav" aria-label="Primary">
         {% block nav %}{% endblock %}
       </nav>
     </div>
   </header>
+  {% endblock %}
   <main id="main" class="shell-main">
     {% block content %}{% endblock %}
   </main>

@@ -21,7 +21,7 @@ use axum_extra::extract::cookie::{Cookie, SameSite};
 use brolly_identity::db::{self, DbError, User};
 use serde::Deserialize;
 
-use crate::{AppState, render};
+use crate::{AppState, Chrome, render};
 
 /// Name of the session cookie.
 pub const SESSION_COOKIE: &str = "brolly_session";
@@ -85,7 +85,7 @@ pub struct Alternate {
 #[derive(Template)]
 #[template(path = "auth.html")]
 struct AuthPage<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     heading: &'a str,
     intro: Option<&'a str>,
     error: Option<&'a str>,
@@ -123,13 +123,13 @@ fn login_action(next: Option<&str>) -> String {
 }
 
 fn login_page<'a>(
-    instance_name: &'a str,
+    state: &'a AppState,
     error: Option<&'a str>,
     username: &str,
     action: &'a str,
 ) -> AuthPage<'a> {
     AuthPage {
-        instance_name,
+        chrome: state.chrome(),
         heading: "Log in",
         intro: None,
         error,
@@ -148,13 +148,13 @@ fn login_page<'a>(
 }
 
 fn register_page<'a>(
-    instance_name: &'a str,
+    state: &'a AppState,
     error: Option<&'a str>,
     username: &str,
     invite: &str,
 ) -> AuthPage<'a> {
     AuthPage {
-        instance_name,
+        chrome: state.chrome(),
         heading: "Create an account",
         intro: Some("This server is invite-only. Your data lives in your own pod."),
         error,
@@ -187,7 +187,7 @@ pub struct Next {
 /// `GET /login`
 pub async fn login_form(State(state): State<AppState>, Query(query): Query<Next>) -> Response {
     let action = login_action(query.next.as_deref());
-    render(&login_page(&state.instance_name, None, "", &action))
+    render(&login_page(&state, None, "", &action))
 }
 
 #[derive(Deserialize)]
@@ -222,7 +222,7 @@ pub async fn login_submit(
             // One message for every failure mode, matching db::authenticate —
             // the page must not reveal whether the account exists.
             render(&login_page(
-                &state.instance_name,
+                &state,
                 Some("Incorrect username or password."),
                 &form.username,
                 &action,
@@ -246,7 +246,7 @@ pub struct RegisterForm {
 
 /// `GET /register`
 pub async fn register_form(State(state): State<AppState>) -> Response {
-    render(&register_page(&state.instance_name, None, "", ""))
+    render(&register_page(&state, None, "", ""))
 }
 
 /// `POST /register`
@@ -263,7 +263,7 @@ pub async fn register_submit(
         return (
             StatusCode::BAD_REQUEST,
             render(&register_page(
-                &state.instance_name,
+                &state,
                 Some(message),
                 &form.username,
                 &form.invite,
@@ -275,7 +275,7 @@ pub async fn register_submit(
         return (
             StatusCode::BAD_REQUEST,
             render(&register_page(
-                &state.instance_name,
+                &state,
                 Some("Use at least 12 characters. Length beats punctuation."),
                 &form.username,
                 &form.invite,
@@ -294,7 +294,7 @@ pub async fn register_submit(
             return (
                 StatusCode::BAD_REQUEST,
                 render(&register_page(
-                    &state.instance_name,
+                    &state,
                     Some("That invite is not valid, has expired, or has been used up."),
                     &form.username,
                     "",
@@ -365,7 +365,7 @@ pub async fn register_submit(
         Err(DbError::UsernameTaken) => (
             StatusCode::CONFLICT,
             render(&register_page(
-                &state.instance_name,
+                &state,
                 Some("That username is taken."),
                 &form.username,
                 &form.invite,

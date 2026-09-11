@@ -18,7 +18,7 @@ use axum_extra::extract::CookieJar;
 use brolly_identity::db::{self, DbError, User};
 
 use crate::auth::session_user;
-use crate::{AppState, render};
+use crate::{AppState, Chrome, render};
 
 /// The role an invite or a user carries to reach this console.
 pub const ADMIN: &str = "admin";
@@ -123,7 +123,7 @@ fn tabs(current: &str) -> Vec<Tab> {
 #[derive(Template)]
 #[template(path = "admin/overview.html")]
 struct OverviewPage<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     tabs: Vec<Tab>,
     base_domain: &'a str,
     members: i64,
@@ -152,7 +152,7 @@ pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response
     };
 
     render(&OverviewPage {
-        instance_name: &state.instance_name,
+        chrome: state.chrome(),
         tabs: tabs("/admin"),
         base_domain: &state.base_domain,
         members,
@@ -180,7 +180,7 @@ struct MemberView {
 #[derive(Template)]
 #[template(path = "admin/users.html")]
 struct UsersPage<'a> {
-    instance_name: &'a str,
+    chrome: Chrome<'a>,
     tabs: Vec<Tab>,
     members: Vec<MemberView>,
 }
@@ -210,7 +210,7 @@ pub async fn users(State(state): State<AppState>, jar: CookieJar) -> Response {
         .collect();
 
     render(&UsersPage {
-        instance_name: &state.instance_name,
+        chrome: state.chrome(),
         tabs: tabs("/admin/users"),
         members,
     })

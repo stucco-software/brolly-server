@@ -1,6 +1,6 @@
 {% extends "base.html" %}
 
-{% block title %}Admin — {{ instance_name }}{% endblock %}
+{% block title %}Admin — {{ chrome.instance_name }}{% endblock %}
 
 {% block nav %}{% include "admin/_nav.html" %}{% endblock %}
 
@@ -11,7 +11,7 @@
     {% include "admin/_tabs.html" %}
     <section class="dashboard-panel">
       <p class="lede">
-        <strong>{{ instance_name }}</strong> serves
+        <strong>{{ chrome.instance_name }}</strong> serves
         <span class="mono">{{ base_domain }}</span> and every member subdomain
         under it.
       </p>
