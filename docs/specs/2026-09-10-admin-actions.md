@@ -329,13 +329,16 @@ worse than either behaviour alone.
 | `revoke_all_sessions(pool, user_id)` | `revoke_other_sessions` (`:394`) requires a `keep_token` an admin does not have |
 | `list_invites(pool) -> Vec<InviteRow>` | nothing lists invites today |
 | `revoke_invite_by_hash(pool, code_hash)` | `revoke_invite` (`:301`) takes plaintext the console does not have |
+| `find_row_by_id(pool, id) -> Option<UserRow>` | `find_by_id` (`:147`) returns `User`, which carries no `created_at`, and the detail page shows one |
 
 `find_by_id` (`:147`), `count_sessions` (`:380`), `count_admins` (`:429`),
 `set_role` (`:442`) and `delete_user` (`:480`) all already exist — listed to
 record that they were checked rather than assumed.
 
-`users.status` is `CHECK (status IN ('active','disabled'))`, so `set_status`
-takes a constant, not a bare `&str`: `ACTIVE` and `DISABLED` join `ADMIN` and
+`users.status` is `CHECK (status IN ('active','disabled'))`, and that constraint
+is the only thing enforcing it — a typo reaches the database and returns a 500.
+Constants do not fix that; they only make call sites share one spelling, which
+is worth having and worth not overselling. `ACTIVE` and `DISABLED` join `ADMIN` and
 `MEMBER` at `server/src/admin.rs:24–26`. A typo should not be a 500.
 
 Admin deletion reuses `delete_account`'s order exactly (`account.rs:524` then

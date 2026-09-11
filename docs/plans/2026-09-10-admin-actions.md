@@ -8,7 +8,7 @@
 
 **Goal:** Give the admin console the verbs it has none of — disable, enable, promote, demote, end sessions, delete, and invite management — and close the two disclosure holes that would otherwise make the Disable button a lie.
 
-**Architecture:** Four new `identity/src/db.rs` functions, one generic `ConfirmPage` page template behind every high-consequence action, a member detail page, and an invites list. Before any of it, two `is_active` filters that make disabling mean what the console will claim it means.
+**Architecture:** Five new `identity/src/db.rs` functions, one generic `ConfirmPage` page template behind every high-consequence action, a member detail page, and an invites list. Before any of it, two `is_active` filters that make disabling mean what the console will claim it means.
 
 **Tech Stack:** Rust, axum 0.8.9 (brace route params — `:id` panics), Askama 0.14, sqlx/Postgres, testcontainers.
 
@@ -41,7 +41,7 @@ action.
 |---|---|---|
 | `server/src/xrpc.rs` | `resolve_repo` gates on `is_active` | Modify |
 | `server/src/mastodon_api.rs` | `local_author`, `fetch_note` gate on `is_active` | Modify |
-| `identity/src/db.rs` | 4 new functions; one misplaced doc comment | Modify |
+| `identity/src/db.rs` | 5 new functions; one misplaced doc comment | Modify |
 | `server/src/admin.rs` | detail page, actions, invites — grows substantially | Modify |
 | `server/templates/admin/confirm.html` | the one confirmation page | Create |
 | `server/templates/admin/user_detail.html` | one account | Create |
@@ -270,7 +270,7 @@ than a bug fix. Task 6's confirmation copy names the gap.
 
 ## Chunk 2: The database layer and the detail page
 
-### Task 3: Four new `db` functions
+### Task 3: Five new `db` functions
 
 **Files:**
 - Modify: `identity/src/db.rs`
@@ -392,6 +392,20 @@ pub async fn list_invites(pool: &PgPool) -> Result<Vec<InviteRow>, DbError> {
 /// `revoke_invite` takes plaintext and hashes it. The console only ever has the
 /// hash, which is safe to put in a form action: `hash_secret` is hex SHA-256 of
 /// a high-entropy random value, so it is URL-safe and reverses to nothing.
+/// One account, by id, with the columns the console's list already renders.
+///
+/// `find_by_id` returns `User`, which has no `created_at` — and widening `User`
+/// would touch four explicit-column queries to serve one page. `UserRow` is
+/// already the right shape; this is `list_users` with a `WHERE`.
+pub async fn find_row_by_id(pool: &PgPool, id: Uuid) -> Result<Option<UserRow>, DbError> {
+    Ok(sqlx::query_as::<_, UserRow>(
+        "SELECT id, username, role, status, did_plc, created_at FROM users WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 pub async fn revoke_invite_by_hash(pool: &PgPool, code_hash: &str) -> Result<u64, DbError> {
     let result =
         sqlx::query("UPDATE invites SET revoked_at = now() WHERE code_hash = $1 AND revoked_at IS NULL")
