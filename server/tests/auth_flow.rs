@@ -480,3 +480,20 @@ async fn a_stale_session_cookie_falls_back_to_the_anonymous_front_door() {
     assert!(body.contains(r#"href="/login""#), "got: {body}");
     assert!(!body.contains("Log out"), "got: {body}");
 }
+
+/// The source link is not optional: AGPL-3.0 §13 means an operator running a
+/// modified copy owes their users the source, and a link from a page every user
+/// reaches is the cheapest discharge. Terms and privacy are optional.
+#[tokio::test]
+async fn the_fine_print_is_configuration() {
+    let (_db, _dir, router) = harness().await;
+    let (status, body) = get(&router, "/login").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains(brolly_server::SOURCE_URL_DEFAULT),
+        "the source link always renders"
+    );
+    assert!(!body.contains(">Terms<"), "unset terms renders no link");
+    assert!(!body.contains(">Privacy<"), "unset privacy renders no link");
+}

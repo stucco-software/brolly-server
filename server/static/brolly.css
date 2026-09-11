@@ -204,6 +204,9 @@ a:visited { color: inherit; }
 .shell-footer a { text-decoration: none; border-block-end: 1px solid currentColor; }
 .shell-footer p + p { margin-block-start: var(--sp--1); }
 .footer-fine { color: var(--muted-fg); }
+.fine-print { display: flex; flex-wrap: wrap; gap: var(--sp-0); font-size: var(--txt--1); }
+/* The footer centres its text, and flex ignores text-align. */
+.shell-footer .fine-print { justify-content: center; }
 
 /* --- bands ------------------------------------------------------------- */
 /* Flat, full-bleed fields of colour. brolly.id's whole page rhythm is these

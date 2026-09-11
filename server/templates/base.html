@@ -25,11 +25,13 @@
   <main id="main" class="shell-main">
     {% block content %}{% endblock %}
   </main>
+  {% block footer %}
   <footer class="shell-footer">
     <div class="wrap">
-      <p>Running <a href="https://github.com/">Brolly</a> — a Solid pod, an ATProto PDS, and an ActivityPub server over one triplestore.</p>
+      <p class="fine-print">{% include "_fine_print.html" %}</p>
       <p class="footer-fine">Your data lives in your pod. Take it with you whenever you like.</p>
     </div>
   </footer>
+  {% endblock %}
 </body>
 </html>

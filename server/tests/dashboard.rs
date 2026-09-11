@@ -707,3 +707,18 @@ async fn deleting_an_account_removes_the_user_and_the_pod() {
         "the session must not outlive the account"
     );
 }
+
+/// The footer is the other page every user reaches, so §13 is discharged there
+/// too — and it stops naming the product while it is at it.
+#[tokio::test]
+async fn the_authenticated_footer_carries_the_source_link() {
+    let h = harness().await;
+    let cookie = h.login().await;
+
+    let reply = h.get("/account", Some(&cookie)).await;
+    assert!(reply.body.contains(brolly_server::SOURCE_URL_DEFAULT));
+    assert!(
+        !reply.body.contains("Brolly"),
+        "the footer stops naming the product"
+    );
+}

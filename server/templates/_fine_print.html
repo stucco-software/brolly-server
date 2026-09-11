@@ -1,0 +1,6 @@
+{# Partial: the fine print. Rendered in base.html's footer and, later, in the
+   door's name panel. The source link has no unset state — see Chrome's doc
+   comment in lib.rs. #}
+<a href="{{ chrome.source_url }}">Source</a>
+{% if let Some(url) = chrome.terms_url %}<a href="{{ url }}">Terms</a>{% endif %}
+{% if let Some(url) = chrome.privacy_url %}<a href="{{ url }}">Privacy</a>{% endif %}
