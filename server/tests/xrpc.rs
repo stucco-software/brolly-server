@@ -341,6 +341,55 @@ async fn an_unknown_repo_is_a_typed_xrpc_error() {
     assert!(reply.json()["message"].as_str().is_some());
 }
 
+/// Disabling an account must stop it serving, on every protocol.
+///
+/// Before this, an admin could disable a member for moderation reasons, watch
+/// their pod 404 and their actor stop resolving, and anyone on the internet
+/// could still download their whole repository as a CAR.
+#[tokio::test]
+async fn a_disabled_member_serves_no_repo() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    // Give her a record, so getRecord has something to find and the test
+    // cannot pass merely because the repo is empty.
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "before"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'alice'")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+
+    // All three, because resolve_repo feeds all three — testing two would
+    // leave the fix looking complete while one endpoint still served.
+    for uri in [
+        format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.feed.post&rkey=3kaaaaaaaaaaa"
+        ),
+        format!("/xrpc/com.atproto.repo.describeRepo?repo=alice.{BASE}"),
+        format!("/xrpc/com.atproto.sync.getRepo?did=alice.{BASE}"),
+    ] {
+        let reply = get(&h, &uri).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::NOT_FOUND,
+            "{uri} still served a disabled member: {}",
+            reply.text()
+        );
+    }
+}
+
 // --- authorization -------------------------------------------------------------------
 
 #[tokio::test]

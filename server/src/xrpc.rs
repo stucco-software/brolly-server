@@ -125,6 +125,14 @@ async fn token_caller(state: &AppState, headers: &HeaderMap) -> Option<User> {
 /// Both are accepted because both appear in the wild, but they are not
 /// equivalent: the DID is the identity and the handle is a rented alias for it
 /// (D11), so a handle lookup is a convenience and a DID lookup is the truth.
+///
+/// **Every branch filters `is_active`, and none of them is redundant.** A
+/// disabled account must be unreachable by *any* spelling of its address, and
+/// the four branches are four separate lookups — dropping the filter from one
+/// leaves a way in. This is the whole of moderation on the ATProto read path:
+/// `getRecord`, `describeRepo` and `sync.getRepo` are unauthenticated, so
+/// nothing downstream of here would catch it. The two write callers filter
+/// their *caller* rather than their target, which is a different question.
 async fn resolve_repo(state: &AppState, repo: &str) -> Option<User> {
     // **DID forms first.** A handle check runs `strip_suffix(".<base>")`, and
     // `did:web:alice.brolly.test` ends in the base domain too — so ordering the
@@ -138,7 +146,11 @@ async fn resolve_repo(state: &AppState, repo: &str) -> Option<User> {
             .ok()
             .flatten();
         return match row {
-            Some((id,)) => db::find_by_id(&state.pool, id).await.ok().flatten(),
+            Some((id,)) => db::find_by_id(&state.pool, id)
+                .await
+                .ok()
+                .flatten()
+                .filter(User::is_active),
             None => None,
         };
     }
@@ -150,7 +162,8 @@ async fn resolve_repo(state: &AppState, repo: &str) -> Option<User> {
             Some(username) => db::find_by_username(&state.pool, &username)
                 .await
                 .ok()
-                .flatten(),
+                .flatten()
+                .filter(User::is_active),
             None => None,
         };
     }
@@ -160,11 +173,16 @@ async fn resolve_repo(state: &AppState, repo: &str) -> Option<User> {
         return db::find_by_username(&state.pool, handle)
             .await
             .ok()
-            .flatten();
+            .flatten()
+            .filter(User::is_active);
     }
 
     // A bare username, which clients send more often than the spec suggests.
-    db::find_by_username(&state.pool, repo).await.ok().flatten()
+    db::find_by_username(&state.pool, repo)
+        .await
+        .ok()
+        .flatten()
+        .filter(User::is_active)
 }
 
 /// A member's repo, its blocks, and its signing key.
