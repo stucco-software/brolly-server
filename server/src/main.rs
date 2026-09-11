@@ -67,6 +67,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .ok()
             .filter(|d| !d.trim().is_empty())
             .unwrap_or_else(|| "A private community server.".to_string()),
+        source_url: std::env::var("BROLLY_SOURCE_URL")
+            .unwrap_or_else(|_| brolly_server::SOURCE_URL_DEFAULT.to_string()),
+        terms_url: std::env::var("BROLLY_TERMS_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
+        privacy_url: std::env::var("BROLLY_PRIVACY_URL")
+            .ok()
+            .filter(|s| !s.is_empty()),
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),
         instance_actor: std::sync::Arc::new(instance_actor),

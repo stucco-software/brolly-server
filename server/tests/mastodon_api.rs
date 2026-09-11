@@ -34,6 +34,9 @@ async fn harness() -> Harness {
             base_domain: BASE.into(),
             instance_name: BASE.to_string(),
             instance_description: "A private community server.".to_string(),
+            source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
+            terms_url: None,
+            privacy_url: None,
             stores: std::sync::Arc::new(
                 brolly_store::StoreManager::open(dir.path(), 4, 60).unwrap(),
             ),

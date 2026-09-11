@@ -242,6 +242,11 @@ Nothing about the instance is baked into the build. `BROLLY_INSTANCE_NAME` and
 the name falls back to `BROLLY_BASE_DOMAIN`, which is never wrong. The full list
 is in [deploying.md](deploying.md).
 
+`BROLLY_SOURCE_URL`, `BROLLY_TERMS_URL` and `BROLLY_PRIVACY_URL` are the
+footer's fine print. The first has a compiled-in default because AGPL-3.0 §13
+means an instance owes its users the source; the other two simply do not render
+when unset.
+
 To see the first-run path without touching your existing data, point the server
 at a database of its own:
 

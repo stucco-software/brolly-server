@@ -47,6 +47,9 @@ pub struct AppState {
     /// Configurable for the same reason as the name: every deployment is
     /// somebody else's community.
     pub instance_description: String,
+    pub source_url: String,
+    pub terms_url: Option<String>,
+    pub privacy_url: Option<String>,
     pub stores: std::sync::Arc<brolly_store::StoreManager>,
     /// The Solid-OIDC provider's signing key, loaded once at startup.
     ///
@@ -76,6 +79,43 @@ pub struct AppState {
     /// published yet is very different from a member who was never given an
     /// identity at all (ADR 0016).
     pub plc_client: Option<reqwest::Client>,
+}
+
+/// The upstream repository, and the default value of `BROLLY_SOURCE_URL`.
+///
+/// AGPL-3.0 §13 (ADR 0003) obliges an operator running a modified copy to offer
+/// their users the source. This is that offer, so it has no unset state — an
+/// operator running a fork points the variable at theirs.
+///
+/// The default is **provisional**: `www.brolly.id` is the flagship instance's
+/// front page, not a source repository, so it does not yet discharge §13.
+/// Point this at the repository once there is a public one.
+pub const SOURCE_URL_DEFAULT: &str = "https://www.brolly.id";
+
+/// What every page's chrome renders, regardless of which page it is.
+///
+/// One field on every page struct rather than five, because `base.html`'s
+/// footer renders the fine print and Askama type-checks an `{% include %}`
+/// against the *including* struct. The upside of the indirection is that a new
+/// page cannot compile without it.
+pub struct Chrome<'a> {
+    pub instance_name: &'a str,
+    pub instance_description: &'a str,
+    pub source_url: &'a str,
+    pub terms_url: Option<&'a str>,
+    pub privacy_url: Option<&'a str>,
+}
+
+impl AppState {
+    pub fn chrome(&self) -> Chrome<'_> {
+        Chrome {
+            instance_name: &self.instance_name,
+            instance_description: &self.instance_description,
+            source_url: &self.source_url,
+            terms_url: self.terms_url.as_deref(),
+            privacy_url: self.privacy_url.as_deref(),
+        }
+    }
 }
 
 /// Build the application router.

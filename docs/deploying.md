@@ -55,6 +55,9 @@ repository heads, the PLC log.
 | `BROLLY_BASE_DOMAIN` | **yes** | `brolly.test` | The apex. Baked into every WebID, DID document, actor IRI, OAuth issuer and DPoP `htu`. |
 | `BROLLY_INSTANCE_NAME` | no | the base domain | What the instance calls itself in titles and headings. |
 | `BROLLY_INSTANCE_DESCRIPTION` | no | `A private community server.` | One line, shown by Mastodon clients. |
+| `BROLLY_SOURCE_URL` | no | the upstream repository | Where this instance's source can be obtained. AGPL-3.0 §13 — point it at your fork if you run one. |
+| `BROLLY_TERMS_URL` | no | — | Linked in the footer and on the door. Omitted entirely when unset. |
+| `BROLLY_PRIVACY_URL` | no | — | Same. |
 | `BROLLY_DATA_DIR` | no | `/var/lib/brolly` in the image | Must be the volume mount. |
 | `BROLLY_PORT` | no | `3000` | |
 | `BROLLY_STATIC_DIR` | no | `/srv/static` in the image | |

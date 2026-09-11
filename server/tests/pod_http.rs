@@ -81,6 +81,9 @@ async fn harness() -> Harness {
             base_domain: "brolly.test".into(),
             instance_name: "brolly.test".to_string(),
             instance_description: "A private community server.".to_string(),
+            source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
+            terms_url: None,
+            privacy_url: None,
             stores,
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)
