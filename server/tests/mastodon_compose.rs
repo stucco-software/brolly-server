@@ -398,6 +398,62 @@ async fn a_public_post_reaches_the_server_index() {
     assert_eq!(indexed, 1, "the public timeline index was not populated");
 }
 
+/// The same class of hole as resolve_repo, on a different code path, so it
+/// needs its own assertion rather than being assumed from the ATProto fix.
+#[tokio::test]
+async fn a_disabled_member_is_off_the_public_timeline() {
+    let h = harness().await;
+    let (_, token) = a_member(&h, "alice").await;
+
+    let created = post_form(
+        &h,
+        "/api/v1/statuses",
+        "status=hello%20world&visibility=public",
+        &token,
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "setup: {}", created.body);
+
+    // Confirm it IS on the timeline first — without this the test passes for
+    // any reason the timeline happens to be empty.
+    let before = send(
+        &h,
+        Request::builder()
+            .uri("/api/v1/timelines/public")
+            .header(header::HOST, BASE)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(before.status, StatusCode::OK, "setup: {}", before.body);
+    assert!(
+        before.body.contains("hello world"),
+        "setup: {}",
+        before.body
+    );
+
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'alice'")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+
+    let after = send(
+        &h,
+        Request::builder()
+            .uri("/api/v1/timelines/public")
+            .header(header::HOST, BASE)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(after.status, StatusCode::OK);
+    assert!(
+        !after.body.contains("hello world"),
+        "a disabled member's notes are still on the public timeline: {}",
+        after.body
+    );
+}
+
 #[tokio::test]
 async fn a_posted_status_is_fetchable_by_its_id() {
     let h = harness().await;

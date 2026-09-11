@@ -114,7 +114,14 @@ async fn local_author(state: &AppState, actor: &str) -> Option<translate::Author
         .strip_suffix("/actor")
         .map(|base| format!("{base}/profile#me"))
         .and_then(|webid| webid::local_username(&webid, &state.base_domain))?;
-    let user = db::find_by_username(&state.pool, &username).await.ok()??;
+    // The public timeline is unauthenticated, and this is where each note's
+    // author is resolved for it — a disabled account's posts must vanish
+    // here, since nothing upstream of this filters by status.
+    let user = db::find_by_username(&state.pool, &username)
+        .await
+        .ok()
+        .flatten()
+        .filter(User::is_active)?;
     Some(author_for(state, &user).await)
 }
 
@@ -370,7 +377,14 @@ async fn fetch_note(state: &AppState, iri: &str) -> Option<Value> {
         .strip_prefix("https://")
         .and_then(|rest| rest.split_once('.'))
         .map(|(user, _)| user.to_string())?;
-    let user = db::find_by_username(&state.pool, &username).await.ok()??;
+    // Same reasoning as local_author: `public_note_iris` is a store-index
+    // query with no notion of account status, so a disabled member's note
+    // must be dropped here, at the point it is fetched by owner.
+    let user = db::find_by_username(&state.pool, &username)
+        .await
+        .ok()
+        .flatten()
+        .filter(User::is_active)?;
     let pod = state.stores.pod(user.id).ok()?;
     brolly_store::collection::read_record(&pod, iri)
 }
