@@ -24,8 +24,14 @@ page struct's `instance_name` field with `chrome: Chrome<'a>` and rewrites every
 has landed.
 
 It also assumes the door's **Task 3**, which puts `{% block header %}` /
-`{% block footer %}` into `base.html` — Task 6 below adds a `<script>` tag to
-`<head>`, which sits outside both blocks, so the two edits do not collide.
+`{% block footer %}` into `base.html` — Task 5 below adds a `<script>` tag to
+`<head>` (lines 3-12), which sits outside both blocks, so the two edits do not
+collide semantically.
+
+**They do collide on line numbers.** The door plan is unusually
+line-number-dependent, citing `base.html:15-22` for the header and `:26-31` for
+the footer. Task 5's `<script>` insertion at ~`:9` shifts both by one. Run the
+door plan first, or re-derive those ranges from the file rather than the plan.
 
 If the door has not landed, every template snippet below that says
 `{{ chrome.instance_name }}` should say `{{ instance_name }}`, and nothing else
@@ -33,7 +39,7 @@ changes.
 
 ## Ordering
 
-All five tasks are independently deployable. Task 2 (cards) before Task 3
+All six tasks are independently deployable. Task 2 (cards) before Task 3
 (chips) only because the chips land inside a card that Task 2 builds.
 
 ## File Structure
@@ -100,6 +106,19 @@ async fn revoking_an_app_says_so() {
     assert!(reply.body.contains("role=\"status\""));
 }
 
+/// Polite for confirmations, assertive for errors. The spec asks for both and
+/// only the first had a test; this one holds by inspection of delete.html:14
+/// otherwise.
+#[tokio::test]
+async fn an_error_is_assertive_not_polite() {
+    let h = harness().await;
+    let cookie = h.login().await;
+
+    let reply = h.post("/account/delete", "confirm=wrong", Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.body.contains("role=\"alert\""));
+}
+
 /// ...and the notice is not permanent furniture.
 #[tokio::test]
 async fn the_apps_page_is_quiet_without_the_parameter() {
@@ -121,20 +140,25 @@ Expected: FAIL — `Location` is `/account/apps`, without the parameter.
 `Saved` already exists at `account.rs:157` and is used by `profile_form` — reuse
 it rather than inventing a second query type.
 
+**`Query` is not imported in `account.rs`** — the imports at `:10-17` stop at
+`axum::extract::State`. Both existing consumers write it fully qualified
+(`:166`, `:272`), so match them rather than adding an import that would leave
+those two inconsistent:
+
 ```rust
 /// `GET /account/apps`
 pub async fn apps(
     State(state): State<AppState>,
     jar: CookieJar,
-    Query(query): Query<Saved>,
+    axum::extract::Query(query): axum::extract::Query<Saved>,
 ) -> Response {
 ```
 
 Add `saved: bool` to the `Apps` struct and pass `saved: query.saved` where it is
-constructed. Change `:408` to `Redirect::to("/account/apps?saved=true")`.
+constructed. `Saved.saved` is private to `account.rs` and `apps` is in
+`account.rs`, so it is directly accessible — no accessor needed.
 
-`Saved`'s field is private to the module, so if the compiler objects, mirror
-exactly what `profile_form` (`:163`) already does with it.
+Change `:408` to `Redirect::to("/account/apps?saved=true")`.
 
 - [ ] **Step 4: Render the notice**
 
@@ -178,8 +202,15 @@ takes over the measure cap (`max-width: var(--measure)`, `brolly.css:428`) and
 solely to defeat that cap for the admin member table.
 
 **Files:**
-- Modify: `server/static/brolly.css:428-433`
+- Modify: `server/static/brolly.css:428` and `:433` — **not** the whole range
 - Modify: all 5 `server/templates/account/*.html` pages and both `admin/` pages
+
+⚠️ **Do not delete `:428-433` wholesale.** Line `:432` is `.dashboard-wide`,
+which is a *different* class from `.dashboard-panel-wide` and is still live —
+`admin/users.html:9` is `<div class="dashboard dashboard-wide">`, defeating
+`.dashboard`'s own `max-width: var(--grid-max-width)` (`:395`). Replace `:428`
+and `:433`; keep `:432`; reword the comment at `:430-431`, which currently
+documents both.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -240,10 +271,27 @@ In `server/static/brolly.css`, replacing `.dashboard-panel` (`:428`) and
 /* A table is not prose and does not want the reading measure. */
 .dashboard-card-wide { max-width: none; }
 
+```
+
+Then **edit the existing `.facts dd` in place at `:474`** — do not add a second
+rule. It currently reads
+`.facts dd { margin: 0 0 var(--sp--1) 0; overflow-wrap: anywhere; }`, and
+`.facts` itself already sets `gap: var(--sp--2)` (`:465`). A second rule at the
+same specificity would apply *as well*, leaving every row with its margin plus
+the grid gap — each value floating detached from its label. Zero the margin as
+part of the change:
+
+```css
 /* solidid rules each row rather than spacing them; it is what makes a long
-   fact list scannable, and it is one property. */
-.facts dd { border-block-end: var(--hairline) solid var(--border-subtle); padding-block-end: var(--sp--2); }
-.facts dd:last-child { border-block-end: 0; }
+   fact list scannable, and it is one property. The margin goes with it: the
+   rule is the separator now, and `.facts` already contributes a grid gap. */
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  padding-block-end: var(--sp--2);
+  border-block-end: var(--hairline) solid var(--border-subtle);
+}
+.facts dd:last-of-type { border-block-end: 0; }
 ```
 
 - [ ] **Step 4: Convert the seven pages**
@@ -252,15 +300,28 @@ Card headings are `<h2>`. solidid's card `<header>` holds an `<h1>`, which is
 fine in a Svelte component and wrong here — the page's own `<h1>` already exists
 and `every_template_has_one_h1_and_a_main_landmark` counts textually.
 
-| Page | Cards |
-|---|---|
-| `account/overview.html` | one — the facts |
-| `account/profile.html` | one — the form |
-| `account/security.html` | **two** — Password, Sessions |
-| `account/apps.html` | one, holding the list |
-| `account/delete.html` | one |
-| `admin/overview.html` | one |
-| `admin/users.html` | one `.dashboard-card-wide`, holding the table |
+**A card whose heading would only repeat the page's `<h1>` omits its `<header>`
+entirely.** The `<header>` exists to say which of several concerns this card is;
+on a single-concern page there is nothing to disambiguate, and repeating
+"Profile" under `<h1>Profile</h1>` is noise. The Step 3 CSS uses the child
+selector `.dashboard-card > header`, so a card with no header renders correctly
+with no extra rule.
+
+Every heading, named so nobody has to guess:
+
+| Page | Cards | Heading |
+|---|---|---|
+| `account/overview.html` | one — the facts | *no header* — the page `<h1>` is "Account" |
+| `account/profile.html` | one — the form | *no header* |
+| `account/security.html` | **two** | `<h2>Password</h2>`, `<h2>Sessions</h2>` |
+| `account/apps.html` | one, holding the list | *no header* |
+| `account/delete.html` | one | *no header* |
+| `admin/overview.html` | one | *no header* |
+| `admin/users.html` | one `.dashboard-card-wide` | *no header* |
+
+So only `security.html` grows headers in this pass — which is the page the whole
+card idea exists for. The rest gain a border and lose a class name, and that is
+the honest extent of it.
 
 The shape, using `account/apps.html` as the worked example:
 
@@ -324,14 +385,39 @@ In `server/tests/admin.rs`, following that file's existing harness:
 /// <mark> exists to distinguish itself from.
 #[tokio::test]
 async fn the_member_list_marks_only_the_exceptional() {
-    // Sign in as an admin and add a disabled member — follow the harness at
-    // server/tests/admin.rs:16 and the `register` helper at :72.
-    let (_, body) = get_as(&router, "/admin/users", Some(&admin_cookie)).await;
+    let (db, _dir, router) = harness().await;
+
+    // An admin to do the looking — registered through an admin invite, as
+    // `an_admin_sees_the_console` (:152) does.
+    let invite = db::create_invite(&db.pool, None, 1, None, Some("admin"))
+        .await
+        .unwrap();
+    let cookie = register(&router, "keeper", &invite).await;
+
+    // An ordinary member, then disabled — the raw UPDATE is how
+    // `counting_admins_ignores_disabled_ones` (:278) does it, and there is no
+    // set_status yet at this point in the sequence.
+    let invite = db::create_invite(&db.pool, None, 1, None, None).await.unwrap();
+    let _ = register(&router, "alice", &invite).await;
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'alice'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = get_as(&router, "/admin/users", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
 
     assert!(body.contains("chip-disabled"), "a disabled account is marked");
-    assert!(!body.contains("chip-active"), "an active one is not");
     assert!(body.contains("chip-admin"), "an admin is marked");
-    assert!(!body.contains("chip-member"), "an ordinary member is not");
+    // Exactly two marks on the page: keeper's role and alice's status. Counting
+    // binds this in a way `!contains("chip-active")` cannot — no such class is
+    // ever defined, so that assertion would pass even if every cell were
+    // wrapped in a bare `.chip`.
+    assert_eq!(
+        body.matches("<mark").count(),
+        2,
+        "only the exceptional values are marked; got: {body}"
+    );
 }
 ```
 
@@ -406,19 +492,31 @@ async fn the_empty_apps_state_names_the_next_step() {
 
     let reply = h.get("/account/apps", Some(&cookie)).await;
     assert!(
-        reply.body.contains("Solid"),
+        reply.body.contains("Nothing has asked for access yet"),
         "it should say what an authorised application is and where grants come from"
     );
     assert!(!reply.body.contains("You have not authorised any applications yet."));
 }
 ```
 
-Note this deliberately asserts the word "Solid" appears — the door's guard
-(`the_unauthenticated_surface_sells_nothing`) is scoped to `auth.html`,
-`base.html` and `_fine_print.html`, and the authenticated surface keeps saying
-"point a Solid app here" because that is instruction, not advertisement.
+**Do not assert on the bare word "Solid".** It is already in the body of every
+page — `base.html:28` renders "a Solid pod, an ATProto PDS, and an ActivityPub
+server over one triplestore" into the footer — so that assertion would pass
+vacuously today and then silently change meaning once the door's Task 3 rewrites
+that footer. Assert on a distinctive phrase from the new copy.
 
-- [ ] **Step 2: Rewrite the empty state**
+(The new copy *does* name Solid, and that is fine: the door's guard,
+`the_unauthenticated_surface_sells_nothing`, is scoped to `auth.html`,
+`base.html` and `_fine_print.html`. The authenticated surface keeps saying
+"point a Solid app here" because that is instruction, not advertisement.)
+
+- [ ] **Step 2: Run and watch fail**
+
+Run: `cargo test -p brolly-server --test dashboard the_empty_apps_state`
+Expected: FAIL on the first assertion — the current copy is
+"You have not authorised any applications yet."
+
+- [ ] **Step 3: Rewrite the empty state**
 
 Replacing `apps.html`'s current `<p class="hint">`:
 
@@ -430,9 +528,10 @@ Replacing `apps.html`'s current `<p class="hint">`:
 </p>
 ```
 
-- [ ] **Step 3: Verify and commit**
+- [ ] **Step 4: Verify and commit**
 
 Run: `cargo test -p brolly-server --test dashboard the_empty_apps_state`
+Expected: PASS.
 
 ```bash
 git add server/templates/account/apps.html server/tests/dashboard.rs
@@ -468,16 +567,22 @@ without JavaScript is never offered a control that does nothing.
 document.querySelectorAll("[data-copy]").forEach((el) => {
   const button = document.createElement("button");
   button.type = "button";
-  button.className = "button button-compact";
+  button.className = "button";
   button.textContent = "Copy";
+  // Two copy buttons sit on /account. Without this both announce as "Copy"
+  // and a screen-reader user cannot tell which value they are taking.
+  const label = el.closest("dd")?.previousElementSibling?.textContent?.trim();
+  if (label) button.setAttribute("aria-label", `Copy ${label}`);
   button.addEventListener("click", async () => {
     try {
       await navigator.clipboard.writeText(el.dataset.copy);
       button.textContent = "Copied";
       setTimeout(() => (button.textContent = "Copy"), 2000);
     } catch {
-      // Clipboard access can be refused outright. Say so rather than
-      // pretending it worked.
+      // Covers both refusal and `navigator.clipboard` being undefined on an
+      // insecure origin — the property access throws inside the try, so this
+      // is deliberate, not an oversight. Say so rather than pretending it
+      // worked.
       button.textContent = "Press ⌘C";
     }
   });
@@ -485,9 +590,13 @@ document.querySelectorAll("[data-copy]").forEach((el) => {
 });
 ```
 
-**Note:** this uses `.button-compact`, which the door plan's Task 9 deletes as
-dead CSS. Either land this first, or re-add the rule here. Check
-`brolly.css:277` before assuming it exists.
+**Deliberately plain `.button`, not `.button-compact`.** The door plan's Task 9
+deletes `.button-compact` (`brolly.css:277`) on the stated grounds that
+`landing.html:8` was its only consumer. Using it here would make that
+justification quietly false *and* invisible to the obvious check — a
+`grep button-compact server/templates/` comes back empty either way, because the
+new consumer would be a `.js` file nobody greps. If the copy button ever needs
+its own size, give it its own class.
 
 - [ ] **Step 2: Load it**
 
@@ -632,4 +741,5 @@ cargo deny check
 ```
 
 All five pass; `/account/apps` says "Access withdrawn." after a revoke; and
-`grep -r "dashboard-panel" server/` returns nothing.
+`grep -r "dashboard-panel" server/templates server/static` returns nothing.
+(Not `server/` — the invariant test added in Task 2 names the class itself.)
