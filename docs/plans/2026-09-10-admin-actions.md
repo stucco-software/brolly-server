@@ -47,13 +47,20 @@ action.
 | `server/templates/admin/user_detail.html` | one account | Create |
 | `server/templates/admin/invites.html` | list + mint | Create |
 | `server/tests/admin.rs` | the guards and the actions | Modify |
-| `server/tests/xrpc.rs`, `mastodon_api.rs` | the two holes | Modify |
+| `server/tests/xrpc.rs`, `mastodon_compose.rs` | the two holes | Modify |
 | `server/tests/admin_cli.rs` | new: spawns the binary | Create |
 
 **On `server/src/admin.rs` growing:** it is 217 lines today and this roughly
 triples it. If it passes ~600 lines, split it the way mycomyco does —
 `admin/mod.rs` (router, guard, tabs), `admin/users.rs`, `admin/invites.rs` —
 rather than letting one file hold the guard, six actions and two lists.
+
+**Every new template must carry `class="wrap"`.**
+`every_page_template_uses_the_page_container` (`server/tests/ui_invariants.rs:224`)
+asserts it on every non-`_`-prefixed template, so `confirm.html`,
+`user_detail.html` and `invites.html` each fail `cargo test --workspace` without
+it. They must also have exactly one `<h1>` (`:183`). Both are easy to forget on
+a new file and neither failure is obvious from the page itself.
 
 ---
 
@@ -77,6 +84,9 @@ CAR.
 Nothing in `server/tests/xrpc.rs` currently sets `status = 'disabled'`, so this
 is new ground in that file.
 
+This file's helper is `get(h: &Harness, uri) -> Reply` (`xrpc.rs:109`) — there
+is no bare `router` or `db` binding, and the pool is `h.db.pool`.
+
 ```rust
 /// Disabling an account must stop it serving, on every protocol.
 ///
@@ -85,22 +95,28 @@ is new ground in that file.
 /// could still download their whole repository as a CAR.
 #[tokio::test]
 async fn a_disabled_member_serves_no_repo() {
-    // Follow this file's existing harness; create alice, provision her repo,
-    // then:
+    let h = harness().await;
+    // ...create alice and provision her repo, following this file's existing
+    // setup for a repo-reading test.
+
     sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'alice'")
-        .execute(&db.pool)
+        .execute(&h.db.pool)
         .await
         .unwrap();
 
-    for path in [
+    // All three, because resolve_repo feeds all three — testing two would
+    // leave the fix looking complete while one endpoint still served.
+    for uri in [
+        "/xrpc/com.atproto.repo.getRecord?repo=alice.brolly.test\
+         &collection=app.bsky.feed.post&rkey=self",
         "/xrpc/com.atproto.repo.describeRepo?repo=alice.brolly.test",
         "/xrpc/com.atproto.sync.getRepo?did=alice.brolly.test",
     ] {
-        let (status, _) = get(&router, path).await;
+        let reply = get(&h, uri).await;
         assert_eq!(
-            status,
+            reply.status,
             StatusCode::NOT_FOUND,
-            "{path} still served a disabled member"
+            "{uri} still served a disabled member"
         );
     }
 }
@@ -173,30 +189,43 @@ checks `wrong_host` and nothing else — and resolves note authors through
 
 **Files:**
 - Modify: `server/src/mastodon_api.rs:117`, `:373`
-- Test: `server/tests/mastodon_api.rs`
+- Test: `server/tests/mastodon_compose.rs` — **not** `mastodon_api.rs`
 
-- [ ] **Step 1: Write the failing test**
+- [ ] **Step 1: Write the failing test, in the right file**
+
+The test needs a member who has actually posted, and `server/tests/mastodon_api.rs`
+cannot do that: its `request()` helper (`:78`) only sends empty bodies, and its
+one public-timeline test (`:392`) just asserts an empty array.
+
+The machinery lives in `server/tests/mastodon_compose.rs` — `post_form` (`:89`),
+`a_member` (`:105`), and `a_public_post_reaches_the_server_index` (`:383`),
+which is almost exactly this test's setup. Put it there.
 
 ```rust
 /// The same class of hole as resolve_repo, on a different code path, so it
 /// needs its own assertion rather than being assumed from the ATProto fix.
 #[tokio::test]
 async fn a_disabled_member_is_off_the_public_timeline() {
-    // Follow this file's harness: create alice, have her post a public note,
-    // confirm it appears, then:
+    // Follow `a_public_post_reaches_the_server_index` (:383) to get a member
+    // with a public note, and confirm it appears on the timeline first —
+    // otherwise this passes for the wrong reason.
+
     sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'alice'")
-        .execute(&db.pool)
+        .execute(&h.db.pool)
         .await
         .unwrap();
 
-    let (status, body) = get(&router, "/api/v1/timelines/public").await;
-    assert_eq!(status, StatusCode::OK);
+    let reply = get(&h, "/api/v1/timelines/public", None).await;
+    assert_eq!(reply.status, StatusCode::OK);
     assert!(
-        !body.contains("alice"),
+        !reply.body.contains("alice"),
         "a disabled member's notes are still on the public timeline"
     );
 }
 ```
+
+Asserting the note is present *before* disabling is not ceremony: without it,
+an empty timeline for any reason makes this pass.
 
 - [ ] **Step 2: Run and watch fail**
 
@@ -254,7 +283,11 @@ In `identity/tests/persistence.rs`, following that file's existing shape:
 ```rust
 #[tokio::test]
 async fn status_round_trips() {
-    // create a user, set_status(DISABLED), assert !is_active, set back
+    // create a user, set_status(.., "disabled"), assert !is_active, set back.
+    //
+    // The literal, not `admin::DISABLED`: those constants live in
+    // `server/src/admin.rs`, and `brolly-identity` cannot depend on
+    // `brolly-server` — the dependency runs the other way.
 }
 
 #[tokio::test]
@@ -279,9 +312,12 @@ async fn revoking_by_hash_stops_redemption() {
 In `server/src/admin.rs`, beside `ADMIN` and `MEMBER` (`:24-26`):
 
 ```rust
-/// The two values `users.status` permits. A `CHECK` constraint enforces them,
-/// so a typo reaching the database is a 500 rather than a compile error —
-/// which is why `set_status` takes these rather than a bare `&str`.
+/// The two values `users.status` permits.
+///
+/// A `CHECK` constraint is what actually enforces them, so a typo reaching the
+/// database is a 500 rather than a compile error. These constants do not
+/// prevent that — they only mean call sites share one spelling. A newtype would
+/// enforce it, and is not worth it for two values behind one setter.
 pub const ACTIVE: &str = "active";
 pub const DISABLED: &str = "disabled";
 ```
@@ -356,12 +392,16 @@ pub async fn list_invites(pool: &PgPool) -> Result<Vec<InviteRow>, DbError> {
 /// `revoke_invite` takes plaintext and hashes it. The console only ever has the
 /// hash, which is safe to put in a form action: `hash_secret` is hex SHA-256 of
 /// a high-entropy random value, so it is URL-safe and reverses to nothing.
-pub async fn revoke_invite_by_hash(pool: &PgPool, code_hash: &str) -> Result<(), DbError> {
-    sqlx::query("UPDATE invites SET revoked_at = now() WHERE code_hash = $1 AND revoked_at IS NULL")
-        .bind(code_hash)
-        .execute(pool)
-        .await?;
-    Ok(())
+pub async fn revoke_invite_by_hash(pool: &PgPool, code_hash: &str) -> Result<u64, DbError> {
+    let result =
+        sqlx::query("UPDATE invites SET revoked_at = now() WHERE code_hash = $1 AND revoked_at IS NULL")
+            .bind(code_hash)
+            .execute(pool)
+            .await?;
+    // Returns the row count, as `revoke_all_sessions` does: without it the
+    // console cannot tell a bogus hash from a successful revoke, and would
+    // report "revoked" either way.
+    Ok(result.rows_affected())
 }
 ```
 
@@ -473,9 +513,23 @@ pub async fn detail(
 }
 ```
 
-`find_by_id` returns `User`, which has no `created_at` — either widen the query
-or render creation date only in the list. Decide when the compiler says so; do
-not add a store lookup for it.
+**`find_by_id` cannot feed this page, and the fix is a fifth db function.**
+`find_by_id` returns `User` (`identity/src/db.rs:48-56`), which has no
+`created_at`; `MemberView` needs `created: String` (`admin.rs:177`). Three ways
+out, and the third is the one to take:
+
+- *Add `created_at` to `User`* — it is a `sqlx::FromRow` struct built by four
+  explicit-column queries (`db.rs:113`, `:132`, `:148`, `:223`), so this is a
+  four-site change to serve one page. No.
+- *Drop "created" from the detail page* — silently loses a field the spec's
+  Facts list names. No.
+- **Add `find_row_by_id(pool, id) -> Option<UserRow>`**, mirroring `list_users`
+  (`db.rs:471`) with a `WHERE id = $1`. `UserRow` already carries exactly the
+  five columns this page renders, and `MemberView` is already built from one.
+  One function, no ripple.
+
+Also note `server/src/admin.rs` imports only `axum::extract::State` (`:14`):
+`Path` and, for the POST handlers in Tasks 5–8, `Form` both need adding.
 
 - [ ] **Step 4: Write the template**
 
@@ -533,15 +587,62 @@ where one will do.
 - Modify: `server/src/admin.rs`, `server/src/lib.rs`
 - Test: `server/tests/admin.rs`
 
-- [ ] **Step 1: Write the failing tests**
+- [ ] **Step 1: Give the test harness a `post_as`**
+
+**Every POST test below depends on this and it does not exist.**
+`server/tests/admin.rs` has `get_as(router, path, Option<&str>)` (`:90`) but
+`post(router, path, body)` (`:45`) takes **no cookie**. An anonymous POST to an
+admin route gets `require_admin`'s 303 to `/login`, not the 400 or 404 these
+tests assert — so without this step every one of them fails for the wrong
+reason.
+
+Add a cookie parameter to `post`, mirroring `get_as`:
+
+```rust
+async fn post_as(
+    router: &axum::Router,
+    path: &str,
+    body: &str,
+    cookie: Option<&str>,
+) -> (StatusCode, String, Vec<String>) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+    if let Some(cookie) = cookie {
+        request = request.header(header::COOKIE, cookie);
+    }
+    // ...body and response handling identical to `post` at :45.
+}
+```
+
+Keep `post` as a thin wrapper passing `None`, so the existing callers at `:73`
+and elsewhere do not move.
+
+Run: `cargo test -p brolly-server --test admin`
+Expected: PASS, unchanged — this step adds capability and changes no behaviour.
+
+- [ ] **Step 2: Write the failing tests**
 
 ```rust
 /// Disabling is not "cannot log in" on this server. It is "every URL under
 /// alice.example.org returns 404, on every protocol, immediately."
 #[tokio::test]
 async fn disabling_a_member_takes_their_pod_offline() {
-    // confirm the pod serves, disable via POST with the typed confirmation,
-    // then assert the pod 404s.
+    // confirm the pod serves, disable via post_as with the typed confirmation,
+    // then assert BOTH:
+    //   - the pod 404s (pod.rs:52)
+    //   - the actor stops resolving (activitypub.rs:58 gates member_actor and
+    //     webfinger) — the spec asks for both, and an admin will check both
+    //     by hand.
+}
+
+/// Otherwise disable is a one-way door dressed as a toggle. The spec calls
+/// this out by name and it is the easiest assertion to skip.
+#[tokio::test]
+async fn enabling_restores_everything_disabling_took() {
+    // disable, confirm the pod 404s and the actor is gone, then POST enable
+    // and confirm both come back and alice can log in again.
 }
 
 /// Disable needs no revocation step: auth.rs:410 filters session_user on
@@ -567,7 +668,7 @@ async fn a_mistyped_confirmation_changes_nothing() {
 adopted. There is no `render_with_status` helper in this workspace — use the
 tuple form as `account.rs:512` does.
 
-- [ ] **Step 2: Write the confirmation page**
+- [ ] **Step 3: Write the confirmation page**
 
 ```rust
 #[derive(Template)]
@@ -591,7 +692,7 @@ struct ConfirmPage<'a> {
 `admin/confirm.html` has one `<h1>` (the action label) and a form posting to
 `form_action` with a `confirm` field, mirroring `account/delete.html`.
 
-- [ ] **Step 3: Write the disable confirmation copy**
+- [ ] **Step 4: Write the disable confirmation copy**
 
 This is the spec's main obligation. It must say what disabling does, and it must
 name the gap Chunk 1 did not close:
@@ -607,7 +708,7 @@ name the gap Chunk 1 did not close:
 >
 > This is reversible — you can enable the account again from the same page.
 
-- [ ] **Step 4: Implement the handlers**
+- [ ] **Step 5: Implement the handlers**
 
 `GET /admin/users/{id}/disable` renders `ConfirmPage`. `POST` checks, in this
 order: `require_admin`, member exists, **not self**, **not the last active
@@ -617,14 +718,14 @@ and redirect to the detail page.
 `POST /admin/users/{id}/enable` is a direct POST with no confirmation — it
 restores a previous state and is undone by the button next to it.
 
-- [ ] **Step 5: Route them**
+- [ ] **Step 6: Route them**
 
 ```rust
         .route("/admin/users/{id}/disable", get(admin::disable_form).post(admin::disable))
         .route("/admin/users/{id}/enable", post(admin::enable))
 ```
 
-- [ ] **Step 6: Verify and commit**
+- [ ] **Step 7: Verify and commit**
 
 Run: `cargo test --workspace`
 
@@ -691,7 +792,22 @@ omission: the self-guard forbids deleting yourself, so the acting admin survives
 every deletion and `count_admins` cannot reach zero. Unlike demote, there is no
 second entry point — `brolly-admin` has no delete verb.
 
-- [ ] **Step 3: Verify and commit**
+- [ ] **Step 3: Route them, in this task**
+
+A task that ends red is not a task. Task 6's tests exercise `demote`, so its
+routes belong here rather than in Task 7 — otherwise they hit the router's own
+404 and the asserted 400 never happens.
+
+```rust
+        .route("/admin/users/{id}/promote", get(admin::promote_form).post(admin::promote))
+        .route("/admin/users/{id}/demote", get(admin::demote_form).post(admin::demote))
+```
+
+The `delete` arm of `an_admin_cannot_act_on_themselves` moves to Task 7 for the
+same reason — that route does not exist yet either. Iterate
+`["disable", "demote"]` here and add `delete` there.
+
+- [ ] **Step 4: Verify and commit**
 
 Run: `cargo test --workspace`
 
@@ -739,9 +855,10 @@ exists, and nothing would ever collect it.
 ```rust
         .route("/admin/users/{id}/end-sessions", post(admin::end_sessions))
         .route("/admin/users/{id}/delete", get(admin::delete_form).post(admin::delete))
-        .route("/admin/users/{id}/promote", get(admin::promote_form).post(admin::promote))
-        .route("/admin/users/{id}/demote", get(admin::demote_form).post(admin::demote))
 ```
+
+The promote and demote routes are **not** here — they land in Task 6, with the
+handlers they serve.
 
 - [ ] **Step 4: Assert the guard covers the POSTs too**
 
@@ -904,8 +1021,9 @@ async fn demote_refuses_the_last_active_admin() {
         .expect("spawn brolly-admin");
 
     assert!(!output.status.success(), "demoting the last admin must fail");
+    // The exact wording, from bin/admin.rs:186 — there is no "last" in it.
     assert!(
-        String::from_utf8_lossy(&output.stderr).contains("last"),
+        String::from_utf8_lossy(&output.stderr).contains("only active admin"),
         "and say why"
     );
 }
