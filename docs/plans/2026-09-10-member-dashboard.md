@@ -42,6 +42,25 @@ changes.
 All six tasks are independently deployable. Task 2 (cards) before Task 3
 (chips) only because the chips land inside a card that Task 2 builds.
 
+## Verify every commit from a clean checkout
+
+Running the gates in your working tree proves the *tree* is consistent, not that
+`main` is. On 2026-09-11 two commits landed here that passed every local gate and
+did not compile from a fresh clone, because they referenced APIs that existed
+only in uncommitted work. `cargo test --workspace` cannot catch that; only a
+detached checkout can.
+
+So the last step of every task below is:
+
+```bash
+rm -rf /tmp/verify && git worktree add --detach /tmp/verify HEAD
+cd /tmp/verify && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
+cd - && git worktree remove /tmp/verify --force
+```
+
+Green there, or the commit is not done. The first compile in a new worktree takes
+about three minutes; run it in the background rather than skipping it.
+
 ## File Structure
 
 | File | Responsibility | Change |
