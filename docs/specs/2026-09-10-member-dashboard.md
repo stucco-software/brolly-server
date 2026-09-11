@@ -35,7 +35,7 @@ The rest of the gap is presentation, and it is real but smaller than it looks:
   next: "StuccoID has not been used for any applications yet. Browse the App
   Store to get started." One is a fact about the database; the other is
   addressed to a person.
-- **There is no vocabulary for state.** `admin/users.html` renders `role` and
+- **There is no vocabulary for state.** `server/templates/admin/users.html` renders `role` and
   `status` as bare table text — the strings `member` and `active`, straight from
   Postgres. solidid marks status with `<mark>`, which is both a visual chip and
   the correct element for "this is the relevant bit."
@@ -64,8 +64,8 @@ The rest of the gap is presentation, and it is real but smaller than it looks:
   already has one.
 - **No nav change.** solidid uses a left `<aside>` rail; the tabs stay.
   solidid's rail is three flat links and reads as a SvelteKit layout convenience
-  rather than an IA decision. Note that `account/_tabs.html` and
-  `admin/_tabs.html` are two near-identical files, not one shared partial —
+  rather than an IA decision. Note that `server/templates/account/_tabs.html` and
+  `server/templates/admin/_tabs.html` are two near-identical files, not one shared partial —
   the shape is common, the file is not — so this non-goal is also declining to
   unify them, which is separate work.
 - **No SPA, no app shell.** §4.2, and it is not close.
@@ -123,16 +123,16 @@ Every page converts, so none is left as the odd one out:
 
 | Page | Cards |
 |---|---|
-| `account/overview.html` | one — the facts |
-| `account/profile.html` | one — the form |
-| `account/security.html` | **two** — Password, Sessions |
-| `account/apps.html` | one, holding the list |
-| `account/delete.html` | one |
-| `admin/overview.html` | one |
-| `admin/users.html` | one `.dashboard-card-wide`, holding the table |
+| `server/templates/account/overview.html` | one — the facts |
+| `server/templates/account/profile.html` | one — the form |
+| `server/templates/account/security.html` | **two** — Password, Sessions |
+| `server/templates/account/apps.html` | one, holding the list |
+| `server/templates/account/delete.html` | one |
+| `server/templates/admin/overview.html` | one |
+| `server/templates/admin/users.html` | one `.dashboard-card-wide`, holding the table |
 
 The `<dl>` inside is `.facts`, which already exists (`brolly.css:465`) and is
-already how `account/overview.html` renders WebID, storage root and DID. solidid
+already how `server/templates/account/overview.html` renders WebID, storage root and DID. solidid
 puts a rule under each `<dd>`; `.facts` uses spacing instead. The rule is
 adopted — it is what makes a long fact list scannable, and it is one property.
 
@@ -165,7 +165,7 @@ that an operator scanning the member list finds the account they just disabled
 without reading is literally true, because it is the only marked thing in the
 column.
 
-**Scope: the admin surface only, and only `admin/users.html` here.** The admin
+**Scope: the admin surface only, and only `server/templates/admin/users.html` here.** The admin
 member detail page is proposed by the admin-actions spec, which specifies its
 own Facts region including role and status — it renders chips because this spec
 defines them, and that spec owns the page.

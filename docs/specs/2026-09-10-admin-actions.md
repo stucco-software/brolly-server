@@ -152,7 +152,7 @@ action in the product, and it is reached from a nav tab." mycomyco generalises
 exactly that into one `confirm_action.html` parameterised by label, target, form
 action, warning text and button class.
 
-Adopted as **one full page template, `admin/confirm.html`, rendered by a single
+Adopted as **one full page template, `confirm.html`, rendered by a single
 `ConfirmPage` struct** — not as a `_`-prefixed partial. Askama's `{% include %}`
 inherits the *including* struct's fields, so a partial would mean four page
 templates (disable, promote, demote, delete) each carrying the same seven
