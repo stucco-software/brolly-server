@@ -2,36 +2,57 @@
 
 {% block title %}{{ heading }} — {{ chrome.instance_name }}{% endblock %}
 
+{# The door has no chrome. The name panel *is* the brand, so a header
+   repeating the instance name would be the same words twice. <main> and the
+   skip link stay in base.html, outside both blocks. #}
+{% block header %}{% endblock %}
+{% block footer %}{% endblock %}
+
 {% block content %}
-<div class="wrap">
-  <div class="auth-card">
-    <h1>{{ heading }}</h1>
-    {% if let Some(message) = intro %}<p class="lede">{{ message }}</p>{% endif %}
+<div class="door">
+  <div class="door-name">
+    <div class="door-name-top">
+      <h1>{{ chrome.instance_name }}</h1>
+      <p class="lede">{{ chrome.instance_description }}</p>
+    </div>
+    {# Two copies, one per breakpoint. Stacked, the fine print belongs at the
+       foot of the page rather than wedged between the description and the form
+       the visitor came for. CSS shows exactly one. #}
+    <p class="fine-print fine-print-wide">{% include "_fine_print.html" %}</p>
+  </div>
 
-    {% if let Some(message) = error %}
-    <p class="error" role="alert">{{ message }}</p>
-    {% endif %}
+  <div class="door-act">
+    <div class="wrap">
+      <h2>{{ heading }}</h2>
+      {% if let Some(message) = intro %}<p class="lede">{{ message }}</p>{% endif %}
 
-    <form method="post" action="{{ action }}" class="stack-form">
-      {% for field in fields %}
-      <div class="field">
-        <label for="{{ field.name }}">{{ field.label }}</label>
-        <input
-          type="{{ field.kind }}"
-          id="{{ field.name }}"
-          name="{{ field.name }}"
-          value="{{ field.value }}"
-          {% if field.required %}required{% endif %}
-          {% if let Some(hint) = field.autocomplete %}autocomplete="{{ hint }}"{% endif %}
-        >
-      </div>
-      {% endfor %}
-      <button type="submit" class="button button-primary">{{ submit }}</button>
-    </form>
+      {% if let Some(message) = error %}
+      <p class="error" role="alert">{{ message }}</p>
+      {% endif %}
 
-    {% if let Some(link) = alternate %}
-    <p class="auth-alt">{{ link.prefix }} <a href="{{ link.href }}">{{ link.text }}</a></p>
-    {% endif %}
+      <form method="post" action="{{ action }}" class="stack-form">
+        {% for field in fields %}
+        <div class="field">
+          <label for="{{ field.name }}">{{ field.label }}</label>
+          <input
+            type="{{ field.kind }}"
+            id="{{ field.name }}"
+            name="{{ field.name }}"
+            value="{{ field.value }}"
+            {% if field.required %}required{% endif %}
+            {% if let Some(hint) = field.autocomplete %}autocomplete="{{ hint }}"{% endif %}
+          >
+        </div>
+        {% endfor %}
+        <button type="submit" class="button button-primary">{{ submit }}</button>
+      </form>
+
+      {% if let Some(link) = alternate %}
+      <p class="auth-alt">{{ link.prefix }} <a href="{{ link.href }}">{{ link.text }}</a></p>
+      {% endif %}
+
+      <p class="fine-print fine-print-narrow">{% include "_fine_print.html" %}</p>
+    </div>
   </div>
 </div>
 {% endblock %}

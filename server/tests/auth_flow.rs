@@ -569,3 +569,54 @@ async fn a_successful_login_lands_on_the_account() {
     assert_eq!(status, StatusCode::SEE_OTHER);
     assert_eq!(location.as_deref(), Some("/account"));
 }
+
+// --- the door ----------------------------------------------------------------
+
+/// The door is chromeless: the name panel IS the brand, so a header repeating
+/// the instance name would be the same words twice.
+#[tokio::test]
+async fn the_door_has_no_chrome() {
+    let (_db, _dir, router) = harness().await;
+    let (_, body, _) = get_as(&router, "/login", None).await;
+
+    assert!(
+        !body.contains("shell-header"),
+        "the door suppresses the header"
+    );
+    assert!(!body.contains("shell-footer"), "and the footer");
+    assert!(body.contains("skip-link"), "but keeps the skip link");
+    assert!(body.contains("<main"), "and the main landmark");
+}
+
+/// The page is *this instance*; logging in is what you do on it. The invariant
+/// counts h1s but does not say which one wins — this does.
+#[tokio::test]
+async fn the_instance_name_is_the_heading() {
+    let (_db, _dir, router) = harness().await;
+    let (_, body, _) = get_as(&router, "/login", None).await;
+
+    assert!(body.contains("<h1>brolly.test</h1>"), "got: {body}");
+    assert!(body.contains("<h2>Log in</h2>"), "got: {body}");
+}
+
+/// The description has never reached a human before now — it was read only by
+/// mastodon_api, for /api/v1/instance.
+#[tokio::test]
+async fn the_door_shows_the_instance_description() {
+    let (_db, _dir, router) = harness().await;
+    let (_, body, _) = get_as(&router, "/login", None).await;
+    assert!(body.contains("A private community server."), "got: {body}");
+}
+
+/// Register shares the door. This is the seam the whole design exists to close,
+/// so it gets its own assertion rather than being assumed from /login.
+#[tokio::test]
+async fn register_renders_the_door_too() {
+    let (_db, _dir, router) = harness().await;
+    let (status, body, _) = get_as(&router, "/register", None).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("shell-header"));
+    assert!(body.contains("<h1>brolly.test</h1>"));
+    assert!(body.contains("name=\"invite\""));
+}
