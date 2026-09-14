@@ -118,9 +118,7 @@ a:visited { color: inherit; }
    Each wash already pairs with a foreground that clears AA against it, so the
    ring borrows that instead of the token — one rule that stays correct for
    every wash, in both themes. */
-.band :focus-visible,
 .door-name :focus-visible,
-.card-feature :focus-visible,
 .notice :focus-visible {
   outline-color: currentColor;
 }
@@ -180,19 +178,11 @@ a:visited { color: inherit; }
 .shell-nav a { text-decoration: none; }
 .shell-nav a:hover { text-decoration: underline; }
 
-/* A column, so a page shorter than the window can hand its slack to the last
-   band instead of leaving a strip of bare paper above the footer. */
+/* A column, so a page shorter than the window can hand its slack to whatever
+   closes it rather than leaving a strip of bare paper above the footer. */
 .shell-main { flex: 1; width: 100%; display: flex; flex-direction: column; }
-/* The band that closes a page takes that slack and centres itself in it, so it
-   reads as a deliberate full-bleed panel at any window height. */
-.shell-main > .band:last-child {
-  flex: 1;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-}
-/* A page that is not a full-bleed band gets its breathing room here, so a
-   band can still sit flush under the header. */
+/* The shell's pages get their breathing room here. The door supplies its own,
+   because it suppresses the shell entirely. */
 .shell-main > .wrap { padding-block: var(--sp-2) var(--sp-3); }
 
 .shell-footer {
@@ -256,38 +246,6 @@ a:visited { color: inherit; }
 /* The footer centres its text, and flex ignores text-align. */
 .shell-footer .fine-print { justify-content: center; }
 
-/* --- bands ------------------------------------------------------------- */
-/* Flat, full-bleed fields of colour. brolly.id's whole page rhythm is these
-   alternating with plain paper. */
-.band { padding-block: var(--sp-3); background: var(--wash-quiet); color: var(--wash-quiet-fg); }
-.band-hero { background: var(--wash); color: var(--wash-fg); }
-.band-invite { background: var(--wash-invite); color: var(--wash-invite-fg); }
-/* A band that ends the page runs into the footer, the way brolly.id stacks its
-   sections — otherwise the footer's own top margin leaves a strip of paper
-   between the colour and the rule. A browser without :has() just gets the
-   strip, which is untidy rather than broken. */
-.shell-main:has(> .band:last-child) + .shell-footer { margin-block-start: 0; }
-
-/* --- hero -------------------------------------------------------------- */
-.hero { display: grid; gap: var(--sp-1-2); align-items: center; }
-@media (min-width: 44rem) {
-  .hero { grid-template-columns: minmax(0, 1fr) auto; }
-}
-.hero h1 {
-  font-size: var(--txt-3);
-  font-weight: 900;
-  max-width: 18ch;
-}
-.hero .lede { font-size: var(--txt-1); line-height: 1.2; max-width: 34rem; }
-.hero-figure { margin: 0; justify-self: center; }
-.hero-figure img {
-  width: 15rem;
-  height: auto;
-  max-width: 100%;
-  margin-inline: auto;
-  mix-blend-mode: var(--illustration-blend);
-  filter: var(--illustration-filter);
-}
 
 .lede { font-size: var(--txt-0); max-width: var(--measure); margin-block-start: var(--sp--1); }
 .actions { display: flex; flex-wrap: wrap; gap: var(--sp--1); margin-block-start: var(--sp-1); }
@@ -324,9 +282,6 @@ section > h2 + * { margin-block-start: var(--sp-0); }
   color: var(--destructive-fg);
 }
 .button-danger:hover { background: var(--destructive); opacity: 0.88; }
-/* The nav CTA is the same object at label size — brolly.id's `.nav-cta`. */
-.button-compact { padding: var(--space-1) var(--space-3); font-size: var(--txt--1); }
-
 /* A logout control has to be a POST, so it is a form in the nav. Strip the
    form's block layout so it sits inline with the links beside it. */
 .nav-form { display: inline; margin: 0; }
@@ -340,26 +295,6 @@ section > h2 + * { margin-block-start: var(--sp-0); }
   cursor: pointer;
   text-decoration: underline;
 }
-
-/* --- cards ------------------------------------------------------------- */
-.card-grid {
-  display: grid;
-  gap: var(--sp-1);
-  grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr));
-}
-.card {
-  display: flex;
-  flex-direction: column;
-  gap: var(--sp--1);
-  padding: var(--sp-1);
-  background: var(--surface);
-  border: var(--border-width) solid var(--border);
-  border-radius: var(--radius);
-}
-.card h2 { font-size: var(--txt-1); }
-.card p { flex: 1; margin: 0; }
-/* One card in a set may carry the yellow — brolly.id's `.way-featured`. */
-.card-feature { background: var(--wash-feature); color: var(--wash-feature-fg); }
 
 /* --- forms ------------------------------------------------------------- */
 .field { display: flex; flex-direction: column; gap: var(--sp--2); }

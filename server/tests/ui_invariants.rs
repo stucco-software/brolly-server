@@ -290,3 +290,37 @@ fn collect_templates(dir: &Path, out: &mut Vec<PathBuf>) {
         out.push(path);
     }
 }
+
+/// The unauthenticated surface names no product and no protocol.
+///
+/// A guard rather than a test of behaviour. The protocol cards this replaced
+/// were a plausible, well-meant addition — "a member might want to know whether
+/// their Mastodon client works here" — and they are how the front page becomes
+/// a pitch again a year from now.
+///
+/// Scoped to the three templates every visitor sees. The authenticated surface
+/// keeps saying "point a Solid app here", which is instruction and belongs.
+///
+/// Case-sensitive on purpose: `base.html` links `/static/brolly.css` and
+/// `/static/favicon/…`, and those filenames must keep their names.
+///
+/// Known gap: the door's heading, intro and alt-link text are Rust string
+/// literals in `login_page` and `register_page`, and a scan of `templates/`
+/// never sees them. Whoever adds "we speak Solid" to an `intro` and watches
+/// this pass should know it was a hole, not a permission.
+#[test]
+fn the_unauthenticated_surface_sells_nothing() {
+    const BANNED: [&str; 4] = ["Brolly", "Solid", "ATProto", "ActivityPub"];
+    let templates = workspace_root().join("server/templates");
+
+    for name in ["auth.html", "base.html", "_fine_print.html"] {
+        let text = std::fs::read_to_string(templates.join(name)).expect("read template");
+        for word in BANNED {
+            assert!(
+                !text.contains(word),
+                "{name} contains {word:?}. The door says only what an operator \
+                 configured; see docs/specs/2026-09-10-the-door.md."
+            );
+        }
+    }
+}

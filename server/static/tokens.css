@@ -59,12 +59,8 @@
   --shadow-elevated: 1px 2px 2px rgb(0 0 0 / 0.1), 2px 4px 4px rgb(0 0 0 / 0.1), 4px 8px 8px rgb(0 0 0 / 0.1), 8px 16px 16px rgb(0 0 0 / 0.1);
   --wash: var(--blue-DEFAULT);
   --wash-fg: var(--ink-darkest);
-  --wash-quiet: var(--ink-lighter);
-  --wash-quiet-fg: var(--ink-darkest);
   --wash-feature: var(--yellow-DEFAULT);
   --wash-feature-fg: var(--ink-darkest);
-  --wash-invite: var(--green-dark);
-  --wash-invite-fg: var(--ink-lightest);
   --illustration-blend: multiply;
   --illustration-filter: none;
 }
@@ -94,12 +90,8 @@
   --shadow-elevated: 1px 2px 2px rgb(0 0 0 / 0.5), 2px 4px 4px rgb(0 0 0 / 0.5), 4px 8px 8px rgb(0 0 0 / 0.5), 8px 16px 16px rgb(0 0 0 / 0.5);
   --wash: var(--blue-darker);
   --wash-fg: var(--ink-lighter);
-  --wash-quiet: var(--ink-darkest);
-  --wash-quiet-fg: var(--ink-lighter);
   --wash-feature: var(--yellow-dark);
   --wash-feature-fg: var(--ink-lightest);
-  --wash-invite: var(--green-dark);
-  --wash-invite-fg: var(--ink-lightest);
   --illustration-blend: screen;
   --illustration-filter: invert(1);
 }
@@ -292,12 +284,8 @@
   --shadow-elevated: 1px 2px 2px rgb(0 0 0 / 0.1), 2px 4px 4px rgb(0 0 0 / 0.1), 4px 8px 8px rgb(0 0 0 / 0.1), 8px 16px 16px rgb(0 0 0 / 0.1);
   --wash: var(--blue-DEFAULT);
   --wash-fg: var(--ink-darkest);
-  --wash-quiet: var(--ink-lighter);
-  --wash-quiet-fg: var(--ink-darkest);
   --wash-feature: var(--yellow-DEFAULT);
   --wash-feature-fg: var(--ink-darkest);
-  --wash-invite: var(--green-dark);
-  --wash-invite-fg: var(--ink-lightest);
   --illustration-blend: multiply;
   --illustration-filter: none;
 }
@@ -331,12 +319,8 @@
   --shadow-elevated: 1px 2px 2px rgb(0 0 0 / 0.5), 2px 4px 4px rgb(0 0 0 / 0.5), 4px 8px 8px rgb(0 0 0 / 0.5), 8px 16px 16px rgb(0 0 0 / 0.5);
   --wash: var(--blue-darker);
   --wash-fg: var(--ink-lighter);
-  --wash-quiet: var(--ink-darkest);
-  --wash-quiet-fg: var(--ink-lighter);
   --wash-feature: var(--yellow-dark);
   --wash-feature-fg: var(--ink-lightest);
-  --wash-invite: var(--green-dark);
-  --wash-invite-fg: var(--ink-lightest);
   --illustration-blend: screen;
   --illustration-filter: invert(1);
   }

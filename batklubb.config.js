@@ -108,12 +108,8 @@ export default {
       // båtklubb's role vocabulary, so they ride along as extra theme keys.
       wash: 'var(--blue-DEFAULT)',
       'wash-fg': 'var(--ink-darkest)',
-      'wash-quiet': 'var(--ink-lighter)',
-      'wash-quiet-fg': 'var(--ink-darkest)',
       'wash-feature': 'var(--yellow-DEFAULT)',
       'wash-feature-fg': 'var(--ink-darkest)',
-      'wash-invite': 'var(--green-dark)',
-      'wash-invite-fg': 'var(--ink-lightest)',
 
       // The umbrella illustration is black line art on white. Multiplying it
       // into the wash drops the paper and keeps the pencil texture.
@@ -148,12 +144,8 @@ export default {
 
       wash: 'var(--blue-darker)',
       'wash-fg': 'var(--ink-lighter)',
-      'wash-quiet': 'var(--ink-darkest)',
-      'wash-quiet-fg': 'var(--ink-lighter)',
       'wash-feature': 'var(--yellow-dark)',
       'wash-feature-fg': 'var(--ink-lightest)',
-      'wash-invite': 'var(--green-dark)',
-      'wash-invite-fg': 'var(--ink-lightest)',
 
       // Inverted, the same line art becomes white-on-dark; screen then drops
       // the (now black) paper.
