@@ -352,10 +352,15 @@ struct Apps<'a> {
     chrome: Chrome<'a>,
     tabs: Vec<Tab>,
     apps: Vec<oidc_store::AuthorisedApp>,
+    saved: bool,
 }
 
 /// `GET /account/apps`
-pub async fn apps(State(state): State<AppState>, jar: CookieJar) -> Response {
+pub async fn apps(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    axum::extract::Query(query): axum::extract::Query<Saved>,
+) -> Response {
     let session = match require_session(&state, &jar, "/account/apps").await {
         Ok(s) => s,
         Err(response) => return response,
@@ -371,6 +376,7 @@ pub async fn apps(State(state): State<AppState>, jar: CookieJar) -> Response {
 
     render(&Apps {
         chrome: state.chrome(),
+        saved: query.saved,
         tabs: tabs("/account/apps"),
         apps,
     })
@@ -400,7 +406,10 @@ pub async fn revoke_app(
     match oidc_store::revoke_app_for_user(&state.pool, session.user.id, &form.client_id).await {
         Ok(revoked) => {
             tracing::info!(user = %session.user.id, client = %form.client_id, revoked, "app access withdrawn");
-            Redirect::to("/account/apps").into_response()
+            // Withdrawing an application's access to your pod is a security
+            // action, and without the parameter the page comes back looking
+            // almost the same — the row is simply gone.
+            Redirect::to("/account/apps?saved=true").into_response()
         }
         Err(e) => {
             tracing::error!(error = %e, "revoking an app failed");

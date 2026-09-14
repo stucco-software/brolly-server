@@ -722,3 +722,48 @@ async fn the_authenticated_footer_carries_the_source_link() {
         "the footer stops naming the product"
     );
 }
+
+/// Revoking is a security action, and the only feedback was that a row
+/// vanished. Same parameter and same extractor as profile and security; only
+/// the sentence differs.
+#[tokio::test]
+async fn revoking_an_app_says_so() {
+    let h = harness().await;
+    let cookie = h.login().await;
+    let client_id = an_authorised_app(&h, &cookie, "Notes App").await;
+
+    let reply = h
+        .post(
+            "/account/apps",
+            &format!(
+                "client_id={}",
+                form_urlencoded::byte_serialize(client_id.as_bytes()).collect::<String>()
+            ),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.location.as_deref(), Some("/account/apps?saved=true"));
+
+    let reply = h.get("/account/apps?saved=true", Some(&cookie)).await;
+    assert!(
+        reply.body.contains("Access withdrawn."),
+        "got: {}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("role=\"status\""),
+        "got: {}",
+        reply.body
+    );
+}
+
+/// ...and the notice is not permanent furniture.
+#[tokio::test]
+async fn the_apps_page_is_quiet_without_the_parameter() {
+    let h = harness().await;
+    let cookie = h.login().await;
+
+    let reply = h.get("/account/apps", Some(&cookie)).await;
+    assert!(!reply.body.contains("Access withdrawn."));
+}
