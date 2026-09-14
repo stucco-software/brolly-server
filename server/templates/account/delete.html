@@ -9,7 +9,7 @@
   <div class="dashboard">
     <h1>Delete account</h1>
     {% include "account/_tabs.html" %}
-    <section class="dashboard-panel">
+    <section class="dashboard-card">
       {% if let Some(message) = error %}
       <p class="error" role="alert">{{ message }}</p>
       {% endif %}

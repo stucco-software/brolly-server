@@ -411,12 +411,37 @@ textarea { width: 100%; }
   border-block-end-color: var(--border);
 }
 
-.dashboard-panel { margin-block-start: var(--sp-1); max-width: var(--measure); }
+/* A card is one concern: a header naming it when there is more than one, a
+   body, and the controls that act on it. A page renders as many as it has
+   concerns, which is how the security page stops being a password form and a
+   session count in one undivided box. */
+.dashboard-card {
+  margin-block-start: var(--sp-1);
+  max-width: var(--measure);
+  border: var(--border-width) solid var(--border);
+  border-radius: var(--radius);
+  background: var(--surface);
+  padding: var(--sp-0);
+}
+/* A card whose heading would only repeat the page's own <h1> omits its header
+   entirely — there is nothing to disambiguate on a single-concern page. When
+   there *is* a header, the children carry the padding instead. */
+.dashboard-card:has(> header) { padding: 0; }
+.dashboard-card > header {
+  padding: var(--sp--1) var(--sp-0);
+  border-block-end: var(--border-width) solid var(--border);
+}
+.dashboard-card > header h2 { font-size: var(--txt-0); margin: 0; }
+.dashboard-card > section { padding: var(--sp-0); }
+.dashboard-card > footer {
+  padding: var(--sp-0);
+  border-block-start: var(--hairline) solid var(--border-subtle);
+}
 
 /* A table is not prose and does not want the reading measure. The console's
    member list is the only surface so far that needs the full grid. */
 .dashboard-wide { max-width: none; }
-.dashboard-panel-wide { max-width: none; }
+.dashboard-card-wide { max-width: none; }
 
 /* --- tables ------------------------------------------------------------ */
 /* Rules, not zebra stripes: the same hairline that separates rows inside a
@@ -457,7 +482,16 @@ textarea { width: 100%; }
   letter-spacing: 0.08em;
   color: var(--muted-fg);
 }
-.facts dd { margin: 0 0 var(--sp--1) 0; overflow-wrap: anywhere; }
+/* Ruled rather than spaced: it is what makes a long fact list scannable, and
+   the rule replaces the margin rather than joining it — `.facts` already
+   contributes a grid gap. */
+.facts dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+  padding-block-end: var(--sp--2);
+  border-block-end: var(--hairline) solid var(--border-subtle);
+}
+.facts dd:last-of-type { border-block-end: 0; }
 
 .hint { font-size: var(--txt--1); color: var(--muted-fg); margin-block-start: var(--sp--2); }
 .notice {

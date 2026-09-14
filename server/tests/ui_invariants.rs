@@ -324,3 +324,21 @@ fn the_unauthenticated_surface_sells_nothing() {
         }
     }
 }
+
+/// The card replaced the panel, everywhere.
+///
+/// A page half-converted looks like a page with a rendering bug, and the old
+/// class going unused is the only signal that the job finished.
+#[test]
+fn the_dashboard_panel_is_retired() {
+    let mut pages = Vec::new();
+    collect_templates(&workspace_root().join("server/templates"), &mut pages);
+
+    for path in pages {
+        let text = std::fs::read_to_string(&path).expect("read template");
+        assert!(
+            !text.contains("dashboard-panel"),
+            "{path:?} still uses .dashboard-panel; .dashboard-card replaced it"
+        );
+    }
+}
