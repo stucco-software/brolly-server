@@ -450,48 +450,49 @@ async fn registering_provisions_a_pod_the_member_can_write_to() {
     );
 }
 
-// --- the front door, once you are through it --------------------------------
+// --- the front door -------------------------------------------------------
 
+/// `/` and `/login` are one template on two routes, so they cannot drift.
 #[tokio::test]
-async fn the_landing_page_knows_you_are_signed_in() {
+async fn the_front_door_and_the_login_page_are_the_same_page() {
+    let (_db, _dir, router) = harness().await;
+
+    let (_, root, _) = get_as(&router, "/", None).await;
+    let (_, login, _) = get_as(&router, "/login", None).await;
+
+    assert_eq!(root, login);
+}
+
+/// Replaces `the_landing_page_knows_you_are_signed_in`, which asserted 200 on a
+/// page that named who you were. A login form is not an answer to a request
+/// from somebody already logged in.
+#[tokio::test]
+async fn the_front_door_sends_a_signed_in_member_to_their_account() {
     let (db, _dir, router) = harness().await;
     let cookie = register_alice(&db, &router).await;
 
-    let (status, body, _) = get_as(&router, "/", Some(&cookie)).await;
+    let (status, _, location) = get_as(&router, "/", Some(&cookie)).await;
 
-    assert_eq!(status, StatusCode::OK);
-    // Login redirects to `/`. When `/` renders the anonymous nav regardless,
-    // a successful login is indistinguishable from a failed one, and members
-    // retry until they conclude the server is broken.
-    assert!(
-        body.contains("Log out"),
-        "a signed-in member must be able to sign out from the front door, got: {body}"
-    );
-    assert!(
-        body.contains("alice"),
-        "the front door must name who is signed in, got: {body}"
-    );
-    assert!(
-        !body.contains(r#"href="/login""#),
-        "a signed-in member must not be invited to log in again, got: {body}"
-    );
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/account"));
 }
 
+/// Replaces `the_landing_page_still_invites_anonymous_visitors_in`. The door
+/// names the instance and lets you in; it no longer sells anything.
 #[tokio::test]
-async fn the_landing_page_still_invites_anonymous_visitors_in() {
+async fn the_front_door_names_the_instance_and_lets_you_in() {
     let (_db, _dir, router) = harness().await;
 
-    let (status, body) = get(&router, "/").await;
+    let (status, body, _) = get_as(&router, "/", None).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(body.contains(r#"href="/login""#), "got: {body}");
+    assert!(body.contains("<h1>brolly.test</h1>"), "got: {body}");
+    assert!(body.contains("name=\"password\""), "got: {body}");
     assert!(body.contains(r#"href="/register""#), "got: {body}");
-    assert!(
-        !body.contains("Log out"),
-        "an anonymous visitor has nothing to sign out of, got: {body}"
-    );
 }
 
+/// Kept, retargeted: a stale cookie still reaches the door rather than
+/// bouncing into a loop.
 #[tokio::test]
 async fn a_stale_session_cookie_falls_back_to_the_anonymous_front_door() {
     let (_db, _dir, router) = harness().await;
@@ -499,8 +500,7 @@ async fn a_stale_session_cookie_falls_back_to_the_anonymous_front_door() {
     let (status, body, _) = get_as(&router, "/", Some("brolly_session=not-a-real-token")).await;
 
     assert_eq!(status, StatusCode::OK, "a bad cookie must not 500");
-    assert!(body.contains(r#"href="/login""#), "got: {body}");
-    assert!(!body.contains("Log out"), "got: {body}");
+    assert!(body.contains("name=\"password\""), "got: {body}");
 }
 
 /// The source link is not optional: AGPL-3.0 §13 means an operator running a

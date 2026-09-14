@@ -25,7 +25,6 @@ pub mod outbox;
 pub mod pod;
 pub mod provision;
 pub mod solid_oidc;
-pub mod views;
 pub mod xrpc;
 
 /// Everything a handler needs. Composed here because `server` is the only crate
@@ -145,7 +144,11 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         ));
 
     Router::new()
-        .route("/", get(views::landing))
+        // `/` and `/login` are one template on two routes. Collapsing them
+        // would mean re-pointing five redirects that target the login form
+        // (account.rs, solid_oidc.rs, mastodon_oauth.rs, atproto_oauth.rs,
+        // admin.rs) — the fiddliest flows in the workspace.
+        .route("/", get(auth::login_form))
         .route("/health", get(health))
         // Auth surfaces ship with identity, not after it (plan §4.4).
         .route("/login", get(auth::login_form).post(auth::login_submit))
