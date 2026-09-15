@@ -34,6 +34,10 @@ struct Harness {
     _dir: tempfile::TempDir,
     router: axum::Router,
     session: String,
+    /// Exposed so a test can write into the pod directly, rather than only
+    /// through HTTP.
+    stores: std::sync::Arc<StoreManager>,
+    user: uuid::Uuid,
 }
 
 async fn harness() -> Harness {
@@ -84,7 +88,7 @@ async fn harness() -> Harness {
             source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
             terms_url: None,
             privacy_url: None,
-            stores,
+            stores: std::sync::Arc::clone(&stores),
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)
                     .await
@@ -109,6 +113,8 @@ async fn harness() -> Harness {
         _dir: dir,
         router,
         session,
+        stores,
+        user: user.id,
     }
 }
 
@@ -400,4 +406,289 @@ async fn rdf_xml_is_refused_over_http_rather_than_stored_as_a_blob() {
         )
         .await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+// --- the WebID profile document ----------------------------------------------
+
+/// A GET with an explicit `Accept`, which `send` does not offer.
+async fn get_accepting(h: &Harness, path: &str, accept: &str) -> (StatusCode, String, String) {
+    let request = Request::builder()
+        .method("GET")
+        .uri(path)
+        .header(header::HOST, HOST)
+        .header(header::ACCEPT, accept)
+        .body(Body::empty())
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    (status, body, content_type)
+}
+
+/// The triple that makes WebID-first login possible.
+///
+/// An app handed a WebID dereferences it and reads `solid:oidcIssuer` to learn
+/// where to send the member to authenticate. Before this endpoint existed the
+/// WebID answered 501, so no conformant Solid client could log anybody in
+/// however well the OIDC endpoints themselves worked.
+#[tokio::test]
+async fn a_webid_advertises_its_issuer_and_its_storage() {
+    let h = harness().await;
+    let (status, body, content_type) = get_accepting(&h, "/profile", "text/turtle").await;
+
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+    assert!(
+        content_type.starts_with("text/turtle"),
+        "got: {content_type}"
+    );
+
+    assert!(
+        body.contains("http://www.w3.org/ns/solid/terms#oidcIssuer"),
+        "no oidcIssuer, so no client can log in: {body}"
+    );
+    // The issuer is the apex, matching what /.well-known/openid-configuration
+    // publishes — a client compares the two.
+    assert!(body.contains("https://brolly.test"), "got: {body}");
+
+    assert!(
+        body.contains("http://www.w3.org/ns/pim/space#storage"),
+        "got: {body}"
+    );
+    assert!(body.contains(ROOT), "storage must be discoverable: {body}");
+}
+
+/// The document is not the person, and `#me` is the difference.
+#[tokio::test]
+async fn the_profile_document_is_distinct_from_its_subject() {
+    let h = harness().await;
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+
+    assert!(body.contains("PersonalProfileDocument"), "got: {body}");
+    assert!(body.contains("primaryTopic"), "got: {body}");
+    assert!(body.contains("/profile#me"), "got: {body}");
+}
+
+/// A browser must not be handed a Turtle download.
+///
+/// Its Accept header ends in `*/*`, which the RDF negotiator maps to Turtle,
+/// so this is a real trap rather than a hypothetical one.
+#[tokio::test]
+async fn a_browser_gets_a_page_it_can_read() {
+    let h = harness().await;
+    let (status, body, content_type) = get_accepting(
+        &h,
+        "/profile",
+        "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        content_type.starts_with("text/html"),
+        "a browser was handed {content_type}"
+    );
+    assert!(body.contains("alice"), "got: {body}");
+}
+
+/// A member's own triples survive the projection. The server adds to the
+/// document; it does not replace it.
+#[tokio::test]
+async fn the_members_own_triples_are_still_there() {
+    let h = harness().await;
+    let pod = h.stores.pod(h.user).unwrap();
+    let document = format!("{BASE}/profile");
+    let me = format!("{document}#me");
+    brolly_solid::profile::write(
+        &pod,
+        &me,
+        &document,
+        &brolly_solid::profile::Profile {
+            display_name: "Alice Example".into(),
+            ..brolly_solid::profile::Profile::blank()
+        },
+    )
+    .unwrap();
+
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert!(body.contains("Alice Example"), "got: {body}");
+    // ...alongside the derived ones.
+    assert!(body.contains("oidcIssuer"), "got: {body}");
+}
+
+// --- the actor's collections --------------------------------------------------
+
+/// Followers and following are public, as the fediverse expects: a follower
+/// list is how another server decides whether it already knows you.
+#[tokio::test]
+async fn the_follow_collections_are_public() {
+    let h = harness().await;
+
+    for path in ["/followers", "/following"] {
+        let (status, body, content_type) =
+            get_accepting(&h, path, "application/activity+json").await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        assert!(
+            content_type.starts_with("application/activity+json"),
+            "{path}: {content_type}"
+        );
+        assert!(body.contains("OrderedCollection"), "{path}: {body}");
+        assert!(body.contains("totalItems"), "{path}: {body}");
+    }
+}
+
+/// The inbox is the member's home timeline (D6), so it is the one collection
+/// here that is not public — serving it anonymously would publish who they
+/// follow and everything those people have sent them.
+///
+/// 404 rather than 403, matching `require_admin`: 403 would confirm both that
+/// the resource exists and that the caller found a real member.
+#[tokio::test]
+async fn an_anonymous_caller_cannot_read_an_inbox() {
+    let h = harness().await;
+    let (status, _, _) = get_accepting(&h, "/inbox", "application/activity+json").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn the_owner_can_read_their_own_inbox() {
+    let h = harness().await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/inbox")
+        .header(header::HOST, HOST)
+        .header(header::ACCEPT, "application/activity+json")
+        .header(header::COOKIE, format!("brolly_session={}", h.session))
+        .body(Body::empty())
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+    assert!(body.contains("OrderedCollection"), "got: {body}");
+}
+
+// --- CORS ----------------------------------------------------------------------
+
+async fn headers_of(
+    h: &Harness,
+    method: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> (StatusCode, axum::http::HeaderMap) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, HOST);
+    for (k, v) in extra {
+        builder = builder.header(*k, *v);
+    }
+    let response = h
+        .router
+        .clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    (response.status(), response.headers().clone())
+}
+
+/// Solid is a browser protocol: an app at another origin dereferences the
+/// WebID. Without this header the browser refuses to hand the response to the
+/// script, and login fails at the very first step.
+#[tokio::test]
+async fn a_webid_is_readable_cross_origin() {
+    let h = harness().await;
+    let (status, headers) =
+        headers_of(&h, "GET", "/profile", &[("origin", "https://app.example")]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+}
+
+/// The omission that matters more than the header.
+///
+/// `Allow-Origin: *` paired with `Allow-Credentials: true` would let any site
+/// make cookie-authenticated requests to the dashboard and read the answers.
+/// Solid authenticates with a header the calling script must already hold, so
+/// credentials are never allowed here.
+#[tokio::test]
+async fn cors_never_allows_credentials() {
+    let h = harness().await;
+    let (_, headers) =
+        headers_of(&h, "GET", "/profile", &[("origin", "https://app.example")]).await;
+
+    assert!(
+        headers.get("access-control-allow-credentials").is_none(),
+        "a wildcard origin must never be paired with credentials"
+    );
+}
+
+/// `DPoP` is not on the CORS safelist, so every authenticated Solid request is
+/// preflighted. If the preflight does not name the header, the real request is
+/// never sent.
+#[tokio::test]
+async fn a_preflight_admits_the_headers_a_solid_client_sends() {
+    let h = harness().await;
+    let (status, headers) = headers_of(
+        &h,
+        "OPTIONS",
+        "/~/notes/first",
+        &[
+            ("origin", "https://app.example"),
+            ("access-control-request-method", "PUT"),
+            (
+                "access-control-request-headers",
+                "authorization,dpop,content-type",
+            ),
+        ],
+    )
+    .await;
+
+    assert!(status.is_success(), "preflight rejected: {status}");
+    let allowed = headers
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(allowed.contains("dpop"), "got: {allowed}");
+    assert!(allowed.contains("authorization"), "got: {allowed}");
+
+    let methods = headers
+        .get("access-control-allow-methods")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_uppercase();
+    assert!(methods.contains("PUT"), "got: {methods}");
+    assert!(methods.contains("PATCH"), "got: {methods}");
+}
+
+/// A script can read only safelisted response headers unless they are exposed.
+/// `Location` after a POST and `Link` for the ACL are both load-bearing in LDP.
+#[tokio::test]
+async fn the_headers_ldp_depends_on_are_exposed() {
+    let h = harness().await;
+    let (_, headers) =
+        headers_of(&h, "GET", "/profile", &[("origin", "https://app.example")]).await;
+
+    let exposed = headers
+        .get("access-control-expose-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    for wanted in ["location", "link", "etag", "wac-allow"] {
+        assert!(exposed.contains(wanted), "{wanted} not exposed: {exposed}");
+    }
 }

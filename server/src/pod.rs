@@ -89,7 +89,12 @@ async fn resolve(
 ///
 /// An unauthenticated request is anonymous rather than rejected: WAC decides
 /// whether anonymous is enough, so public resources work without a credential.
-async fn subject_for(state: &AppState, headers: &HeaderMap, method: &str, url: &str) -> Subject {
+pub(crate) async fn subject_for(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &str,
+    url: &str,
+) -> Subject {
     let anonymous = Subject {
         user_id: None,
         did: None,

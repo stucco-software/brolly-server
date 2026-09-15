@@ -8,6 +8,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use axum::Router;
+use axum::http::{Method, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use sqlx::PgPool;
@@ -23,6 +24,7 @@ pub mod mastodon_api;
 pub mod mastodon_oauth;
 pub mod outbox;
 pub mod pod;
+pub mod profile;
 pub mod provision;
 pub mod solid_oidc;
 pub mod xrpc;
@@ -121,6 +123,74 @@ impl AppState {
 ///
 /// Adapters contribute their own routers here. Nothing else in the workspace
 /// constructs a `Router` at the top level.
+
+/// The CORS posture for the whole server.
+///
+/// Solid is a browser protocol. An app at another origin dereferences a
+/// member's WebID, reads the discovery document, registers itself, exchanges a
+/// token and then reads the pod — every one of those is a cross-origin fetch,
+/// and without these headers the browser refuses to hand the response to the
+/// script. There was no CORS here at all, which made the server unusable from
+/// any browser-based Solid client however correct its endpoints were.
+///
+/// **Hand-rolled rather than `tower_http::cors`, for one specific reason.**
+/// That layer short-circuits *every* `OPTIONS` request as a preflight
+/// (`cors/mod.rs:715`, no check for `Access-Control-Request-Method`). LDP uses
+/// `OPTIONS` for capability discovery — it is how a client learns which PATCH
+/// syntaxes a resource accepts — so using that layer silently replaced those
+/// answers with an empty preflight. A preflight is `OPTIONS` **with**
+/// `Access-Control-Request-Method`; a bare `OPTIONS` is a real request and has
+/// to reach the handler.
+///
+/// **`Allow-Origin: *` with no `Allow-Credentials`, and the omission is the
+/// security-critical half.** Echoing the origin *with* credentials would let
+/// any site on the web make cookie-authenticated requests to the dashboard and
+/// read the answers. Solid authenticates with a `DPoP` or `Authorization`
+/// header the calling script must already hold, never with our cookie, so the
+/// wildcard costs nothing and grants nothing: a cross-origin script with no
+/// token is anonymous, and WAC treats it accordingly.
+///
+/// The session cookie is `SameSite=Lax` besides, so it is not sent on a
+/// cross-site subresource request in the first place. These headers change only
+/// which responses a script may *read*, never which requests reach the server,
+/// so they add no CSRF surface.
+async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let preflight = request.method() == Method::OPTIONS
+        && request
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
+
+    let mut response = if preflight {
+        axum::http::StatusCode::NO_CONTENT.into_response()
+    } else {
+        next.run(request).await
+    };
+
+    // `dpop` and `slug` are not on the CORS safelist, so any request carrying
+    // one is preflighted and fails unless named here.
+    const ALLOW_HEADERS: &str =
+        "authorization, dpop, content-type, accept, slug, link, if-match, if-none-match";
+    // A script sees only safelisted response headers unless they are exposed.
+    // `location` after a POST and `link` for the ACL are load-bearing in LDP.
+    const EXPOSE_HEADERS: &str =
+        "location, link, etag, allow, accept-patch, accept-post, wac-allow, updates-via";
+
+    let headers = response.headers_mut();
+    for (name, value) in [
+        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+        (
+            header::ACCESS_CONTROL_ALLOW_METHODS,
+            "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
+        ),
+        (header::ACCESS_CONTROL_ALLOW_HEADERS, ALLOW_HEADERS),
+        (header::ACCESS_CONTROL_EXPOSE_HEADERS, EXPOSE_HEADERS),
+        (header::ACCESS_CONTROL_MAX_AGE, "86400"),
+    ] {
+        headers.insert(name, axum::http::HeaderValue::from_static(value));
+    }
+    response
+}
+
 pub fn app(state: AppState, static_dir: &str) -> Router {
     // Solid-OIDC (ADR 0008). Its own router so `apex_only` can wrap the whole
     // surface: the guard has to run before extraction, or a wrong method or an
@@ -187,7 +257,19 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // member subdomains and means a different actor on each — one route
         // with a host branch, because a route matches before the host is
         // looked at and two would shadow each other.
+        // The WebID profile document. Subdomain-only: the apex's identity is
+        // an actor, not a person. This is what a Solid client dereferences to
+        // discover the issuer, so without it WebID login is impossible.
+        .route("/profile", get(profile::profile_document))
         .route("/actor", get(activitypub::actor_document))
+        // The actor's collections. Followers and following are public, as the
+        // fediverse expects; the inbox is the member's home timeline (D6) and
+        // is owner-only. POST /inbox — federation ingress — stays unrouted
+        // until Phase 8, because accepting it without HTTP-signature
+        // verification would let anyone write into anyone's timeline.
+        .route("/followers", get(activitypub::followers_collection))
+        .route("/following", get(activitypub::following_collection))
+        .route("/inbox", get(activitypub::inbox_collection))
         // The publication surface (ADR 0012): a write here is a post,
         // the same write anywhere in the pod is private CRUD.
         .route("/outbox", post(outbox::publish))
@@ -236,6 +318,9 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .nest_service("/static", ServeDir::new(static_dir))
         // Default-deny on subdomains. No LDP fallback (ADR 0010).
         .fallback(pod::subdomain_fallback)
+        // Outermost, so it covers the OAuth sub-router and the fallback too —
+        // a 404 that a browser cannot read is a 404 nobody can debug.
+        .layer(axum::middleware::from_fn(cors))
         .with_state(state)
 }
 

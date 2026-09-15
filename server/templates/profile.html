@@ -1,0 +1,62 @@
+{# The human-readable face of a WebID.
+
+   Standalone rather than extending base.html: this is served on a member's
+   own subdomain, where the shell's nav points at apex-only paths that are
+   pod storage or a 404 here (ADR 0010). It is also public, so it carries
+   nothing an anonymous reader should not see. #}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>@{{ username }} — {{ chrome.instance_name }}</title>
+  <link rel="stylesheet" href="https://{{ chrome.instance_name }}/static/tokens.css">
+  <link rel="stylesheet" href="https://{{ chrome.instance_name }}/static/brolly.css">
+  {# The same document a client parses. `alternate` rather than `describedby`:
+     it is this resource in another syntax, not a description of it. #}
+  <link rel="alternate" type="text/turtle" href="{{ webid }}">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <main id="main" class="shell-main">
+    <div class="wrap">
+      <div class="dashboard">
+        <h1>{% if display_name.is_empty() %}@{{ username }}{% else %}{{ display_name }}{% endif %}</h1>
+
+        {% if !bio.is_empty() %}<p class="lede">{{ bio }}</p>{% endif %}
+
+        <section class="dashboard-card">
+          <header><h2>WebID</h2></header>
+          <section>
+            <dl class="facts">
+              <dt>WebID</dt>
+              <dd><span class="mono">{{ webid }}</span></dd>
+
+              <dt>Sign in with this</dt>
+              <dd>
+                <span class="mono">{{ issuer }}</span>
+                <p class="hint">
+                  Paste the WebID above into a Solid application. It reads this
+                  page to find that issuer, and sends you here to sign in.
+                </p>
+              </dd>
+
+              <dt>Storage</dt>
+              <dd>
+                <span class="mono">{{ storage_root }}</span>
+                <p class="hint">Where this account's data lives. Applications discover it from this page.</p>
+              </dd>
+            </dl>
+          </section>
+          <footer>
+            <p class="hint">
+              This page is also the machine-readable profile. Request it as
+              <span class="mono">text/turtle</span> to get the RDF a client sees.
+            </p>
+          </footer>
+        </section>
+      </div>
+    </div>
+  </main>
+</body>
+</html>

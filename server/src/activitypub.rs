@@ -207,3 +207,95 @@ pub async fn nodeinfo(State(state): State<AppState>, headers: HeaderMap) -> Resp
 
     json_response("application/json", actor::nodeinfo(users, posts))
 }
+
+// --- the actor's collections -------------------------------------------------
+
+/// An AS2 `OrderedCollection` rendered whole.
+///
+/// No paging. These are small on a private community server, and a `first`
+/// page that never gets a second one is a lie in the shape of a standard. Add
+/// paging when a collection is big enough to need it, not before.
+fn ordered_collection(id: &str, items: Vec<String>) -> Value {
+    serde_json::json!({
+        "@context": "https://www.w3.org/ns/activitystreams",
+        "id": id,
+        "type": "OrderedCollection",
+        "totalItems": items.len(),
+        "orderedItems": items,
+    })
+}
+
+/// `GET /followers` and `GET /following` on a member subdomain.
+///
+/// Public, matching `/actor` and the fediverse's own convention: a follower
+/// list is how another server decides whether it already knows you.
+async fn follow_collection(state: &AppState, headers: &HeaderMap, which: Which) -> Response {
+    let Some(username) = extract::subdomain_user(host_of(headers), &state.base_domain) else {
+        return not_found();
+    };
+    let Some(user) = active_member(state, &username).await else {
+        return not_found();
+    };
+    let Ok(pod) = state.stores.pod(user.id) else {
+        tracing::error!(user = %user.id, "pod unavailable serving a collection");
+        return server_error();
+    };
+
+    let actor = webid::actor(&username, &state.base_domain);
+    let (id, items) = match which {
+        Which::Followers => (
+            webid::followers(&username, &state.base_domain),
+            brolly_activitypub::follows::followers(&pod, &actor),
+        ),
+        Which::Following => (
+            webid::following(&username, &state.base_domain),
+            brolly_activitypub::follows::following(&pod, &actor),
+        ),
+    };
+    json_response(ACTIVITY_JSON, ordered_collection(&id, items))
+}
+
+enum Which {
+    Followers,
+    Following,
+}
+
+pub async fn followers_collection(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    follow_collection(&state, &headers, Which::Followers).await
+}
+
+pub async fn following_collection(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    follow_collection(&state, &headers, Which::Following).await
+}
+
+/// `GET /inbox` on a member subdomain.
+///
+/// **Owner only.** Your inbox is your home timeline (D6), which makes it the
+/// one collection here that is not public — serving it to anonymous callers
+/// would publish who you follow and everything they have sent you.
+///
+/// 404 rather than 403 for a caller who is not the owner, matching
+/// `require_admin`: 403 confirms the resource exists and that the caller found
+/// a real member, which is a disclosure with nothing on the other side of it.
+pub async fn inbox_collection(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let Some(username) = extract::subdomain_user(host_of(&headers), &state.base_domain) else {
+        return not_found();
+    };
+    let Some(user) = active_member(&state, &username).await else {
+        return not_found();
+    };
+
+    let inbox = webid::inbox(&username, &state.base_domain);
+    let subject = crate::pod::subject_for(&state, &headers, "GET", &inbox).await;
+    if subject.user_id != Some(user.id) {
+        return not_found();
+    }
+
+    let Ok(pod) = state.stores.pod(user.id) else {
+        tracing::error!(user = %user.id, "pod unavailable serving an inbox");
+        return server_error();
+    };
+
+    let items = brolly_store::collection::members(&pod, &inbox);
+    json_response(ACTIVITY_JSON, ordered_collection(&inbox, items))
+}

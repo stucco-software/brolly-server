@@ -167,3 +167,77 @@ pub fn write(
     }
     Ok(())
 }
+
+/// The WebID profile document, as a client dereferencing the WebID sees it.
+///
+/// A **projection**, not a second copy: the member's own triples come out of
+/// the pod exactly as they were written, and the server adds the handful that
+/// make the document usable.
+///
+/// Those additions are generated per request rather than persisted at
+/// provisioning, and that is the load-bearing decision here. `oidcIssuer` and
+/// `space:storage` are both derived from the base domain, so writing them into
+/// the pod would freeze one deployment's hostname into every member's data —
+/// change `BROLLY_BASE_DOMAIN` and every profile would still name the old
+/// issuer, which is precisely the failure that makes one image unable to serve
+/// many deployments.
+///
+/// `solid:oidcIssuer` is the reason this endpoint has to exist at all. An app
+/// handed a WebID dereferences it and reads that triple to learn where to send
+/// the member to authenticate; without it there is no way in, however well the
+/// OIDC endpoints themselves work.
+pub fn document(
+    store: &Store,
+    webid: &str,
+    document: &str,
+    storage_root: &str,
+    issuer: &str,
+) -> Vec<Quad> {
+    let graph = iri(document);
+    let subject = NamedOrBlankNode::NamedNode(iri(webid));
+
+    // Whatever the member has written, verbatim.
+    let mut quads: Vec<Quad> = store
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(graph.as_ref())),
+        )
+        .filter_map(Result::ok)
+        .collect();
+
+    let derived = [
+        // The document describes the person; it is not the person. That
+        // distinction is what the `#me` fragment exists for.
+        (
+            NamedOrBlankNode::NamedNode(graph.clone()),
+            vocab::RDF_TYPE,
+            vocab::FOAF_PERSONAL_PROFILE_DOCUMENT,
+        ),
+        (
+            NamedOrBlankNode::NamedNode(graph.clone()),
+            vocab::FOAF_PRIMARY_TOPIC,
+            webid,
+        ),
+        (subject.clone(), vocab::RDF_TYPE, vocab::FOAF_PERSON),
+        (subject.clone(), vocab::SOLID_OIDC_ISSUER, issuer),
+        (subject.clone(), vocab::SPACE_STORAGE, storage_root),
+    ];
+
+    for (s, p, o) in derived {
+        let quad = Quad::new(
+            s,
+            iri(p),
+            Term::NamedNode(iri(o)),
+            GraphName::NamedNode(graph.clone()),
+        );
+        // A member could have written one of these themselves. Theirs stands;
+        // duplicating it would put two values on a predicate whose readers
+        // expect one.
+        if !quads.contains(&quad) {
+            quads.push(quad);
+        }
+    }
+    quads
+}
