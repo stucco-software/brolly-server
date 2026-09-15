@@ -324,3 +324,43 @@ async fn only_bootstrap_invite(pool: &sqlx::PgPool) -> String {
         .await
         .unwrap()
 }
+
+/// Disabled is the state that must never read as ordinary: an operator
+/// scanning for the account they just disabled should find it without reading.
+/// Marking `active` and `member` too would make everything marked, which is the
+/// condition <mark> exists to distinguish itself from.
+#[tokio::test]
+async fn the_member_list_marks_only_the_exceptional() {
+    let (db, _dir, router) = harness().await;
+
+    let invite = db::create_invite(&db.pool, None, 1, None, Some("admin"))
+        .await
+        .unwrap();
+    let cookie = register(&router, "keeper", &invite).await;
+
+    let invite = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
+    let _ = register(&router, "alice", &invite).await;
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'alice'")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+    let (status, body) = get_as(&router, "/admin/users", Some(&cookie)).await;
+    assert_eq!(status, StatusCode::OK);
+
+    assert!(
+        body.contains("chip-disabled"),
+        "a disabled account is marked"
+    );
+    assert!(body.contains("chip-admin"), "an admin is marked");
+    // Exactly two marks: keeper's role and alice's status. Counting binds this
+    // in a way `!contains("chip-active")` cannot — no such class is ever
+    // defined, so that would pass even if every cell were wrapped in a chip.
+    assert_eq!(
+        body.matches("<mark").count(),
+        2,
+        "only the exceptional values are marked; got: {body}"
+    );
+}

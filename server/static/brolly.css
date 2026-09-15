@@ -493,6 +493,25 @@ textarea { width: 100%; }
 }
 .facts dd:last-of-type { border-block-end: 0; }
 
+/* <mark> rather than a span: it is the element for "this run of text is
+   relevant", so the distinction survives with CSS off — the same argument as
+   <strong> over a bold class.
+
+   Only the exceptional value is marked. `member` and `active` are the default
+   state of almost every row, and marking those too would make everything
+   marked, which is the condition <mark> exists to distinguish itself from. */
+.chip {
+  display: inline-block;
+  padding: var(--badge-padding-block) var(--badge-padding-inline);
+  border-radius: var(--radius-sm);
+  font-size: var(--txt--1);
+  font-weight: var(--weight-semibold);
+}
+/* --accent, not --wash-feature: .notice already owns that yellow, and a
+   success notice beside a role chip in the same colour would read as related. */
+.chip-admin { background: var(--accent); color: var(--accent-fg); }
+.chip-disabled { background: var(--destructive); color: var(--destructive-fg); }
+
 .hint { font-size: var(--txt--1); color: var(--muted-fg); margin-block-start: var(--sp--2); }
 .notice {
   padding: var(--sp--2) var(--sp--1);

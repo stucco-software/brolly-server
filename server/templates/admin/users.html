@@ -26,8 +26,16 @@
           {% for member in members %}
           <tr>
             <th scope="row">@{{ member.username }}</th>
-            <td>{{ member.role }}</td>
-            <td>{{ member.status }}</td>
+            <td>
+              {% if member.role == "admin" %}
+              <mark class="chip chip-admin">admin</mark>
+              {% else %}member{% endif %}
+            </td>
+            <td>
+              {% if member.status == "disabled" %}
+              <mark class="chip chip-disabled">disabled</mark>
+              {% else %}active{% endif %}
+            </td>
             <td>{{ member.created }}</td>
             <td>
               {% if let Some(did) = member.did %}
