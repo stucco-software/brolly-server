@@ -40,15 +40,17 @@ an existing key.
 
 | # | Decision | Why |
 |---|---|---|
-| M1 | **Keep identity, ATProto and posts.** Carry over accounts, password hashes, `did:plc` identities, handles, ATProto repos, notes, follows between members, profiles and media. Solid resources move under `/~/`. **Drop** sessions, every kind of OAuth grant, Mastodon tokens, invites, blocks, mutes, reports, instance rules, and the old note, media and root-level Solid URLs. | Members keep who they are and what they published. Everything dropped is either re-created by logging in again or is empty on a 10-person beta. Redirecting old URLs has no audience, because nothing federated. |
+| M1 | **Keep identity, ATProto and posts.** Carry over accounts, password hashes, `did:plc` identities, handles, ATProto repos and their blobs, notes, follows between members, profiles and avatars. **Drop** post media attachments, Solid resources that members stored, sessions, every kind of OAuth grant, Mastodon tokens, invites, blocks, mutes, reports, instance rules, and the old note, media and root-level Solid URLs. | Members keep who they are and what they published. Everything dropped is either re-created by logging in again, not worth carrying on a 10-person beta, or has no audience: nothing federated, so nobody depends on the old URLs. |
 | M2 | **Two stages: mycorhizza exports a bundle, brolly-server imports it.** | brolly-server never learns mycorhizza's schema. The bundle can be inspected before anything irreversible happens, and a rehearsal is just an import into an empty instance. Reading mycorhizza's stores directly isn't possible anyway: Oxigraph 0.4.11 and 0.5.9 use incompatible on-disk formats. |
-| M3 | **The bundle holds protocol formats, not either server's RDF.** Notes are AS2 JSON, repos are CAR files, and Solid resources and media are bytes plus metadata. | The exporter is the only code that knows mycorhizza, and the importer writes through brolly-server's ordinary write paths: canonicalization, the faithful layer, the public index. Neither server's internal vocabulary appears in the bundle. |
+| M3 | **The bundle holds protocol formats, not either server's RDF.** Notes are AS2 JSON, repos are CAR files, and avatars and blobs are bytes plus metadata. | The exporter is the only code that knows mycorhizza, and the importer writes through brolly-server's ordinary write paths: canonicalization, the faithful layer, the public index. Neither server's internal vocabulary appears in the bundle. |
 | M4 | **Replace the rotation key, keep the old one as backup.** Each DID gets a PLC update with `rotationKeys: [<new per-user key>, <mycorhizza instance key>]`. After the migration is verified, a second update removes the instance key. | brolly-server's model is one rotation key per user (`server/src/provision.rs`). While the old key stays listed, it can sign a new operation on top of the head at any time, so a lost or wrongly encoded new key can still be recovered from. PLC gives the first key priority, so the old key cannot override anything the new key signs. The backup protects against losing the new key. It doesn't protect against an update that the new key signs and that removes the old key, which is why removing it is a separate, later step. |
 | M5 | **Import each member's existing signing key unchanged.** | Existing commits stay valid and record CIDs don't change, so replies and likes from Bluesky users still point at the right posts. The PLC update only changes the rotation keys and the PDS endpoint. |
 | M6 | **Announced maintenance window.** Take mycorhizza offline, export a final snapshot, import, switch the domains, submit the PLC updates, request re-crawls. Rehearse first on a copy of production. | With ten members, adding incremental sync or running both servers side by side isn't worth the work. Railway's `*.brolly.id` wildcard can only point at one service anyway. |
 | M7 | **The import never signs a PLC operation. `plc-adopt` signs and submits in one step, after the checks.** | The import can be wiped and re-run. A submitted PLC operation cannot be undone. If the importer built signed updates, every rehearsal would leave valid, submittable operations for ten live DIDs in a staging database, and the existing `brolly-admin plc-retry` would submit them: it sends every row with `submitted_at IS NULL` and checks no environment variable. |
 | M8 | **Every member's PDS endpoint moves to `https://brolly.id`.** Nine DIDs currently point at `https://<username>.brolly.id`; nikolas's already points at the apex. | brolly-server serves XRPC on the apex and mints genesis operations for it (`server/src/provision.rs`). Relays track PDS hosts by hostname, so one host is simpler for them than ten. Keeping the subdomain endpoints would mean serving XRPC on member subdomains, against ADR 0009. The cost is that relays treat those nine accounts as having moved host, so the runbook handles the identity events and asks members not to post during the switch. |
 | M9 | **The rehearsal bundle has no instance rotation key.** | Staging can then never sign for a live DID, whatever runs there. `plc-adopt` refuses without the key, and the rehearsal checks the signing path offline instead (piece 2). |
+| M10 | **Avatars use the same media model as every other upload, on every protocol.** There is no special case for avatars in the migration. | A profile picture is an upload that happens to be referenced from a profile. If Solid, ActivityPub, Mastodon and ATProto each stored their own copy, they would drift apart, which is the predecessor's mistake again. The importer writes the avatar once, through the shared path. |
+| M11 | **A post exists either as an AS2 note or as an ATProto record, never both.** | Confirmed for mycorhizza's data. The importer handles the two separately, with no de-duplication. |
 
 ## The pieces
 
@@ -65,10 +67,21 @@ migration.
   `@<username>.brolly.id` handle fails verification. This needs an entry in ADR
   0009's reserved-path table.
 - **`com.atproto.sync.listRepos`, `getLatestCommit`, `getBlocks`, `getBlob`.**
-  `getBlob` needs somewhere to keep ATProto blobs. ADR 0013's store is keyed by
-  the SHA-256 of the content, and the repo block store already strips the codec
-  from CIDs (`adapters/atproto/src/blocks.rs`), so an avatar's raw-codec CID can
-  probably resolve there. Piece 1's spec decides.
+- **One way to store media, for every protocol (M10).** An avatar, a Mastodon
+  or ActivityPub attachment, a Solid binary upload and an ATProto blob are all
+  the same kind of thing: bytes in ADR 0013's content-addressed store, described
+  by a resource in the pod. Each protocol gets its own view of that resource:
+  - Solid: the LDP binary, and `foaf:depiction` on the profile for an avatar
+  - ActivityPub: `icon` and `attachment`
+  - Mastodon: `avatar` and media attachments (both `null` or missing today,
+    `adapters/mastodon/src/translate.rs`)
+  - ATProto: the blob CID behind `getBlob` and the profile record's `avatar`
+
+  Setting an avatar through any one protocol shows it in all of them. ADR 0013
+  keys by the content's SHA-256, and the repo block store already strips the
+  codec from CIDs (`adapters/atproto/src/blocks.rs`), so a raw-codec blob CID
+  can find the same bytes. Piece 1's spec designs this and records it in an
+  ADR.
 - **`rev` must be a TID.** `atproto_repos.rev` is an integer counter, and
   `adapters/atproto/src/firehose.rs` sends it as `rev`. Relays compare revs as
   TIDs and ignore commits that don't advance, so after an import every existing
@@ -213,27 +226,21 @@ accounts/<uuid>/
   activitypub/objects.jsonl   one AS2 activity per line, with source IRIs
   activitypub/follows.jsonl   follower, followee, state
   profile.json           name, summary, manuallyApprovesFollowers, bot,
-                         discoverable, avatar (media key)
-  media/index.jsonl      key, source URL, media type, size, width, height,
-                         description, blurhash, attached_to
-  media/<key>            bytes
-  solid/index.jsonl      path relative to the old storage root, content
-                         type, kind (rdf | binary), acl
-  solid/<n>              body: Turtle with relative IRIs, or bytes
+                         discoverable
+  profile/avatar         bytes, plus media type (absent if none)
 ```
 
 **Rewriting IRIs follows one rule.** The importer builds a map from every source
-IRI listed in the bundle (notes, activities, media URLs, Solid resource IRIs) to
-the IRI it mints for that item, then rewrites every IRI found in bundle content
-through that map. It never parses an IRI to work out its shape, so it needs no
-knowledge of mycorhizza's URL layout. Notes keep their ULID
-(`/outbox/<ULID>` becomes `/~/notes/<ULID>`), so they stay in order. Actor IRIs
-are identical on both servers (`https://<username>.brolly.id/actor`) and need
-no mapping.
+IRI listed in the bundle (notes and activities) to the IRI it mints for that
+item, then rewrites every IRI found in bundle content through that map.
+References to dropped media are left as they are and will 404. It never parses
+an IRI to work out its shape, so it needs no knowledge of mycorhizza's URL
+layout. Notes keep their ULID (`/outbox/<ULID>` becomes `/~/notes/<ULID>`), so
+they stay in order. Actor IRIs are identical on both servers
+(`https://<username>.brolly.id/actor`) and need no mapping.
 
 **The exporter leaves out:**
-- anything mycorhizza generated rather than a member wrote: type indexes,
-  `/settings/`, the `/inbox/` ACL, the `profile/card` scaffolding
+- every Solid resource and post media attachment (M1)
 - `urn:atproto:*` graphs, because the CAR is the authoritative copy of ATProto
   records
 
@@ -254,12 +261,11 @@ is removed afterwards.
 - **For each account:**
   1. Adopt the identity (piece 2).
   2. Provision the pod with its root ACL.
-  3. Write the profile.
+  3. Write the profile, and the avatar through the shared media path (M10).
   4. Store the CAR's blocks unchanged, set the head to the CAR's commit, and
      ingest its records into the pod through the faithful layer.
-  5. Store the ATProto blobs.
-  6. Write media as LDP binaries under `/~/media/`.
-  7. Write Solid resources under `/~/`.
+  5. Store the ATProto blobs through the same media path, so that a profile
+     record's avatar blob and the member's avatar are one resource.
 - **Then, across accounts:**
   1. Replay notes and activities through the local delivery path
      (ADR 0014), so that inboxes and the public index fill the way they do in
@@ -315,7 +321,8 @@ against a rehearsal.
    - `listRepos` shows every repo, and each head CID matches the manifest
    - `/.well-known/atproto-did` answers for all ten members
    - notes appear on the public timeline
-   - media and Solid resources load
+   - avatars show in a Mastodon client, on the ActivityPub actor and in each
+     profile's `getBlob`
 7. **Adopt.** Set `BROLLY_PLC_SUBMIT=1`, run
    `brolly-admin plc-adopt --endpoint https://brolly.id`, then send
    `com.atproto.sync.requestCrawl` for `brolly.id` to the Bluesky relay.
@@ -349,10 +356,11 @@ against a rehearsal.
 
 ## Known losses
 
+- Post media attachments, and Solid resources that members stored.
 - Old URLs 404: `/outbox/<ULID>`, `/media/<owner>/<id>/<name>`, and Solid
   resources outside `/~/`.
-- Mastodon status and media IDs change (ADR 0015's format carries the owner).
-  Clients re-fetch.
+- Mastodon status IDs change (ADR 0015's format carries the owner). Clients
+  re-fetch.
 - Every session and OAuth grant: Solid, ATProto, Mastodon. Members log in again
   and re-authorize apps.
 - Blocks, mutes, reports and instance rules. Record their counts at rehearsal;
@@ -360,19 +368,6 @@ against a rehearsal.
 
 ## Open questions
 
-These don't block pieces 1 and 2. Resolve them during piece 3 and its
-rehearsal:
-
-- **Are media and blob files actually on the volume?** mycorhizza sets
-  `MYCORRIZA_MEDIA_PATH` and `MYCORRIZA_BLOB_PATH` explicitly, but the values
-  were redacted when checked. If they point outside the `/stores` mount, those
-  files didn't survive past restarts, and the bundle will say so.
-- **Avatars have nowhere to live in brolly-server outside the ATProto profile
-  record.** Mastodon avatars are always `null` (`adapters/mastodon/src/translate.rs`)
-  and the Solid profile has no `foaf:depiction`. Decide in piece 3 whether to
-  add it or accept the gap.
-- **Did mycorhizza posts also go to the ATProto repo?** If a post exists both as
-  an AS2 note and an ATProto record, the importer must not turn it into two
-  posts.
-- **Did anyone store Solid resources of their own?** If not, the Solid half of
-  the bundle is empty and piece 3 gets smaller.
+None at umbrella level. Resolved on 2026-09-16: media attachments and Solid
+resources are dropped (M1), avatars share one media model (M10), and notes and
+ATProto records don't overlap (M11).
