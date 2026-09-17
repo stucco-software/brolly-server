@@ -450,8 +450,11 @@ has no vetted list, so neither is fetched for display.
 - **New errors: `DpopError::Replayed`, and `DpopError::Storage(String)`** for a
   database failure. `DpopError` derives `Clone` and `Eq`, so it keeps the
   message, not the `sqlx::Error`.
-- **A storage failure fails closed.** Token endpoints answer `500`
-  `server_error`; resource requests treat the caller as anonymous.
+- **A storage failure fails closed.**
+  - The Solid token endpoint answers `500` `server_error`.
+  - The ATProto endpoints answer `400` `invalid_dpop_proof` and log the failure
+    at `error`, because `proof_thumbprint` returns only `Option`.
+  - Resource requests treat the caller as anonymous.
 - **Existing unit tests in `identity/src/dpop.rs` that read `.thumbprint` from
   `verify`** are rewritten to use `bound_to` with a thumbprint they compute
   themselves.
@@ -523,7 +526,9 @@ All of this runs under the existing testcontainers harness.
 - **`Delete`:** Mallory sends one whose `object` is Alice's `/~/.acl`. Alice's
   ACL is unchanged, and she can still read her storage root.
 - **`Create`:** Mallory, whom Alice follows, sends one whose embedded object `id`
-  is Alice's `/~/.acl`. The outbox answers 400. Delivering the same activity
+  is Alice's `/~/.acl`. Over HTTP the outbox replaces that id with a minted
+  note id, so the post is accepted and Alice's ACL is untouched. Calling
+  `outbox::deliver` directly with the foreign id is refused. Delivering it
   straight to `processor::process` returns `ForeignObject` and leaves the graph
   untouched.
 - **References still work:** a `Like` and a `Follow` whose `object` names another
@@ -634,7 +639,8 @@ Six commits on `main`, in this order, each deployable with its tests:
 1. **A1** (activity origin) is first because it is the worst hole.
 2. **A2** (ACL Control), plus `brolly-admin acl-uncontain`, an idempotent
    command that removes `ldp:contains` triples pointing at `.acl` resources.
-   Operators run it once after deploying. It's a command rather than a startup
+   Operators run it once after deploying, with the server stopped, because
+   Oxigraph opens each store exclusively. It's a command rather than a startup
    task because it opens every pod, which would slow startup and churn the store
    cache on large instances.
 3. **C**, with the migration.
