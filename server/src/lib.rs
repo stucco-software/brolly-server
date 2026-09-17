@@ -119,11 +119,6 @@ impl AppState {
     }
 }
 
-/// Build the application router.
-///
-/// Adapters contribute their own routers here. Nothing else in the workspace
-/// constructs a `Router` at the top level.
-
 /// The CORS posture for the whole server.
 ///
 /// Solid is a browser protocol. An app at another origin dereferences a
@@ -191,6 +186,10 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
     response
 }
 
+/// Build the application router.
+///
+/// Adapters contribute their own routers here. Nothing else in the workspace
+/// constructs a `Router` at the top level.
 pub fn app(state: AppState, static_dir: &str) -> Router {
     // Solid-OIDC (ADR 0008). Its own router so `apex_only` can wrap the whole
     // surface: the guard has to run before extraction, or a wrong method or an
