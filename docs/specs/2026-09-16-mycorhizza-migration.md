@@ -1,6 +1,9 @@
 # Migrating brolly.id off mycorhizza
 
-**Status:** Draft (2026-09-16)
+**Status:** Paused (2026-09-17). Nothing here starts until brolly-server works
+end to end with Bluesky, ATProto apps and Solid apps. A survey on 2026-09-17
+found its ATProto repo, firehose, OAuth and media paths short of the protocols,
+so piece 1 below understates the work.
 **Scope:** Umbrella spec. It records the decisions and splits the work into four
 pieces, each of which gets its own spec and plan.
 **Depends on:** ADR 0002 (atrium), ADR 0010 (storage root), ADR 0013 (blobs),
