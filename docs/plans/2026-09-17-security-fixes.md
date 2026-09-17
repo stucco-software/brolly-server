@@ -13,9 +13,10 @@
 - DPoP proofs that can be replayed
 - no outbound HTTPS
 
-**Architecture:** Five chunks, one per spec section, landing as **six commits
-on `main`**. Chunk 5's first commit, threading `ClientLookup` through
-`AppState`, is a separate commit with no behaviour change.
+**Architecture:** Chunk 0 restores the gates. Then five chunks, one per spec
+section, land as **eight commits on `main`**: A1, A2 and C are one commit each,
+B0 is one, and B is four (rules, threading `ClientLookup` through `AppState`
+with no behaviour change, fetcher, PAR).
 - An origin rule in the ActivityPub processor and outbox.
 - A governed-path rule in `ldp::check`.
 - An `Unspent<T>` type that makes recording a DPoP `jti` a compile-time
@@ -33,7 +34,7 @@ on `main`**. Chunk 5's first commit, threading `ClientLookup` through
 
 ## Ordering
 
-Chunks run in order: **1 (A1), 2 (A2), 3 (C), 4 (B0), 5 (B).** Each chunk
+Chunks run in order: **0 (gates), 1 (A1), 2 (A2), 3 (C), 4 (B0), 5 (B).** Each chunk
 assumes the previous ones are merged. Rules:
 
 - **Gates, then commit.** Each commit runs the gates and is verified from a
@@ -84,6 +85,29 @@ access, because `rustls-platform-verifier` is new to the lock.
 - **Chunk 4:** on an instance with `BROLLY_PLC_SUBMIT` set, `brolly-admin plc-retry`
   can now reach plc.directory. That's an optional manual check, not a gate.
 
+## Chunk 0: Restore the gates on `main` (done, `b5088b8`)
+
+Found while reviewing this plan. Before any stage 0 work, `main` failed two of
+its own gates:
+
+- **`cargo deny check`:** RUSTSEC-2026-0285 in rustls 0.23.43, plus yanked
+  `chacha20` 0.10.1 and `wnaf` 0.14.0.
+- **`cargo clippy -D warnings`:** `empty_line_after_doc_comments` at
+  `server/src/lib.rs:125`. `956cad9` inserted `cors` between `app()` and its
+  doc comment, which left the comment attached to nothing.
+
+### Task 0: Update the crates and reattach the doc
+
+- [x] **Step 1:** Run `cargo update -p rustls -p chacha20 -p wnaf`. This takes
+  rustls to 0.23.45, chacha20 to 0.10.2 and wnaf to 0.14.1.
+- [x] **Step 2:** Move the `/// Build the application router.` doc block from
+  above `cors` to directly above `pub fn app`.
+- [x] **Step 3: Gates.** `cargo deny check` reports `advisories ok, bans ok,
+  licenses ok, sources ok`. `cargo fmt --all -- --check` and
+  `cargo clippy --workspace --all-targets -- -D warnings` are clean.
+  `cargo test --workspace` gives 716 passed, 0 failed.
+- [x] **Step 4: Commit** `b5088b8`, then verify from a clean checkout.
+
 ## Chunk 1: Activities only touch graphs their actor owns (A1)
 
 Spec section A1, and its tests under **Testing → A1**. This is rollout commit 1,
@@ -95,12 +119,12 @@ leaves the outbox writing graphs the processor would refuse.
 
 | File | Change |
 |---|---|
-| `adapters/activitypub/src/processor.rs` | `same_origin`, `ProcessError::ForeignObject`, the origin gate in `process`, `Recipient::Member { inbox, outbox }`, `Delete` removes only embedded carriers, index guards |
-| `store/src/index.rs` | `record_note` never adds a second author |
-| `server/src/outbox.rs` | `as_activity` mints and flattens; `deliver` becomes `pub`, checks `authored` first, and returns `DeliverError`; refusals logged at `warn` |
+| `adapters/activitypub/src/processor.rs` | `same_origin`, `ProcessError::ForeignObject`, the origin gate in `process`, `Recipient::Member { inbox, outbox }`, `Delete` removes only embedded carriers, index guards (an `Announce` only touches an already-indexed note) |
+| `store/src/index.rs` | `record_note` writes nothing for a note already indexed (no second author, no second `published`); new read `is_indexed` |
+| `server/src/outbox.rs` | `as_activity` mints and flattens; `deliver` becomes `pub`, checks `authored` first, and returns `DeliverError`; refusals logged at `warn`; a federation warning on the follow bookkeeping in `deliver_locally` |
 | `server/src/mastodon_api.rs` | `create_status` maps `DeliverError` |
-| `adapters/activitypub/tests/processor.rs` | adapter-level tests |
-| `store/tests/storage_invariants.rs` | one author per pointer |
+| `adapters/activitypub/tests/processor.rs` | adapter-level tests; `an_announce_is_indexed_like_a_create` rewritten to pre-index the note |
+| `store/tests/storage_invariants.rs` | the first record of a pointer wins |
 | `server/tests/federation_flows.rs` | the spec's A1 tests; harness gains `mallory`, real root ACLs, and `state` |
 
 ---
@@ -108,8 +132,12 @@ leaves the outbox writing graphs the processor would refuse.
 ### Task 1: The processor refuses foreign ids
 
 **Files:**
-- Modify: `adapters/activitypub/src/processor.rs:41-54` (`ProcessError` and its `Display`), `:76-87` (`process`), plus two new functions after `object_id` (`:176-183`), plus the unit test module (`:204-245`)
-- Modify: `server/src/outbox.rs:199-208` (instance delivery in `deliver`) and `:304-306` (`deliver_locally`), so refusals are logged at `warn`
+- Modify: `adapters/activitypub/src/processor.rs` (`ProcessError` and its `Display`, `process`, two new functions after `object_id`, and `mod tests`)
+- Modify: `server/src/outbox.rs` (the processor import, the instance delivery at the end of `deliver`, and `deliver_locally`), so refusals are logged at `warn` and the follow bookkeeping carries a warning for federation
+
+Line numbers below are for the files as they are before this task. Each step
+names its anchor too, and once an earlier step in the same file has changed its
+length, go by the anchor.
 - Test: `adapters/activitypub/tests/processor.rs`
 
 - [ ] **Step 1: Write the failing tests**
@@ -157,13 +185,13 @@ use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad
 use serde_json::{Value, json};
 ```
 
-Add a constant after `ACTIVITY` (`:24`):
+Add a constant after `const ACTIVITY` (`:24`):
 
 ```rust
 const ALICE_ACL: &str = "https://alice.brolly.test/~/.acl";
 ```
 
-Add two helpers after `literals` (`:49-59`):
+Add two helpers directly after `fn literals` (before the `// --- the member subscriber ---` rule):
 
 ```rust
 /// Put one quad in `name`, standing in for a resource someone would attack.
@@ -331,7 +359,7 @@ Expected: FAIL to compile. `error[E0599]: no variant or associated item named 'F
 
 - [ ] **Step 3: Implement**
 
-In `adapters/activitypub/src/processor.rs`, replace `ProcessError` and its `Display` (`:41-54`):
+In `adapters/activitypub/src/processor.rs`, replace `pub enum ProcessError` and its `impl std::fmt::Display` (`:41-54`):
 
 ```rust
 #[derive(Debug)]
@@ -357,7 +385,7 @@ impl std::fmt::Display for ProcessError {
 }
 ```
 
-Replace `process` (`:76-87`):
+Replace `pub fn process` and its doc comment (`:76-87` before the step above; it now sits just after the `From<WriteError>` impl):
 
 ```rust
 /// Handle one delivered activity.
@@ -383,7 +411,7 @@ pub fn process(
 }
 ```
 
-Add these two functions directly after `object_id` (`:176-183`):
+Add these two functions directly after `fn object_id` (before `fn addressed_publicly`):
 
 ```rust
 /// The activity's actor, provided every graph the activity would write is on
@@ -433,7 +461,7 @@ In `server/src/outbox.rs`, change the processor import (`:19`):
 use brolly_activitypub::processor::{self, ProcessError, Recipient};
 ```
 
-Replace the instance delivery at the end of `deliver` (`:199-208`):
+Replace the instance delivery at the end of `deliver` (`:199-208`, the `if let Err(e) = processor::process(state.stores.instance(), ...)` just before `Ok(())`):
 
 ```rust
     // The instance is a recipient like any other (D4), and its processor writes
@@ -450,7 +478,29 @@ Replace the instance delivery at the end of `deliver` (`:199-208`):
     }
 ```
 
-Replace the last statement of `deliver_locally` (`:304-306`):
+In `deliver_locally`, the follow bookkeeping runs *before* `processor::process`,
+so it never sees the origin gate. Today that is safe, because every activity
+reaching `deliver_locally` came through `outbox::deliver` with an `actor` the
+server set. Replace the comment above `if activity["type"] == "Follow"`
+(`:281-287`) with one that says so:
+
+```rust
+    // A Follow arriving establishes the relationship in the recipient's pod,
+    // which is what delivery reads to resolve recipients next time — *unless*
+    // the account is locked, in which case it waits for approval instead.
+    //
+    // This is the whole of what "locked" means, and the predecessor recorded
+    // the follow unconditionally, so the flag did nothing. It did nothing
+    // invisibly, too: the profile still rendered the lock.
+    //
+    // FEDERATION: this writes before `processor::process` applies its origin
+    // check (stage 0, A1). That is only safe while every activity here came
+    // through `outbox::deliver` with an actor the server set. Revisit when
+    // federation is enabled (ADR 0016): an inbound Follow's `actor` must be
+    // verified before it is recorded as a follower.
+```
+
+Replace the last statement of `deliver_locally` (`:304-306`, the `if let Err(e) = processor::process(&pod, Recipient::Member { inbox }, ...)`):
 
 ```rust
     // A refusal isn't a failure: the activity named a graph its actor doesn't
@@ -469,14 +519,21 @@ Replace the last statement of `deliver_locally` (`:304-306`):
 Run: `cargo test -p brolly-activitypub`
 Expected: PASS, including every existing test in `tests/processor.rs`. They all use ids on Bob's origin, and `an_announce_is_indexed_like_a_create` names Carol's note only by string.
 
-- [ ] **Step 5: Gates**
+- [ ] **Step 5: Format**
+
+The snippets above aren't guaranteed to match `rustfmt.toml` (`max_width = 100`), and the gate checks formatting. Format first, as its own step:
 
 ```bash
 cargo fmt --all
+```
+
+- [ ] **Step 6: Gates**
+
+```bash
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-- [ ] **Step 6: Don't commit**
+- [ ] **Step 7: Don't commit**
 
 A1 is one commit (spec, Rollout 1). Carry on to Task 2 with the tree dirty.
 
@@ -485,8 +542,11 @@ A1 is one commit (spec, Rollout 1). Carry on to Task 2 with the tree dirty.
 ### Task 2: A `Delete` removes only what delivery embedded, from inbox and outbox
 
 **Files:**
-- Modify: `adapters/activitypub/src/processor.rs:32-39` (`Recipient`), `process` (as left by Task 1), `:89-110` (`process_for_member`), `:112-118` (`references`, which is deleted)
-- Modify: `server/src/outbox.rs:159-166` (author's `Delete` copy in `deliver`) and `deliver_locally` (as left by Task 1)
+- Modify: `adapters/activitypub/src/processor.rs`, as left by Task 1: `pub enum Recipient`, the body of `pub fn process`, `fn process_for_member`, and `fn references` (deleted)
+- Modify: `server/src/outbox.rs`, as left by Task 1: the author's `Delete` copy in `deliver` (the `processor::process(&author_pod, Recipient::Member { ... })` call) and the `match processor::process(...)` at the end of `deliver_locally`
+
+Task 1 changed the length of both files, so every location in this task is named
+by its function or anchor, not by line.
 - Test: `adapters/activitypub/tests/processor.rs`, `server/tests/federation_flows.rs`
 
 - [ ] **Step 1: Write the failing tests**
@@ -616,9 +676,9 @@ fn a_delete_also_clears_the_authors_outbox_copy() {
 root ACLs. Today's harness only calls `storage::init_storage_root`, so there is
 no ACL to protect.
 
-Delete the import `use brolly_solid::storage;` (`:14`).
+Delete the import `use brolly_solid::storage;`.
 
-In `harness()` (`:40-48`), replace the member loop:
+In `harness()`, replace the member loop (`for name in ["alice", "bob"] { ... }`, with the `let mut ids` above it):
 
 ```rust
     let mut ids = std::collections::HashMap::new();
@@ -634,7 +694,7 @@ In `harness()` (`:40-48`), replace the member loop:
     }
 ```
 
-Add these to `impl Harness`, after `index_count` (`:147-149`):
+Add these to `impl Harness`, after `fn index_count`:
 
 ```rust
     /// Every quad in one graph of a member's pod, as text, so "left untouched"
@@ -675,7 +735,7 @@ Add these to `impl Harness`, after `index_count` (`:147-149`):
     }
 ```
 
-Add free helpers after `inbox_of` (`:156-158`):
+Add free helpers after `fn inbox_of`:
 
 ```rust
 fn outbox_of(username: &str) -> String {
@@ -836,11 +896,14 @@ Run: `cargo test -p brolly-activitypub --test processor`
 Expected: FAIL to compile. `error[E0026]: variant 'Recipient::Member' does not have a field named 'outbox'`.
 
 Run: `cargo test -p brolly-server --test federation_flows -- a_delete_naming_another_members_acl a_delete_of_your_own_note an_owner_cannot_delete`
-Expected: all three FAIL. The first two on "cleared Alice's ACL" or "cleared an LDP resource without WAC", because `process_for_member` calls `inbox::remove(store, inbox, target)` unconditionally. The third on "the author's outbox still lists the deleted post", because the author's copy is swept from the inbox only.
+Expected: all three FAIL, each at a different assertion:
+- `a_delete_naming_another_members_acl_leaves_it_alone` on `Mallory's Delete cleared Alice's ACL`. The string `object` routes the Delete to Alice's inbox, Task 1's gate lets it through (its id and actor are both Mallory's), and `process_for_member` calls `inbox::remove(store, inbox, target)` on Alice's pod unconditionally, which clears the graph.
+- `a_delete_of_your_own_note_removes_every_copy` on `the author's Create survived`. The follower's copy and the author's note graph do go, so the three assertions before it pass. But the author's own `Delete` is processed with only Mallory's *inbox*, and her `Create` is a member of her *outbox*, so the sweep never finds it.
+- `an_owner_cannot_delete_their_own_acl_through_the_outbox` on `a Delete through the outbox cleared an LDP resource without WAC`. Alice's own `Delete` reaches `process_for_member` on her own pod, which clears `/~/.acl` the same way.
 
 - [ ] **Step 3: Implement**
 
-In `adapters/activitypub/src/processor.rs`, replace `Recipient` (`:32-39`):
+In `adapters/activitypub/src/processor.rs`, replace `pub enum Recipient` and its doc comment:
 
 ```rust
 /// Who a delivery is for.
@@ -866,7 +929,7 @@ Replace the body of `process` (as left by Task 1):
     }
 ```
 
-Replace `process_for_member` and `references` (`:89-118`) with:
+Replace `fn process_for_member` and `fn references` (with its doc comment), which sit between `pub fn process` and `fn process_for_instance`, with:
 
 ```rust
 fn process_for_member(
@@ -927,7 +990,7 @@ fn carriers(store: &Store, collection: &str, actor: &str, target: &str) -> Vec<S
 }
 ```
 
-In `server/src/outbox.rs`, the author's `Delete` copy in `deliver` (`:159-166`) becomes:
+In `server/src/outbox.rs`, inside `deliver`, the `if let Err(e) = processor::process(&author_pod, Recipient::Member { inbox: ... }, activity, &received) {` head of the author's `Delete` copy becomes:
 
 ```rust
         if let Err(e) = processor::process(
@@ -972,14 +1035,21 @@ Expected: PASS, including `a_delete_removes_both_the_members_copy_and_the_pointe
 Run: `cargo test -p brolly-server --test federation_flows`
 Expected: PASS, including the existing `a_delete_reaches_everyone_the_post_did`.
 
-- [ ] **Step 5: Gates**
+- [ ] **Step 5: Format**
+
+The snippets above aren't guaranteed to match `rustfmt.toml` (`max_width = 100`), and the gate checks formatting. Format first, as its own step:
 
 ```bash
 cargo fmt --all
+```
+
+- [ ] **Step 6: Gates**
+
+```bash
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-- [ ] **Step 6: Don't commit**
+- [ ] **Step 7: Don't commit**
 
 Still one commit. Carry on to Task 3.
 
@@ -988,9 +1058,25 @@ Still one commit. Carry on to Task 3.
 ### Task 3: The public index follows the same rule
 
 **Files:**
-- Modify: `adapters/activitypub/src/processor.rs` (`process` from Task 2; `process_for_instance`, originally `:120-136`)
-- Modify: `store/src/index.rs:67-100` (`record_note`), plus a new private `has_author`
-- Test: `adapters/activitypub/tests/processor.rs`, `store/tests/storage_invariants.rs`, `server/tests/federation_flows.rs`
+- Modify: `adapters/activitypub/src/processor.rs`, as left by Task 2: the `Recipient::Instance` arm of `pub fn process`, and `fn process_for_instance`
+- Modify: `store/src/index.rs:67-100` (`record_note`, untouched by earlier tasks), plus a new `pub fn is_indexed` after it
+- Test: `adapters/activitypub/tests/processor.rs` (one existing test rewritten, see below), `store/tests/storage_invariants.rs`, `server/tests/federation_flows.rs`
+
+**The rule for `Announce` (spec A1, "The public index follows the same rule").**
+An `Announce` names someone else's note by definition, so it may keep a post on
+the public timeline but never put one there. It updates the index only when the
+announced note is **already indexed**, meaning its own `Create` already made it
+public. A note nobody indexed may be followers-only or direct, and
+`public_timeline` in `server/src/mastodon_api.rs` reads whatever a pointer names
+from the owner's pod without checking its audience. Indexing the boost would
+publish that post under the booster's name.
+
+For a note that *is* indexed, `index::record_note` leaves the pointer exactly as
+the first record wrote it. No second author triple, which would let a booster
+claim the post and make `count_notes` count it twice. No second `published`
+literal either: `public_timeline` sorts on `published` with no `DISTINCT`, so a
+second literal would list the note twice, once at the boost's time, ahead of
+posts that are really newer.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -998,36 +1084,50 @@ Still one commit. Carry on to Task 3.
 
 ```rust
 #[test]
-fn a_pointer_keeps_the_author_it_was_first_recorded_with() {
-    // An Announce records the pointer again, naming the announcer. A second
-    // author triple would let anyone who boosts a post claim it.
+fn a_pointer_keeps_what_it_was_first_recorded_with() {
+    // A later record of the same note, such as a replayed Create, must not add
+    // a second author (anyone who boosts a post could claim it) or a second
+    // published time (the note would be listed twice, at the later time).
     let (mgr, _dir) = manager();
+    let note = "https://alice.brolly.id/~/notes/1";
     let pointer = |author: &str, published: &str| NotePointer {
-        note: node("https://alice.brolly.id/~/notes/1"),
+        note: node(note),
         author: node(author),
         published: published.to_string(),
         audience: node("https://www.w3.org/ns/activitystreams#Public"),
         in_reply_to: None,
     };
 
+    assert!(!index::is_indexed(mgr.instance(), &node(note)).unwrap());
     index::record_note(
         mgr.instance(),
         &pointer("https://alice.brolly.id/actor", "2026-09-17T10:00:00Z"),
     )
     .unwrap();
+    assert!(index::is_indexed(mgr.instance(), &node(note)).unwrap());
+
     index::record_note(
         mgr.instance(),
         &pointer("https://mallory.brolly.id/actor", "2026-09-17T11:00:00Z"),
     )
     .unwrap();
 
-    let authors: Vec<String> = mgr
-        .instance()
-        .quads_for_pattern(None, Some(node(index::P_AUTHOR).as_ref()), None, None)
-        .filter_map(Result::ok)
-        .map(|quad| quad.object.to_string())
-        .collect();
-    assert_eq!(authors, vec!["<https://alice.brolly.id/actor>".to_string()]);
+    let values = |predicate: &str| -> Vec<String> {
+        mgr.instance()
+            .quads_for_pattern(None, Some(node(predicate).as_ref()), None, None)
+            .filter_map(Result::ok)
+            .map(|quad| quad.object.to_string())
+            .collect()
+    };
+    assert_eq!(
+        values(index::P_AUTHOR),
+        vec!["<https://alice.brolly.id/actor>".to_string()]
+    );
+    assert_eq!(
+        values(index::P_PUBLISHED),
+        vec!["\"2026-09-17T10:00:00Z\"".to_string()],
+        "a second published literal lists the note twice"
+    );
     assert_eq!(index::count_notes(mgr.instance()).unwrap(), 1);
 }
 ```
@@ -1036,6 +1136,75 @@ fn a_pointer_keeps_the_author_it_was_first_recorded_with() {
 
 ```rust
 const MALLORY_ACTOR: &str = "https://mallory.brolly.test/actor";
+```
+
+**Rewrite the existing `an_announce_is_indexed_like_a_create`.** Today it has
+Bob announce `https://carol.example/notes/9`, a note nothing indexed, and asserts
+that a pointer appears. Under the new rule that is exactly the leak, so the test
+as written must fail. The rewrite keeps its name and its point (the pointer names
+the announced note, not the `Announce`), but first indexes Carol's note through
+Carol's own public `Create`, then asserts that Bob's boost leaves one row, still
+Carol's. The spec says this test "keeps passing". It keeps its name and
+purpose, but its body changes. The negative case, a boost of a note nobody
+indexed, is the new `an_announce_of_a_note_nobody_indexed_is_not_indexed` below.
+Replace the whole function with:
+
+```rust
+#[test]
+fn an_announce_is_indexed_like_a_create() {
+    // A boost keeps an already-public post on the public timeline, under its
+    // author. It can't put one there: the note has to be indexed first, by its
+    // own public Create, or a boost of a followers-only post would publish it.
+    const CAROL_ACTOR: &str = "https://carol.example/actor";
+    const CAROL_NOTE: &str = "https://carol.example/notes/9";
+    let (_dir, manager) = stores();
+    let index_store = manager.instance();
+
+    processor::process(
+        index_store,
+        Recipient::Instance,
+        &json!({
+            "type": "Create",
+            "id": "https://carol.example/notes/9/activity",
+            "actor": CAROL_ACTOR,
+            "published": "2026-08-26T12:00:00Z",
+            "to": [PUBLIC],
+            "object": {"type": "Note", "id": CAROL_NOTE, "attributedTo": CAROL_ACTOR},
+        }),
+        "2026-08-26T12:00:01Z",
+    )
+    .expect("setup: carol's post is public");
+
+    processor::process(
+        index_store,
+        Recipient::Instance,
+        &json!({
+            "type": "Announce",
+            "id": "https://bob.brolly.test/~/boosts/1",
+            "actor": BOB_ACTOR,
+            "published": "2026-08-26T12:05:00Z",
+            "to": [PUBLIC],
+            "object": CAROL_NOTE,
+        }),
+        "2026-08-26T12:05:01Z",
+    )
+    .expect("process");
+
+    let page = index::public_timeline(index_store, &NamedNode::new_unchecked(PUBLIC), 10, None)
+        .expect("query");
+    assert_eq!(page.len(), 1, "{page:?}");
+    assert_eq!(
+        page[0].note.as_str(),
+        CAROL_NOTE,
+        "the pointer names the announced note, not the Announce"
+    );
+    assert_eq!(
+        page[0].author.as_str(),
+        CAROL_ACTOR,
+        "a boost doesn't change whose post it is"
+    );
+    assert_eq!(page[0].published, "2026-08-26T12:00:00Z");
+}
 ```
 
 Append to the `// --- the instance subscriber ---` section (after `a_reply_records_what_it_replies_to`):
@@ -1066,17 +1235,70 @@ fn a_create_naming_someone_elses_note_is_not_indexed() {
 }
 
 #[test]
-fn an_announce_of_an_indexed_note_keeps_its_author() {
+fn an_announce_of_a_note_nobody_indexed_is_not_indexed() {
+    // Bob's post is for his followers only, so the instance didn't index it.
+    // Mallory can see it and boosts it publicly. If the boost were indexed, the
+    // public timeline would read Bob's followers-only post out of his pod and
+    // show it to everyone.
     let (_dir, manager) = stores();
     let index_store = manager.instance();
     processor::process(
         index_store,
         Recipient::Instance,
-        &create(PUBLIC, "hello"),
+        &create("https://bob.brolly.test/followers", "just for followers"),
         "2026-08-26T12:00:01Z",
     )
     .unwrap();
+    assert!(
+        graph(index_store, index::PUBLIC_TIMELINE).is_empty(),
+        "setup"
+    );
 
+    processor::process(
+        index_store,
+        Recipient::Instance,
+        &json!({
+            "type": "Announce",
+            "id": "https://mallory.brolly.test/~/activities/1",
+            "actor": MALLORY_ACTOR,
+            "published": "2026-08-26T12:05:00Z",
+            "to": [PUBLIC],
+            "object": NOTE,
+        }),
+        "2026-08-26T12:05:01Z",
+    )
+    .unwrap();
+
+    assert!(
+        graph(index_store, index::PUBLIC_TIMELINE).is_empty(),
+        "a boost published a note nobody had made public"
+    );
+    assert_eq!(index::count_notes(index_store).unwrap(), 0);
+}
+
+#[test]
+fn an_announce_of_an_indexed_note_keeps_its_author_and_its_place() {
+    let (_dir, manager) = stores();
+    let index_store = manager.instance();
+    const LATER: &str = "https://bob.brolly.test/~/notes/2";
+
+    // Bob posts NOTE at 12:00 and LATER at 12:03, both public.
+    let mut later = create(PUBLIC, "later");
+    later["id"] = json!("https://bob.brolly.test/~/notes/2/activity");
+    later["published"] = json!("2026-08-26T12:03:00Z");
+    later["object"]["id"] = json!(LATER);
+    later["object"]["published"] = json!("2026-08-26T12:03:00Z");
+    for activity in [create(PUBLIC, "hello"), later] {
+        processor::process(
+            index_store,
+            Recipient::Instance,
+            &activity,
+            "2026-08-26T12:03:01Z",
+        )
+        .unwrap();
+    }
+
+    // Mallory boosts the older one at 12:05.
     processor::process(
         index_store,
         Recipient::Instance,
@@ -1094,12 +1316,29 @@ fn an_announce_of_an_indexed_note_keeps_its_author() {
 
     assert_eq!(
         index::count_notes(index_store).unwrap(),
-        1,
+        2,
         "the Announce added a second author"
     );
     let page = index::public_timeline(index_store, &NamedNode::new_unchecked(PUBLIC), 10, None)
         .expect("query");
-    assert!(page.iter().all(|row| row.author.as_str() == BOB_ACTOR), "{page:?}");
+    let rows: Vec<(&str, &str, &str)> = page
+        .iter()
+        .map(|row| {
+            (
+                row.note.as_str(),
+                row.author.as_str(),
+                row.published.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (LATER, BOB_ACTOR, "2026-08-26T12:03:00Z"),
+            (NOTE, BOB_ACTOR, "2026-08-26T12:00:00Z"),
+        ],
+        "the boosted note moved, or appears twice"
+    );
 }
 ```
 
@@ -1171,8 +1410,13 @@ async fn another_member_cannot_take_over_a_post_on_the_public_timeline() {
         None,
     )
     .unwrap();
-    assert_eq!(page.len(), 1, "Mallory's Delete took Alice's post off the public timeline");
+    assert_eq!(
+        page.len(),
+        1,
+        "Mallory's Delete took Alice's post off the public timeline"
+    );
     assert_eq!(page[0].note.as_str(), note);
+    let published = page[0].published.clone();
 
     h.publish(
         "mallory",
@@ -1192,38 +1436,108 @@ async fn another_member_cannot_take_over_a_post_on_the_public_timeline() {
         None,
     )
     .unwrap();
+    assert_eq!(page.len(), 1, "the boost listed the post twice: {page:?}");
+    assert_eq!(page[0].author.as_str(), actor("alice"));
+    assert_eq!(page[0].published, published, "the boost moved the post");
+}
+
+#[tokio::test]
+async fn a_public_announce_does_not_publish_a_followers_only_note() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let mallory = h.login("mallory").await;
+    // Mallory follows Alice, so she receives, and can boost, a followers-only post.
+    h.publish(
+        "mallory",
+        &mallory,
+        &json!({"type": "Follow", "object": actor("alice")}),
+    )
+    .await;
+
+    let (_, created) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({
+                "type": "Note",
+                "content": "just for followers",
+                "to": [format!("https://alice.{BASE}/followers")],
+            }),
+        )
+        .await;
+    let note = created["object"]["id"].as_str().unwrap().to_string();
     assert!(
-        page.iter().all(|row| row.author.as_str() == actor("alice")),
-        "{page:?}"
+        inbox::read_activity(&h.pod("mallory"), &note).is_some(),
+        "setup: mallory received the post"
     );
+    assert_eq!(h.index_count(), 0, "setup: a followers-only post isn't indexed");
+
+    let (status, body) = h
+        .publish(
+            "mallory",
+            &mallory,
+            &json!({"type": "Announce", "object": note, "to": [PUBLIC]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    assert_eq!(
+        h.index_count(),
+        0,
+        "Mallory's boost put Alice's followers-only post on the public timeline"
+    );
+    let page = index::public_timeline(
+        h.stores.instance(),
+        &NamedNode::new_unchecked(PUBLIC),
+        10,
+        None,
+    )
+    .unwrap();
+    assert!(page.is_empty(), "{page:?}");
 }
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cargo test -p brolly-store --test storage_invariants a_pointer_keeps_the_author`
-Expected: FAIL. `authors` has two entries.
+Run: `cargo test -p brolly-store --test storage_invariants a_pointer_keeps`
+Expected: FAIL to compile. `error[E0425]: cannot find function 'is_indexed' in module 'index'`.
 
 Run: `cargo test -p brolly-activitypub --test processor`
-Expected: `a_create_naming_someone_elses_note_is_not_indexed` fails (count 1), `an_announce_of_an_indexed_note_keeps_its_author` fails (count 2), and `a_delete_from_another_origin_leaves_the_pointer` fails (count 0).
+Expected: five FAIL, the rest pass:
+- `a_create_naming_someone_elses_note_is_not_indexed`: count is 1, not 0.
+- `an_announce_is_indexed_like_a_create` (rewritten): `page.len()` is more than 1. Bob's boost added a second author and a second `published`, and the query returns one row per combination.
+- `an_announce_of_a_note_nobody_indexed_is_not_indexed`: on "a boost published a note nobody had made public".
+- `an_announce_of_an_indexed_note_keeps_its_author_and_its_place`: on "the Announce added a second author" (count 3).
+- `a_delete_from_another_origin_leaves_the_pointer`: count is 0.
 
-Run: `cargo test -p brolly-server --test federation_flows another_member_cannot_take_over`
-Expected: FAIL on "Mallory's Delete took Alice's post off the public timeline".
+Run: `cargo test -p brolly-server --test federation_flows -- another_member_cannot_take_over a_public_announce_does_not_publish`
+Expected: both FAIL. The first on "Mallory's Delete took Alice's post off the public timeline", the second on "Mallory's boost put Alice's followers-only post on the public timeline".
 
 - [ ] **Step 3: Implement**
 
-In `store/src/index.rs`, replace `record_note` (`:67-100`) and add `has_author` after it:
+In `store/src/index.rs`, replace `record_note` (`:67-100`) and add `is_indexed` after it:
 
 ```rust
 /// Record a note in the public timeline index.
 ///
-/// The author is whoever first recorded the pointer, and it's never added a
-/// second time. An `Announce` records a pointer to someone else's note, with
-/// the announcer as actor. If that added an author triple, anyone who boosts a
-/// post could claim it, and `count_notes` would count it twice.
+/// **The first record wins.** If the note is already indexed, nothing is
+/// written. A pointer names one author and one published time. A second author
+/// triple would let anyone who boosts a post claim it, and `count_notes` would
+/// count it twice. A second `published` literal would list the note twice in
+/// [`public_timeline`], once at the later time.
 pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteError> {
+    if is_indexed(store, &pointer.note)? {
+        return Ok(());
+    }
+
     let subject = NamedOrBlankNode::NamedNode(pointer.note.clone());
     let mut quads = vec![
+        Quad::new(
+            subject.clone(),
+            iri(P_AUTHOR),
+            Term::NamedNode(pointer.author.clone()),
+            graph(),
+        ),
         Quad::new(
             subject.clone(),
             iri(P_PUBLISHED),
@@ -1237,14 +1551,6 @@ pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteErro
             graph(),
         ),
     ];
-    if !has_author(store, &subject)? {
-        quads.push(Quad::new(
-            subject.clone(),
-            iri(P_AUTHOR),
-            Term::NamedNode(pointer.author.clone()),
-            graph(),
-        ));
-    }
     if let Some(parent) = &pointer.in_reply_to {
         quads.push(Quad::new(
             subject,
@@ -1257,29 +1563,37 @@ pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteErro
     Ok(())
 }
 
-/// Does this pointer already name an author?
-fn has_author(store: &Store, subject: &NamedOrBlankNode) -> Result<bool, WriteError> {
+/// Is this note on the public timeline?
+///
+/// A pointer always has exactly one author triple, so that is what's checked.
+/// A read, not a write: the ActivityPub processor asks before it lets an
+/// `Announce` touch the index.
+pub fn is_indexed(store: &Store, note: &NamedNode) -> Result<bool, StoreError> {
+    let subject = NamedOrBlankNode::NamedNode(note.clone());
     let first = store
         .quads_for_pattern(
-            Some(subject.into()),
+            Some((&subject).into()),
             Some(iri(P_AUTHOR).as_ref()),
             None,
             Some(GraphNameRef::NamedNode(iri(PUBLIC_TIMELINE).as_ref())),
         )
         .next()
-        .transpose()
-        .map_err(|e| WriteError::Store(StoreError::from(e)))?;
+        .transpose()?;
     Ok(first.is_some())
 }
 ```
 
-In `adapters/activitypub/src/processor.rs`, pass the actor through in `process`:
+`?` on `is_indexed` inside `record_note` converts through the existing
+`From<StoreError> for WriteError`, and `transpose()?` through the existing
+`From<StorageError> for StoreError` that `forget_note` already relies on.
+
+In `adapters/activitypub/src/processor.rs`, pass the actor through in `process`. The `Recipient::Instance` arm Task 2 wrote becomes:
 
 ```rust
         Recipient::Instance => process_for_instance(store, actor, activity),
 ```
 
-Replace `process_for_instance`:
+Replace `fn process_for_instance`:
 
 ```rust
 fn process_for_instance(store: &Store, actor: &str, activity: &Value) -> Result<(), ProcessError> {
@@ -1291,9 +1605,24 @@ fn process_for_instance(store: &Store, actor: &str, activity: &Value) -> Result<
             Some(note) if same_origin(note, actor) => index_note(store, activity),
             _ => Ok(()),
         },
-        // An Announce names someone else's note by definition. The pointer
-        // keeps whoever created the note as its author (`index::record_note`).
-        Some("Announce") => index_note(store, activity),
+        // An Announce names someone else's note by definition, so it can keep a
+        // post on the public timeline but never put one there. A note nobody
+        // indexed may be followers-only or direct, and the Mastodon public
+        // timeline reads whatever a pointer names out of the owner's pod
+        // without checking its audience. Indexing the boost would publish that
+        // post under the booster's name.
+        //
+        // For a note that is indexed, `index::record_note` keeps the pointer as
+        // its Create wrote it: same author, same `published`, same place. So
+        // today this writes nothing new. The guard is what matters.
+        Some("Announce") => {
+            if let Some(note) = object_id(activity)
+                && index::is_indexed(store, &NamedNode::new_unchecked(note))?
+            {
+                index_note(store, activity)?;
+            }
+            Ok(())
+        }
         Some("Delete") => {
             // A delete for something we never saw is normal, not an error: the
             // sender fans out to every follower's instance regardless of what
@@ -1317,16 +1646,23 @@ fn process_for_instance(store: &Store, actor: &str, activity: &Value) -> Result<
 - [ ] **Step 4: Run it and watch it pass**
 
 Run: `cargo test -p brolly-store --test storage_invariants && cargo test -p brolly-activitypub --test processor && cargo test -p brolly-server --test federation_flows`
-Expected: PASS, including `an_announce_is_indexed_like_a_create` and `a_delete_removes_both_the_members_copy_and_the_pointer`.
+Expected: PASS. That includes the rewritten `an_announce_is_indexed_like_a_create`, and `a_delete_removes_both_the_members_copy_and_the_pointer`, `public_timeline_is_ordered_and_paginated` and `the_index_can_count_its_notes_without_opening_a_pod`, whose notes are each recorded once. `server/tests/architecture.rs`'s Mastodon write lint is unaffected: `is_indexed` is a read, and Mastodon doesn't call it.
 
-- [ ] **Step 5: Gates**
+- [ ] **Step 5: Format**
+
+The snippets above aren't guaranteed to match `rustfmt.toml` (`max_width = 100`), and the gate checks formatting. Format first, as its own step:
 
 ```bash
 cargo fmt --all
+```
+
+- [ ] **Step 6: Gates**
+
+```bash
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-- [ ] **Step 6: Don't commit**
+- [ ] **Step 7: Don't commit**
 
 Still one commit. Carry on to Task 4.
 
@@ -1335,8 +1671,8 @@ Still one commit. Carry on to Task 4.
 ### Task 4: The server chooses embedded object ids
 
 **Files:**
-- Modify: `server/src/outbox.rs:27-74` (`as_activity`), plus a new `mint_note`
-- Test: `server/src/outbox.rs` `mod tests` (`:317-393`), `server/tests/federation_flows.rs`
+- Modify: `server/src/outbox.rs`, as left by Task 2: `fn as_activity` and its doc comment (still at `:27-74`, since earlier tasks only changed code below it), plus a new `mint_note`
+- Test: `server/src/outbox.rs` `mod tests` (at the end of the file; Tasks 1 and 2 moved it), `server/tests/federation_flows.rs`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -1576,7 +1912,7 @@ Expected: the first two FAIL on the `starts_with` assertion, because the client'
 
 - [ ] **Step 3: Implement**
 
-In `server/src/outbox.rs`, replace `as_activity` (`:27-74`) and add `mint_note` after it:
+In `server/src/outbox.rs`, replace `fn as_activity` and its doc comment (from `/// Wrap a bare object in the \`Create\` that publishes it.` to the closing brace before `fn now`) and add `mint_note` after it:
 
 ```rust
 /// Wrap a bare object in the `Create` that publishes it.
@@ -1654,14 +1990,21 @@ fn mint_note(base: &str) -> String {
 Run: `cargo test -p brolly-server --lib outbox && cargo test -p brolly-server --test federation_flows`
 Expected: PASS, including the existing `an_activity_is_left_as_one` (its objects are strings) and `a_follow_is_delivered_and_recorded_on_both_sides`.
 
-- [ ] **Step 5: Gates**
+- [ ] **Step 5: Format**
+
+The snippets above aren't guaranteed to match `rustfmt.toml` (`max_width = 100`), and the gate checks formatting. Format first, as its own step:
 
 ```bash
 cargo fmt --all
+```
+
+- [ ] **Step 6: Gates**
+
+```bash
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-- [ ] **Step 6: Don't commit**
+- [ ] **Step 7: Don't commit**
 
 Still one commit. Carry on to Task 5.
 
@@ -1670,8 +2013,11 @@ Still one commit. Carry on to Task 5.
 ### Task 5: `outbox::deliver` refuses what the server didn't mint, then commit A1
 
 **Files:**
-- Modify: `server/src/outbox.rs` (new `Refusal`, `DeliverError`, `authored`, `minted_under`; `publish`'s match at `:117-134`; `deliver` at `:137-211` becomes `pub`, checks first, and returns `DeliverError`)
-- Modify: `server/src/mastodon_api.rs:811-813` (`create_status`)
+- Modify: `server/src/outbox.rs`, as left by Task 4 (new `Refusal`, `DeliverError`, `authored`, `minted_under` after `fn now`; the `match deliver(...)` at the end of `publish`; `deliver` becomes `pub`, checks first, and returns `DeliverError`)
+- Modify: `server/src/mastodon_api.rs:811-813` (the `crate::outbox::deliver(...)` call in `create_status`; no earlier task touches this file)
+
+Tasks 1, 2 and 4 all changed `outbox.rs`, so its locations below are named by
+function or anchor, not by line.
 - Test: `server/src/outbox.rs` `mod tests`, `server/tests/federation_flows.rs`
 
 - [ ] **Step 1: Write the failing tests**
@@ -1748,7 +2094,7 @@ In `server/src/outbox.rs` `mod tests`, add:
     }
 ```
 
-In `server/tests/federation_flows.rs`, extend the imports (`:11-13`):
+In `server/tests/federation_flows.rs`, replace the imports from `use brolly_activitypub::{follows, inbox};` through `use brolly_server::{AppState, app};` with:
 
 ```rust
 use brolly_activitypub::processor::{self, ProcessError, Recipient};
@@ -1758,7 +2104,7 @@ use brolly_server::outbox::{DeliverError, Refusal, deliver};
 use brolly_server::{AppState, app};
 ```
 
-Give `Harness` the state (`:26-32`):
+Give `struct Harness` the state:
 
 ```rust
 struct Harness {
@@ -1773,7 +2119,7 @@ struct Harness {
 }
 ```
 
-In `harness()`, bind the `AppState { ... }` literal (`:51-75`, unchanged inside) to `let state = AppState { ... };`, then build the router and harness from it:
+In `harness()`, bind the `AppState { ... }` literal that is currently the first argument of `let router = app(` (unchanged inside) to `let state = AppState { ... };`, then replace the rest of the function, from `let router = app(` to the end, with:
 
 ```rust
     let router = app(state.clone(), "server/static");
@@ -1948,6 +2294,43 @@ async fn an_embedded_object_the_server_cannot_name_is_a_bad_request() {
         "a refused activity was stored"
     );
 }
+
+#[tokio::test]
+async fn a_refusal_by_a_recipient_does_not_fail_the_publish() {
+    // Once `authored` has passed, a recipient's refusal is logged at warn and
+    // never returned (Task 1). The author's copy stands and `deliver` carries
+    // on to every remaining recipient, the instance last.
+    //
+    // Members and the instance run the same origin gate in processor::process,
+    // so no activity is refused by the instance and accepted by a member. What
+    // this can pin is that refusals by a member *and* by the instance still
+    // leave `deliver` returning Ok. `authored` checks ids against the author,
+    // not the activity's own `actor` field, so an activity with no `actor`
+    // passes the outbox and is refused by every recipient's processor.
+    let h = harness().await;
+    let alice = h.user("alice").await;
+    let like = json!({
+        "type": "Like",
+        "id": format!("https://alice.{BASE}/~/activities/{}", Uuid::new_v4()),
+        "object": actor("bob"),
+    });
+
+    let result = deliver(&h.state, &alice, &actor("alice"), &like).await;
+    assert!(
+        result.is_ok(),
+        "a downstream refusal failed the publish: {result:?}"
+    );
+    assert_eq!(
+        inbox::members(&h.pod("alice"), &outbox_of("alice")),
+        vec![like["id"].as_str().unwrap().to_string()],
+        "the author's copy stands"
+    );
+    assert!(
+        inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Like"], 10, None).is_empty(),
+        "setup: Bob's processor should have refused an activity with no actor"
+    );
+    assert_eq!(h.index_count(), 0);
+}
 ```
 
 - [ ] **Step 2: Run it and watch it fail**
@@ -1960,7 +2343,7 @@ Expected: FAIL to compile. `error[E0432]: unresolved imports 'brolly_server::out
 
 - [ ] **Step 3: Implement**
 
-In `server/src/outbox.rs`, add the refusal types and checks after `now()` (`:76-80`):
+In `server/src/outbox.rs`, add the refusal types and checks directly after `fn now()` (before `/// \`POST /outbox\` — publish on the member's behalf.`):
 
 ```rust
 /// Why [`deliver`] refused an activity. Each is the caller's fault, so each is
@@ -2037,7 +2420,7 @@ fn authored(activity: &Value, base: &str) -> Result<(), Refusal> {
 }
 ```
 
-Replace the `match deliver(...)` in `publish` (`:117-134`):
+Replace the `match deliver(&state, &caller, &actor, &activity).await { ... }` at the end of `publish`:
 
 ```rust
     match deliver(&state, &caller, &actor, &activity).await {
@@ -2063,7 +2446,7 @@ Replace the `match deliver(...)` in `publish` (`:117-134`):
     }
 ```
 
-Replace the head of `deliver` (`:137-178`), from the doc comment through the author's-copy `if`/`else if`:
+Replace the head of `deliver`, from its doc comment (starting at the stray `/// Store the activity in the author's pod, then deliver it.` line, which goes) through the author's-copy `if`/`else if` that ends just before `// A Follow is also a relationship, not only a notification.`:
 
 ```rust
 /// Publish an activity: store the author's copy, then fan out.
@@ -2140,16 +2523,25 @@ In `server/src/mastodon_api.rs`, replace `:811-813` in `create_status`:
 - [ ] **Step 4: Run it and watch it pass**
 
 Run: `cargo test -p brolly-server --lib outbox && cargo test -p brolly-server --test federation_flows && cargo test -p brolly-server --test mastodon_compose`
-Expected: PASS. `mastodon_compose` is the regression check that compose's own minted ids (`mastodon_api.rs:797-809`) satisfy `authored`: `a_content_warning_survives_being_posted` and the rest still get `200`.
+Expected: PASS, including `a_refusal_by_a_recipient_does_not_fail_the_publish`. `mastodon_compose` is the regression check that compose's own minted ids (`mastodon_api.rs:797-809`) satisfy `authored`: `a_content_warning_survives_being_posted` and the rest still get `200`.
 
-- [ ] **Step 5: Gates**
+- [ ] **Step 5: Format**
+
+The snippets above aren't guaranteed to match `rustfmt.toml` (`max_width = 100`), and the gate checks formatting. Format first, as its own step:
 
 ```bash
 cargo fmt --all
+```
+
+- [ ] **Step 6: Gates**
+
+```bash
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
+
+Operator note, for the deploy log: activities stored before this deploy may still embed client-chosen object ids (for example an outbox `Create` whose embedded object id is the member's own `/~/.acl`), and A1 doesn't rewrite them, so such a stored activity would still count as a carrier for a later `Delete`.
 
 ```bash
 git add adapters/activitypub/src/processor.rs \
@@ -2171,7 +2563,10 @@ or embedded object id isn't on its actor's origin. A Delete removes a
 graph only if it arrived as the embedded object of one of the actor's
 own activities, in the pod's inbox or outbox, so the owner can't reach
 their own LDP resources through the outbox either. The public index
-follows the same rule, and a pointer's author is never added twice.
+follows the same rule. An Announce only touches a note that is already
+indexed, so a boost can't publish a followers-only post, and recording a
+pointer that exists writes nothing, so a boost can't claim a post or move
+it.
 
 POST /outbox now mints every Create's object id and names any other
 activity's object by id. outbox::deliver refuses, with a 400, anything
@@ -2184,7 +2579,7 @@ Then verify from a clean checkout (see "Verify every commit from a clean checkou
 
 ```bash
 rm -rf /tmp/verify && git worktree add --detach /tmp/verify HEAD
-cd /tmp/verify && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
+cd /tmp/verify && cargo fmt --all -- --check && cargo test --workspace && cargo clippy --workspace --all-targets -- -D warnings
 cd - && git worktree remove /tmp/verify --force
 ```
 
@@ -2202,11 +2597,13 @@ Green there, or the commit isn't done. The first compile in a new worktree takes
 6. **"Minted" is checked strictly.** An activity id must be one `[A-Za-z0-9-]+` segment directly under `/~/activities/`, and a `Create`'s note id must pass `status_id::is_note_id` directly under `/~/notes/`. The spec only says "under", but this also rules out `..`, nested paths and non-ULID note ids, none of which the server produces.
 7. **The `Undo` test.** Once the object is flattened, `recipients` routes on the Follow's own IRI, which is on the *author's* origin. The Undo therefore goes to the author's followers and the author's own inbox, not to the Follow's target. That's no change: an embedded object reached followers only before this, too. The test makes Alice a follower of Bob, so "reaches its target" is observable. Routing an `Undo` to the undone activity's target is a follow-up, not part of A1.
 8. **A `Delete` naming an activity IRI** (say, a `Like`'s id) no longer removes anything, because only embedded objects are removable. This follows the spec's rule, but it's a behaviour change.
-9. **`record_note` skips only the author triple.** When the pointer exists, `published` and `audience` are still added, so an `Announce` of an indexed note adds a second `published` literal, and `public_timeline` may list that note twice. That's existing behaviour. The tests assert on `count_notes` (author triples) and on every row's author, not on page length. There's also a related gap the spec left "as today": an `Announce` that arrives *before* the note is indexed (for example, a boost of a followers-only note) records the announcer as author, and a later `Create` can't correct it.
+9. **An `Announce` never creates a pointer, and `record_note` is first-writer-wins.** The spec's decision: an `Announce` touches the index only when the announced note is already indexed (`index::is_indexed`), because `public_timeline` in `server/src/mastodon_api.rs` reads a pointer's note out of the owner's pod without checking its audience, so indexing a boost of a followers-only or direct note would publish it under the booster's name (`an_announce_of_a_note_nobody_indexed_is_not_indexed`, `a_public_announce_does_not_publish_a_followers_only_note`). For an indexed note, `record_note` now writes nothing at all: no second author triple, and no second `published` literal. A second `published` would have made `public_timeline`, which sorts on `published` without `DISTINCT`, list the note twice, once at the boost's time. `an_announce_of_an_indexed_note_keeps_its_author_and_its_place` and the server takeover test pin that the note keeps its row and its position. So today an `Announce` changes nothing in the index; the call to `index_note` behind the guard is kept so the rule reads as the spec states it. Two consequences worth a look: (a) the spec says `an_announce_is_indexed_like_a_create` "keeps passing", but as written it announces a note nothing indexed and asserts a pointer appears, which is the leak. Task 3 rewrites its body to index Carol's note first and keeps its name and purpose. The spec line should be corrected. (b) `is_indexed` then insert isn't atomic, so two concurrent first records of the same note could still both write. Delivery of one activity is sequential, and a note has one `Create`, so this needs a replayed `Create` racing its original.
 10. **Federation harness.** It switches from `storage::init_storage_root` to `brolly_server::provision::pod`, so members have a real root ACL, and it adds `mallory`. `the_public_index_is_populated_only_by_delivery` now does its `ldp::put` against a pod whose ACL allows it, and its index assertion still holds.
 11. **`Create` with a string `object`** is still accepted, delivered and, if public and same-origin, indexed. So Alice can put a pointer to her own `/~/.acl` IRI on the public timeline. Nothing is written or read around WAC, since the timeline only dereferences faithful records, but a follow-up may want to refuse string-object `Create`s.
 12. **"References still work"** (a `Like` and a `Follow` naming another member) is covered by the new adapter test `a_reference_may_name_anyone` and by the existing HTTP tests `a_follow_is_delivered_and_recorded_on_both_sides` and `a_like_reaches_the_author`. No new HTTP test duplicates them.
 13. **`same_origin` stays private** to `processor.rs`, as the spec names it. `outbox.rs` doesn't need it, because its checks are stricter prefix checks against the author's base.
+14. **Follow bookkeeping runs before the origin gate.** `deliver_locally` calls `follows::record` / `record_request` before `processor::process`, so a `Follow` is recorded even if the processor would refuse it. That is safe only while every local activity comes from `outbox::deliver` with a server-set `actor`. Task 1 leaves a `FEDERATION:` comment there so it is revisited when ADR 0016's switch is turned on. No behaviour change in A1.
+15. **A downstream refusal never fails a publish.** Members and the instance share one gate, so "the instance refuses, a member accepts" can't be built. `a_refusal_by_a_recipient_does_not_fail_the_publish` pins the observable part instead: with refusals from both a member and the instance, `deliver` still returns `Ok` and the author's copy stands.
 
 
 ## Chunk 2: ACL resources require Control (A2)
@@ -2237,7 +2634,7 @@ works on a full IRI too, which `append` and `storage::uncontain_acls` rely on.
 **The pod_http harness root ACL has no Control** (`server/tests/pod_http.rs:61-80`
 grants Alice Read and Write only). The HTTP tests below give her Control on
 `/~/shared/` in that container's own ACL rather than editing the shared harness.
-Real pods get Control from `server::provision::pod` (`server/src/provision.rs:718-733`).
+Real pods get Control from `server::provision::pod` (`server/src/provision.rs:41-70`).
 
 ---
 
@@ -2286,7 +2683,7 @@ mod tests {
 - [ ] **Step 2: Run it and watch it fail**
 
 Run: `cargo test -p brolly-solid --lib ldp::tests`
-Expected: compile error, `cannot find function 'governed' in module 'super'`.
+Expected: compile error, `error[E0432]: unresolved import 'super::governed'`.
 
 - [ ] **Step 3: Implement**
 
@@ -2319,6 +2716,7 @@ for it before Task 2 uses it.
 - [ ] **Step 5: Gates**
 
 ```bash
+cargo fmt --all
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
@@ -2335,7 +2733,7 @@ A2 is one commit (rollout item 2). Task 7 commits.
 ### Task 2: every mode on an ACL resource needs Control
 
 **Files:**
-- Modify: `adapters/solid/src/ldp.rs:130-161` (`check`, `granted_modes`)
+- Modify: `adapters/solid/src/ldp.rs`: `check` and `granted_modes` (directly below Task 1's `governed`)
 - Create: `adapters/solid/tests/acl_control.rs`
 - Modify: `server/tests/pod_http.rs`: append after `:694`
 
@@ -2544,13 +2942,24 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
     );
 }
 
+/// No `doc.acl.acl` exists in this test, on purpose. If one did, it would be
+/// the first ACL candidate for `doc.acl` under the old rule and would refuse
+/// Bob by itself (it grants nothing), so the assertion would pass without the
+/// fix.
 #[test]
-fn bob_cannot_reach_the_acls_of_what_he_can_write() {
+fn bob_cannot_create_the_acl_of_a_document_he_can_write() {
     let (_m, _d, store) = shared_pod();
-    // Alice creates both, so a refusal below means "refused", not "absent".
-    for path in ["/~/shared/doc", "/~/shared/doc.acl.acl"] {
-        ldp::put(&store, None, BASE, path, &alice(), NOTE, "text/turtle", ROOT).unwrap();
-    }
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
 
     let takeover = acl_granting(BOB, &format!("{ROOT}shared/doc"));
     assert!(
@@ -2569,6 +2978,25 @@ fn bob_cannot_reach_the_acls_of_what_he_can_write() {
         ),
         "Write on a document must not let Bob create its ACL"
     );
+    assert!(!storage::exists(&store, &format!("{ROOT}shared/doc.acl")));
+}
+
+#[test]
+fn bob_cannot_read_an_acl_of_an_acl() {
+    let (_m, _d, store) = shared_pod();
+    // Alice creates it, so the refusal below means "refused", not "absent".
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc.acl.acl",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+
     assert!(matches!(
         ldp::read(&store, None, BASE, "/~/shared/doc.acl.acl", &bob(), None),
         Err(LdpError::NotFound)
@@ -2598,6 +3026,9 @@ fn bob_keeps_his_access_to_ordinary_resources() {
     );
 }
 
+/// The regression guard: this passes before the fix and must still pass after.
+/// Alice holds Control on `/~/shared/` (and so, by default, on everything in
+/// it), so tightening ACL access must not lock her out of any of it.
 #[test]
 fn the_owner_can_do_all_of_it() {
     let (_m, _d, store) = shared_pod();
@@ -2606,7 +3037,17 @@ fn the_owner_can_do_all_of_it() {
     assert!(ldp::read(&store, None, BASE, "/~/shared/.acl", &alice(), None).is_ok());
     assert!(ldp::may_write(&store, BASE, "/~/shared/.acl", &alice()).unwrap());
 
-    ldp::put(&store, None, BASE, "/~/shared/doc", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
     ldp::put(
         &store,
         None,
@@ -2618,6 +3059,7 @@ fn the_owner_can_do_all_of_it() {
         ROOT,
     )
     .unwrap();
+    assert!(ldp::read(&store, None, BASE, "/~/shared/doc.acl", &alice(), None).is_ok());
     ldp::put(
         &store,
         None,
@@ -2631,6 +3073,13 @@ fn the_owner_can_do_all_of_it() {
     .unwrap();
     assert!(ldp::read(&store, None, BASE, "/~/shared/doc.acl.acl", &alice(), None).is_ok());
 
+    // `doc.acl.acl` goes before `doc.acl`. It holds a note, not grants, and
+    // while it exists the old rule takes it as `doc.acl`'s own ACL, which would
+    // refuse the delete for a reason that has nothing to do with this fix.
+    ldp::delete(&store, None, BASE, "/~/shared/doc.acl.acl", &alice(), ROOT).unwrap();
+    ldp::delete(&store, None, BASE, "/~/shared/doc.acl", &alice(), ROOT).unwrap();
+    assert!(!storage::exists(&store, &format!("{doc}.acl")));
+
     ldp::put(
         &store,
         None,
@@ -2642,7 +3091,6 @@ fn the_owner_can_do_all_of_it() {
         ROOT,
     )
     .unwrap();
-    ldp::delete(&store, None, BASE, "/~/shared/doc.acl", &alice(), ROOT).unwrap();
     ldp::delete(&store, None, BASE, "/~/shared/.acl", &alice(), ROOT).unwrap();
 }
 
@@ -2746,7 +3194,12 @@ fn share_with_bob(h: &Harness) {
             t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
             t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
             t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Control")),
-            t(&g, &owner, &format!("{ACL}agent"), &format!("{BASE}/profile#me")),
+            t(
+                &g,
+                &owner,
+                &format!("{ACL}agent"),
+                &format!("{BASE}/profile#me"),
+            ),
             t(&g, &bob, &format!("{ACL}default"), &shared),
             t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Read")),
             t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Write")),
@@ -2788,6 +3241,64 @@ async fn bob_cannot_patch_an_acl_he_does_not_control() {
     assert!(!granted, "the refused PATCH must not have landed");
 }
 
+/// The same takeover by replacing the whole document. `ldp::put` refuses with
+/// `Forbidden`, which `pod.rs::ldp_error` answers with 403.
+#[tokio::test]
+async fn bob_cannot_put_an_acl_he_does_not_control() {
+    let h = harness().await;
+    share_with_bob(&h);
+    let bob = member_session(&h, "bob").await;
+
+    let shared = format!("{ROOT}shared/");
+    let takeover = format!(
+        "@prefix acl: <{ACL}> .\n\
+         <#bob> acl:agent <{BOB_WEBID}> ; acl:accessTo <{shared}> ; acl:default <{shared}> ;\n\
+           acl:mode acl:Read, acl:Write, acl:Control .\n"
+    );
+    let (status, _, _) = send_as(
+        &h,
+        &bob,
+        "PUT",
+        "/~/shared/.acl",
+        Some(("text/turtle", &takeover)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let pod = h.stores.pod(h.user).unwrap();
+    let g = format!("{shared}.acl");
+    let control = |auth: &str| {
+        pod.contains(&t(
+            &g,
+            auth,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Control"),
+        ))
+        .unwrap()
+    };
+    assert!(!control(&format!("{g}#bob")), "the refused PUT landed");
+    assert!(control(&format!("{g}#owner")), "Alice's grant was replaced");
+}
+
+/// Deleting the container's ACL would drop Alice's grants on `/~/shared/` and
+/// fall back to the root ACL. `ldp::delete` refuses with `Forbidden` before it
+/// looks for the resource, so this is a 403, not a 404.
+#[tokio::test]
+async fn bob_cannot_delete_an_acl_he_does_not_control() {
+    let h = harness().await;
+    share_with_bob(&h);
+    let bob = member_session(&h, "bob").await;
+
+    let (status, _, _) = send_as(&h, &bob, "DELETE", "/~/shared/.acl", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let pod = h.stores.pod(h.user).unwrap();
+    assert!(
+        storage::exists(&pod, &format!("{ROOT}shared/.acl")),
+        "the refused DELETE landed"
+    );
+}
+
 #[tokio::test]
 async fn wac_allow_on_an_acl_names_nothing_for_bob() {
     let h = harness().await;
@@ -2816,22 +3327,35 @@ async fn wac_allow_on_an_acl_names_nothing_for_bob() {
 
 Run: `cargo test -p brolly-solid --test acl_control`
 Expected: compile error, `function 'granted_modes' is private`
-(`error[E0603]`). If you make it `pub` on its own first, three tests fail on
-their assertions instead (`bob_cannot_read_rewrite_or_delete_the_containers_acl`,
-`bob_cannot_reach_the_acls_of_what_he_can_write`,
-`wac_allow_on_an_acl_is_all_or_nothing`). For example, `bob_cannot_read_rewrite_or_delete_the_containers_acl`
-panics at the first `matches!`, because Bob's inherited Read lets him read the
-ACL.
+(`error[E0603]`). If you make it `pub` on its own first, exactly four of the six
+fail on their assertions:
+
+- `bob_cannot_read_rewrite_or_delete_the_containers_acl` panics at the first
+  `matches!`: Bob's inherited Read lets him read the ACL.
+- `bob_cannot_create_the_acl_of_a_document_he_can_write` panics at its first
+  `assert!` ("Write on a document must not let Bob create its ACL"): the only
+  ACL candidate that exists is `/~/shared/.acl`, whose default gives him Write.
+- `bob_cannot_read_an_acl_of_an_acl` panics at its `matches!`: `doc.acl.acl`
+  inherits Bob's Read the same way.
+- `wac_allow_on_an_acl_is_all_or_nothing` panics on Carol's `read(...).unwrap()`
+  with `NotFound`: her grant is `accessTo` only, and the old rule looks for a
+  `default` on `/~/shared/.acl`.
+
+`bob_keeps_his_access_to_ordinary_resources` and `the_owner_can_do_all_of_it`
+pass. The owner test is the guard that the fix doesn't lock Alice out, and it
+passes on the old code too.
 
 Run: `cargo test -p brolly-server --test pod_http acl`
-Expected: `bob_cannot_patch_an_acl_he_does_not_control` fails with
+Expected: four fail. `bob_cannot_patch_an_acl_he_does_not_control`,
+`bob_cannot_put_an_acl_he_does_not_control` and
+`bob_cannot_delete_an_acl_he_does_not_control` each fail with
 `left: 204, right: 403`. `wac_allow_on_an_acl_names_nothing_for_bob` fails with
 `left: 200, right: 404`.
 
 - [ ] **Step 3: Implement**
 
-In `adapters/solid/src/ldp.rs`, replace `check` and `granted_modes` (`:130-161`)
-with:
+In `adapters/solid/src/ldp.rs`, replace `check` and `granted_modes` (the two
+functions directly below `governed`) with:
 
 ```rust
 /// Resolve and evaluate the ACL governing `resource`.
@@ -2892,23 +3416,23 @@ pub fn granted_modes(store: &Store, base: &str, path: &str, subject: &Subject) -
 }
 ```
 
-`read` (`:168`), `put` (`:231`), `append` (`:341`), `may_write` (`:392`) and
-`delete` (`:402`) don't change. They all call `check`, and `read` calls
-`granted_modes`. Refusals stay as they are: `read` answers `NotFound`, and the
+`read`, `put`, `append`, `may_write` and `delete` don't change. They all call
+`check`, and `read` calls `granted_modes`. Refusals stay as they are: `read` answers `NotFound`, and the
 writes answer `Forbidden`, which `server/src/pod.rs::ldp_error` (`:199-216`)
 turns into 404 and 403.
 
 - [ ] **Step 4: Run them and watch them pass**
 
 Run: `cargo test -p brolly-solid --test acl_control`
-Expected: 5 passed.
+Expected: 6 passed.
 
 Run: `cargo test -p brolly-server --test pod_http acl`
-Expected: 2 passed.
+Expected: 4 passed.
 
 - [ ] **Step 5: Gates**
 
 ```bash
+cargo fmt --all
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
@@ -2929,7 +3453,7 @@ git add adapters/solid/src/ldp.rs adapters/solid/tests/acl_control.rs server/tes
 ### Task 3: ACL resources aren't contained
 
 **Files:**
-- Modify: `adapters/solid/src/ldp.rs`: `put` (`:274`, `:279`), `append` (`:378`, `:384`), plus a new private `contain` after `put`
+- Modify: `adapters/solid/src/ldp.rs`: the two `storage::add_containment` calls in `put` and the two in `append`, plus a new private `contain` after `put`
 - Test: `adapters/solid/tests/acl_control.rs` (append)
 
 - [ ] **Step 1: Write the failing tests**
@@ -2944,7 +3468,17 @@ fn an_acl_is_not_a_member_of_its_container() {
     let (_m, _d, store) = shared_pod();
     let doc = format!("{ROOT}shared/doc");
 
-    ldp::put(&store, None, BASE, "/~/shared/doc", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
     ldp::put(
         &store,
         None,
@@ -2970,9 +3504,18 @@ fn an_acl_is_not_a_member_of_its_container() {
     assert_eq!(appended, format!("{ROOT}shared/.acl"));
 
     let members = storage::members(&store, &format!("{ROOT}shared/"));
-    assert!(members.contains(&doc), "an ordinary resource is still contained");
-    assert!(!members.contains(&format!("{ROOT}shared/doc.acl")), "got {members:?}");
-    assert!(!members.contains(&format!("{ROOT}shared/.acl")), "got {members:?}");
+    assert!(
+        members.contains(&doc),
+        "an ordinary resource is still contained"
+    );
+    assert!(
+        !members.contains(&format!("{ROOT}shared/doc.acl")),
+        "got {members:?}"
+    );
+    assert!(
+        !members.contains(&format!("{ROOT}shared/.acl")),
+        "got {members:?}"
+    );
 }
 
 /// An ACL may exist before the resource it governs. Writing one must not
@@ -3009,7 +3552,7 @@ with `/~/newdir/ was created`.
 
 - [ ] **Step 3: Implement**
 
-In `adapters/solid/src/ldp.rs`, add this directly after `put` (after `:281`):
+In `adapters/solid/src/ldp.rs`, add this directly after `put` (before `refuse_rdf_xml`):
 
 ```rust
 /// Record `resource` as a member of its container, unless it is an ACL.
@@ -3028,13 +3571,16 @@ fn contain(store: &Store, resource: &str, storage_root: &str) -> Result<(), LdpE
 }
 ```
 
-In `put`, replace both calls:
-- `:274` `storage::add_containment(store, &resource, storage_root)?;` → `contain(store, &resource, storage_root)?;`
-- `:279` `storage::add_containment(store, &resource, storage_root)?;` → `contain(store, &resource, storage_root)?;`
+In `put`, replace both calls (one at the end of the blob branch, before its
+`return Ok(())`, and one after the final `replace_graph`):
+- `storage::add_containment(store, &resource, storage_root)?;` → `contain(store, &resource, storage_root)?;`
 
-In `append`, replace both calls:
-- `:378` `storage::add_containment(store, &target, storage_root)?;` → `contain(store, &target, storage_root)?;`
-- `:384` `storage::add_containment(store, &target, storage_root)?;` → `contain(store, &target, storage_root)?;`
+In `append`, replace both calls (one at the end of the blob branch, before
+`return Ok(target)`, and one after the final `insert_quads`):
+- `storage::add_containment(store, &target, storage_root)?;` → `contain(store, &target, storage_root)?;`
+
+After this, `grep -n add_containment adapters/solid/src/ldp.rs` shows only the
+call inside `contain`.
 
 `append` gets `target`, a full IRI. `governed` only checks the suffix, so that's
 fine. A POST to a container mints `{container}{uuid}`, which never ends in
@@ -3043,12 +3589,13 @@ fine. A POST to a container mints `{container}{uuid}`, which never ends in
 - [ ] **Step 4: Run them and watch them pass**
 
 Run: `cargo test -p brolly-solid --test acl_control`
-Expected: 7 passed. `containment_is_maintained_up_the_tree` and
+Expected: 8 passed. `containment_is_maintained_up_the_tree` and
 `posting_to_a_container_mints_a_member` in `ldp_conformance` must still pass.
 
 - [ ] **Step 5: Gates**
 
 ```bash
+cargo fmt --all
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
@@ -3063,7 +3610,7 @@ git add adapters/solid/src/ldp.rs adapters/solid/tests/acl_control.rs
 ### Task 4: deleting a resource deletes its ACL
 
 **Files:**
-- Modify: `adapters/solid/src/ldp.rs`: `delete`, after `:432`
+- Modify: `adapters/solid/src/ldp.rs`: `delete`, after its `storage::remove_containment` call
 - Test: `adapters/solid/tests/acl_control.rs` (append)
 
 - [ ] **Step 1: Write the failing tests**
@@ -3077,7 +3624,17 @@ fn deleting_a_resource_deletes_its_acl() {
     let (_m, _d, store) = shared_pod();
     let doc = format!("{ROOT}shared/doc");
 
-    ldp::put(&store, None, BASE, "/~/shared/doc", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
     ldp::put(
         &store,
         None,
@@ -3110,7 +3667,17 @@ fn a_recreated_container_does_not_get_its_old_grants_back() {
            acl:mode acl:Read, acl:Write .\n"
     );
 
-    ldp::put(&store, None, BASE, "/~/shared/", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
     ldp::put(
         &store,
         None,
@@ -3130,7 +3697,17 @@ fn a_recreated_container_does_not_get_its_old_grants_back() {
     ldp::delete(&store, None, BASE, "/~/shared/", &alice(), ROOT).unwrap();
     assert!(!storage::exists(&store, &format!("{shared}.acl")));
 
-    ldp::put(&store, None, BASE, "/~/shared/", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
     assert!(
         ldp::granted_modes(&store, BASE, "/~/shared/doc", &bob()).is_empty(),
         "the old grants came back with the container"
@@ -3155,7 +3732,7 @@ In `adapters/solid/src/ldp.rs` `delete`, replace:
     storage::remove_containment(store, &resource, storage_root)?;
 ```
 
-(`:430-432`) with:
+(the only `clear_graph` in `delete`) with:
 
 ```rust
     let digest = blob_digest(store, &resource);
@@ -3173,16 +3750,17 @@ In `adapters/solid/src/ldp.rs` `delete`, replace:
     store.clear_graph(GraphNameRef::NamedNode(iri(&acl).as_ref()))?;
 ```
 
-The blob release that follows (`:434-441`) doesn't change.
+The blob release that follows (`if let Some(digest) = digest ...`) doesn't change.
 
 - [ ] **Step 4: Run them and watch them pass**
 
 Run: `cargo test -p brolly-solid --test acl_control`
-Expected: 9 passed.
+Expected: 10 passed.
 
 - [ ] **Step 5: Gates**
 
 ```bash
+cargo fmt --all
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
@@ -3217,7 +3795,17 @@ Append to `adapters/solid/tests/acl_control.rs`:
 #[test]
 fn stale_acl_containment_is_swept_and_a_rerun_removes_nothing() {
     let (_m, _d, store) = shared_pod();
-    ldp::put(&store, None, BASE, "/~/shared/doc", &alice(), NOTE, "text/turtle", ROOT).unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
 
     // The triples an old `put` of each ACL would have left behind.
     storage::add_containment(&store, &format!("{ROOT}.acl"), ROOT).unwrap();
@@ -3294,11 +3882,12 @@ fn is_acl_containment(quad: &Quad) -> bool {
 - [ ] **Step 4: Run it and watch it pass**
 
 Run: `cargo test -p brolly-solid --test acl_control`
-Expected: 10 passed.
+Expected: 11 passed.
 
 - [ ] **Step 5: Gates**
 
 ```bash
+cargo fmt --all
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
@@ -3317,7 +3906,7 @@ spawning a process.
 
 **Files:**
 - Create: `server/src/maintenance.rs`
-- Modify: `server/src/lib.rs:17-30`: add `pub mod maintenance;` between `pub mod mastodon_oauth;` and `pub mod outbox;`
+- Modify: `server/src/lib.rs:17-30`: add `pub mod maintenance;` between `pub mod consent;` and `pub mod mastodon_api;`
 - Create: `server/tests/maintenance.rs`
 
 - [ ] **Step 1: Write the failing test**
@@ -3367,7 +3956,9 @@ async fn acl_uncontain_sweeps_every_pod_and_a_rerun_is_a_no_op() {
     let first = brolly_server::maintenance::acl_uncontain(&db.pool, &stores)
         .await
         .unwrap();
+    assert_eq!(first.accounts, 3, "bob is counted even without a pod");
     let mut removed: Vec<(String, usize)> = first
+        .pods
         .iter()
         .map(|sweep| (sweep.username.clone(), *sweep.outcome.as_ref().unwrap()))
         .collect();
@@ -3381,15 +3972,21 @@ async fn acl_uncontain_sweeps_every_pod_and_a_rerun_is_a_no_op() {
     for (user, root) in &seeded {
         let pod = stores.pod(*user).unwrap();
         assert!(!storage::members(&pod, root).contains(&format!("{root}.acl")));
-        assert!(storage::exists(&pod, &format!("{root}.acl")), "the ACL stays");
+        assert!(
+            storage::exists(&pod, &format!("{root}.acl")),
+            "the ACL stays"
+        );
     }
 
     let second = brolly_server::maintenance::acl_uncontain(&db.pool, &stores)
         .await
         .unwrap();
-    assert_eq!(second.len(), 2);
+    assert_eq!(second.pods.len(), 2);
     assert!(
-        second.iter().all(|sweep| matches!(sweep.outcome, Ok(0))),
+        second
+            .pods
+            .iter()
+            .all(|sweep| matches!(sweep.outcome, Ok(0))),
         "a rerun removed something: {second:?}"
     );
 }
@@ -3414,6 +4011,17 @@ use brolly_identity::db::{self, DbError};
 use brolly_store::StoreManager;
 use sqlx::PgPool;
 
+/// What [`acl_uncontain`] found and did.
+#[derive(Debug)]
+pub struct AclUncontain {
+    /// Every row in `users`, whatever its status. Compared with `pods.len()`,
+    /// this is how `brolly-admin` notices it was pointed at the wrong data
+    /// directory: members in the database, none of their pods on disk.
+    pub accounts: usize,
+    /// One entry per account whose pod exists on disk.
+    pub pods: Vec<PodSweep>,
+}
+
 /// What a sweep did to one member's pod.
 #[derive(Debug)]
 pub struct PodSweep {
@@ -3432,9 +4040,10 @@ pub struct PodSweep {
 ///
 /// This is a command, not a startup task, because it opens every pod. At
 /// startup that would slow boot and churn the store cache on a large instance.
-pub async fn acl_uncontain(pool: &PgPool, stores: &StoreManager) -> Result<Vec<PodSweep>, DbError> {
+pub async fn acl_uncontain(pool: &PgPool, stores: &StoreManager) -> Result<AclUncontain, DbError> {
     let users = db::list_users(pool).await?;
-    Ok(users
+    let accounts = users.len();
+    let pods = users
         .into_iter()
         .filter(|user| stores.pod_exists(user.id))
         .map(|user| {
@@ -3449,19 +4058,19 @@ pub async fn acl_uncontain(pool: &PgPool, stores: &StoreManager) -> Result<Vec<P
                 outcome,
             }
         })
-        .collect())
+        .collect();
+    Ok(AclUncontain { accounts, pods })
 }
 ```
 
-In `server/src/lib.rs`, add the module in order:
+In `server/src/lib.rs`, add the module in the order rustfmt sorts them
+(`maintenance` before `mastodon_api`, because `i` sorts before `s`):
 
 ```rust
-pub mod mastodon_oauth;
+pub mod consent;
 pub mod maintenance;
-pub mod outbox;
+pub mod mastodon_api;
 ```
-
-(If `cargo fmt` reorders it, go with fmt.)
 
 - [ ] **Step 4: Run it and watch it pass**
 
@@ -3471,6 +4080,7 @@ Expected: 1 passed.
 - [ ] **Step 5: Gates**
 
 ```bash
+cargo fmt --all
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
 ```
 
@@ -3516,7 +4126,7 @@ and the constructor (`:49-52`):
     }
 ```
 
-- [ ] **Step 2: Write the failing test**
+- [ ] **Step 2: Write the failing tests**
 
 Create `server/tests/admin_cli.rs`:
 
@@ -3527,11 +4137,26 @@ Create `server/tests/admin_cli.rs`:
 //! package that declares the binary, which `server` does.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::process::Command;
+use std::path::Path;
+use std::process::{Command, Output};
 
 use brolly_identity::{db, routing};
 use brolly_solid::storage;
 use brolly_store::StoreManager;
+
+/// `brolly-admin acl-uncontain`, against this database and data directory.
+fn acl_uncontain(database_url: &str, data_dir: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_brolly-admin"))
+        .arg("acl-uncontain")
+        .env("DATABASE_URL", database_url)
+        .env("BROLLY_DATA_DIR", data_dir)
+        .output()
+        .expect("spawn brolly-admin")
+}
+
+fn stderr(output: &Output) -> String {
+    String::from_utf8_lossy(&output.stderr).to_string()
+}
 
 #[tokio::test]
 async fn acl_uncontain_sweeps_the_configured_data_dir_and_is_safe_to_rerun() {
@@ -3554,29 +4179,12 @@ async fn acl_uncontain_sweeps_the_configured_data_dir_and_is_safe_to_rerun() {
         storage::add_containment(&pod, &acl, &root).unwrap();
     }
 
-    let run = || {
-        Command::new(env!("CARGO_BIN_EXE_brolly-admin"))
-            .arg("acl-uncontain")
-            .env("DATABASE_URL", &db.url)
-            .env("BROLLY_DATA_DIR", dir.path())
-            .output()
-            .expect("spawn brolly-admin")
-    };
-
-    let first = run();
-    assert!(
-        first.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&first.stderr)
-    );
+    let first = acl_uncontain(&db.url, dir.path());
+    assert!(first.status.success(), "stderr: {}", stderr(&first));
     assert_eq!(String::from_utf8_lossy(&first.stdout), "alice\t1\n");
 
-    let second = run();
-    assert!(
-        second.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&second.stderr)
-    );
+    let second = acl_uncontain(&db.url, dir.path());
+    assert!(second.status.success(), "stderr: {}", stderr(&second));
     assert_eq!(String::from_utf8_lossy(&second.stdout), "alice\t0\n");
 
     let stores = StoreManager::open(dir.path(), 4, 60).unwrap();
@@ -3584,13 +4192,63 @@ async fn acl_uncontain_sweeps_the_configured_data_dir_and_is_safe_to_rerun() {
     assert!(!storage::members(&pod, &root).contains(&acl));
     assert!(storage::exists(&pod, &acl), "the ACL itself stays");
 }
+
+/// An unset or mistyped `BROLLY_DATA_DIR` must not "succeed". `StoreManager::open`
+/// would create an empty data directory there, find no pods, and exit 0.
+#[tokio::test]
+async fn acl_uncontain_refuses_a_data_dir_without_a_users_directory() {
+    let db = brolly_test_support::postgres().await;
+    db::MIGRATOR.run(&db.pool).await.expect("migrations");
+    let dir = tempfile::tempdir().unwrap();
+
+    let out = acl_uncontain(&db.url, dir.path());
+    let err = stderr(&out);
+    assert!(
+        err.contains("no pod directory at") && err.contains("BROLLY_DATA_DIR"),
+        "stderr: {err}"
+    );
+    assert!(!out.status.success());
+    assert!(
+        !dir.path().join("users").exists(),
+        "the refusal created users/"
+    );
+    assert!(
+        !dir.path().join("instance").exists(),
+        "the refusal created instance/"
+    );
+}
+
+/// Members in the database and none of their pods on disk means the command is
+/// looking in the wrong place, not that there is nothing to do.
+#[tokio::test]
+async fn acl_uncontain_fails_when_the_database_has_members_but_no_pods_are_found() {
+    let db = brolly_test_support::postgres().await;
+    db::MIGRATOR.run(&db.pool).await.expect("migrations");
+    db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    // A data directory in the right shape with nobody's pod in it.
+    std::fs::create_dir(dir.path().join("users")).unwrap();
+
+    let out = acl_uncontain(&db.url, dir.path());
+    let err = stderr(&out);
+    assert!(
+        err.contains("1 account(s) in the database but no pods under"),
+        "stderr: {err}"
+    );
+    assert!(!out.status.success());
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "");
+}
 ```
 
-- [ ] **Step 3: Run it and watch it fail**
+- [ ] **Step 3: Run them and watch them fail**
 
 Run: `cargo test -p brolly-server --test admin_cli`
-Expected: the first `assert!` fails. Its stderr contains
-`unknown command: acl-uncontain`.
+Expected: all three fail, each on its first `assert!`, and each prints a stderr
+that starts `unknown command: acl-uncontain`. The two refusal tests check stderr
+before the exit status on purpose: an unknown command also exits non-zero, so a
+status check alone would pass before the command exists.
 
 - [ ] **Step 4: Implement**
 
@@ -3626,7 +4284,7 @@ COMMANDS:
 ENVIRONMENT:
     DATABASE_URL          required
     BROLLY_BASE_DOMAIN    defaults to brolly.test
-    BROLLY_DATA_DIR       defaults to data (acl-uncontain)
+    BROLLY_DATA_DIR       defaults to data (acl-uncontain); must already exist
 ";
 ```
 
@@ -3643,10 +4301,23 @@ Append after `whoami` (after `:331`):
 /// Sweep every pod for `ldp:contains` triples naming `.acl` resources.
 ///
 /// One line per pod on stdout, `username<TAB>removed`, so the output can be
-/// piped. Failures go to stderr and make the exit status non-zero. A rerun
-/// skips nothing and removes only what's left.
+/// piped, and a one-line summary on stderr. Failures go to stderr and make the
+/// exit status non-zero. A rerun skips nothing and removes only what's left.
 async fn acl_uncontain(pool: &sqlx::PgPool) -> ExitCode {
     let data_dir = std::env::var("BROLLY_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+
+    // `StoreManager::open` creates whatever is missing. Pointed at the wrong
+    // place, it would make an empty data directory, find no pods, and report
+    // success. The server creates `users/` on its first boot, so a directory
+    // without one isn't the server's.
+    let pods_dir = std::path::Path::new(&data_dir).join("users");
+    if !pods_dir.is_dir() {
+        eprintln!("no pod directory at {}", pods_dir.display());
+        eprintln!("set BROLLY_DATA_DIR to the directory the server uses");
+        eprintln!("(/var/lib/brolly in the image); this command never creates it");
+        return ExitCode::FAILURE;
+    }
+
     // A small resident set: the sweep visits each pod once, so there is no
     // working set to keep warm.
     let stores = match brolly_store::StoreManager::open(&data_dir, 16, 60) {
@@ -3658,17 +4329,28 @@ async fn acl_uncontain(pool: &sqlx::PgPool) -> ExitCode {
         }
     };
 
-    let sweeps = match brolly_server::maintenance::acl_uncontain(pool, &stores).await {
-        Ok(sweeps) => sweeps,
+    let report = match brolly_server::maintenance::acl_uncontain(pool, &stores).await {
+        Ok(report) => report,
         Err(e) => {
             eprintln!("could not list members: {e}");
             return ExitCode::FAILURE;
         }
     };
 
+    // Every member gets a pod at registration, so members with no pods at all
+    // means the wrong volume, not an instance with nothing to sweep.
+    if report.accounts > 0 && report.pods.is_empty() {
+        eprintln!(
+            "{} account(s) in the database but no pods under {data_dir}",
+            report.accounts
+        );
+        eprintln!("is BROLLY_DATA_DIR the directory the server uses?");
+        return ExitCode::FAILURE;
+    }
+
     let mut removed = 0usize;
     let mut failed = 0usize;
-    for sweep in &sweeps {
+    for sweep in &report.pods {
         match &sweep.outcome {
             Ok(count) => {
                 removed += count;
@@ -3682,8 +4364,8 @@ async fn acl_uncontain(pool: &sqlx::PgPool) -> ExitCode {
     }
 
     eprintln!(
-        "{removed} containment triple(s) removed across {} pod(s)",
-        sweeps.len()
+        "acl-uncontain: {removed} containment triple(s) removed across {} pod(s)",
+        report.pods.len()
     );
     if failed > 0 {
         eprintln!("{failed} pod(s) could not be swept; safe to re-run");
@@ -3703,21 +4385,54 @@ Append to `docs/deploying.md`:
 `.acl` resources are no longer members of their containers. Pods written
 before the upgrade still list them. Until that's cleaned up, those containers
 show their ACL in listings, and a container with an ACL can't be deleted.
-Once, after deploying:
+Access control is unaffected either way.
+
+Run `brolly-admin acl-uncontain` once, after deploying the new image, with:
+
+- **the server stopped.** It holds the stores open, and the command fails to
+  open them while it runs.
+- **the server's `DATABASE_URL` and `BROLLY_DATA_DIR`.** The command needs the
+  volume itself, not a copy. It refuses a `BROLLY_DATA_DIR` with no `users/`
+  directory in it, and fails if the database has members but none of their
+  pods are there. Both mean it is looking in the wrong place.
+
+It prints one `username<TAB>removed` line per pod, then a summary line,
+`acl-uncontain: N containment triple(s) removed across M pod(s)`. It is safe to
+re-run, and a second run removes 0.
+
+**On Railway.** A one-off command can't do this. It can't reach the service's
+volume, and the running service holds the stores open. Run the command as the
+service's start command for one deploy instead:
+
+1. In the service's settings, set the custom start command to
+   `sh -c 'brolly-admin acl-uncontain && exec brolly-server'`.
+2. Deploy. A service with a volume never runs two deployments at once, so the
+   old server is gone before the sweep starts and nothing else holds the stores.
+3. In the deploy logs, confirm the `acl-uncontain: … removed across … pod(s)`
+   line, followed by the server's normal startup. If the sweep fails, `&&`
+   keeps the server from starting. The error is in the same logs.
+4. Clear the custom start command so the image's `brolly-server` is used again,
+   and deploy. Left in place, the sweep reruns on every boot. That's harmless,
+   but it opens every pod before the server starts.
+
+**With docker compose, or anywhere else.** Stop the server, run the command
+against the same database and data directory, start the server again:
 
 ```fish
-# stop the server first: it holds the stores open
-brolly-admin acl-uncontain
+docker compose stop brolly
+docker compose run --rm brolly brolly-admin acl-uncontain
+docker compose start brolly
 ```
 
-It prints one `username<TAB>removed` line per pod and is safe to re-run. Point
-`BROLLY_DATA_DIR` at the same volume the server uses.
+From a checkout, stop `brolly-server` and run
+`BROLLY_DATA_DIR=<the server's data dir> cargo run --bin brolly-admin -- acl-uncontain`
+with the server's `DATABASE_URL`, then start the server.
 ~~~
 
-- [ ] **Step 5: Run it and watch it pass**
+- [ ] **Step 5: Run them and watch them pass**
 
 Run: `cargo test -p brolly-server --test admin_cli`
-Expected: 1 passed.
+Expected: 3 passed.
 
 Run the whole A2 set once more:
 `cargo test -p brolly-solid --lib ldp::tests && cargo test -p brolly-solid --test acl_control && cargo test -p brolly-server --test pod_http acl && cargo test -p brolly-server --test maintenance`
@@ -3725,6 +4440,7 @@ Run the whole A2 set once more:
 - [ ] **Step 6: Gates**
 
 ```bash
+cargo fmt --all
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && ./tools/check-doc-paths.sh
 ```
 
@@ -3757,7 +4473,10 @@ recreating the container would quietly bring the old grants back.
 
 brolly-admin acl-uncontain removes the ldp:contains triples existing pods
 still hold for ACLs. Run it once after deploying, with the server stopped
-because it holds the stores open. It is idempotent.
+because it holds the stores open. It is idempotent. It refuses a
+BROLLY_DATA_DIR with no users/ directory, and fails when the database has
+members but no pods were found, so a misconfigured run can't report
+success. docs/deploying.md has the Railway and docker compose recipes.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 ```
@@ -3810,15 +4529,24 @@ about three minutes; run it in the background rather than skipping it.
    instance store, and `pod` opens RocksDB directories exclusively. With the
    server running, the command fails on open with a message saying so. The spec
    says "run once after deploying", and the usage text and `docs/deploying.md`
-   add "stop the server first". On Railway a one-off command against a running
-   service's volume would hit this. Until the command runs, the stale triples
-   only affect listings and container deletes, not access, so running it at the
-   next maintenance window is fine. If that's not acceptable, the alternative is
-   a startup task, which the spec rejected.
+   add "stop the server first". On Railway a one-off command can't reach the
+   volume at all, so `docs/deploying.md` gives a recipe: set the start command to
+   `sh -c 'brolly-admin acl-uncontain && exec brolly-server'` for one deploy
+   (Railway never runs two deployments of a volume-backed service at once),
+   confirm the `acl-uncontain: …` summary line in the logs, then clear the start
+   command. For docker compose it's `stop`, `run --rm brolly brolly-admin
+   acl-uncontain`, `start`. Until the command runs, the stale triples only affect
+   listings and container deletes, not access.
 8. **The sweep goes by the `users` table, not by directories on disk.** It covers
    every account whatever its status, including disabled ones, and skips
    accounts whose pod directory doesn't exist (`StoreManager::pod_exists`), so
    it never creates a pod. A pod directory with no user row isn't visited.
+   Two guards stop a misconfigured run from reporting success: the command
+   refuses a `BROLLY_DATA_DIR` with no `users/` in it (checked before
+   `StoreManager::open`, which would create one), and it exits non-zero when the
+   database has accounts but no pod was found (`AclUncontain.accounts` vs
+   `pods`). Every member gets a pod at registration, so that combination only
+   means the wrong directory.
 9. **`uncontain_acls` removes only triples shaped like `add_containment`'s
    output:** a container IRI (ends in `/`) as subject, in its own graph, with an
    ACL object. A member's own document that uses `ldp:contains` is left alone.
@@ -3863,7 +4591,7 @@ spread over three tasks:
 | File | Change |
 |---|---|
 | `migrations/20260917000000_identity_dpop_jti.sql` | Create |
-| `identity/src/dpop.rs` | `Unspent<T>`, `Replayed`, `Storage`, `verify` returns `Unspent`, tests rewritten |
+| `identity/src/dpop.rs` | `Unspent<T>`, `Replayed`, `Storage`, `MAX_JTI_BYTES`, `verify` returns `Unspent` and bounds `jti`, tests rewritten |
 | `identity/tests/dpop_replay.rs` | Create: spend once, two keys with one `jti`, pruning by the app clock, storage failure |
 | `adapters/solid/src/oidc/tokens.rs` | `Access` enum; `verify_access` returns it |
 | `server/src/pod.rs` | `subject_for` spends a `Bound` |
@@ -3887,9 +4615,9 @@ none of them start failing.
 - Test: `server/tests/solid_token_access.rs` (append at end of file)
 - Test: `server/tests/atproto_oauth.rs:164-195` (split `push`), plus a new test
   after `a_client_id_that_is_not_a_fetchable_url_is_refused` (`:439`)
-- Test: `server/tests/xrpc.rs` (new imports at `:11-18`; new helpers and test
-  after `a_deleted_record_is_gone_from_the_repo`, before the
-  `// --- hygiene` divider at `:468`)
+- Test: `server/tests/xrpc.rs` (new imports after `use axum::body::Body;`;
+  new helpers and test after `a_deleted_record_is_gone_from_the_repo`,
+  immediately before the `// --- hygiene` divider, `:469` at time of writing)
 
 Every test sends a request that would succeed, then sends a second request that
 would also succeed except that it reuses the first request's proof. A third
@@ -4074,7 +4802,8 @@ This file has no DPoP tests. Its `send` drops `Location`, and its `a_member`
 `(user_id, cookie)`. The test builds the full ATProto OAuth flow on top of that
 member, following `full_flow` in `server/tests/atproto_oauth.rs:233`.
 
-Add to the imports at the top (`:11-18`). `p256::ecdsa::SigningKey` is written
+Add to the imports at the top (the `use` block starting at
+`use axum::body::Body;`). `p256::ecdsa::SigningKey` is written
 out in full below, so it can't be confused with `brolly_atproto::keys::SigningKey`,
 which this file already names in full.
 
@@ -4085,13 +4814,17 @@ use p256::ecdsa::signature::Signer;
 use sha2::{Digest, Sha256};
 ```
 
-Add the helpers and the test before the `// --- hygiene` divider:
+Add the helpers and the test immediately before the
+`// --- hygiene ----` divider line:
 
 ```rust
 // --- DPoP-bound callers ------------------------------------------------------------
 
+// Chunk 5 (B) makes PAR look these up in the harness's `StaticClients`. It must
+// register exactly this client, redirect and scope there. See the note below.
 const OAUTH_CLIENT: &str = "https://app.example/client-metadata.json";
 const OAUTH_REDIRECT: &str = "https://app.example/cb";
+const OAUTH_SCOPE: &str = "atproto transition:generic";
 
 /// A DPoP proof, as a real client produces one.
 fn dpop_proof(key: &p256::ecdsa::SigningKey, method: &str, url: &str, ath: Option<&str>) -> String {
@@ -4128,7 +4861,7 @@ async fn atproto_access_token(h: &Harness, cookie: &str, key: &p256::ecdsa::Sign
         .append_pair("client_id", OAUTH_CLIENT)
         .append_pair("redirect_uri", OAUTH_REDIRECT)
         .append_pair("response_type", "code")
-        .append_pair("scope", "atproto transition:generic")
+        .append_pair("scope", OAUTH_SCOPE)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
         .finish();
@@ -4283,6 +5016,19 @@ async fn an_xrpc_write_proof_is_good_for_one_request() {
 }
 ```
 
+**Handoff to Chunk 5 (B), required.** Today PAR accepts any `client_id`, so this
+test runs against the current `AppState`. Chunk 5 adds client-metadata lookup
+and threads `clients` through every `AppState`, including the `harness()` in
+`server/tests/xrpc.rs`. When it does, that harness's `StaticClients` **must**
+register a client document for `OAUTH_CLIENT`
+(`https://app.example/client-metadata.json`) whose `redirect_uris` contains
+`OAUTH_REDIRECT` (`https://app.example/cb`) and whose `scope` allows
+`OAUTH_SCOPE` (`atproto transition:generic`), the same way
+`server/tests/atproto_oauth.rs` registers its client. Without it,
+`an_xrpc_write_proof_is_good_for_one_request` fails at PAR with
+`invalid_client`. Chunk 5's executor should check this test is still green
+after its harness change.
+
 - [ ] **Step 5: Run them and watch them fail**
 
 ```bash
@@ -4314,9 +5060,10 @@ now would put a red commit on `main`.
 **Files:**
 - Create: `migrations/20260917000000_identity_dpop_jti.sql`
 - Modify: `identity/src/dpop.rs`: module doc (`:1-23`), imports (`:25-30`),
-  `DpopError` (`:38-69`), `Claims` (`:89-98`), a new `Unspent` after
-  `VerifiedProof` (`:100-109`), `verify` (`:161-230`), and the whole `tests`
-  module (`:240-443`)
+  a new `MAX_JTI_BYTES` after `MAX_AGE_SECONDS` (`:36`), `DpopError`
+  (`:38-69`), `Claims` (`:89-98`), a new `Unspent` after `VerifiedProof`
+  (`:100-109`), `verify` (`:161-230`), and the whole `tests` module
+  (`:240-443`). Line numbers are as of `dd7b357`; the item names are the anchors.
 - Test: `identity/tests/dpop_replay.rs` (create)
 
 - [ ] **Step 1: Write the failing database tests**
@@ -4474,7 +5221,9 @@ async fn a_storage_failure_refuses_the_proof() {
 `Unspent` deliberately derives neither `Debug` nor `PartialEq` (see Step 6), so
 `assert_eq!(verify(..), Err(..))` no longer compiles. Those assertions become
 `assert_eq!(verify(..).err(), Some(..))`. The two tests that read `.thumbprint`
-now use `bound_to` with a thumbprint the test computes itself. Replace the whole
+now use `bound_to` with a thumbprint the test computes itself. `make_proof`
+becomes a wrapper over `make_proof_with_jti`, so three new tests can pick the
+`jti` (empty, exactly `MAX_JTI_BYTES`, one byte over). Replace the whole
 `#[cfg(test)] mod tests` (`:240-443`) with:
 
 ```rust
@@ -4492,6 +5241,18 @@ mod tests {
         ath: Option<&str>,
         typ: &str,
     ) -> String {
+        make_proof_with_jti(key, method, url, iat, ath, typ, "unique")
+    }
+
+    fn make_proof_with_jti(
+        key: &SigningKey,
+        method: &str,
+        url: &str,
+        iat: i64,
+        ath: Option<&str>,
+        typ: &str,
+        jti: &str,
+    ) -> String {
         // SEC1 uncompressed: 0x04 || x || y.
         let sec1 = key.verifying_key().to_sec1_bytes();
         assert_eq!(sec1[0], 0x04, "expected an uncompressed point");
@@ -4503,7 +5264,7 @@ mod tests {
         });
         let header = serde_json::json!({"alg": "ES256", "typ": typ, "jwk": jwk});
         let mut claims = serde_json::json!({
-            "htm": method, "htu": url, "jti": "unique", "iat": iat
+            "htm": method, "htu": url, "jti": jti, "iat": iat
         });
         if let Some(ath) = ath {
             claims["ath"] = serde_json::Value::String(ath.to_string());
@@ -4702,6 +5463,37 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_jti_is_malformed() {
+        // Nothing to record, so nothing to stop a replay.
+        let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", "");
+        assert!(matches!(
+            verify(&proof, "GET", URL, None, 1000),
+            Err(DpopError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_jti_of_exactly_the_limit_is_accepted() {
+        let jti = "j".repeat(MAX_JTI_BYTES);
+        let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", &jti);
+        let unspent = verify(&proof, "GET", URL, None, 1000).unwrap();
+        assert_eq!(unspent.jti, jti);
+    }
+
+    #[test]
+    fn a_jti_over_the_limit_is_malformed() {
+        // Otherwise it reaches the (jkt, jti) primary key, overflows the btree
+        // row, and comes back as Storage: a client's mistake logged as a
+        // server fault.
+        let jti = "j".repeat(MAX_JTI_BYTES + 1);
+        let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", &jti);
+        assert!(matches!(
+            verify(&proof, "GET", URL, None, 1000),
+            Err(DpopError::Malformed(_))
+        ));
+    }
+
+    #[test]
     fn a_der_encoded_signature_is_rejected_not_accidentally_accepted() {
         // Guards the P1363 decision: if this ever starts passing, someone has
         // loosened signature parsing and browser clients may silently break.
@@ -4734,8 +5526,9 @@ cargo test -p brolly-identity --lib dpop
 ```
 
 Expected: neither compiles. The errors include `no method named 'spend'`,
-`no method named 'bound_to'`, `no method named 'replace'`, and
-`no field 'jti' on type 'VerifiedProof'`.
+`no method named 'bound_to'`, `no method named 'replace'`,
+`no field 'jti' on type 'VerifiedProof'`, and
+`cannot find value 'MAX_JTI_BYTES'`.
 
 - [ ] **Step 4: The migration**
 
@@ -4774,14 +5567,33 @@ In `identity/src/dpop.rs`, append this to the module doc after line 23:
 //! A proof is also **single-use**. `verify` can't know whether it has seen a
 //! proof before, because that needs the database. So it returns [`Unspent`],
 //! and the only way to reach the value inside is [`Unspent::spend`], which
-//! records the proof's `jti`. A call site that forgets the replay check doesn't
-//! compile.
+//! records the proof's `jti`. A call site can't read the key thumbprint, or a
+//! bound Solid token's claims, without spending the proof first.
+//!
+//! That guarantee covers only what arrives inside the `Unspent`. A caller that
+//! learns something from elsewhere before checking the proof is not held to it
+//! by the compiler: XRPC's `token_caller` gets the grant, and so the `user_id`,
+//! from `brolly_atproto::oauth::verify_token` before any proof is looked at,
+//! and spends only by convention. Closing that is a stage 2 follow-up.
 ```
 
 Add to the imports (`:25-30`):
 
 ```rust
 use sqlx::PgPool;
+```
+
+After `MAX_AGE_SECONDS` (`:36`), add:
+
+```rust
+
+/// The longest `jti` a proof may carry, in bytes.
+///
+/// RFC 9449 sets no limit. This one keeps the `(jkt, jti)` primary key of
+/// `dpop_jti` well inside a btree index row, so an oversized `jti` is refused
+/// here as `Malformed` instead of failing the insert and being logged as a
+/// storage fault.
+pub const MAX_JTI_BYTES: usize = 256;
 ```
 
 Replace `DpopError` and its `Display` (`:38-69`) with:
@@ -4925,6 +5737,12 @@ impl<T> Unspent<T> {
     /// Returns [`DpopError::Replayed`] if this key has already used this `jti`,
     /// and [`DpopError::Storage`] if the proof couldn't be recorded. Callers
     /// must treat both as a refusal.
+    ///
+    /// Concurrent spends are safe for replay: the primary key lets exactly one
+    /// insert of a `(jkt, jti)` pair win. Their prune `DELETE`s can overlap,
+    /// though, and two of them locking expired rows in different orders can
+    /// rarely deadlock. Postgres aborts one; that spend comes back as
+    /// `Storage` and its request is refused, so a deadlock fails closed.
     pub async fn spend(self, pool: &PgPool, now: i64) -> Result<T, DpopError> {
         let recorded: Option<String> = sqlx::query_scalar(SPEND_JTI)
             .bind(self.jkt.as_str())
@@ -4965,8 +5783,10 @@ impl<T> Unspent<T> {
 
 - [ ] **Step 7: `verify` returns `Unspent`**
 
-Replace `verify` (`:161-230`). The checks and the signature don't change; only
-the return type and the final `Ok` do:
+Replace `verify` (`:161-230`, from its `/// Verify a DPoP proof` doc comment to
+the closing `}` before `htu_matches`). The existing checks and the signature
+don't change. What changes is the return type, the final `Ok`, and a new `jti`
+length check right after the claims are decoded:
 
 ```rust
 /// Verify a DPoP proof against the request it arrived on.
@@ -5013,6 +5833,14 @@ pub fn verify(
         .map_err(|_| DpopError::BadSignature)?;
 
     let claims: Claims = decode_part(claims_b64)?;
+
+    // An empty jti can't be told apart from the next one, and an oversized one
+    // would fail the dpop_jti insert as a storage error rather than a client's.
+    if claims.jti.is_empty() || claims.jti.len() > MAX_JTI_BYTES {
+        return Err(DpopError::Malformed(format!(
+            "jti must be 1 to {MAX_JTI_BYTES} bytes"
+        )));
+    }
 
     if !claims.htm.eq_ignore_ascii_case(method) {
         return Err(DpopError::WrongTarget {
@@ -5076,8 +5904,9 @@ The workspace doesn't compile at this point. Task 3 commits.
 **Files:**
 - Modify: `adapters/solid/src/oidc/tokens.rs:117-149` (`verify_access`), and
   its tests at `:244-263` and a new test after `:352`
-- Modify: `server/src/pod.rs:10-17` (imports), `:128-150` (`Credential::Dpop`
-  arm of `subject_for`)
+- Modify: `server/src/pod.rs:10-17` (imports), `:129-150` (the
+  `Credential::Dpop { token, proof } => {` arm of `subject_for`, up to the
+  `// Mastodon's bearer tokens.` comment)
 - Modify: `server/src/solid_oidc.rs:419-437` (`token`)
 - Modify: `server/src/atproto_oauth.rs:61-81` (`proof_thumbprint`), `:150`
   (`par`), `:449` (`token`)
@@ -5089,7 +5918,7 @@ closed.
 | Call site | `Replayed` | `Storage` |
 |---|---|---|
 | Solid token endpoint | `400 invalid_dpop_proof`, logged at `warn` | `500 server_error`, logged at `error` |
-| ATProto PAR and token (`proof_thumbprint`) | `400 invalid_dpop_proof`, logged at `warn` | `400 invalid_dpop_proof`, logged at `error` (see the notes for the reviewer) |
+| ATProto PAR and token (`proof_thumbprint`) | `400 invalid_dpop_proof`, logged at `warn` | `400 invalid_dpop_proof`, logged at `error`, as the spec requires |
 | Solid resource (`subject_for`, which covers the pod and the ActivityPub inbox GET) | anonymous, logged at `warn` | anonymous, logged at `error` |
 | XRPC (`token_caller`) | `None`, so the caller falls back to the cookie and otherwise gets `401`, logged at `warn` | same, logged at `error` |
 
@@ -5238,8 +6067,8 @@ In `server/src/pod.rs`, add to the imports (`:10-17`):
 use brolly_identity::dpop::DpopError;
 ```
 
-Replace the `Credential::Dpop { token, proof } => { ... }` arm (`:128-150`)
-with:
+Replace the `Credential::Dpop { token, proof } => { ... }` arm (`:129-150`,
+ending just before the `// Mastodon's bearer tokens.` comment) with:
 
 ```rust
         Credential::Dpop { token, proof } => {
@@ -5432,6 +6261,12 @@ from the `// The proof must be for this request` comment through the closing
 `caller` is called once per handler (`create_record` at `:420` and
 `delete_record` at `:534`), so no request spends its proof twice.
 
+Unlike the other call sites, nothing here forces the spend. The grant, and with
+it `grant.user_id`, comes from `brolly_atproto::oauth::verify_token` above,
+before any proof is checked, so a future edit could use it without spending.
+Stage 2 should restructure `token_caller` so the user is reachable only through
+the spent proof.
+
 - [ ] **Step 9: Run Task 1's tests and watch them pass**
 
 ```bash
@@ -5454,9 +6289,15 @@ Expected: PASS.
 
 - [ ] **Step 10: Gates**
 
-Run `cargo fmt --all` first. Some of the code above has lines longer than
-rustfmt allows, for example the `Bound` arm in `pod.rs` and the helper
-signatures in `xrpc.rs`. Formatting changes layout only. Then:
+First format. Some of the code above has lines longer than rustfmt allows, for
+example the `Bound` arm in `pod.rs` and the helper signatures in
+`server/tests/xrpc.rs`. Formatting changes layout only.
+
+```bash
+cargo fmt --all
+```
+
+Then the gates:
 
 ```bash
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace
@@ -5483,10 +6324,18 @@ for MAX_AGE_SECONDS either side of its iat: at the Solid and ATProto
 token endpoints, at PAR, on every pod read and write, and on XRPC writes.
 
 verify now returns Unspent<VerifiedProof>. The value is reachable only
-through spend, which records (jkt, jti) in the new dpop_jti table, so a
-call site that skips the replay check does not compile. Pruning runs in
-the same statement, using the application's clock, because that is the
-clock that decides freshness.
+through spend, which records (jkt, jti) in the new dpop_jti table, so
+the key thumbprint at the token endpoints and PAR, and a bound Solid
+token's claims, can't be read without the replay check. XRPC is not
+held to it by the compiler: token_caller gets the grant from
+verify_token before the proof is checked, and spends by convention.
+Restructuring that is left for stage 2. Pruning runs in the same
+statement, using the application's clock, because that is the clock
+that decides freshness.
+
+verify also refuses a jti that is empty or over 256 bytes as Malformed,
+so an oversized one can't overflow the primary key's index row and be
+logged as a server fault.
 
 A replay gets the same refusal as any other bad proof. A storage failure
 fails closed.
@@ -5514,15 +6363,14 @@ stale expansion can't hide.
 
 ### Notes for the reviewer
 
-1. **At ATProto PAR and token, a storage failure gets `400 invalid_dpop_proof`,
-   not `500 server_error`.** The spec says token endpoints answer
-   `500 server_error` when storage fails. But the cross-chunk interface fixes
-   `proof_thumbprint` as `async fn ... -> Option<String>`, and Chunk 5 (B) calls
-   it that way, so it can't carry the difference. The request still fails
-   closed, and the failure is logged at `error`, not `warn`. The Solid token
-   endpoint does return `500`. If `500` matters here, change the return type to
-   a small `enum Proof { Spent(String), Refused, Unavailable }` in both this
-   chunk and Chunk 5.
+1. **The compile-time guarantee has a known gap at XRPC.** The thumbprint at
+   the Solid and ATProto token endpoints and PAR, and a bound Solid token's
+   claims, are reachable only through `spend`. `token_caller` is different:
+   `brolly_atproto::oauth::verify_token` returns the grant, including
+   `user_id`, before any proof is checked (`server/src/xrpc.rs`, the
+   `let grant = ...verify_token` line), so its spend is by convention. The
+   module doc and the commit message say so. Closing it is a stage 2
+   follow-up.
 2. **The migration is named `20260917000000_identity_dpop_jti.sql`**, not
    `<timestamp>_dpop_jti.sql`. `migrations/README.md` rule 2 requires the
    owning crate's prefix. No earlier chunk adds a migration, so the timestamp
@@ -5551,12 +6399,15 @@ stale expansion can't hide.
    `Bearer` unit test checks claim extraction, and
    `an_app_reads_the_pod_with_the_token_it_was_issued` still checks a bound
    token's WebID over HTTP.
-7. **For Chunk 5 (B): the XRPC replay test runs a real PAR with
-   `https://app.example/client-metadata.json` in `server/tests/xrpc.rs`.** When
-   B threads `clients` through every `AppState`, that file's `StaticClients`
-   has to register this client the same way `server/tests/atproto_oauth.rs`
-   does. Otherwise `an_xrpc_write_proof_is_good_for_one_request` fails at PAR
-   with `invalid_client`.
+7. **For Chunk 5 (B): the XRPC replay test runs a real PAR in
+   `server/tests/xrpc.rs`.** When B threads `clients` through every
+   `AppState`, that file's `StaticClients` has to register `OAUTH_CLIENT`
+   (`https://app.example/client-metadata.json`) with redirect `OAUTH_REDIRECT`
+   (`https://app.example/cb`) and scope `OAUTH_SCOPE`
+   (`atproto transition:generic`), the same way
+   `server/tests/atproto_oauth.rs` registers its client. Otherwise
+   `an_xrpc_write_proof_is_good_for_one_request` fails at PAR with
+   `invalid_client`. Task 1 Step 4 spells this out as a required handoff.
 8. **Each replay test sends a third request with a fresh proof and expects it
    to succeed.** The spec only asks that the replay be refused. The third
    request shows the refusal came from the reused `jti`, not from the code,
@@ -5574,11 +6425,23 @@ stale expansion can't hide.
     `Storage`, not `Ok`. How each call site maps `Storage` is in Task 3's table
     and has no HTTP-level test, because the test harness can't break the
     database halfway through a request.
+11. **The `jti` length bound is tested in `dpop.rs` unit tests only**
+    (empty, exactly 256 bytes, 257 bytes). The check is in `verify`, before
+    anything touches the database, so there is nothing for the
+    `dpop_replay.rs` database tests to add.
 
 
 ## Chunk 4: Outbound HTTPS (B0)
 
 **Spec:** `docs/specs/2026-09-17-security-fixes.md`, § B0, and problem 5.
+
+**Assumes Chunk 0 has landed.** Chunk 0 ran `cargo update -p rustls -p chacha20
+-p wnaf`, which moved rustls to 0.23.45 or later (RUSTSEC-2026-0285) and removed
+the yanked crates, and it fixed clippy's `empty_line_after_doc_comments` in
+`server/src/lib.rs`. So at the start of this chunk `cargo deny check` and
+`cargo clippy --workspace --all-targets -- -D warnings` are green on `main`. The
+expectations in Steps 8-10 rely on that. If either is red before you start, fix
+Chunk 0 first, not here.
 
 Right now `reqwest` is declared with `default-features = false, features = ["json"]` in
 both `server/Cargo.toml:45` and `adapters/atproto/Cargo.toml:36`. No TLS
@@ -5604,9 +6467,26 @@ If no provider is installed it hits `default_rustls_crypto_provider()`, which
 process dies. The provider has to be installed before any client is built.
 That's why `install_crypto_provider()` is the first statement of both `main`s.
 
+**Building a client now reads the OS root store, and can fail.** Unless
+`tls_certs_only` is used, `build()` constructs
+`rustls_platform_verifier::Verifier::new(provider)`
+(`reqwest-0.13.4/src/async_impl/client.rs:748-758`). On Linux and other
+non-Apple Unix, `Verifier::new` calls `rustls_native_certs::load_native_certs()`
+**right then**, and if nothing loads it returns
+`rustls::Error::General("No CA certificates were loaded from the system")`
+(`Verifier::new` at `rustls-platform-verifier-0.7.0/src/verification/others.rs:27`
+calls `new_inner`, which loads the store at `:92-110`). reqwest
+turns that into a builder error, and `Client::new()` turns the builder error
+into a panic. On macOS the verifier asks Security.framework at verification
+time, so the build doesn't touch the store there. So this chunk also replaces
+both `reqwest::Client::new()` calls with `tls::https_client()`, which is
+`Client::builder().build()` with the error mapped to a readable message. A host
+with no CA bundle then gets a clear startup error and a non-zero exit, not a panic.
+
 **The lib crate is `brolly_server`** (`server/Cargo.toml` `[lib] name =
 "brolly_server"`). Both binaries and every integration test reach the new
-function as `brolly_server::tls::install_crypto_provider()`.
+functions as `brolly_server::tls::install_crypto_provider()` and
+`brolly_server::tls::https_client()`.
 
 **Existing tests that build a reqwest client: none.** Every hand-built
 `AppState` in `server/tests/*.rs` sets `plc_client: None`. No file under
@@ -5630,8 +6510,10 @@ One commit, as the spec's rollout requires ("Its own commit").
 - Modify: `Cargo.lock` (regenerated by cargo)
 - Create: `server/src/tls.rs`
 - Modify: `server/src/lib.rs:29-30` (`pub mod tls;` between `solid_oidc` and `xrpc`)
-- Modify: `server/src/main.rs:6-9` (first statement of `main`)
-- Modify: `server/src/bin/admin.rs:42-43` (first statement of `main`)
+- Modify: `server/src/main.rs:6-14` (first statement of `main`, and the PLC
+  client built right after logging) and `:88-92` (the `plc_client` field)
+- Modify: `server/src/bin/admin.rs:42-43` (first statement of `main`) and `:236`
+  (the `plc-retry` client)
 - Test: `server/src/tls.rs` (`#[cfg(test)] mod tests`)
 
 - [ ] **Step 1: Add the test-only dependencies, and write the failing tests**
@@ -5661,7 +6543,9 @@ rcgen = { version = "0.13", default-features = false, features = ["crypto", "rin
 ```
 
 Create `server/src/tls.rs`. For now `install_crypto_provider` is a no-op
-stub, so the file compiles once the reqwest feature lands in Step 3:
+stub, so the file compiles once the reqwest feature lands in Step 3.
+`https_client` is written in full now: it isn't what the provider tests
+exercise, and the binaries switch to it in Step 6.
 
 ```rust
 //! Outbound TLS.
@@ -5673,7 +6557,9 @@ stub, so the file compiles once the reqwest feature lands in Step 3:
 //! first statement, and so does every test that builds a client.
 //!
 //! Root certificates come from `rustls-platform-verifier`, which reads the OS
-//! store. The runtime image installs `ca-certificates` for that (`Dockerfile`).
+//! store. On Linux it reads it when the client is *built*, and fails the build
+//! if the store is empty, so [`https_client`] returns that as an error rather
+//! than panicking. The runtime image installs `ca-certificates` (`Dockerfile`).
 
 /// Install ring as the process-wide rustls crypto provider.
 ///
@@ -5683,6 +6569,32 @@ stub, so the file compiles once the reqwest feature lands in Step 3:
 /// installed by us". Tests call this from many threads in one process, so
 /// the second call being harmless is required, not just convenient.
 pub fn install_crypto_provider() {}
+
+/// Build the outbound HTTPS client. Call [`install_crypto_provider`] first:
+/// without a provider this panics inside reqwest.
+///
+/// `Client::builder().build()`, not `Client::new()`. On Linux, building
+/// constructs rustls-platform-verifier, which loads the OS root store there
+/// and then fails with "No CA certificates were loaded from the system" if
+/// the host has no CA bundle. `Client::new()` would turn that into a panic.
+/// It's a deployment mistake, so the binaries report it and exit non-zero.
+///
+/// The error is the whole source chain on one line. reqwest's own `Display`
+/// for a builder error is just "builder error", and the cause is the part an
+/// operator needs.
+pub fn https_client() -> Result<reqwest::Client, String> {
+    reqwest::Client::builder().build().map_err(|e| {
+        let mut message = format!("cannot build the outbound HTTPS client: {e}");
+        let mut source = std::error::Error::source(&e);
+        while let Some(cause) = source {
+            message.push_str(": ");
+            message.push_str(&cause.to_string());
+            source = cause.source();
+        }
+        message.push_str(" (is the OS CA bundle, e.g. `ca-certificates`, installed?)");
+        message
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -5703,9 +6615,19 @@ mod tests {
 
     /// Generated per run: a committed fixture would expire, and then the test
     /// would fail for reasons unrelated to what it checks.
-    fn pki() -> Pki {
+    ///
+    /// `ca_name` becomes the CA's common name, and so the leaf's issuer name.
+    /// Every CA needs its own. rcgen's default DN is the same for every
+    /// certificate ("rcgen self signed cert"), and webpki picks candidate
+    /// issuers by name. Two CAs with the same name would make the refusal test
+    /// fail with `BadSignature` (right name, wrong key) instead of
+    /// `UnknownIssuer`, which is not the case it means to check.
+    fn pki(ca_name: &str) -> Pki {
         let ca_key = rcgen::KeyPair::generate().unwrap();
         let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, ca_name);
         ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         ca_params.key_usages = vec![
             rcgen::KeyUsagePurpose::KeyCertSign,
@@ -5715,6 +6637,9 @@ mod tests {
 
         let leaf_key = rcgen::KeyPair::generate().unwrap();
         let mut leaf_params = rcgen::CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "localhost");
         leaf_params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         let leaf = leaf_params.signed_by(&leaf_key, &ca, &ca_key).unwrap();
 
@@ -5776,6 +6701,15 @@ mod tests {
 
     /// A client trusting only `roots`, with `localhost` pinned to `addr`.
     ///
+    /// `tls_certs_only` makes reqwest use rustls's own `WebPkiServerVerifier`
+    /// over exactly these roots. It does **not** go through
+    /// rustls-platform-verifier (the `else` branch at
+    /// `reqwest-0.13.4/src/async_impl/client.rs:784-788`, not the
+    /// `Verifier::new` branch at `:748-758`). So the handshake tests
+    /// prove reqwest's rustls stack verifies chains; they don't exercise the
+    /// platform verifier. `a_client_builds_once_the_provider_is_installed`
+    /// covers that one being constructed.
+    ///
     /// `resolve` so the test never depends on whether `localhost` resolves to
     /// `::1` or `127.0.0.1` first. The URL's port is the one used.
     fn client_trusting(roots: &[&CertificateDer<'static>], addr: SocketAddr) -> reqwest::Client {
@@ -5791,6 +6725,35 @@ mod tests {
             .unwrap()
     }
 
+    /// The rustls error somewhere in `err`'s source chain, if there is one.
+    ///
+    /// A refused handshake is wrapped twice in `io::Error`:
+    /// - tokio-rustls wraps the `rustls::Error`
+    ///   (`tokio-rustls-0.26.4/src/common/mod.rs:115`)
+    /// - hyper-rustls wraps that `io::Error` in `io::Error::other`
+    ///   (`hyper-rustls-0.27.9/src/connector.rs:118-120`)
+    ///
+    /// reqwest then boxes the result under hyper-util's connect error. For a
+    /// custom payload, `io::Error::source` returns the payload's *source*, not
+    /// the payload, so walking with `source()` alone skips both layers. At
+    /// every `io::Error` the walk steps into its payload with `get_ref`
+    /// instead, which handles any depth of nesting.
+    fn rustls_error_in(err: &reqwest::Error) -> Option<&rustls::Error> {
+        let mut next: Option<&(dyn std::error::Error + 'static)> = Some(err);
+        while let Some(current) = next {
+            if let Some(tls) = current.downcast_ref::<rustls::Error>() {
+                return Some(tls);
+            }
+            next = match current.downcast_ref::<std::io::Error>() {
+                Some(io) => io
+                    .get_ref()
+                    .map(|payload| payload as &(dyn std::error::Error + 'static)),
+                None => current.source(),
+            };
+        }
+        None
+    }
+
     #[test]
     fn installing_the_provider_twice_is_harmless() {
         install_crypto_provider();
@@ -5801,10 +6764,18 @@ mod tests {
     /// Exactly the constructor `main.rs` (`plc_client`) and `brolly-admin
     /// plc-retry` use. With `rustls-no-provider` and no provider installed,
     /// this panics inside reqwest.
+    ///
+    /// This one does read the OS: on Linux, building constructs
+    /// rustls-platform-verifier, which loads the system root store and fails
+    /// if it is empty. The test host needs a CA bundle. `ubuntu-latest` (CI)
+    /// and `rust:1-bookworm` have `ca-certificates`; a slim container without
+    /// it fails here with "No CA certificates were loaded from the system".
     #[test]
     fn a_client_builds_once_the_provider_is_installed() {
         install_crypto_provider();
-        let _client = reqwest::Client::new();
+        if let Err(e) = https_client() {
+            panic!("{e}");
+        }
     }
 
     /// Nothing may be `#[ignore]`d, so no call to a real host. A real handshake
@@ -5813,7 +6784,7 @@ mod tests {
     #[tokio::test]
     async fn https_completes_against_a_trusted_root() {
         install_crypto_provider();
-        let pki = pki();
+        let pki = pki("brolly test CA");
         let addr = serve_once(pki.leaf, pki.leaf_key);
         let client = client_trusting(&[&pki.ca], addr);
 
@@ -5829,20 +6800,38 @@ mod tests {
 
     /// Without this, the test above would also pass against a client that
     /// verifies nothing.
+    ///
+    /// Asserts the refusal is certificate verification, not just "an error".
+    /// `is_connect()` can't tell them apart: the handshake runs inside the
+    /// connector, so a refused certificate and a refused TCP connection are
+    /// both connect errors. The rustls error in the chain can.
     #[tokio::test]
     async fn https_refuses_a_certificate_from_an_untrusted_root() {
         install_crypto_provider();
-        let served = pki();
-        let stranger = pki();
+        let served = pki("brolly test CA");
+        let stranger = pki("stranger CA");
         let addr = serve_once(served.leaf, served.leaf_key);
         let client = client_trusting(&[&stranger.ca], addr);
 
-        let result = client
+        let err = match client
             .get(format!("https://localhost:{}/", addr.port()))
             .send()
-            .await;
+            .await
+        {
+            Ok(response) => panic!("an unknown issuer was accepted: {}", response.status()),
+            Err(err) => err,
+        };
 
-        assert!(result.is_err(), "an unknown issuer was accepted: {result:?}");
+        let tls = rustls_error_in(&err);
+        assert!(
+            matches!(
+                tls,
+                Some(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::UnknownIssuer
+                ))
+            ),
+            "expected the chain to be refused as UnknownIssuer, got rustls error {tls:?} in {err:?}",
+        );
     }
 }
 ```
@@ -5862,10 +6851,10 @@ cargo test -p brolly-server --lib tls::
 
 Expected: **compile error**, `no method named `tls_certs_only` found for struct
 `ClientBuilder``. That method is `#[cfg(feature = "__tls")]`
-(`reqwest-0.13.4/src/async_impl/client.rs:1878-1885`), and no TLS feature is on.
+(`reqwest-0.13.4/src/async_impl/client.rs:1880-1885`), and no TLS feature is on.
 This is problem 5 as a compiler error: this reqwest can't do TLS at all. The
-first build downloads `rcgen`, `yasna` and their dependencies, so it needs
-network.
+first build downloads `rcgen`, `yasna` and their dependencies if they aren't
+in the local cache, so it may need network.
 
 - [ ] **Step 3: Turn on reqwest's TLS, and watch the provider tests fail**
 
@@ -5907,9 +6896,10 @@ cargo test -p brolly-server --lib tls::
 ```
 
 This first build adds `rustls-platform-verifier` and its dependencies to
-`Cargo.lock`, which needs network. Expected: it compiles, and
-`installing_the_provider_twice_is_harmless` fails its assertion. The other three
-panic with reqwest's
+`Cargo.lock`. `rustls-platform-verifier` 0.7.0 is in the local registry cache,
+but some of its target-specific dependencies may not be, so it may need
+network. Expected: it compiles, and `installing_the_provider_twice_is_harmless`
+fails its assertion. The other three panic with reqwest's
 `No rustls crypto provider is configured. When using the `rustls-no-provider` feature you must install a crypto provider before building a Client.`
 That's the panic `main.rs` and `brolly-admin` would hit if they didn't install
 one.
@@ -5930,9 +6920,13 @@ pub fn install_crypto_provider() {
 }
 ```
 
-(`install_default` returns `Result<(), Arc<CryptoProvider>>`.
-`rustls-0.23.43/src/crypto/mod.rs:227`. Binding the result to a named `_`
-variable discards it without `unwrap`. The workspace lints forbid `unwrap`.)
+(`install_default` returns `Result<(), Arc<CryptoProvider>>`. See
+`CryptoProvider::install_default` in rustls 0.23.x (>=0.23.45 after Chunk 0),
+`src/crypto/mod.rs`. The signature is identical at `:227` in the cached 0.23.40
+and 0.23.43; 0.23.45 isn't in the local cache, so after Chunk 0's update confirm
+with `grep -n 'pub fn install_default' ~/.cargo/registry/src/*/rustls-0.23.4[5-9]*/src/crypto/mod.rs`.
+Binding the result to a named `_` variable discards it without `unwrap`. The
+workspace lints forbid `unwrap`.)
 
 - [ ] **Step 5: Run it and watch it pass**
 
@@ -5940,17 +6934,25 @@ variable discards it without `unwrap`. The workspace lints forbid `unwrap`.)
 cargo test -p brolly-server --lib tls::
 ```
 
-Expected: 4 passed.
+Expected: 4 passed. On Linux, `a_client_builds_once_the_provider_is_installed`
+needs the host's CA bundle (see its doc comment). If it fails with
+`No CA certificates were loaded from the system`, install `ca-certificates`;
+don't change the test.
 
-- [ ] **Step 6: Install the provider in both binaries**
+- [ ] **Step 6: Install the provider in both binaries, and build their clients without panicking**
 
-`server/src/main.rs`. Replace lines 6-9:
+`server/src/main.rs`. Replace lines 6-14:
 
 ```rust
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Structured logging from the first line. No `println!` anywhere in the
     // workspace — the lint denies it (implementation plan §5).
     tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
 ```
 
 with:
@@ -5965,6 +6967,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Structured logging from the first line. No `println!` anywhere in the
     // workspace — the lint denies it (implementation plan §5).
     tracing_subscriber::fmt()
+        .json()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
+        )
+        .init();
+
+    // Absent unless asked for, so a local instance does not try to publish
+    // test identities to the real PLC directory. Built here, before the
+    // database, so a host with no CA bundle fails at once with a clear error
+    // and a non-zero exit, not a panic after migrations have run.
+    let plc_client = if std::env::var("BROLLY_PLC_SUBMIT").is_ok_and(|v| v == "1" || v == "true")
+    {
+        match brolly_server::tls::https_client() {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::error!(error = %e, "BROLLY_PLC_SUBMIT is set but the HTTPS client cannot be built");
+                return Err(e.into());
+            }
+        }
+    } else {
+        None
+    };
+```
+
+Then replace lines 88-92:
+
+```rust
+        // Absent unless asked for, so a local instance does not try to publish
+        // test identities to the real PLC directory.
+        plc_client: std::env::var("BROLLY_PLC_SUBMIT")
+            .is_ok_and(|v| v == "1" || v == "true")
+            .then(reqwest::Client::new),
+```
+
+with:
+
+```rust
+        plc_client,
 ```
 
 `server/src/bin/admin.rs`. Replace lines 42-43:
@@ -5985,14 +7025,36 @@ async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 ```
 
-Leave `main.rs:92` (`.then(reqwest::Client::new)`) and `admin.rs:236`
-(`reqwest::Client::new()`) unchanged. They now run after the install.
+Then replace line 236:
+
+```rust
+    let client = reqwest::Client::new();
+```
+
+with:
+
+```rust
+    // Not `Client::new()`: on a host with no CA bundle, building panics there.
+    // Say what's wrong and exit non-zero instead.
+    let client = match brolly_server::tls::https_client() {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+```
+
+(`admin.rs` already has `#![allow(clippy::print_stdout, clippy::print_stderr)]`
+at `:11`. `main.rs` returns `Box<dyn Error>`, and `String` converts into it.)
 
 ```bash
+cargo fmt --all
 cargo build -p brolly-server --bins
 ```
 
-Expected: builds.
+Expected: builds. `cargo fmt --all` may reflow the `if` condition and the
+`tracing::error!` line in `main.rs`; keep whatever it produces.
 
 - [ ] **Step 7: Confirm no other client is built without the provider**
 
@@ -6001,12 +7063,12 @@ grep -rn "Client::new\|Client::builder\|ClientBuilder::new\|Client::default" \
   --include='*.rs' server adapters identity store authz domain test-support
 ```
 
-Expected: only `server/src/main.rs`, `server/src/bin/admin.rs` and the tests in
-`server/src/tls.rs`. If anything else appears, it's a client built outside
-`main`. Add `brolly_server::tls::install_crypto_provider();` as the first line
-of that test, or of its harness setup function. An adapter crate has no
-`rustls` dependency, so in an adapter, move the construction to the server
-instead.
+Expected: only `server/src/tls.rs` (`https_client` and the tests).
+`server/src/main.rs` and `server/src/bin/admin.rs` no longer appear. If
+anything else appears, it's a client built outside `main`. Add
+`brolly_server::tls::install_crypto_provider();` as the first line of that test,
+or of its harness setup function. An adapter crate has no `rustls` dependency,
+so in an adapter, move the construction to the server instead.
 
 - [ ] **Step 8: Check the supply chain**
 
@@ -6014,13 +7076,44 @@ instead.
 cargo deny check
 ```
 
-Expected: `advisories ok, bans ok, licenses ok, sources ok`. You may see new
-`multiple-versions` **warnings**, which are allowed (`deny.toml` `[bans]`).
-`rustls-platform-verifier` and `rcgen` are `MIT OR Apache-2.0`. `yasna` is
-`MIT OR Apache-2.0`. `webpki-root-certs`, if it arrives, is
-`CDLA-Permissive-2.0`, which is already allowed.
+Expected: `advisories ok, bans ok, licenses ok, sources ok`. `advisories ok`
+holds only because Chunk 0 already moved rustls past RUSTSEC-2026-0285 and
+removed the yanked crates; this chunk adds no advisory of its own. You may see
+new `multiple-versions` **warnings**, which are allowed (`deny.toml` `[bans]`).
 
-If a license is refused, check which crate brings it with `cargo tree -i <crate>
+`cargo deny` checks the lock for every target, so the platform verifier's
+Android, Apple, Windows and wasm dependencies count too. What this chunk can
+add to `Cargo.lock`, with licences (checked against the local registry cache;
+several are already in the lock through sqlx/hyper-rustls):
+
+| Crate | Pulled in by | Licence |
+|---|---|---|
+| `rustls-platform-verifier` 0.7.0 | reqwest | MIT OR Apache-2.0 |
+| `rustls-native-certs`, `openssl-probe`, `rustls-webpki` | verifier (Linux/BSD) | Apache-2.0 OR ISC OR MIT; MIT OR Apache-2.0; ISC |
+| `security-framework`(`-sys`), `core-foundation`(`-sys`) | verifier (Apple) | MIT OR Apache-2.0 |
+| `windows-sys` | verifier (Windows) | MIT OR Apache-2.0 |
+| `webpki-root-certs` | verifier (wasm32) | CDLA-Permissive-2.0 (already allowed) |
+| `rustls-platform-verifier-android` | verifier (Android) | MIT OR Apache-2.0 |
+| `jni`, `jni-macros`, `jni-sys`, `jni-sys-macros` | verifier (Android) | MIT OR Apache-2.0 |
+| `once_cell`, `log`, `thiserror`, `cfg-if`, `windows-link` | jni / verifier | MIT OR Apache-2.0 |
+| `combine` | jni | MIT |
+| `bytes` | combine | MIT |
+| `memchr` | combine | Unlicense OR MIT |
+| `simd_cesu8`, `simdutf8` | jni, jni-macros | Apache-2.0 OR MIT; MIT OR Apache-2.0 |
+| `rustc_version`, `semver` | simd_cesu8, jni-macros (build) | MIT OR Apache-2.0 |
+| `walkdir`, `same-file` | jni (build) | Unlicense/MIT |
+| `winapi-util` | walkdir (Windows) | Unlicense OR MIT |
+| `proc-macro2`, `quote`, `syn` | jni-macros | MIT OR Apache-2.0 (already in the lock) |
+| `rcgen`, `yasna` | dev-dependency | MIT OR Apache-2.0 |
+
+Every entry is satisfiable from the current `[licenses] allow` list: the
+`Unlicense` ones are `OR MIT` (`walkdir`/`same-file` spell it with the old
+`/`, which cargo-deny reads as `OR`), `ISC` and `CDLA-Permissive-2.0` are
+already allowed. `jni`'s `java-locator` and `libloading` are behind its
+`invocation` feature, which nothing enables, so they shouldn't appear; if they
+do, `libloading` is ISC and `java-locator` is MIT/Apache-2.0.
+
+If a licence is still refused, check which crate brings it with `cargo tree -i <crate>
 --target all`. Add it to `[licenses] allow` only if it is permissive and
 OSI-approved, with a comment naming that crate, as the existing
 `CDLA-Permissive-2.0` entry does. Anything else: stop and raise it. Don't
@@ -6038,6 +7131,15 @@ packages` (or no output). If aws-lc-rs is present, something enabled reqwest's
 `rustls` feature. Find it and remove it.
 
 - [ ] **Step 9: Gates**
+
+Format first, so the check that follows isn't failing on layout alone:
+
+```bash
+cargo fmt --all
+```
+
+Then the gates. Chunk 0 left clippy and `cargo deny` green on `main`, so any
+failure here is this chunk's:
 
 ```bash
 cargo fmt --all -- --check && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace && cargo deny check
@@ -6062,9 +7164,15 @@ binaries (`tls::install_crypto_provider`, idempotent). The `rustls` feature
 would have compiled aws-lc-rs. Roots come from the OS store through
 rustls-platform-verifier.
 
+The verifier loads the OS store when the client is built on Linux and fails
+if it is empty, so both binaries build their client with
+`tls::https_client()` (`Client::builder().build()`) and exit non-zero with
+the cause instead of panicking in `Client::new()`.
+
 Tested with a real handshake against a local rustls server whose certificate
-comes from a CA generated at test time, a refusal of an untrusted root, and a
-check that `Client::new()` builds once the provider is installed.
+comes from a CA generated at test time, a refusal of an untrusted root that
+checks the error is UnknownIssuer, and a check that the binaries' client
+builds once the provider is installed.
 
 Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>
 MSG
@@ -6079,7 +7187,8 @@ cd - && git worktree remove /tmp/verify --force
 ```
 
 Green there, or the commit is not done. Here the clean checkout also catches
-a `Cargo.lock` that was left out of `git add`.
+a `Cargo.lock` that was left out of `git add`. `cargo deny check` is green here
+on the same assumption as Step 8: Chunk 0 is already in `HEAD`.
 
 **How this shows PLC submission is fixed, without the network.** `plc::submit`
 does a single `client.post(https://plc.directory/…)` with the client it's given.
@@ -6088,16 +7197,20 @@ without binding a privileged port. So the fix is shown in two parts that
 together cover the path:
 
 1. `a_client_builds_once_the_provider_is_installed` runs exactly the
-   constructor `main.rs:92` and `admin.rs:236` use, in the same order the
-   binaries now run it.
+   constructor `main.rs` and `admin.rs` now use (`tls::https_client`), in the
+   same order the binaries run it. On Linux that includes constructing
+   rustls-platform-verifier, which loads the OS root store.
 2. `https_completes_against_a_trusted_root` shows that same reqwest build
    completing a verified TLS request. Before this commit, the request was
-   impossible: Step 2's compile error.
+   impossible: Step 2's compile error. That client uses `tls_certs_only`, so it
+   verifies through rustls's `WebPkiServerVerifier`, not the platform verifier.
 
-The only thing the unit tests don't cover is the platform verifier's reading
-of the OS store. Covering it needs a public host. An operator can check it on
-a deployed instance with `brolly-admin plc-retry --dry-run`, and then without
-`--dry-run`. The last message should be about the directory's answer, not
+What the unit tests don't cover is the platform verifier *verifying* a real
+chain against the OS store. That needs a public host. On macOS they don't cover
+the store at all, since the verifier only consults Security.framework during a
+handshake. An operator can check it on a deployed instance with
+`brolly-admin plc-retry --dry-run`, and then without `--dry-run`. The last
+message should be about the directory's answer, not
 `Unreachable(... scheme is not http ...)`. That check is optional and not a gate.
 
 ### Notes for the reviewer
@@ -6113,6 +7226,28 @@ a deployed instance with `brolly-admin plc-retry --dry-run`, and then without
   outside the repo that can't be checked here. And they'd be opaque in review.
   Generating at test time keeps every property the test depends on visible in
   the test itself.
+- **Each test CA gets its own common name.** rcgen gives every certificate the
+  same default DN. With two CAs sharing it, webpki matched the served leaf's
+  issuer name to the stranger CA, tried its key, and the refusal came back as
+  `BadSignature`. Distinct names ("brolly test CA", "stranger CA") make it
+  `UnknownIssuer`, the case the test is named for, and the test now asserts
+  that exact error.
+- **The refusal assertion looks for the rustls error in the source chain.**
+  `reqwest::Error::is_connect()` is true for both a refused certificate and a
+  refused TCP connection, because the handshake runs inside the connector, so
+  it can't tell them apart. The rustls error sits inside two `io::Error`
+  layers, one from tokio-rustls and one from hyper-rustls's
+  `io::Error::other`. `rustls_error_in` steps into each `io::Error`'s payload
+  with `get_ref` rather than calling `source()`, because
+  `io::Error::source` skips the payload itself.
+- **The handshake tests bypass rustls-platform-verifier.** `tls_certs_only`
+  sends reqwest down its `WebPkiServerVerifier` branch
+  (`reqwest-0.13.4/src/async_impl/client.rs:784-788`), not the
+  `Verifier::new` branch at `:748-758`. So they prove reqwest's rustls stack,
+  with ring as the provider, verifies chains and completes requests. They
+  don't prove the platform verifier works. The build test covers the platform
+  verifier being constructed (and, on Linux, loading the OS store); verifying
+  through it against a real root needs a public host (see the end of Task 1).
 - **Test server: blocking `rustls::StreamOwned` on a `std::thread`, not
   `tokio-rustls`.** It needs no dependency beyond the `rustls` the spec already
   adds. The server config uses `builder_with_provider(ring)` explicitly, so it
@@ -6127,6 +7262,15 @@ a deployed instance with `brolly-admin plc-retry --dry-run`, and then without
   The spec forbids `resolve` for the production `Fetcher` (B). This is a
   test-only client, and pinning it avoids depending on the order `localhost`
   resolves in, or on a proxy in the CI environment.
+- **`tls::https_client()` instead of `reqwest::Client::new()` in both binaries.**
+  Not in the spec, which only asked that building not panic for want of a
+  provider. On Linux the build also loads the OS store and can fail, and
+  `Client::new()` panics on that. The server logs the cause and returns an
+  error from `main` (non-zero exit) before touching the database; `plc-retry`
+  prints it and returns `ExitCode::FAILURE`. The message includes the whole
+  source chain, because reqwest's `Display` for a builder error is only
+  "builder error". Only reached when `BROLLY_PLC_SUBMIT` is set or `plc-retry`
+  runs without `--dry-run`, so an instance that never submits is unaffected.
 - **"Every test that builds a reqwest client" is currently the empty set**
   outside `tls.rs`. Every `AppState` in `server/tests` uses `plc_client: None`.
   No integration test is modified. Step 7 checks this with a grep rather than
@@ -6143,17 +7287,24 @@ a deployed instance with `brolly-admin plc-retry --dry-run`, and then without
 - **Placement "first thing":** the call goes before `tracing_subscriber`
   initialisation in `main.rs`, and before argument parsing in `admin.rs`, so
   even `--help` runs after it. It costs nothing and does no I/O.
-- **The Dockerfile is unchanged:** the runtime stage already installs
-  `ca-certificates`, and the build stage already has the C toolchain ring
-  needs. ring is already built there for sqlx.
+- **The Dockerfile is unchanged, but the CA bundle now matters in two places.**
+  The runtime stage (`debian:bookworm-slim`) already installs
+  `ca-certificates`, which the binaries need at client build time, not just at
+  handshake time. The build stage (`rust:1-bookworm`) runs no tests, but if
+  anyone runs `cargo test` in it, it already ships `ca-certificates`, and so
+  does CI's `ubuntu-latest`. A test run in a slimmer image without a CA bundle
+  fails `a_client_builds_once_the_provider_is_installed` with "No CA
+  certificates were loaded from the system"; that's the environment's fault,
+  not the test's. The build stage already has the C toolchain ring needs, and
+  ring is already built there for sqlx.
 - **The PLC fix is verified at unit level only** (see the end of Task 1). An
   https request to the real `plc.directory` can't be a test without the
   network, and `plc::submit`'s hard-coded URL can't be redirected to a local
   server without binding port 443.
-- **Network for the first build:** `rustls-platform-verifier` is not in the
-  local registry cache, so Steps 2-3 need crates.io access once. After that
-  the lock pins it.
-
+- **Network for the first build:** `rustls-platform-verifier` 0.7.0 is in the
+  local registry cache but not in `Cargo.lock`, and some of its target-specific
+  dependencies may not be cached, so Steps 2-3 may need crates.io access once.
+  After that the lock pins them.
 
 ## Chunk 5: ATProto OAuth validates clients (B)
 
@@ -7836,6 +8987,71 @@ mod fetch_tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
+    #[tokio::test]
+    async fn production_refuses_ip_literals_and_plain_http() {
+        // Pins Fetcher::new, what main.rs builds, to allow_loopback = false and
+        // allow_http = false. `request` rather than `fetch`, so each refusal is
+        // seen to come from its own flag and not from something further on.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(StatusCode::OK, "application/json", document(&url).to_string(), &hits)
+        })
+        .await;
+        let fetcher = Fetcher::new().unwrap();
+
+        // http://127.0.0.1:PORT: refused as an IP literal, before connecting.
+        assert!(matches!(fetcher.request(&url).await, Err(Failure::Refused(_))));
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+
+        // An https IP literal, loopback or public, is refused the same way.
+        let mut https_loopback = url.clone();
+        https_loopback.set_scheme("https").unwrap();
+        assert!(matches!(fetcher.request(&https_loopback).await, Err(Failure::Refused(_))));
+        let https_public = Url::parse("https://1.1.1.1/client-metadata.json").unwrap();
+        assert!(matches!(fetcher.request(&https_public).await, Err(Failure::Refused(_))));
+
+        // http by name gets past the literal check and is refused by
+        // https_only, which reqwest reports as a builder error, before any
+        // resolution or connection.
+        let mut http_by_name = url.clone();
+        http_by_name.set_host(Some("localhost")).unwrap();
+        assert!(matches!(
+            fetcher.request(&http_by_name).await,
+            Err(Failure::Http(e)) if e.is_builder()
+        ));
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the server");
+    }
+
+    #[tokio::test]
+    async fn the_fetch_names_its_software() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let url = serve(|url| {
+            let body = document(&url).to_string();
+            let seen = seen.clone();
+            Router::new().route(
+                "/client-metadata.json",
+                get(move |headers: axum::http::HeaderMap| {
+                    let body = body.clone();
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().unwrap() = headers
+                            .get(header::USER_AGENT)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        ([(header::CONTENT_TYPE, "application/json")], body)
+                    }
+                }),
+            )
+        })
+        .await;
+
+        local_fetcher().fetch(&url).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.as_deref(), Some(FETCH_USER_AGENT));
+        assert!(FETCH_USER_AGENT.starts_with("brolly-server/"));
+    }
+
     // --- PublicOnly -----------------------------------------------------------------
 
     #[test]
@@ -7863,6 +9079,7 @@ mod fetch_tests {
             "198.18.0.1",      // benchmarking
             "198.19.255.254",  // benchmarking
             "192.0.0.8",       // IETF protocol assignments
+            "192.88.99.1",     // 6to4 relay anycast (deprecated)
             // IPv6
             "::",             // unspecified
             "::1",            // loopback
@@ -7875,6 +9092,22 @@ mod fetch_tests {
             "2001:2::1",      // benchmarking
             "::127.0.0.1",    // IPv4-compatible (deprecated)
             "64:ff9b::a00:1", // NAT64 of 10.0.0.1
+            "100::1",         // discard-only (RFC 6666)
+            // local-use NAT64 (RFC 8215), refused whatever it embeds
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1::808:808",
+            // SIIT IPv4-translated (::ffff:0:0:0/96) of refused IPv4 addresses
+            "::ffff:0:0.0.0.0",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.0.0.1",
+            "::ffff:0:169.254.169.254",
+            "::ffff:0:100.64.0.1",
+            // 6to4 (2002::/16), refused whatever it embeds
+            "2002:a00:1::1",
+            "2002:808:808::1",
+            // Teredo (2001::/32), refused whatever it embeds
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001::1",
             // IPv4-mapped IPv6 forms
             "::ffff:0.0.0.0",
             "::ffff:127.0.0.1",
@@ -7907,7 +9140,11 @@ mod fetch_tests {
             "2606:4700:4700::1111",
             "2a00:1450:4001::1",
             "::ffff:1.1.1.1",
-            "64:ff9b::808:808", // NAT64 of 8.8.8.8
+            "64:ff9b::808:808",   // NAT64 of 8.8.8.8
+            "::ffff:0:8.8.8.8",   // SIIT of 8.8.8.8
+            "2001:4860:4860::8888", // Google DNS, in 2001::/16 but not Teredo
+            "2003::1",            // just above 6to4
+            "100:0:0:1::1",       // just outside the discard 100::/64
         ] {
             assert!(is_public(ip.parse().unwrap()), "{ip} should be allowed");
         }
@@ -7930,7 +9167,8 @@ mod fetch_tests {
 
 Run: `cargo test -p brolly-server --lib client_metadata::fetch_tests`
 Expected: FAIL to compile — `cannot find type Duration`, `cannot find type
-Fetcher`, `cannot find function is_public`, `cannot find struct PublicOnly`.
+Fetcher`, `cannot find type Failure`, `cannot find value FETCH_USER_AGENT`,
+`cannot find function is_public`, `cannot find struct PublicOnly`.
 
 - [ ] **Step 3: Add `moka`**
 
@@ -7978,8 +9216,37 @@ const OK_TTL: Duration = Duration::from_secs(10 * 60);
 /// fetch again.
 const ERR_TTL: Duration = Duration::from_secs(60);
 const CAPACITY: u64 = 1_000;
+/// Static, not per instance: `Fetcher::new` takes no arguments, and the software
+/// and version are what a client operator needs to recognise the fetch in their
+/// logs. Which instance asked is the one their user just signed in to.
+const FETCH_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 type Cached = Result<ClientMetadata, LookupError>;
+
+/// Why one retrieval failed, in the detail the operator's log needs and the
+/// caller must never see.
+enum Failure {
+    /// Refused without reading a response, or while reading it.
+    Refused(&'static str),
+    /// Any status other than 200.
+    Status(reqwest::StatusCode),
+    /// reqwest's own: https-only, DNS refusal by [`PublicOnly`], connection,
+    /// TLS, timeout, a broken body.
+    Http(reqwest::Error),
+    /// The document was read and broke a rule.
+    Invalid(ClientError),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Refused(why) => f.write_str(why),
+            Failure::Status(status) => write!(f, "answered {status}"),
+            Failure::Http(e) => e.fmt(f),
+            Failure::Invalid(e) => e.fmt(f),
+        }
+    }
+}
 
 /// Fetches client metadata over the network, from public addresses only, and
 /// caches the answer.
@@ -8036,6 +9303,7 @@ impl Fetcher {
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
             .timeout(TIMEOUT)
+            .user_agent(FETCH_USER_AGENT)
             .https_only(!allow_http)
             .dns_resolver(PublicOnly { allow_loopback })
             .build()?;
@@ -8063,32 +9331,34 @@ impl Fetcher {
         }
     }
 
+    /// One retrieval, as the cache stores it. The only place a failure is
+    /// logged, so each is logged once, and a cached failure not again.
     async fn retrieve(&self, url: &Url) -> Cached {
-        if !self.host_allowed(url) {
-            return Err(LookupError::Unreachable);
-        }
-        let result = self.request(url).await;
-        if let Err(e) = &result {
+        self.request(url).await.map_err(|failure| {
             // The caller gets one description; the operator gets the detail.
-            tracing::info!(client_id = %url, error = %e, "client metadata lookup failed");
-        }
-        result
+            tracing::info!(client_id = %url, error = %failure, "client metadata lookup failed");
+            match failure {
+                Failure::Invalid(e) => LookupError::Invalid(e),
+                Failure::Refused(_) | Failure::Status(_) | Failure::Http(_) => {
+                    LookupError::Unreachable
+                }
+            }
+        })
     }
 
-    async fn request(&self, url: &Url) -> Cached {
-        let unreachable = |e: reqwest::Error| {
-            tracing::info!(client_id = %url, error = %e, "client metadata fetch failed");
-            LookupError::Unreachable
-        };
+    async fn request(&self, url: &Url) -> Result<ClientMetadata, Failure> {
+        if !self.host_allowed(url) {
+            return Err(Failure::Refused("the host is an IP address"));
+        }
         let mut response = self
             .http
             .get(url.as_str())
             .header(reqwest::header::ACCEPT, "application/json")
             .send()
             .await
-            .map_err(unreachable)?;
+            .map_err(Failure::Http)?;
         if response.status() != reqwest::StatusCode::OK {
-            return Err(LookupError::Unreachable);
+            return Err(Failure::Status(response.status()));
         }
         let content_type = response
             .headers()
@@ -8098,15 +9368,15 @@ impl Fetcher {
             .to_owned();
 
         let mut body = Vec::new();
-        while let Some(chunk) = response.chunk().await.map_err(unreachable)? {
+        while let Some(chunk) = response.chunk().await.map_err(Failure::Http)? {
             if body.len() + chunk.len() > MAX_BODY {
-                return Err(LookupError::Unreachable);
+                return Err(Failure::Refused("the body is over 64 KiB"));
             }
             body.extend_from_slice(&chunk);
         }
 
         validate(&ClientId::Discoverable(url.clone()), &content_type, &body)
-            .map_err(LookupError::Invalid)
+            .map_err(Failure::Invalid)
     }
 }
 
@@ -8172,7 +9442,9 @@ async fn resolve_public(
 ///
 /// Refuses loopback, private (RFC 1918 / RFC 4193), link-local, unspecified,
 /// multicast, broadcast, CGNAT, documentation and benchmarking ranges, and
-/// every IPv6 form that embeds one of those IPv4 addresses.
+/// IPv6 forms that can carry an IPv4 address. IPv4-mapped, SIIT-translated
+/// and NAT64 are judged by the IPv4 address inside them. IPv4-compatible,
+/// local-use NAT64, 6to4 and Teredo are refused outright.
 fn is_public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => is_public_v4(v4),
@@ -8191,6 +9463,7 @@ fn is_public_v4(ip: Ipv4Addr) -> bool {
         || ip.is_link_local()                             // 169.254.0.0/16
         || (a == 100 && (b & 0b1100_0000) == 64)          // 100.64.0.0/10, CGNAT
         || (a == 192 && b == 0 && c == 0)                 // 192.0.0.0/24, IETF protocol assignments
+        || (a == 192 && b == 88 && c == 99)               // 192.88.99.0/24, 6to4 relay anycast (deprecated)
         || ip.is_documentation()                          // 192.0.2/24, 198.51.100/24, 203.0.113/24
         || (a == 198 && (b & 0b1111_1110) == 18)          // 198.18.0.0/15, benchmarking
         || ip.is_multicast()                              // 224.0.0.0/4
@@ -8204,13 +9477,29 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
     if s[..6] == [0; 6] {
         return false;
     }
-    // NAT64 (64:ff9b::/96) reaches whatever IPv4 address it embeds.
-    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0; 4] {
+    // Forms that reach exactly the IPv4 address in their last 32 bits: judge
+    // that address. (IPv4-mapped, ::ffff:0:0/96, is unwrapped in `is_public`.)
+    let embedded = || {
         let [a, b] = s[6].to_be_bytes();
         let [c, d] = s[7].to_be_bytes();
-        return is_public_v4(Ipv4Addr::new(a, b, c, d));
+        Ipv4Addr::new(a, b, c, d)
+    };
+    // NAT64 well-known prefix, 64:ff9b::/96 (RFC 6052).
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0; 4] {
+        return is_public_v4(embedded());
     }
-    let refused = (s[0] & 0xfe00) == 0xfc00             // fc00::/7, unique local (RFC 4193)
+    // SIIT IPv4-translated, ::ffff:0:0:0/96 (RFC 7915).
+    if s[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        return is_public_v4(embedded());
+    }
+    // Forms whose destination depends on a translator or relay we can't see,
+    // or that embed IPv4 somewhere other than the last 32 bits: refused
+    // whatever they carry.
+    let refused = (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // 64:ff9b:1::/48, local-use NAT64 (RFC 8215)
+        || s[0] == 0x2002                               // 2002::/16, 6to4
+        || (s[0] == 0x2001 && s[1] == 0x0000)           // 2001::/32, Teredo
+        || (s[0] == 0x0100 && s[1..4] == [0; 3])        // 100::/64, discard-only (RFC 6666)
+        || (s[0] & 0xfe00) == 0xfc00                    // fc00::/7, unique local (RFC 4193)
         || (s[0] & 0xffc0) == 0xfe80                    // fe80::/10, link-local
         || (s[0] & 0xffc0) == 0xfec0                    // fec0::/10, site-local (deprecated)
         || (s[0] & 0xff00) == 0xff00                    // ff00::/8, multicast
@@ -8261,7 +9550,8 @@ connecting.
 Only a 200 with at most 64 KiB, within 5 seconds, is read. Successes
 are cached for 10 minutes and failures for 60 seconds, so a slow client
 can't make every PAR fetch again. Every failure to retrieve has one
-description, so PAR can't map internal hosts.
+description, so PAR can't map internal hosts; the detail is logged once.
+Requests identify themselves as brolly-server/<version>.
 
 main.rs builds it; PAR doesn't use it yet.
 
@@ -8286,7 +9576,8 @@ cd - && git worktree remove /tmp/verify --force
 - Modify: `adapters/atproto/src/oauth.rs:246-279` (remove `is_valid_client_id`
   and its tests module)
 - Test: `server/tests/atproto_oauth.rs` (harness `:36-75`; new helpers and tests)
-- Test: any other `server/tests/*.rs` that pushes a PAR (see Step 6)
+- Test: `server/tests/xrpc.rs` (`harness()` `:29`: register chunk 3's
+  `OAUTH_CLIENT`), and any other `server/tests/*.rs` that pushes a PAR (Step 6)
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -8317,7 +9608,9 @@ async fn harness_with(clients: Arc<dyn ClientLookup>) -> Harness {
 }
 ```
 
-After `push` (`:164-195`) add two helpers:
+After `push_with_proof` (chunk 3 split the original `push`, `:164-195`, into
+`push` followed by `push_with_proof`; add these after the second of the two) add
+two helpers and a counting wrapper:
 
 ```rust
 /// PAR with exactly these form fields, signed by the test client's key.
@@ -8575,6 +9868,34 @@ async fn a_loopback_client_needs_no_metadata_and_is_named_as_development() {
         consent.body
     );
 }
+
+#[tokio::test]
+async fn a_loopback_redirect_uri_not_in_canonical_form_is_refused() {
+    // A loopback redirect matches after URL parsing, which strips tabs and
+    // newlines. The string stored, put in Location and compared at the token
+    // endpoint must be the one that was checked, so only the canonical form
+    // is accepted.
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let reply = par_with(
+        &h,
+        &[
+            (
+                "client_id",
+                "http://localhost?redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback",
+            ),
+            ("redirect_uri", "http://127.0.0.1:52431/call\nback"),
+            ("response_type", "code"),
+            ("scope", "atproto"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_request");
+    assert!(reply.location.is_none());
+}
 ```
 
 - [ ] **Step 2: Run them and watch them fail**
@@ -8584,8 +9905,10 @@ Expected: FAIL.
 - `an_unknown_client_is_refused_without_saying_why_it_could_not_be_reached`,
   `an_undeclared_redirect_uri_is_refused_without_redirecting`,
   `a_scope_without_atproto_is_refused`,
-  `a_scope_the_client_did_not_declare_is_refused` and
-  `a_loopback_client_id_naming_an_external_redirect_is_refused`: 201 where 400 was expected.
+  `a_scope_the_client_did_not_declare_is_refused`,
+  `a_loopback_client_id_naming_an_external_redirect_is_refused` and
+  `a_loopback_redirect_uri_not_in_canonical_form_is_refused`: 201 where 400 was
+  expected.
 - `a_request_missing_pkce_is_refused_before_any_lookup`: the second
   `lookups` assertion, 0 where 1 was expected.
 - `the_consent_screen_names_the_client_by_its_host`: the page says
@@ -8605,7 +9928,10 @@ In `server/src/atproto_oauth.rs`, add to the imports (`:19-33`):
 use brolly_atproto::client_metadata::{ClientError, ClientId, check_request, parse_client_id};
 
 use crate::client_metadata::{LookupError, lookup_client};
+use url::Url;
 ```
+
+(`server` already depends on `url`, `server/Cargo.toml:49`.)
 
 After `missing_proof` (`:83-89`) add:
 
@@ -8707,6 +10033,18 @@ with:
     if let Err(e) = check_request(&metadata, &redirect_uri, scope) {
         return client_refusal(&e);
     }
+    // A loopback redirect matched after URL parsing (ports ignored), and
+    // parsing strips tabs and newlines and normalises the host, so the raw
+    // string may not be the URL that was checked. It is stored, sent as
+    // Location, and compared as an exact string at the token endpoint, so
+    // require it to be its own serialization. (Storing the serialization
+    // instead would refuse, at the token endpoint, a client that repeats what
+    // it sent.) A discoverable client's redirect already equals, byte for
+    // byte, a string its own metadata declares.
+    if client_id.is_loopback() && !Url::parse(&redirect_uri).is_ok_and(|u| u.as_str() == redirect_uri)
+    {
+        return client_refusal(&ClientError::RedirectUriNotAllowed);
+    }
 
     match oauth::push_request(
         &state.pool,
@@ -8786,41 +10124,55 @@ Expected: matches only in `docs/`.
 
 - [ ] **Step 6: Give every other PAR-pushing test file its client**
 
-Run: `grep -rln "oauth/atproto/par" server/tests`
-
-For every file listed other than `atproto_oauth.rs` (chunk 3's XRPC
-DPoP-replay test in `server/tests/xrpc.rs` builds the full ATProto token flow,
-so expect at least that one): its harness has
+**`server/tests/xrpc.rs` (required).** Chunk 3's
+`an_xrpc_write_proof_is_good_for_one_request` runs a real PAR through
+`atproto_access_token`, with `client_id` `OAUTH_CLIENT`
+(`https://app.example/client-metadata.json`), `redirect_uri` `OAUTH_REDIRECT`
+(`https://app.example/cb`) and scope `OAUTH_SCOPE` (`atproto transition:generic`),
+the three constants chunk 3 put above `dpop_proof` in that file. Its `harness()`
+(`:29`) got
 `clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),`
-from Task 2, which now refuses its client as unreachable. Replace that
-`StaticClients::default()` with one that registers the `client_id`,
-`redirect_uri` and scope that file's PAR sends, for example for a file whose PAR
-uses `CLIENT`, `REDIRECT` and `atproto transition:generic`:
+from Task 2, which now refuses that client as unreachable, so the test would
+fail at PAR with `invalid_client`. In `harness()`, replace that line with:
 
 ```rust
+            // an_xrpc_write_proof_is_good_for_one_request pushes a PAR as this
+            // client, so it's registered exactly as production would accept it.
             clients: std::sync::Arc::new(
                 brolly_server::client_metadata::StaticClients::default()
                     .with(
-                        CLIENT,
+                        OAUTH_CLIENT,
                         &serde_json::json!({
-                            "client_id": CLIENT,
-                            "redirect_uris": [REDIRECT],
-                            "scope": "atproto transition:generic",
+                            "client_id": OAUTH_CLIENT,
+                            "redirect_uris": [OAUTH_REDIRECT],
+                            "scope": OAUTH_SCOPE,
                             "grant_types": ["authorization_code", "refresh_token"],
                             "response_types": ["code"],
                             "token_endpoint_auth_method": "none",
+                            "application_type": "web",
                             "dpop_bound_access_tokens": true,
                         })
                         .to_string(),
                     )
-                    .expect("the test client's metadata validates"),
+                    .expect("the XRPC test client's metadata validates"),
             ),
 ```
 
-Use that file's own constants or literals for the id, redirect and scope. If its
-PAR used a `client_id` that `parse_client_id` refuses (an `http://` id other than
-`http://localhost`, or an IP host), change the test's id to
-`https://app.example/client-metadata.json` in both the PAR and the token request.
+Module-level `const`s are visible from `harness()` wherever in the file they
+are declared, so the constants don't need to move.
+
+Run: `cargo test -p brolly-server --test xrpc an_xrpc_write_proof_is_good_for_one_request`
+Expected: PASS.
+
+**Any other file.** Run: `grep -rln "oauth/atproto/par" server/tests`
+
+Expected: `atproto_oauth.rs` and `xrpc.rs`. For any further file listed, do the
+same: replace its `StaticClients::default()` with one registering the
+`client_id`, `redirect_uri` and scope that file's PAR sends, using that file's
+own constants or literals. If its PAR used a `client_id` that `parse_client_id`
+refuses (an `http://` id other than `http://localhost`, or an IP host), change
+the test's id to `https://app.example/client-metadata.json` in both the PAR and
+the token request.
 
 - [ ] **Step 7: Run it all and watch it pass**
 
@@ -8828,6 +10180,9 @@ Run: `cargo test -p brolly-server --test atproto_oauth`
 Expected: PASS, the new tests and every existing one
 (`a_client_gets_a_dpop_bound_token_pair`, `a_refresh_rotates_and_the_old_token_dies`,
 `a_client_id_that_is_not_a_fetchable_url_is_refused` and the rest).
+
+Run: `cargo test -p brolly-server --test xrpc`
+Expected: PASS, including chunk 3's `an_xrpc_write_proof_is_good_for_one_request`.
 
 Run: `cargo test -p brolly-atproto --lib`
 Expected: PASS, with `oauth::tests` gone.
@@ -8852,7 +10207,8 @@ for that member's repo, and the endpoint was an open redirect.
 
 PAR now runs the request's own checks first, then parses the client_id,
 looks up its metadata (loopback clients never touch the network), and
-refuses a redirect_uri or scope the metadata doesn't declare. Refusals
+refuses a redirect_uri or scope the metadata doesn't declare. A loopback
+client's redirect_uri must also be in canonical URL form. Refusals
 are JSON 400s and never redirect: invalid_client, invalid_request or
 invalid_scope. An unreachable client always gets the same description.
 
@@ -8915,9 +10271,14 @@ Green there, or the commit isn't done.
    is the registration API. An unregistered id answers `Unreachable`.
 9. **`PublicOnly` refuses more than the spec lists:** `0.0.0.0/8` (not just
    `0.0.0.0`), `240.0.0.0/4`, `192.0.0.0/24`, IPv4-compatible `::/96`,
-   deprecated site-local `fec0::/10`, and NAT64 `64:ff9b::/96` when its embedded
-   IPv4 address isn't public. `is_public` is hand-rolled on octets and segments
-   because `Ipv4Addr::is_shared`, `is_benchmarking` and `is_global` are unstable.
+   deprecated site-local `fec0::/10`, discard-only `100::/64`, the deprecated
+   6to4 relay anycast `192.88.99.0/24`, and NAT64 `64:ff9b::/96` and SIIT
+   `::ffff:0:0:0/96` when their embedded IPv4 address isn't public. Local-use
+   NAT64 `64:ff9b:1::/48`, 6to4 `2002::/16` and Teredo `2001::/32` are refused
+   outright, as the spec says, even when they embed a public address: where
+   they lead depends on a translator or relay the filter can't see.
+   `is_public` is hand-rolled on octets and segments because
+   `Ipv4Addr::is_shared`, `is_benchmarking` and `is_global` are unstable.
 10. **What `for_tests`' flags mean.** `allow_loopback` lets loopback IP literals
     past `host_allowed` and stops `PublicOnly` dropping loopback addresses.
     `allow_http` maps to reqwest's `https_only(!allow_http)`. Production
@@ -8933,9 +10294,11 @@ Green there, or the commit isn't done.
 13. **The timeout test takes about 5 seconds.** `for_tests` has no timeout
     parameter (fixed interface), so it runs against the production 5-second
     timeout.
-14. **Failure logging.** `Fetcher` logs the underlying reqwest error at `info`
-    for the operator. The caller only ever sees the single `Unreachable`
-    description.
+14. **Failure logging.** `Fetcher::request` returns a private `Failure` with
+    the detail (the refusal, the status, reqwest's error, or the broken rule),
+    and `Fetcher::retrieve` logs it at `info`, once, as it maps it to
+    `LookupError`. A failure served from the cache isn't logged again. The
+    caller only ever sees the single `Unreachable` description.
 15. **`authorize` refuses a stored `client_id` that no longer parses** with a
     400 `invalid_client`. Only PARs pushed before this deploy can hit that, and
     they expire within 300 seconds.
@@ -8948,13 +10311,41 @@ Green there, or the commit isn't done.
     Only Task 4 changes behaviour.
 18. **Main.rs holds an empty `StaticClients` for exactly one commit** (Task 2).
     Nothing reads it until Task 4, and Task 3 replaces it with `Fetcher::new()?`.
-19. **Other PAR-pushing test files.** Chunk 3's XRPC DPoP-replay test runs the
-    full ATProto token flow, which this chunk can't see. Task 4 Step 6 finds
-    every such file by grep and registers its client. If chunk 3's test used a
-    `client_id` that `parse_client_id` refuses, it's changed to
-    `https://app.example/client-metadata.json`.
+19. **Other PAR-pushing test files.** Chunk 3's XRPC DPoP-replay test
+    (`an_xrpc_write_proof_is_good_for_one_request`) pushes a real PAR as
+    `OAUTH_CLIENT` / `OAUTH_REDIRECT` / `OAUTH_SCOPE`. Task 4 Step 6 registers
+    exactly that client in `server/tests/xrpc.rs`'s `harness()`, and greps for
+    any further file.
 20. **`moka` features.** `store` already takes moka 0.12.16 with `sync`, and
     `server` adds it with `future`. Cargo unifies them into one build.
+21. **Rate-limit PAR per IP in a later stage.** PAR is unauthenticated and
+    makes an outbound fetch for every client_id not yet cached, so anyone can
+    use it to have this server send requests to hosts of their choosing (one
+    per distinct URL; the cache only collapses repeats), and each lookup can
+    hold a handler for the 5-second timeout. Name resolution runs through
+    tokio's `lookup_host`, i.e. `getaddrinfo` on the blocking pool, which the
+    reqwest timeout abandons but can't cancel, so slow DNS can tie up blocking
+    threads beyond the timeout. The cache's 60-second failure lifetime and
+    1,000-entry bound don't limit distinct URLs. A per-IP limit on
+    `/oauth/atproto/par` (and a bound on concurrent uncached lookups) belongs in
+    the stage that adds rate limiting; this chunk doesn't add one.
+22. **User-Agent is static:** `brolly-server/<version>`. `Fetcher::new()` takes
+    no arguments (spec interface), and `main.rs` has already moved
+    `base_domain` into `instance_name` by the time `clients` is built, so a
+    per-instance `(+https://<base>)` would mean a constructor parameter and
+    reordering `main`. The software and version are what a client operator
+    needs to recognise the fetch; which instance asked is the one their user
+    just signed in to. Easy to extend later if operators want it.
+23. **Loopback `redirect_uri`s must be in canonical form** (Task 4 Step 3). They
+    match after URL parsing, which strips tabs and newlines and ignores the
+    port, but PAR stores the string, `authorize` sends it as `Location` (a raw
+    newline there is an invalid header value, which axum 0.8's `Redirect`
+    turns into a 500 after the member has approved), and the token
+    endpoint compares it as an exact string. Storing the serialization instead
+    would break that exact comparison for a client that repeats a non-canonical
+    string, so PAR refuses non-canonical ones with `invalid_request`. The spec
+    doesn't say this. Discoverable clients need no such check: their redirect
+    is byte-equal to a string their own metadata declares.
 
 
 ## Done when

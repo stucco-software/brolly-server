@@ -140,12 +140,15 @@ activity reaches a pod:
     `same_origin(target, actor)`, so Bob can't make Alice's post disappear from
     the public timeline.
   - A **`Create`** is indexed only when its note is same-origin with the actor.
-  - An **`Announce`** names someone else's note by definition, so it is indexed
-    as today, with the announcer as actor. But `index::record_note` never adds
-    a second author triple to a pointer that already exists; the author is fixed
-    by whoever created the note. The existing test
-    `an_announce_is_indexed_like_a_create`
-    (`adapters/activitypub/tests/processor.rs`) keeps passing.
+  - An **`Announce`** names someone else's note by definition. It updates the
+    index only when that note is **already indexed**, meaning it was already
+    public, and `index::record_note` never adds a second author triple to an
+    existing pointer. If a boost of a note nobody indexed were indexed, it would
+    publish a followers-only or direct post on the public timeline under the
+    booster's name. The existing test `an_announce_is_indexed_like_a_create`
+    (`adapters/activitypub/tests/processor.rs`) changes: it first indexes the
+    note through its author's own public `Create`, then checks the boost leaves
+    exactly one pointer, still the author's, at the original time.
 - **Foreign embedded objects are rejected now, not ignored.** Some servers embed
   the announced note inside an `Announce`. Whether to drop the embedded object
   and keep the activity is a federation question, decided when ADR 0016's switch
@@ -364,8 +367,11 @@ a single mechanical step.
 - **`PublicOnly` implements reqwest's `Resolve`.** It resolves the host with
   tokio's resolver, then drops every address that is loopback, private (RFC 1918
   / RFC 4193), link-local, unspecified, multicast, broadcast, CGNAT
-  (100.64.0.0/10), documentation or benchmarking ranges, or an IPv4-mapped IPv6
-  form of any of those. If no address survives, resolution fails.
+  (100.64.0.0/10), documentation or benchmarking ranges, or an IPv6 address
+  that embeds a refused IPv4 address. Embedding forms covered: IPv4-mapped
+  (`::ffff:0:0/96`), SIIT-translated (`::ffff:0:0:0/96`), NAT64
+  (`64:ff9b::/96`), and local-use NAT64 (`64:ff9b:1::/48`, refused outright),
+  plus 6to4 (`2002::/16`) and Teredo (`2001::/32`), both refused outright. If no address survives, resolution fails.
   - Filtering at resolution, rather than checking the address first and then
     connecting, leaves no DNS-rebinding window.
   - IP-literal hosts never reach a resolver (hyper connects to them directly),
@@ -447,6 +453,10 @@ has no vetted list, so neither is fetched for display.
   There is no other way to get `T` out.
 - **`verify`** keeps its checks and signature, but returns
   `Unspent<VerifiedProof>`.
+- **`verify` refuses a `jti` that is empty or longer than 256 bytes** as
+  `Malformed`. Otherwise a client could send a `jti` too large for the primary
+  key's btree index and turn its own request into a storage error, which would
+  be logged as a server fault.
 - **New errors: `DpopError::Replayed`, and `DpopError::Storage(String)`** for a
   database failure. `DpopError` derives `Clone` and `Eq`, so it keeps the
   message, not the `sqlx::Error`.
