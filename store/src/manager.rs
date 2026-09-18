@@ -64,8 +64,8 @@ pub struct StoreManager {
     /// RocksDB lets a process open a directory once. The cache can evict a pod
     /// while a request still holds its `Arc`, and a second `Store::open` on
     /// that directory is then refused by the lock. So a cache miss looks here
-    /// first and hands back the live handle. The mutex also serialises opens,
-    /// so two first requests for one pod can't both open it.
+    /// first and hands back the live handle. The lock covers only the map;
+    /// concurrent opens of one pod are deduplicated by the cache itself.
     live: Mutex<HashMap<Uuid, Weak<Store>>>,
     instance: Arc<Store>,
 }
@@ -121,14 +121,20 @@ impl StoreManager {
 
     /// The user's pod, opening it if necessary. Creates on first use.
     pub fn pod(&self, user: Uuid) -> Result<Arc<Store>, StoreError> {
-        if let Some(store) = self.pods.get(&user) {
-            return Ok(store);
-        }
-        // A poisoned lock only means another thread panicked mid-open; the map
-        // holds weak handles, so there is nothing inconsistent to protect.
-        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(store) = live.get(&user).and_then(Weak::upgrade) {
-            self.pods.insert(user, Arc::clone(&store));
+        // `try_get_with` runs `open_pod` at most once per user at a time, and
+        // concurrent requests for that user wait for its result. Requests for
+        // different users open in parallel: opening costs milliseconds (ADR
+        // 0006), so one lock across every open would queue members behind each
+        // other on a burst of cache misses.
+        self.pods
+            .try_get_with(user, || self.open_pod(user))
+            .map_err(|e| StoreError::clone(&e))
+    }
+
+    /// Hand back the live handle if the cache evicted one a request still
+    /// holds, and open the database only when nothing does.
+    fn open_pod(&self, user: Uuid) -> Result<Arc<Store>, StoreError> {
+        if let Some(store) = self.live_handles().get(&user).and_then(Weak::upgrade) {
             return Ok(store);
         }
         // The graph lives in its own subdirectory: Oxigraph owns that
@@ -137,12 +143,19 @@ impl StoreManager {
         let dir = self.pod_dir(user).join("rdf");
         std::fs::create_dir_all(&dir)?;
         let store = Arc::new(Store::open(&dir)?);
+        let mut live = self.live_handles();
         // Drop entries whose pods have closed, so the map tracks what is open
         // rather than everyone who was ever served.
         live.retain(|_, handle| handle.strong_count() > 0);
         live.insert(user, Arc::downgrade(&store));
-        self.pods.insert(user, Arc::clone(&store));
         Ok(store)
+    }
+
+    /// The live-handle map. A poisoned lock only means another thread panicked
+    /// while holding it; the map holds weak handles, so nothing in it can be
+    /// half-written.
+    fn live_handles(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Weak<Store>>> {
+        self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The server agent's own store — the cross-user query surface (ADR 0005).
@@ -158,10 +171,7 @@ impl StoreManager {
     /// on dereference (D5).
     pub fn delete_pod(&self, user: Uuid) -> Result<(), StoreError> {
         self.pods.invalidate(&user);
-        self.live
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .remove(&user);
+        self.live_handles().remove(&user);
         let dir = self.pod_dir(user);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;

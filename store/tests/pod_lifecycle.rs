@@ -10,9 +10,10 @@ use uuid::Uuid;
 
 /// Let every cached pod go idle and be evicted. Idle expiry, not capacity:
 /// moka's admission policy may refuse a newcomer rather than evict, so a full
-/// cache doesn't reliably push anything out.
+/// cache doesn't reliably push anything out. Half a second past the one-second
+/// idle limit, because moka's clock is coarse.
 fn idle_out(stores: &StoreManager) {
-    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::thread::sleep(std::time::Duration::from_millis(1500));
     assert_eq!(stores.open_pods(), 0, "setup: the cache still holds a pod");
 }
 
