@@ -107,6 +107,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .0,
         plc_client,
+        // Nothing reads this yet. The next commit replaces it with the fetcher.
+        clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

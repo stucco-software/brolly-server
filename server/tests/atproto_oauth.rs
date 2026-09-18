@@ -27,6 +27,28 @@ const BASE: &str = "brolly.test";
 const CLIENT: &str = "https://app.example/client-metadata.json";
 const REDIRECT: &str = "https://app.example/cb";
 
+/// The client every test here pushes as, registered the way production would
+/// accept it: through `validate`, so it can't be a client production refuses.
+fn app_example() -> brolly_server::client_metadata::StaticClients {
+    brolly_server::client_metadata::StaticClients::default()
+        .with(
+            CLIENT,
+            &serde_json::json!({
+                "client_id": CLIENT,
+                "client_name": "Example App",
+                "redirect_uris": [REDIRECT],
+                "scope": "atproto transition:generic",
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "token_endpoint_auth_method": "none",
+                "application_type": "web",
+                "dpop_bound_access_tokens": true,
+            })
+            .to_string(),
+        )
+        .expect("app.example's metadata validates")
+}
+
 struct Harness {
     db: brolly_test_support::TestDb,
     _dir: tempfile::TempDir,
@@ -64,6 +86,7 @@ async fn harness() -> Harness {
             ),
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
+            clients: std::sync::Arc::new(app_example()),
         },
         "server/static",
     );

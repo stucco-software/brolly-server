@@ -19,6 +19,7 @@ pub mod activitypub;
 pub mod admin;
 pub mod atproto_oauth;
 pub mod auth;
+pub mod client_metadata;
 pub mod consent;
 pub mod maintenance;
 pub mod mastodon_api;
@@ -82,6 +83,12 @@ pub struct AppState {
     /// published yet is very different from a member who was never given an
     /// identity at all (ADR 0016).
     pub plc_client: Option<reqwest::Client>,
+    /// Where ATProto OAuth client metadata comes from.
+    ///
+    /// The network in production (`client_metadata::Fetcher`), a fixed,
+    /// validated set in tests (`client_metadata::StaticClients`). A trait
+    /// object so tests never need a TLS server to register a client.
+    pub clients: std::sync::Arc<dyn client_metadata::ClientLookup>,
 }
 
 /// The upstream repository, and the default value of `BROLLY_SOURCE_URL`.
