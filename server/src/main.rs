@@ -4,6 +4,11 @@ use std::net::SocketAddr;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything can build a reqwest client: with `rustls-no-provider`,
+    // building one without a provider panics. It comes before logging too,
+    // so no future edit can add a client above it.
+    brolly_server::tls::install_crypto_provider();
+
     // Structured logging from the first line. No `println!` anywhere in the
     // workspace — the lint denies it (implementation plan §5).
     tracing_subscriber::fmt()
@@ -12,6 +17,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+
+    // Absent unless asked for, so a local instance does not try to publish
+    // test identities to the real PLC directory. Built here, before the
+    // database, so a host with no CA bundle fails at once with a clear error
+    // and a non-zero exit, not a panic after migrations have run.
+    let plc_client = if std::env::var("BROLLY_PLC_SUBMIT").is_ok_and(|v| v == "1" || v == "true") {
+        match brolly_server::tls::https_client() {
+            Ok(client) => Some(client),
+            Err(e) => {
+                tracing::error!(error = %e, "BROLLY_PLC_SUBMIT is set but the HTTPS client cannot be built");
+                return Err(e.into());
+            }
+        }
+    } else {
+        None
+    };
 
     let static_dir =
         std::env::var("BROLLY_STATIC_DIR").unwrap_or_else(|_| "server/static".to_string());
@@ -85,11 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             1024,
         )
         .0,
-        // Absent unless asked for, so a local instance does not try to publish
-        // test identities to the real PLC directory.
-        plc_client: std::env::var("BROLLY_PLC_SUBMIT")
-            .is_ok_and(|v| v == "1" || v == "true")
-            .then(reqwest::Client::new),
+        plc_client,
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

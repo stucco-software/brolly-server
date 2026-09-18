@@ -28,6 +28,7 @@ pub mod pod;
 pub mod profile;
 pub mod provision;
 pub mod solid_oidc;
+pub mod tls;
 pub mod xrpc;
 
 /// Everything a handler needs. Composed here because `server` is the only crate

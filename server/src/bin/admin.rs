@@ -46,6 +46,10 @@ ENVIRONMENT:
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    // `plc-retry` builds a reqwest client, and with `rustls-no-provider` that
+    // panics until a provider is installed. First, so no command can get ahead of it.
+    brolly_server::tls::install_crypto_provider();
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(command) = args.first().map(String::as_str) else {
         eprintln!("{USAGE}");
@@ -240,7 +244,15 @@ async fn plc_retry(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let client = reqwest::Client::new();
+    // Not `Client::new()`: on a host with no CA bundle, building panics there.
+    // Say what's wrong and exit non-zero instead.
+    let client = match brolly_server::tls::https_client() {
+        Ok(client) => client,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     let mut failed = 0usize;
     for entry in &pending {
         match brolly_atproto::plc::submit(&client, &entry.did, &entry.operation).await {

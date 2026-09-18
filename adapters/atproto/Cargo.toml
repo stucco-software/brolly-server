@@ -33,7 +33,10 @@ base64 = "0.23.1"
 # 0.13 rather than a third version: the tree already carries 0.13 (via the
 # ActivityPub stack) and 0.14. `multiple-versions` is a warning, not a licence
 # to keep adding.
-reqwest = { version = "0.13.4", default-features = false, features = ["json"] }
+# `rustls-no-provider`: PLC submission is https-only, and without a TLS feature
+# every request to plc.directory failed. This crate builds no Client itself.
+# The binary that passes one in installs the crypto provider (server/src/tls.rs).
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 rand = "0.8"
 tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "io-util"] }
 tracing.workspace = true
