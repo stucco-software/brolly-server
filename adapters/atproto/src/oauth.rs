@@ -242,38 +242,3 @@ pub async fn revoke_all_for_user(pool: &PgPool, user_id: Uuid) -> Result<u64, Db
     .await?;
     Ok(result.rows_affected())
 }
-
-/// Is a `client_id` one we will talk to?
-///
-/// ATProtocol identifies clients by a URL serving their metadata. HTTPS, or
-/// `http://localhost` for development — anything else is either not fetchable
-/// or not authenticated, and a client we cannot verify is one we cannot hold
-/// to its declared redirect URIs.
-pub fn is_valid_client_id(client_id: &str) -> bool {
-    client_id.starts_with("https://") || client_id.starts_with("http://localhost")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_client_id_must_be_a_fetchable_url() {
-        assert!(is_valid_client_id(
-            "https://app.example/client-metadata.json"
-        ));
-        assert!(is_valid_client_id(
-            "http://localhost:3000/client-metadata.json"
-        ));
-    }
-
-    #[test]
-    fn an_unfetchable_or_unauthenticated_client_id_is_refused() {
-        // A client we cannot fetch is one we cannot hold to its declared
-        // redirect URIs.
-        assert!(!is_valid_client_id("urn:uuid:1234"));
-        assert!(!is_valid_client_id("http://app.example/metadata.json"));
-        assert!(!is_valid_client_id("my-app"));
-        assert!(!is_valid_client_id(""));
-    }
-}

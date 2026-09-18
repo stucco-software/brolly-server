@@ -60,7 +60,26 @@ async fn harness() -> Harness {
             ),
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
-            clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
+            // an_xrpc_write_proof_is_good_for_one_request pushes a PAR as this
+            // client, so it's registered exactly as production would accept it.
+            clients: std::sync::Arc::new(
+                brolly_server::client_metadata::StaticClients::default()
+                    .with(
+                        OAUTH_CLIENT,
+                        &serde_json::json!({
+                            "client_id": OAUTH_CLIENT,
+                            "redirect_uris": [OAUTH_REDIRECT],
+                            "scope": OAUTH_SCOPE,
+                            "grant_types": ["authorization_code", "refresh_token"],
+                            "response_types": ["code"],
+                            "token_endpoint_auth_method": "none",
+                            "application_type": "web",
+                            "dpop_bound_access_tokens": true,
+                        })
+                        .to_string(),
+                    )
+                    .expect("the XRPC test client's metadata validates"),
+            ),
         },
         "server/static",
     );

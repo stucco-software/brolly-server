@@ -16,11 +16,14 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
+use brolly_server::client_metadata::{ClientLookup, Lookup, StaticClients};
 use brolly_server::{AppState, app};
 use http_body_util::BodyExt;
 use p256::ecdsa::SigningKey;
 use p256::ecdsa::signature::Signer;
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use tower::ServiceExt;
 
 const BASE: &str = "brolly.test";
@@ -29,7 +32,7 @@ const REDIRECT: &str = "https://app.example/cb";
 
 /// The client every test here pushes as, registered the way production would
 /// accept it: through `validate`, so it can't be a client production refuses.
-fn app_example() -> brolly_server::client_metadata::StaticClients {
+fn app_example() -> StaticClients {
     brolly_server::client_metadata::StaticClients::default()
         .with(
             CLIENT,
@@ -56,6 +59,10 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(Arc::new(app_example())).await
+}
+
+async fn harness_with(clients: Arc<dyn ClientLookup>) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
@@ -86,7 +93,7 @@ async fn harness() -> Harness {
             ),
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
-            clients: std::sync::Arc::new(app_example()),
+            clients,
         },
         "server/static",
     );
@@ -218,6 +225,65 @@ async fn push_with_proof(h: &Harness, dpop: &str, challenge: &str) -> Reply {
             .unwrap(),
     )
     .await
+}
+
+/// PAR with exactly these form fields, signed by the test client's key.
+async fn par_with(h: &Harness, fields: &[(&str, &str)]) -> Reply {
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in fields {
+        form.append_pair(name, value);
+    }
+    send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/par")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                proof(
+                    &client_key(),
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/par"),
+                    None,
+                ),
+            )
+            .body(Body::from(form.finish()))
+            .unwrap(),
+    )
+    .await
+}
+
+/// The consent screen for a pushed request, as a logged-in member sees it.
+async fn consent_page(h: &Harness, client_id: &str, request_uri: &str, cookie: &str) -> Reply {
+    send(
+        h,
+        Request::builder()
+            .uri(format!(
+                "/oauth/atproto/authorize?client_id={}&request_uri={}",
+                urlencode(client_id),
+                urlencode(request_uri)
+            ))
+            .header(header::HOST, BASE)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+/// Counts lookups. Defined here so the production types carry no counters.
+struct CountingClients {
+    inner: StaticClients,
+    lookups: Arc<AtomicUsize>,
+}
+
+impl ClientLookup for CountingClients {
+    fn fetch<'a>(&'a self, url: &'a url::Url) -> Lookup<'a> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        self.inner.fetch(url)
+    }
 }
 
 async fn a_logged_in_member(h: &Harness) -> String {
@@ -462,6 +528,237 @@ async fn a_client_id_that_is_not_a_fetchable_url_is_refused() {
     .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn an_unknown_client_is_refused_without_saying_why_it_could_not_be_reached() {
+    // Every unreachable client gets the same words, so PAR can't be used to
+    // find out which internal hosts exist or answer.
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let reply = par_with(
+        &h,
+        &[
+            ("client_id", "https://unknown.example/client-metadata.json"),
+            ("redirect_uri", "https://unknown.example/cb"),
+            ("response_type", "code"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+    assert_eq!(
+        reply.json()["error_description"],
+        "client metadata could not be retrieved"
+    );
+}
+
+#[tokio::test]
+async fn an_undeclared_redirect_uri_is_refused_without_redirecting() {
+    // Hole 3: this is where the code used to go.
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let reply = par_with(
+        &h,
+        &[
+            ("client_id", CLIENT),
+            ("redirect_uri", "https://evil.example/cb"),
+            ("response_type", "code"),
+            ("scope", "atproto"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_request");
+    assert!(reply.location.is_none(), "a refusal never redirects");
+}
+
+#[tokio::test]
+async fn a_scope_without_atproto_is_refused() {
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let reply = par_with(
+        &h,
+        &[
+            ("client_id", CLIENT),
+            ("redirect_uri", REDIRECT),
+            ("response_type", "code"),
+            ("scope", "transition:generic"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_scope");
+}
+
+#[tokio::test]
+async fn a_scope_the_client_did_not_declare_is_refused() {
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let reply = par_with(
+        &h,
+        &[
+            ("client_id", CLIENT),
+            ("redirect_uri", REDIRECT),
+            ("response_type", "code"),
+            ("scope", "atproto transition:chat.bsky"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_scope");
+}
+
+#[tokio::test]
+async fn a_loopback_client_id_naming_an_external_redirect_is_refused() {
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let reply = par_with(
+        &h,
+        &[
+            (
+                "client_id",
+                "http://localhost?redirect_uri=https%3A%2F%2Fevil.example%2Fcb",
+            ),
+            ("redirect_uri", "https://evil.example/cb"),
+            ("response_type", "code"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+    assert!(reply.location.is_none());
+}
+
+#[tokio::test]
+async fn a_request_missing_pkce_is_refused_before_any_lookup() {
+    // The request's own checks cost nothing; a fetch costs up to five seconds
+    // and a request to someone else's server.
+    let lookups = Arc::new(AtomicUsize::new(0));
+    let h = harness_with(Arc::new(CountingClients {
+        inner: app_example(),
+        lookups: lookups.clone(),
+    }))
+    .await;
+
+    let reply = par_with(
+        &h,
+        &[
+            ("client_id", CLIENT),
+            ("redirect_uri", REDIRECT),
+            ("response_type", "code"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.json()["error"], "invalid_request");
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        0,
+        "refused before the lookup"
+    );
+
+    // And the counter isn't vacuous: a complete request does look the client up.
+    let (_, challenge) = pkce();
+    let pushed = push(&h, &client_key(), &challenge).await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "{}", pushed.body);
+    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn the_consent_screen_names_the_client_by_its_host() {
+    // Not its self-asserted client_name: brolly has no list of vetted clients
+    // (S5). The full client_id is still shown as the requester.
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let pushed = push(&h, &client_key(), &challenge).await;
+    let request_uri = pushed.json()["request_uri"].as_str().unwrap().to_string();
+    let cookie = a_logged_in_member(&h).await;
+
+    let consent = consent_page(&h, CLIENT, &request_uri, &cookie).await;
+    assert_eq!(consent.status, StatusCode::OK, "{}", consent.body);
+    assert!(
+        consent.body.contains("Authorise app.example"),
+        "{}",
+        consent.body
+    );
+    assert!(!consent.body.contains("Authorise https://"));
+    assert!(
+        !consent.body.contains("Example App"),
+        "client_name is not shown"
+    );
+    assert!(
+        consent.body.contains("client-metadata.json"),
+        "the full client_id still appears"
+    );
+}
+
+#[tokio::test]
+async fn a_loopback_client_needs_no_metadata_and_is_named_as_development() {
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let client = "http://localhost?redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback&scope=atproto";
+    let pushed = par_with(
+        &h,
+        &[
+            ("client_id", client),
+            ("redirect_uri", "http://127.0.0.1:52431/callback"),
+            ("response_type", "code"),
+            ("scope", "atproto"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "{}", pushed.body);
+    let request_uri = pushed.json()["request_uri"].as_str().unwrap().to_string();
+    let cookie = a_logged_in_member(&h).await;
+
+    let consent = consent_page(&h, client, &request_uri, &cookie).await;
+    assert_eq!(consent.status, StatusCode::OK, "{}", consent.body);
+    assert!(
+        consent.body.contains("Authorise localhost (development)"),
+        "{}",
+        consent.body
+    );
+}
+
+#[tokio::test]
+async fn a_loopback_redirect_uri_not_in_canonical_form_is_refused() {
+    // A loopback redirect matches after URL parsing, which strips tabs and
+    // newlines. The string stored, put in Location and compared at the token
+    // endpoint must be the one that was checked, so only the canonical form
+    // is accepted.
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let reply = par_with(
+        &h,
+        &[
+            (
+                "client_id",
+                "http://localhost?redirect_uri=http%3A%2F%2F127.0.0.1%2Fcallback",
+            ),
+            ("redirect_uri", "http://127.0.0.1:52431/call\nback"),
+            ("response_type", "code"),
+            ("scope", "atproto"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_request");
+    assert!(reply.location.is_none());
 }
 
 #[tokio::test]

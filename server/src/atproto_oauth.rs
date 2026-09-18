@@ -30,8 +30,12 @@ use brolly_identity::oauth::Protocol;
 use serde::Deserialize;
 use serde_json::json;
 
+use brolly_atproto::client_metadata::{ClientError, ClientId, check_request, parse_client_id};
+
 use crate::auth::session_user;
+use crate::client_metadata::{LookupError, lookup_client};
 use crate::{AppState, consent};
+use url::Url;
 
 const CONSENT_TTL: i64 = 600;
 
@@ -106,6 +110,42 @@ fn missing_proof() -> Response {
     )
 }
 
+/// A client, or what it asked for, was refused.
+///
+/// Always JSON, never a redirect: the redirect URI is exactly the thing that
+/// hasn't been shown to belong to the client.
+fn client_refusal(e: &ClientError) -> Response {
+    let code = match e {
+        ClientError::RedirectUriNotAllowed => "invalid_request",
+        ClientError::ScopeNotAllowed(_) => "invalid_scope",
+        ClientError::InvalidClientId(_)
+        | ClientError::InvalidMetadata(_)
+        | ClientError::ConfidentialUnsupported => "invalid_client",
+    };
+    oauth_error(StatusCode::BAD_REQUEST, code, &e.to_string())
+}
+
+/// The client's metadata couldn't be used.
+///
+/// `LookupError`'s `Display` gives every `Unreachable` the same description,
+/// so this can't be used to map internal hosts (S4).
+fn lookup_refusal(e: &LookupError) -> Response {
+    oauth_error(StatusCode::BAD_REQUEST, "invalid_client", &e.to_string())
+}
+
+/// What the consent screen calls a client: its host, or
+/// `localhost (development)`.
+///
+/// Never its self-asserted `client_name` or `logo_uri`. The spec says not to
+/// show those for clients the operator hasn't vetted, and brolly has no vetted
+/// list (S5). `None` if the stored `client_id` no longer parses.
+fn app_name(client_id: &str) -> Option<String> {
+    match parse_client_id(client_id).ok()? {
+        ClientId::Discoverable(url) => url.host_str().map(str::to_owned),
+        ClientId::Loopback(_) => Some("localhost (development)".to_owned()),
+    }
+}
+
 // --- discovery -------------------------------------------------------------------
 
 /// `GET /.well-known/oauth-authorization-server`
@@ -168,16 +208,10 @@ pub async fn par(
     let Some(jkt) = proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/par").await else {
         return missing_proof();
     };
-
     let form: ParForm = serde_urlencoded::from_bytes(&body).unwrap_or_default();
 
-    let Some(client_id) = form.client_id.filter(|c| oauth::is_valid_client_id(c)) else {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_client",
-            "client_id must be an https URL serving client metadata",
-        );
-    };
+    // The request's own checks first. They cost nothing, and a request that
+    // fails them must not make us fetch anything.
     let Some(redirect_uri) = form.redirect_uri else {
         return oauth_error(
             StatusCode::BAD_REQUEST,
@@ -207,11 +241,46 @@ pub async fn par(
         );
     }
 
+    // Then the client: who it is, what its metadata says, and whether this
+    // request is within it. Only then is anything stored.
+    let Some(raw_client_id) = form.client_id else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "client_id is required",
+        );
+    };
+    let client_id = match parse_client_id(&raw_client_id) {
+        Ok(id) => id,
+        Err(e) => return client_refusal(&e),
+    };
+    let metadata = match lookup_client(state.clients.as_ref(), &client_id).await {
+        Ok(metadata) => metadata,
+        Err(e) => return lookup_refusal(&e),
+    };
+    let scope = form.scope.as_deref().unwrap_or("atproto");
+    if let Err(e) = check_request(&metadata, &redirect_uri, scope) {
+        return client_refusal(&e);
+    }
+    // A loopback redirect matched after URL parsing (ports ignored), and
+    // parsing strips tabs and newlines and normalises the host, so the raw
+    // string may not be the URL that was checked. It is stored, sent as
+    // Location, and compared as an exact string at the token endpoint, so
+    // require it to be its own serialization. (Storing the serialization
+    // instead would refuse, at the token endpoint, a client that repeats what
+    // it sent.) A discoverable client's redirect already equals, byte for
+    // byte, a string its own metadata declares.
+    if client_id.is_loopback()
+        && !Url::parse(&redirect_uri).is_ok_and(|u| u.as_str() == redirect_uri)
+    {
+        return client_refusal(&ClientError::RedirectUriNotAllowed);
+    }
+
     match oauth::push_request(
         &state.pool,
-        &client_id,
+        &raw_client_id,
         &redirect_uri,
-        form.scope.as_deref().unwrap_or("atproto"),
+        scope,
         form.state.as_deref(),
         &code_challenge,
         &jkt,
@@ -279,6 +348,13 @@ pub async fn authorize(
             "client_id does not match the pushed request",
         );
     }
+    let Some(app_name) = app_name(&client_id) else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            "this request's client_id is not valid",
+        );
+    };
 
     let Some(user) = session_user(&state, &jar).await else {
         let next = format!(
@@ -317,7 +393,7 @@ pub async fn authorize(
     consent::render_consent(
         &state,
         Protocol::Atproto,
-        &client_id,
+        &app_name,
         &user.username,
         &client_id,
         &pushed.scope,
