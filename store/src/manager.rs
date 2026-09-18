@@ -10,8 +10,9 @@
 //! the predecessor shipped 500/1h defaults that were never validated against a
 //! number.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use moka::sync::Cache;
 use oxigraph::store::Store;
@@ -58,6 +59,14 @@ impl From<oxigraph::store::LoaderError> for StoreError {
 pub struct StoreManager {
     base: PathBuf,
     pods: Cache<Uuid, Arc<Store>>,
+    /// Every pod handle still alive anywhere, cached or not.
+    ///
+    /// RocksDB lets a process open a directory once. The cache can evict a pod
+    /// while a request still holds its `Arc`, and a second `Store::open` on
+    /// that directory is then refused by the lock. So a cache miss looks here
+    /// first and hands back the live handle. The mutex also serialises opens,
+    /// so two first requests for one pod can't both open it.
+    live: Mutex<HashMap<Uuid, Weak<Store>>>,
     instance: Arc<Store>,
 }
 
@@ -82,6 +91,7 @@ impl StoreManager {
                 .max_capacity(max_open)
                 .time_to_idle(std::time::Duration::from_secs(idle_secs))
                 .build(),
+            live: Mutex::new(HashMap::new()),
             base,
         })
     }
@@ -114,12 +124,23 @@ impl StoreManager {
         if let Some(store) = self.pods.get(&user) {
             return Ok(store);
         }
+        // A poisoned lock only means another thread panicked mid-open; the map
+        // holds weak handles, so there is nothing inconsistent to protect.
+        let mut live = self.live.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(store) = live.get(&user).and_then(Weak::upgrade) {
+            self.pods.insert(user, Arc::clone(&store));
+            return Ok(store);
+        }
         // The graph lives in its own subdirectory: Oxigraph owns that
         // directory's layout, and `blobs/` alongside it would be a stray
         // directory inside a database it manages.
         let dir = self.pod_dir(user).join("rdf");
         std::fs::create_dir_all(&dir)?;
         let store = Arc::new(Store::open(&dir)?);
+        // Drop entries whose pods have closed, so the map tracks what is open
+        // rather than everyone who was ever served.
+        live.retain(|_, handle| handle.strong_count() > 0);
+        live.insert(user, Arc::downgrade(&store));
         self.pods.insert(user, Arc::clone(&store));
         Ok(store)
     }
@@ -137,6 +158,10 @@ impl StoreManager {
     /// on dereference (D5).
     pub fn delete_pod(&self, user: Uuid) -> Result<(), StoreError> {
         self.pods.invalidate(&user);
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&user);
         let dir = self.pod_dir(user);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
