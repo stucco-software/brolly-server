@@ -1,6 +1,6 @@
 # Interop roadmap: Bluesky, ATProto apps, Solid apps
 
-**Status:** Draft (2026-09-17)
+**Status:** In progress. Stage 0 done 2026-09-18.
 **Scope:** Umbrella. It sets the finish line and orders the work. Each stage
 gets its own spec and plan.
 **Supersedes in priority:** `docs/specs/2026-09-16-mycorhizza-migration.md`,
@@ -74,7 +74,7 @@ a constant (trunk-based), the way `FEDERATION_ENABLED` does.
 
 | # | Stage | Contents | Why here |
 |---|---|---|---|
-| 0 | **Security fixes** | `.acl` read and write require `acl:Control`. ATProto OAuth fetches and validates client metadata, checks `redirect_uri` against it, and applies the loopback rules. The PAR, auth-code and DPoP `jti` replay cache. | Exploitable today on any running instance. Small and self-contained. |
+| 0 | **Security fixes** (done, 2026-09-18) | Activities only touch graphs their actor owns. `.acl` read and write require `acl:Control`. DPoP proofs are single-use. Outbound HTTPS works. ATProto OAuth fetches and validates client metadata, checks `redirect_uri` and scope against it, and applies the loopback rules. See `docs/specs/2026-09-17-security-fixes.md` and `docs/plans/2026-09-17-security-fixes.md`. | Exploitable today on any running instance. Small and self-contained. |
 | 1 | **ATProto repo and firehose** | Signed-commit `rev` as a TID, stored and emitted. Head updates check nothing changed. `putRecord` updates, and `createRecord` refuses an existing record. `swapRecord`/`swapCommit`. `applyWrites`. TID record keys, and validation of NSIDs and record keys. Blob refs as real CID links. `#commit` frames that follow the lexicon: CAR `blocks`, `since`, `prevData`, `time`, CID links. `#identity`, `#account`, `#sync`, `#info`. Cursor rules and closing the backfill race. Events written by any process reach live subscribers (`LISTEN`/`NOTIFY`). | Everything ATProto writes goes through this path. Nothing on the network is correct until it is. |
 | 2 | **ATProto auth** | Legacy sessions: `createSession`, `getSession`, `refreshSession`, `deleteSession`, app passwords. OAuth completion: protected-resource metadata, the missing authorization-server fields, DPoP nonces, `htu`/`htm` checked against the actual request, scope checks on XRPC, token lifetimes. `getServiceAuth`. | Without this, nobody can log in from outside the web UI. |
 | 3 | **PDS surface** | `atproto-proxy` forwarding with service auth, defaulting to the Bluesky AppView and refusing protected methods. `app.bsky.actor.getPreferences`/`putPreferences`. `identity.resolveHandle`, `/.well-known/atproto-did`, `/.well-known/did.json`. `repo.listRecords` and a real `describeRepo`. `sync.listRepos`, `getRepoStatus`, `getLatestCommit`, `getBlocks`, `getRecord`. `requestCrawl` sent on startup. | The Bluesky app works and relays can crawl. This is finish-line items 1–3, apart from media. |
