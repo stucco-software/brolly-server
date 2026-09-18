@@ -139,6 +139,22 @@ requirements met.
 `brolly-admin` runs as a one-off command against the same environment, so the
 CLI is available without a shell on the container.
 
+## Upgrading
+
+### Activities stored before `865cc98`
+
+From `865cc98` on, the server chooses the id of every object a member
+publishes, and a `Delete` can only remove a graph that arrived embedded in one
+of its author's own activities. Activities stored before that commit may embed
+object ids the client chose. If one of them embeds a member's own LDP resource,
+such as their `/~/.acl`, that member's own `Delete` can still remove it without
+a WAC check.
+
+Nobody else can reach it: removal still requires the target and the stored
+activity to be on the deleting member's own origin. So this only matters on an
+instance where someone already tried the hole on their own account, and no
+data migration is shipped for it.
+
 ## Before pointing a live domain at it
 
 - **`FEDERATION_ENABLED` is `false`.** ActivityPub delivery to remote inboxes is

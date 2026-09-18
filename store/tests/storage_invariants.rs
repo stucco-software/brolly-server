@@ -301,3 +301,39 @@ fn a_pointer_keeps_what_it_was_first_recorded_with() {
     );
     assert_eq!(index::count_notes(mgr.instance()).unwrap(), 1);
 }
+
+#[test]
+fn concurrent_first_records_of_one_note_write_one_pointer() {
+    // A redelivered Create can race its original. Both see the note unindexed
+    // unless check-then-write is atomic, and the pointer gets two authors.
+    let (stores, _dir) = manager();
+    let instance = std::sync::Arc::clone(stores.instance());
+    let note = node("https://alice.brolly.test/~/notes/01J8Z0000000000000000000A1");
+
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    let writers: Vec<_> = (0..8)
+        .map(|i| {
+            let instance = std::sync::Arc::clone(&instance);
+            let barrier = std::sync::Arc::clone(&barrier);
+            let note = note.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                index::record_note(
+                    &instance,
+                    &NotePointer {
+                        note,
+                        author: node(&format!("https://member{i}.brolly.test/actor")),
+                        published: format!("2026-09-18T12:00:0{i}Z"),
+                        audience: node("https://www.w3.org/ns/activitystreams#Public"),
+                        in_reply_to: None,
+                    },
+                )
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap().unwrap();
+    }
+
+    assert_eq!(index::count_notes(&instance).unwrap(), 1);
+}

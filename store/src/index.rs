@@ -72,6 +72,16 @@ fn graph() -> GraphName {
 /// count it twice. A second `published` literal would list the note twice in
 /// [`public_timeline`], once at the later time.
 pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteError> {
+    // Check-then-write has to be atomic, or two first records of one note (a
+    // redelivered Create racing its original) would both write. A process-wide
+    // lock is enough: RocksDB lets only one process open the instance store.
+    // A poisoned lock only means a writer panicked; the check below re-reads
+    // the store, so there is no state to distrust.
+    static RECORDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _recording = RECORDING
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     if is_indexed(store, &pointer.note)? {
         return Ok(());
     }

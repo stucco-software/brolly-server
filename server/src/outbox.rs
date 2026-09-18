@@ -116,6 +116,8 @@ pub enum Refusal {
     ObjectId,
     /// An activity other than `Create` still embeds its object.
     EmbeddedObject,
+    /// The activity's `actor` isn't the author publishing it.
+    Actor,
 }
 
 impl Refusal {
@@ -126,6 +128,7 @@ impl Refusal {
             Refusal::EmbeddedObject => {
                 "Only a Create may embed its object. Name it by its id instead."
             }
+            Refusal::Actor => "The activity's actor must be the account publishing it.",
         }
     }
 }
@@ -255,6 +258,12 @@ pub async fn deliver(
 ) -> Result<(), DeliverError> {
     let base = format!("https://{}.{}", author.username, state.base_domain);
     authored(activity, &base).map_err(DeliverError::Refused)?;
+    // Delivery trusts `actor`: the follow bookkeeping records it, and every
+    // recipient's processor checks ids against it. Both callers set it, but
+    // `deliver` is public, so it is checked rather than assumed.
+    if activity["actor"].as_str() != Some(actor) {
+        return Err(DeliverError::Refused(Refusal::Actor));
+    }
 
     let received = now();
     let Ok(author_pod) = state.stores.pod(author.id) else {

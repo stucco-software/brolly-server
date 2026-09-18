@@ -1163,40 +1163,39 @@ async fn an_embedded_object_the_server_cannot_name_is_a_bad_request() {
 }
 
 #[tokio::test]
-async fn a_refusal_by_a_recipient_does_not_fail_the_publish() {
-    // Once `authored` has passed, a recipient's refusal is logged at warn and
-    // never returned (Task 1). The author's copy stands and `deliver` carries
-    // on to every remaining recipient, the instance last.
-    //
-    // Members and the instance run the same origin gate in processor::process,
-    // so no activity is refused by the instance and accepted by a member. What
-    // this can pin is that refusals by a member *and* by the instance still
-    // leave `deliver` returning Ok. `authored` checks ids against the author,
-    // not the activity's own `actor` field, so an activity with no `actor`
-    // passes the outbox and is refused by every recipient's processor.
+async fn deliver_refuses_an_activity_whose_actor_is_not_its_author() {
+    // Delivery trusts `actor`: the follow bookkeeping records it as the
+    // follower, and every recipient checks ids against it. So an activity
+    // published by Alice that names Bob, or nobody, as its actor is refused
+    // before anything is stored.
     let h = harness().await;
     let alice = h.user("alice").await;
-    let like = json!({
-        "type": "Like",
-        "id": format!("https://alice.{BASE}/~/activities/{}", Uuid::new_v4()),
-        "object": actor("bob"),
-    });
 
-    let result = deliver(&h.state, &alice, &actor("alice"), &like).await;
+    for actor_field in [json!(actor("bob")), Value::Null] {
+        let mut follow = json!({
+            "type": "Follow",
+            "id": format!("https://alice.{BASE}/~/activities/{}", Uuid::new_v4()),
+            "object": actor("mallory"),
+        });
+        if !actor_field.is_null() {
+            follow["actor"] = actor_field.clone();
+        }
+
+        let result = deliver(&h.state, &alice, &actor("alice"), &follow).await;
+        assert!(
+            matches!(result, Err(DeliverError::Refused(Refusal::Actor))),
+            "got {result:?} for actor {actor_field}"
+        );
+    }
+
     assert!(
-        result.is_ok(),
-        "a downstream refusal failed the publish: {result:?}"
-    );
-    assert_eq!(
-        inbox::members(&h.pod("alice"), &outbox_of("alice")),
-        vec![like["id"].as_str().unwrap().to_string()],
-        "the author's copy stands"
+        inbox::members(&h.pod("alice"), &outbox_of("alice")).is_empty(),
+        "a refused activity was stored"
     );
     assert!(
-        inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Like"], 10, None).is_empty(),
-        "setup: Bob's processor should have refused an activity with no actor"
+        follows::followers(&h.pod("mallory"), &actor("mallory")).is_empty(),
+        "a refused Follow was recorded"
     );
-    assert_eq!(h.index_count(), 0);
 }
 
 #[tokio::test]
