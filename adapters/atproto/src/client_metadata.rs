@@ -371,7 +371,21 @@ pub fn validate(
         ));
     }
     for uri in &doc.redirect_uris {
+        // RFC 6749 §3.1.2: "The endpoint URI MUST NOT include a fragment
+        // component." A code appended to one would land inside the fragment.
+        if uri.contains('#') {
+            return Err(ClientError::InvalidMetadata(
+                "redirect_uris must not contain a fragment",
+            ));
+        }
         match application_type {
+            // "may include a port number, but not if it is the default port
+            // number". Checked on the raw string: parsing drops a default port.
+            ApplicationType::Web if names_default_https_port(uri) => {
+                return Err(ClientError::InvalidMetadata(
+                    "a web client's redirect_uris must not name the default port",
+                ));
+            }
             ApplicationType::Web if !is_https(uri) => {
                 return Err(ClientError::InvalidMetadata(
                     "a web client's redirect_uris must be https URLs",
@@ -396,6 +410,14 @@ pub fn validate(
         application_type,
         loopback: false,
     })
+}
+
+/// Does this `https` URI spell out port 443? Only the authority is examined,
+/// so a `:443` later in the path doesn't count.
+fn names_default_https_port(uri: &str) -> bool {
+    uri.strip_prefix("https://")
+        .map(|rest| rest.split(['/', '?', '#']).next().unwrap_or(rest))
+        .is_some_and(|authority| authority.ends_with(":443"))
 }
 
 fn is_https(uri: &str) -> bool {
@@ -864,6 +886,43 @@ mod tests {
         refused_for(
             validating(&without(web_document(), "redirect_uris")),
             "redirect_uris must not be empty",
+        );
+    }
+
+    #[test]
+    fn a_redirect_uri_may_not_carry_a_fragment() {
+        // RFC 6749 §3.1.2: "The endpoint URI MUST NOT include a fragment
+        // component." The code would otherwise land inside the fragment.
+        refused_for(
+            validating(&with(
+                web_document(),
+                "redirect_uris",
+                json!(["https://app.example/cb#section"]),
+            )),
+            "fragment",
+        );
+        refused_for(validating_native("com.example.app:/cb#section"), "fragment");
+    }
+
+    #[test]
+    fn a_web_redirect_may_not_name_the_default_port() {
+        // "may include a port number, but not if it is the default port number"
+        refused_for(
+            validating(&with(
+                web_document(),
+                "redirect_uris",
+                json!(["https://app.example:443/cb"]),
+            )),
+            "default port",
+        );
+        // Any other port is fine.
+        assert!(
+            validating(&with(
+                web_document(),
+                "redirect_uris",
+                json!(["https://app.example:8443/cb"]),
+            ))
+            .is_ok()
         );
     }
 

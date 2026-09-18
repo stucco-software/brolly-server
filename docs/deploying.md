@@ -203,6 +203,14 @@ From a checkout, stop `brolly-server` and run
 `BROLLY_DATA_DIR=<the server's data dir> cargo run --bin brolly-admin -- acl-uncontain`
 with the server's `DATABASE_URL`, then start the server.
 
+### ATProto OAuth requests pushed before `f2f1982`
+
+From `f2f1982` on, a pushed authorization request is only accepted if the
+client's metadata declares its `redirect_uri` and scope. Requests pushed before
+the upgrade were never checked, and one can still be approved for up to five
+minutes after the deploy, which is how long a pushed request lives. Nothing
+needs doing: they expire on their own.
+
 ## Before pointing a live domain at it
 
 - **`FEDERATION_ENABLED` is `false`.** ActivityPub delivery to remote inboxes is

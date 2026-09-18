@@ -217,10 +217,8 @@ mod tests {
 
         // The header decodes from the front, leaving the body behind it.
         let header: serde_json::Value =
-            serde_ipld_dagcbor::from_slice(&bytes[..]).unwrap_or_else(|_| {
-                // Trailing data is expected — decode just the first object.
-                serde_json::json!(null)
-            });
+            // Trailing data is expected — decode just the first object.
+            serde_ipld_dagcbor::from_slice(&bytes[..]).unwrap_or(serde_json::Value::Null);
         assert!(
             header.is_null() || header["t"] == "#commit",
             "unexpected header: {header}"
