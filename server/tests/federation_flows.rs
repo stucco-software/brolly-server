@@ -39,7 +39,7 @@ async fn harness() -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
-    let stores = std::sync::Arc::new(StoreManager::open(dir.path(), 4, 60).unwrap());
+    let stores = std::sync::Arc::new(StoreManager::open(dir.path(), 8, 60).unwrap());
 
     let mut ids = std::collections::HashMap::new();
     for name in ["alice", "bob", "mallory"] {
@@ -1197,4 +1197,35 @@ async fn a_refusal_by_a_recipient_does_not_fail_the_publish() {
         "setup: Bob's processor should have refused an activity with no actor"
     );
     assert_eq!(h.index_count(), 0);
+}
+
+#[tokio::test]
+async fn a_post_is_attributed_to_whoever_published_it() {
+    // The id is the server's, and so is the author: Mastodon's timelines render
+    // a post under its `attributedTo`, so a client-chosen one would publish
+    // under somebody else's name.
+    let h = harness().await;
+    let mallory = h.login("mallory").await;
+
+    let (status, created) = h
+        .publish(
+            "mallory",
+            &mallory,
+            &json!({
+                "type": "Create",
+                "to": [PUBLIC],
+                "object": {
+                    "type": "Note",
+                    "content": "alice said this",
+                    "attributedTo": actor("alice"),
+                },
+            }),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["object"]["attributedTo"], json!(actor("mallory")));
+    let note = created["object"]["id"].as_str().unwrap();
+    let stored = inbox::read_activity(&h.pod("mallory"), note).expect("the note");
+    assert_eq!(stored["attributedTo"], json!(actor("mallory")));
 }

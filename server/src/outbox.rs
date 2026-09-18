@@ -52,6 +52,11 @@ fn as_activity(body: &Value, actor: &str, base: &str, now: &str) -> Value {
         if let Some(object) = activity.get_mut("object").filter(|o| o.is_object()) {
             if kind == "Create" {
                 object["id"] = json!(mint_note(base));
+                // The author is the outbox's owner, whoever the client named.
+                // `attributedTo` is what the Mastodon timelines render a post
+                // under, so leaving it to the client lets anyone publish under
+                // somebody else's name.
+                object["attributedTo"] = json!(actor);
             } else if let Some(named) = object["id"].as_str().map(str::to_string) {
                 *object = json!(named);
             }
@@ -530,6 +535,26 @@ mod tests {
             activity["object"]["content"], "hello",
             "minting the id must keep the object"
         );
+    }
+
+    #[test]
+    fn a_create_is_attributed_to_the_outbox_owner() {
+        // Mastodon's timelines render a post under its `attributedTo`, so a
+        // client-chosen one publishes under somebody else's name.
+        let activity = as_activity(
+            &json!({
+                "type": "Create",
+                "object": {
+                    "type": "Note",
+                    "content": "bob said this",
+                    "attributedTo": "https://bob.brolly.test/actor",
+                },
+            }),
+            ACTOR,
+            BASE,
+            "2026-08-26T12:00:00Z",
+        );
+        assert_eq!(activity["object"]["attributedTo"], ACTOR);
     }
 
     #[test]
