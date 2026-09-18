@@ -16,7 +16,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum_extra::extract::CookieJar;
 use brolly_activitypub::follows;
-use brolly_activitypub::processor::{self, Recipient};
+use brolly_activitypub::processor::{self, ProcessError, Recipient};
 use brolly_identity::db::{self, User};
 use brolly_identity::{extract, webid};
 use serde_json::{Value, json};
@@ -29,6 +29,13 @@ use crate::auth::session_user;
 /// A client may POST either an activity or a plain object; ActivityPub says the
 /// server wraps the latter. Doing it here means every downstream stage sees an
 /// activity and none of them has to ask.
+///
+/// **The server chooses embedded object ids.** A client-supplied id could name
+/// one of the author's own LDP resources, such as `/~/.acl`. Delivery would then
+/// clear and replace it, and a later `Delete` could remove it, all without WAC.
+/// So a `Create`'s object gets a freshly minted note id. Any other activity's
+/// embedded object becomes its `id` string, because there `object` names
+/// something that already exists.
 fn as_activity(body: &Value, actor: &str, base: &str, now: &str) -> Value {
     const ACTIVITY_TYPES: [&str; 6] = ["Create", "Follow", "Like", "Announce", "Delete", "Undo"];
 
@@ -42,21 +49,21 @@ fn as_activity(body: &Value, actor: &str, base: &str, now: &str) -> Value {
         if activity.get("published").is_none() {
             activity["published"] = json!(now);
         }
+        if let Some(object) = activity.get_mut("object").filter(|o| o.is_object()) {
+            if kind == "Create" {
+                object["id"] = json!(mint_note(base));
+            } else if let Some(named) = object["id"].as_str().map(str::to_string) {
+                *object = json!(named);
+            }
+            // An embedded object with no id is left as it is, and `deliver`
+            // refuses it.
+        }
         return activity;
     }
 
     // A bare object: give it its own IRI in the author's pod, then wrap it.
     let mut object = body.clone();
-    // A ULID, not a UUIDv4, and the reason lives one protocol over: ADR 0015
-    // builds Mastodon's status ID out of this identifier, and Mastodon clients
-    // are permitted to sort IDs lexically. A v4 local part would claim an
-    // ordering it does not have. Nothing else about publication cares, which is
-    // why this is the only line that mentions it.
-    let object_id = format!(
-        "{base}/~/notes/{}",
-        brolly_mastodon::status_id::mint_note_id()
-    );
-    object["id"] = json!(object_id);
+    object["id"] = json!(mint_note(base));
     object["attributedTo"] = json!(actor);
     if object.get("published").is_none() {
         object["published"] = json!(now);
@@ -73,10 +80,96 @@ fn as_activity(body: &Value, actor: &str, base: &str, now: &str) -> Value {
     })
 }
 
+/// A fresh note IRI in the author's pod.
+///
+/// A ULID, not a UUIDv4, and the reason lives one protocol over: ADR 0015
+/// builds Mastodon's status ID out of this identifier, and Mastodon clients
+/// are permitted to sort IDs lexically. A v4 local part would claim an
+/// ordering it does not have.
+fn mint_note(base: &str) -> String {
+    format!(
+        "{base}/~/notes/{}",
+        brolly_mastodon::status_id::mint_note_id()
+    )
+}
+
 fn now() -> String {
     time::OffsetDateTime::now_utc()
         .format(&time::format_description::well_known::Rfc3339)
         .unwrap_or_default()
+}
+
+/// Why [`deliver`] refused an activity. Each is the caller's fault, so each is
+/// a `400`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The activity's id isn't one the server minted under the author's
+    /// `/~/activities/`.
+    ActivityId,
+    /// A `Create`'s embedded object id isn't one the server minted under the
+    /// author's `/~/notes/`.
+    ObjectId,
+    /// An activity other than `Create` still embeds its object.
+    EmbeddedObject,
+}
+
+impl Refusal {
+    pub fn describe(self) -> &'static str {
+        match self {
+            Refusal::ActivityId => "The activity id must be one this server minted.",
+            Refusal::ObjectId => "A Create's object id must be one this server minted.",
+            Refusal::EmbeddedObject => {
+                "Only a Create may embed its object. Name it by its id instead."
+            }
+        }
+    }
+}
+
+/// What went wrong publishing.
+#[derive(Debug)]
+pub enum DeliverError {
+    /// Nothing was stored or sent.
+    Refused(Refusal),
+    /// Storing the author's copy failed.
+    Failed,
+}
+
+/// Is `iri` exactly one minted segment directly under `prefix`?
+///
+/// One segment of letters, digits and hyphens. A UUID and a ULID are both that,
+/// and `..`, `/` and an empty remainder are not.
+fn minted_under(iri: &str, prefix: &str) -> bool {
+    iri.strip_prefix(prefix).is_some_and(|rest| {
+        !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+    })
+}
+
+/// Does this activity name only graphs the server minted for its author?
+///
+/// `base` is the author's origin, `https://<username>.<base_domain>`. This is
+/// what keeps the author's own copy, which `deliver` writes without going
+/// through the processor, off their LDP resources.
+fn authored(activity: &Value, base: &str) -> Result<(), Refusal> {
+    let id = activity["id"].as_str().unwrap_or_default();
+    if !minted_under(id, &format!("{base}/~/activities/")) {
+        return Err(Refusal::ActivityId);
+    }
+    let embedded = activity.get("object").filter(|o| o.is_object());
+    match (activity["type"].as_str(), embedded) {
+        (Some("Create"), Some(object)) => {
+            let note = object["id"].as_str().unwrap_or_default();
+            let minted = note
+                .strip_prefix(&format!("{base}/~/notes/"))
+                .is_some_and(brolly_mastodon::status_id::is_note_id);
+            if minted {
+                Ok(())
+            } else {
+                Err(Refusal::ObjectId)
+            }
+        }
+        (_, None) => Ok(()),
+        (_, Some(_)) => Err(Refusal::EmbeddedObject),
+    }
 }
 
 /// `POST /outbox` — publish on the member's behalf.
@@ -130,11 +223,13 @@ pub async fn publish(
             activity.to_string(),
         )
             .into_response(),
-        Err(response) => response,
+        Err(DeliverError::Refused(refusal)) => {
+            (StatusCode::BAD_REQUEST, refusal.describe()).into_response()
+        }
+        Err(DeliverError::Failed) => server_error(),
     }
 }
 
-/// Store the activity in the author's pod, then deliver it.
 /// Publish an activity: store the author's copy, then fan out.
 ///
 /// Exposed to the Mastodon composer so that `POST /api/v1/statuses` goes
@@ -142,15 +237,23 @@ pub async fn publish(
 /// second fan-out for the Mastodon side that queried a table a migration had
 /// dropped, and the error was swallowed — so statuses were delivered to nobody,
 /// silently. One path, or the second one rots.
-pub(crate) async fn deliver(
+///
+/// Refuses, before anything is stored, an activity naming a graph the server
+/// didn't mint for its author (see [`authored`]). The author's copy is written
+/// here directly and not through the processor, so this is the only check it
+/// gets.
+pub async fn deliver(
     state: &AppState,
     author: &User,
     actor: &str,
     activity: &Value,
-) -> Result<(), Response> {
+) -> Result<(), DeliverError> {
+    let base = format!("https://{}.{}", author.username, state.base_domain);
+    authored(activity, &base).map_err(DeliverError::Refused)?;
+
     let received = now();
     let Ok(author_pod) = state.stores.pod(author.id) else {
-        return Err(server_error());
+        return Err(DeliverError::Failed);
     };
 
     // The author holds their own post — content lives in exactly one place (D2)
@@ -160,12 +263,13 @@ pub(crate) async fn deliver(
             &author_pod,
             Recipient::Member {
                 inbox: &webid::inbox(&author.username, &state.base_domain),
+                outbox: &webid::outbox(&author.username, &state.base_domain),
             },
             activity,
             &received,
         ) {
             tracing::error!(error = %e, "removing the author's copy failed");
-            return Err(server_error());
+            return Err(DeliverError::Failed);
         }
     } else if let Err(e) = brolly_activitypub::inbox::deliver(
         &author_pod,
@@ -174,7 +278,7 @@ pub(crate) async fn deliver(
         &received,
     ) {
         tracing::error!(error = %e, "storing the author's copy failed");
-        return Err(server_error());
+        return Err(DeliverError::Failed);
     }
 
     // A Follow is also a relationship, not only a notification.
@@ -198,13 +302,15 @@ pub(crate) async fn deliver(
 
     // The instance is a recipient like any other (D4), and its processor writes
     // the pointer row. This is the only way anything reaches the public index.
-    if let Err(e) = processor::process(
+    match processor::process(
         state.stores.instance(),
         Recipient::Instance,
         activity,
         &received,
     ) {
-        tracing::error!(error = %e, "indexing failed");
+        Ok(()) => {}
+        Err(e @ ProcessError::ForeignObject) => tracing::warn!(error = %e, "indexing refused"),
+        Err(e) => tracing::error!(error = %e, "indexing failed"),
     }
 
     Ok(())
@@ -285,6 +391,12 @@ async fn deliver_locally(
     // This is the whole of what "locked" means, and the predecessor recorded
     // the follow unconditionally, so the flag did nothing. It did nothing
     // invisibly, too: the profile still rendered the lock.
+    //
+    // FEDERATION: this writes before `processor::process` applies its origin
+    // check (stage 0, A1). That is only safe while every activity here came
+    // through `outbox::deliver` with an actor the server set. Revisit when
+    // federation is enabled (ADR 0016): an inbound Follow's `actor` must be
+    // verified before it is recorded as a follower.
     if activity["type"] == "Follow"
         && let Some(target) = activity["object"].as_str()
         && let Some(follower) = activity["actor"].as_str()
@@ -301,8 +413,23 @@ async fn deliver_locally(
         };
     }
 
-    if let Err(e) = processor::process(&pod, Recipient::Member { inbox }, activity, received) {
-        tracing::error!(error = %e, %inbox, "local delivery failed");
+    // A refusal isn't a failure: the activity named a graph its actor doesn't
+    // own. Delivery to every other recipient carries on either way.
+    let outbox = webid::outbox(&user.username, &state.base_domain);
+    match processor::process(
+        &pod,
+        Recipient::Member {
+            inbox,
+            outbox: &outbox,
+        },
+        activity,
+        received,
+    ) {
+        Ok(()) => {}
+        Err(e @ ProcessError::ForeignObject) => {
+            tracing::warn!(error = %e, %inbox, "local delivery refused");
+        }
+        Err(e) => tracing::error!(error = %e, %inbox, "local delivery failed"),
     }
 }
 
@@ -381,6 +508,145 @@ mod tests {
             "2026-08-26T12:00:00Z",
         );
         assert_eq!(activity["actor"], ACTOR);
+    }
+
+    #[test]
+    fn a_create_gets_a_minted_object_id_whatever_the_client_claimed() {
+        let activity = as_activity(
+            &json!({
+                "type": "Create",
+                "object": {"type": "Note", "id": "https://alice.brolly.test/~/.acl", "content": "hello"},
+            }),
+            ACTOR,
+            BASE,
+            "2026-08-26T12:00:00Z",
+        );
+        let id = activity["object"]["id"].as_str().expect("an object IRI");
+        assert!(
+            id.starts_with("https://alice.brolly.test/~/notes/"),
+            "the client chose where content lives: {id}"
+        );
+        assert_eq!(
+            activity["object"]["content"], "hello",
+            "minting the id must keep the object"
+        );
+    }
+
+    #[test]
+    fn a_bare_object_claiming_an_id_gets_a_minted_one() {
+        let activity = as_activity(
+            &json!({"type": "Note", "id": "https://alice.brolly.test/~/.acl"}),
+            ACTOR,
+            BASE,
+            "2026-08-26T12:00:00Z",
+        );
+        let id = activity["object"]["id"].as_str().expect("an object IRI");
+        assert!(id.starts_with("https://alice.brolly.test/~/notes/"), "{id}");
+    }
+
+    #[test]
+    fn any_other_activity_names_an_embedded_object_by_its_id() {
+        for kind in ["Delete", "Undo", "Like", "Follow", "Announce"] {
+            let activity = as_activity(
+                &json!({
+                    "type": kind,
+                    "object": {"type": "Tombstone", "id": "https://bob.brolly.test/~/notes/1"},
+                }),
+                ACTOR,
+                BASE,
+                "2026-08-26T12:00:00Z",
+            );
+            assert_eq!(
+                activity["object"], "https://bob.brolly.test/~/notes/1",
+                "{kind} kept its embedded object"
+            );
+        }
+    }
+
+    #[test]
+    fn an_embedded_object_with_no_id_is_left_for_deliver_to_refuse() {
+        // There's nothing to name it by, so as_activity can't flatten it.
+        let activity = as_activity(
+            &json!({"type": "Like", "object": {"type": "Note"}}),
+            ACTOR,
+            BASE,
+            "2026-08-26T12:00:00Z",
+        );
+        assert!(activity["object"].is_object());
+    }
+
+    fn activity_id(base: &str) -> String {
+        format!("{base}/~/activities/{}", uuid::Uuid::new_v4())
+    }
+
+    fn note_id(base: &str) -> String {
+        format!(
+            "{base}/~/notes/{}",
+            brolly_mastodon::status_id::mint_note_id()
+        )
+    }
+
+    #[test]
+    fn what_as_activity_produces_deliver_accepts() {
+        for body in [
+            json!({"type": "Note", "content": "hello"}),
+            json!({"type": "Create", "object": {"type": "Note", "id": "https://alice.brolly.test/~/.acl"}}),
+            json!({"type": "Create", "object": "https://alice.brolly.test/~/.acl"}),
+            json!({"type": "Delete", "object": {"type": "Tombstone", "id": "https://alice.brolly.test/~/notes/1"}}),
+            json!({"type": "Like", "object": "https://bob.brolly.test/~/notes/1"}),
+        ] {
+            let activity = as_activity(&body, ACTOR, BASE, "2026-08-26T12:00:00Z");
+            assert_eq!(authored(&activity, BASE), Ok(()), "{activity}");
+        }
+    }
+
+    #[test]
+    fn deliver_refuses_an_activity_id_it_did_not_mint() {
+        for id in [
+            "https://alice.brolly.test/~/.acl".to_string(),
+            activity_id("https://bob.brolly.test"),
+            format!("{BASE}/~/activities/"),
+            format!("{BASE}/~/activities/../.acl"),
+            format!("{BASE}/~/activities/a/b"),
+        ] {
+            let activity =
+                json!({"type": "Like", "id": id, "object": "https://bob.brolly.test/~/notes/1"});
+            assert_eq!(authored(&activity, BASE), Err(Refusal::ActivityId), "{id}");
+        }
+        assert_eq!(
+            authored(&json!({"type": "Like"}), BASE),
+            Err(Refusal::ActivityId)
+        );
+    }
+
+    #[test]
+    fn deliver_refuses_a_create_whose_object_id_it_did_not_mint() {
+        for object in [
+            json!({"type": "Note", "id": "https://alice.brolly.test/~/.acl"}),
+            json!({"type": "Note", "id": note_id("https://bob.brolly.test")}),
+            json!({"type": "Note", "id": format!("{BASE}/~/notes/not-a-ulid")}),
+            json!({"type": "Note"}),
+        ] {
+            let activity = json!({"type": "Create", "id": activity_id(BASE), "object": object});
+            assert_eq!(
+                authored(&activity, BASE),
+                Err(Refusal::ObjectId),
+                "{object}"
+            );
+        }
+    }
+
+    #[test]
+    fn deliver_refuses_any_other_activity_that_embeds_its_object() {
+        for kind in ["Delete", "Undo", "Like", "Follow", "Announce"] {
+            let activity =
+                json!({"type": kind, "id": activity_id(BASE), "object": {"id": note_id(BASE)}});
+            assert_eq!(
+                authored(&activity, BASE),
+                Err(Refusal::EmbeddedObject),
+                "{kind}"
+            );
+        }
     }
 
     #[test]

@@ -8,10 +8,11 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use brolly_activitypub::processor::{self, ProcessError, Recipient};
 use brolly_activitypub::{follows, inbox};
 use brolly_identity::db;
+use brolly_server::outbox::{DeliverError, Refusal, deliver};
 use brolly_server::{AppState, app};
-use brolly_solid::storage;
 use brolly_store::{StoreManager, index};
 use http_body_util::BodyExt;
 use oxigraph::model::NamedNode;
@@ -27,6 +28,9 @@ struct Harness {
     db: brolly_test_support::TestDb,
     _dir: tempfile::TempDir,
     router: axum::Router,
+    /// The state the router was built with, so a test can call
+    /// `outbox::deliver` directly, the way a future caller might.
+    state: AppState,
     stores: std::sync::Arc<StoreManager>,
     ids: std::collections::HashMap<String, Uuid>,
 }
@@ -38,48 +42,46 @@ async fn harness() -> Harness {
     let stores = std::sync::Arc::new(StoreManager::open(dir.path(), 4, 60).unwrap());
 
     let mut ids = std::collections::HashMap::new();
-    for name in ["alice", "bob"] {
+    for name in ["alice", "bob", "mallory"] {
         let user = db::create_user(&db.pool, name, None, PASSWORD, "member")
             .await
             .unwrap();
         let pod = stores.pod(user.id).unwrap();
-        storage::init_storage_root(&pod, &format!("https://{name}.{BASE}/~/")).unwrap();
+        // The real provisioning, so each member has the root ACL an attack
+        // would aim at.
+        brolly_server::provision::pod(&pod, name, BASE).unwrap();
         ids.insert(name.to_string(), user.id);
     }
 
-    let router = app(
-        AppState {
-            pool: db.pool.clone(),
-            base_domain: BASE.into(),
-            instance_name: BASE.to_string(),
-            instance_description: "A private community server.".to_string(),
-            source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
-            terms_url: None,
-            privacy_url: None,
-            stores: std::sync::Arc::clone(&stores),
-            provider_key: std::sync::Arc::new(
-                brolly_solid::oidc::store::load_or_create_key(&db.pool)
-                    .await
-                    .expect("provider key"),
-            ),
-            instance_actor: std::sync::Arc::new(
-                brolly_identity::instance::load_or_create(
-                    &db.pool,
-                    brolly_activitypub::keys::generate,
-                )
+    let state = AppState {
+        pool: db.pool.clone(),
+        base_domain: BASE.into(),
+        instance_name: BASE.to_string(),
+        instance_description: "A private community server.".to_string(),
+        source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
+        terms_url: None,
+        privacy_url: None,
+        stores: std::sync::Arc::clone(&stores),
+        provider_key: std::sync::Arc::new(
+            brolly_solid::oidc::store::load_or_create_key(&db.pool)
+                .await
+                .expect("provider key"),
+        ),
+        instance_actor: std::sync::Arc::new(
+            brolly_identity::instance::load_or_create(&db.pool, brolly_activitypub::keys::generate)
                 .await
                 .expect("instance actor"),
-            ),
-            commits: tokio::sync::broadcast::channel(64).0,
-            plc_client: None,
-        },
-        "server/static",
-    );
+        ),
+        commits: tokio::sync::broadcast::channel(64).0,
+        plc_client: None,
+    };
+    let router = app(state.clone(), "server/static");
 
     Harness {
         db,
         _dir: dir,
         router,
+        state,
         stores,
         ids,
     }
@@ -140,12 +142,56 @@ impl Harness {
         (status, value)
     }
 
+    async fn user(&self, username: &str) -> db::User {
+        db::find_by_username(&self.db.pool, username)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
     fn pod(&self, username: &str) -> std::sync::Arc<brolly_store::Store> {
         self.stores.pod(self.ids[username]).unwrap()
     }
 
     fn index_count(&self) -> i64 {
         index::count_notes(self.stores.instance()).unwrap()
+    }
+
+    /// Every quad in one graph of a member's pod, as text, so "left untouched"
+    /// compares content and not only size.
+    fn graph(&self, username: &str, graph: &str) -> std::collections::BTreeSet<String> {
+        self.pod(username)
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(oxigraph::model::GraphNameRef::NamedNode(
+                    NamedNode::new_unchecked(graph).as_ref(),
+                )),
+            )
+            .filter_map(Result::ok)
+            .map(|quad| quad.to_string())
+            .collect()
+    }
+
+    /// GET a path in a member's pod with a session, for "can she still read her
+    /// own storage".
+    async fn get_status(&self, username: &str, cookie: &str, path: &str) -> StatusCode {
+        self.router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::HOST, format!("{username}.{BASE}"))
+                    .header(header::ACCEPT, "text/turtle")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status()
     }
 }
 
@@ -155,6 +201,14 @@ fn actor(username: &str) -> String {
 
 fn inbox_of(username: &str) -> String {
     format!("https://{username}.{BASE}/inbox")
+}
+
+fn outbox_of(username: &str) -> String {
+    format!("https://{username}.{BASE}/outbox")
+}
+
+fn acl_of(username: &str) -> String {
+    format!("https://{username}.{BASE}/~/.acl")
 }
 
 // --- follow -----------------------------------------------------------------
@@ -534,4 +588,613 @@ async fn publishing_stores_the_post_in_the_authors_own_pod() {
     .await
     .unwrap();
     assert_eq!(rows, 0, "post content must never acquire a Postgres column");
+}
+
+// --- an activity only touches graphs its actor owns (stage 0, A1) -----------
+
+#[tokio::test]
+async fn a_delete_naming_another_members_acl_leaves_it_alone() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let mallory = h.login("mallory").await;
+    let before = h.graph("alice", &acl_of("alice"));
+    assert!(!before.is_empty(), "setup: alice has a root ACL");
+    assert_eq!(
+        h.get_status("alice", &alice, "/~/").await,
+        StatusCode::OK,
+        "setup"
+    );
+
+    let (status, body) = h
+        .publish(
+            "mallory",
+            &mallory,
+            &json!({"type": "Delete", "object": acl_of("alice")}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    assert_eq!(
+        h.graph("alice", &acl_of("alice")),
+        before,
+        "Mallory's Delete cleared Alice's ACL"
+    );
+    assert_eq!(
+        h.get_status("alice", &alice, "/~/").await,
+        StatusCode::OK,
+        "Alice is locked out of her own storage"
+    );
+}
+
+#[tokio::test]
+async fn a_delete_of_your_own_note_removes_every_copy() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let mallory = h.login("mallory").await;
+    h.publish(
+        "alice",
+        &alice,
+        &json!({"type": "Follow", "object": actor("mallory")}),
+    )
+    .await;
+
+    let (_, created) = h
+        .publish(
+            "mallory",
+            &mallory,
+            &json!({"type": "Note", "content": "mine to take back", "to": [PUBLIC]}),
+        )
+        .await;
+    let note = created["object"]["id"].as_str().unwrap().to_string();
+    let create = created["id"].as_str().unwrap().to_string();
+
+    // Setup: every copy exists, or the assertions below prove nothing.
+    assert!(inbox::read_activity(&h.pod("alice"), &note).is_some());
+    assert!(inbox::read_activity(&h.pod("mallory"), &note).is_some());
+    assert_eq!(
+        inbox::members(&h.pod("mallory"), &outbox_of("mallory")),
+        vec![create.clone()]
+    );
+    assert_eq!(h.index_count(), 1);
+
+    let (status, _) = h
+        .publish(
+            "mallory",
+            &mallory,
+            &json!({"type": "Delete", "object": note, "to": [PUBLIC]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    assert!(
+        inbox::read_activity(&h.pod("alice"), &note).is_none(),
+        "the follower's copy survived"
+    );
+    assert!(
+        inbox::timeline(&h.pod("alice"), &inbox_of("alice"), &["Create"], 10, None).is_empty(),
+        "a deleted post left a hole in the follower's timeline"
+    );
+    assert!(
+        inbox::read_activity(&h.pod("mallory"), &note).is_none(),
+        "the author's own note survived"
+    );
+    assert!(
+        inbox::read_activity(&h.pod("mallory"), &create).is_none(),
+        "the author's Create survived"
+    );
+    assert!(
+        inbox::members(&h.pod("mallory"), &outbox_of("mallory")).is_empty(),
+        "the author's outbox still lists the deleted post"
+    );
+    assert_eq!(h.index_count(), 0, "the public timeline still shows it");
+}
+
+#[tokio::test]
+async fn an_owner_cannot_delete_their_own_acl_through_the_outbox() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let before = h.graph("alice", &acl_of("alice"));
+    assert!(!before.is_empty(), "setup: alice has a root ACL");
+
+    // Straight at it.
+    h.publish(
+        "alice",
+        &alice,
+        &json!({"type": "Delete", "object": acl_of("alice")}),
+    )
+    .await;
+    assert_eq!(
+        h.graph("alice", &acl_of("alice")),
+        before,
+        "a Delete through the outbox cleared an LDP resource without WAC"
+    );
+
+    // And after naming it in a Create first, so a stored activity mentions it.
+    let (status, body) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({"type": "Create", "object": acl_of("alice"), "to": [PUBLIC]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    h.publish(
+        "alice",
+        &alice,
+        &json!({"type": "Delete", "object": acl_of("alice")}),
+    )
+    .await;
+
+    assert_eq!(
+        h.graph("alice", &acl_of("alice")),
+        before,
+        "a Create naming the ACL by string made it deletable"
+    );
+    assert_eq!(h.get_status("alice", &alice, "/~/").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn another_member_cannot_take_over_a_post_on_the_public_timeline() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let mallory = h.login("mallory").await;
+
+    let (_, created) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({"type": "Note", "content": "hello", "to": [PUBLIC]}),
+        )
+        .await;
+    let note = created["object"]["id"].as_str().unwrap().to_string();
+    assert_eq!(h.index_count(), 1, "setup");
+
+    h.publish(
+        "mallory",
+        &mallory,
+        &json!({"type": "Delete", "object": note, "to": [PUBLIC]}),
+    )
+    .await;
+    let page = index::public_timeline(
+        h.stores.instance(),
+        &NamedNode::new_unchecked(PUBLIC),
+        10,
+        None,
+    )
+    .unwrap();
+    assert_eq!(
+        page.len(),
+        1,
+        "Mallory's Delete took Alice's post off the public timeline"
+    );
+    assert_eq!(page[0].note.as_str(), note);
+    let published = page[0].published.clone();
+
+    h.publish(
+        "mallory",
+        &mallory,
+        &json!({"type": "Announce", "object": note, "to": [PUBLIC]}),
+    )
+    .await;
+    assert_eq!(
+        h.index_count(),
+        1,
+        "Mallory's Announce added a second author to Alice's post"
+    );
+    let page = index::public_timeline(
+        h.stores.instance(),
+        &NamedNode::new_unchecked(PUBLIC),
+        10,
+        None,
+    )
+    .unwrap();
+    assert_eq!(page.len(), 1, "the boost listed the post twice: {page:?}");
+    assert_eq!(page[0].author.as_str(), actor("alice"));
+    assert_eq!(page[0].published, published, "the boost moved the post");
+}
+
+#[tokio::test]
+async fn a_public_announce_does_not_publish_a_followers_only_note() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let mallory = h.login("mallory").await;
+    // Mallory follows Alice, so she receives, and can boost, a followers-only post.
+    h.publish(
+        "mallory",
+        &mallory,
+        &json!({"type": "Follow", "object": actor("alice")}),
+    )
+    .await;
+
+    let (_, created) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({
+                "type": "Note",
+                "content": "just for followers",
+                "to": [format!("https://alice.{BASE}/followers")],
+            }),
+        )
+        .await;
+    let note = created["object"]["id"].as_str().unwrap().to_string();
+    assert!(
+        inbox::read_activity(&h.pod("mallory"), &note).is_some(),
+        "setup: mallory received the post"
+    );
+    assert_eq!(
+        h.index_count(),
+        0,
+        "setup: a followers-only post isn't indexed"
+    );
+
+    let (status, body) = h
+        .publish(
+            "mallory",
+            &mallory,
+            &json!({"type": "Announce", "object": note, "to": [PUBLIC]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    assert_eq!(
+        h.index_count(),
+        0,
+        "Mallory's boost put Alice's followers-only post on the public timeline"
+    );
+    let page = index::public_timeline(
+        h.stores.instance(),
+        &NamedNode::new_unchecked(PUBLIC),
+        10,
+        None,
+    )
+    .unwrap();
+    assert!(page.is_empty(), "{page:?}");
+}
+
+#[tokio::test]
+async fn a_create_claiming_another_members_acl_gets_a_minted_id() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let mallory = h.login("mallory").await;
+    // Alice follows Mallory, so Mallory's posts are delivered into Alice's pod.
+    h.publish(
+        "alice",
+        &alice,
+        &json!({"type": "Follow", "object": actor("mallory")}),
+    )
+    .await;
+    let before = h.graph("alice", &acl_of("alice"));
+    assert!(!before.is_empty(), "setup: alice has a root ACL");
+
+    let (status, created) = h
+        .publish(
+            "mallory",
+            &mallory,
+            &json!({
+                "type": "Create",
+                "to": [PUBLIC],
+                "object": {
+                    "type": "Note",
+                    "id": acl_of("alice"),
+                    "content": "mallory holds acl:Control now",
+                },
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let note = created["object"]["id"].as_str().unwrap();
+    assert!(
+        note.starts_with(&format!("https://mallory.{BASE}/~/notes/")),
+        "{note}"
+    );
+    assert!(
+        inbox::read_activity(&h.pod("alice"), note).is_some(),
+        "the post is still delivered, under the id the server chose"
+    );
+
+    assert_eq!(h.graph("alice", &acl_of("alice")), before);
+    assert_eq!(h.get_status("alice", &alice, "/~/").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn an_owner_cannot_overwrite_their_own_acl_through_the_outbox() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let before = h.graph("alice", &acl_of("alice"));
+    assert!(!before.is_empty(), "setup: alice has a root ACL");
+
+    let (status, created) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({
+                "type": "Create",
+                "to": [PUBLIC],
+                "object": {"type": "Note", "id": acl_of("alice"), "content": "no WAC here"},
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let note = created["object"]["id"].as_str().unwrap();
+    assert!(
+        note.starts_with(&format!("https://alice.{BASE}/~/notes/")),
+        "{note}"
+    );
+
+    assert_eq!(
+        h.graph("alice", &acl_of("alice")),
+        before,
+        "publishing replaced an LDP resource without WAC"
+    );
+    assert_eq!(h.get_status("alice", &alice, "/~/").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_delete_of_an_embedded_tombstone_removes_the_note_everywhere() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let bob = h.login("bob").await;
+    h.publish(
+        "bob",
+        &bob,
+        &json!({"type": "Follow", "object": actor("alice")}),
+    )
+    .await;
+
+    let (_, created) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({"type": "Note", "content": "regrettable", "to": [PUBLIC]}),
+        )
+        .await;
+    let note = created["object"]["id"].as_str().unwrap().to_string();
+
+    let (status, delete) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({
+                "type": "Delete",
+                "object": {"type": "Tombstone", "id": note},
+                "to": [PUBLIC],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{delete}");
+    assert_eq!(
+        delete["object"],
+        json!(note),
+        "the Tombstone is named by id"
+    );
+
+    assert!(inbox::read_activity(&h.pod("bob"), &note).is_none());
+    assert!(inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Create"], 10, None).is_empty());
+    assert!(inbox::read_activity(&h.pod("alice"), &note).is_none());
+    assert!(inbox::members(&h.pod("alice"), &outbox_of("alice")).is_empty());
+    assert_eq!(h.index_count(), 0);
+}
+
+#[tokio::test]
+async fn an_undo_embedding_a_follow_names_it_by_id() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let bob = h.login("bob").await;
+    // Alice follows Bob, so Bob's activities reach her as a follower.
+    h.publish(
+        "alice",
+        &alice,
+        &json!({"type": "Follow", "object": actor("bob")}),
+    )
+    .await;
+    let (_, follow) = h
+        .publish(
+            "bob",
+            &bob,
+            &json!({"type": "Follow", "object": actor("alice")}),
+        )
+        .await;
+    let follow_id = follow["id"].as_str().unwrap().to_string();
+
+    let (status, undo) = h
+        .publish("bob", &bob, &json!({"type": "Undo", "object": follow}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{undo}");
+    assert_eq!(undo["object"], json!(follow_id));
+
+    let undos = inbox::timeline(&h.pod("alice"), &inbox_of("alice"), &["Undo"], 10, None);
+    assert_eq!(undos.len(), 1, "the Undo did not reach Alice");
+    let stored = inbox::read_activity(&h.pod("alice"), &undos[0].activity).unwrap();
+    assert_eq!(stored["object"], json!(follow_id));
+}
+
+#[tokio::test]
+async fn a_create_embedding_another_members_acl_is_refused_at_both_ends() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    // Alice follows Mallory, so Mallory's posts would be delivered to her.
+    h.publish(
+        "alice",
+        &alice,
+        &json!({"type": "Follow", "object": actor("mallory")}),
+    )
+    .await;
+    let before = h.graph("alice", &acl_of("alice"));
+    assert!(!before.is_empty(), "setup: alice has a root ACL");
+
+    let attack = json!({
+        "type": "Create",
+        "id": format!("https://mallory.{BASE}/~/activities/{}", Uuid::new_v4()),
+        "actor": actor("mallory"),
+        "to": [PUBLIC],
+        "object": {
+            "type": "Note",
+            "id": acl_of("alice"),
+            "content": "mallory holds acl:Control now",
+        },
+    });
+
+    // The outbox refuses it...
+    let refused = deliver(
+        &h.state,
+        &h.user("mallory").await,
+        &actor("mallory"),
+        &attack,
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(DeliverError::Refused(Refusal::ObjectId))),
+        "got {refused:?}"
+    );
+    assert!(
+        inbox::members(&h.pod("mallory"), &outbox_of("mallory")).is_empty(),
+        "the author's copy was written before the refusal"
+    );
+
+    // ...and so does the processor, for the day it arrives from another server.
+    let processed = processor::process(
+        &h.pod("alice"),
+        Recipient::Member {
+            inbox: &inbox_of("alice"),
+            outbox: &outbox_of("alice"),
+        },
+        &attack,
+        "2026-09-17T12:00:00Z",
+    );
+    assert!(
+        matches!(processed, Err(ProcessError::ForeignObject)),
+        "got {processed:?}"
+    );
+
+    assert_eq!(h.graph("alice", &acl_of("alice")), before);
+    assert_eq!(h.get_status("alice", &alice, "/~/").await, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn every_publishing_path_refuses_an_id_it_did_not_mint() {
+    // POST /outbox and POST /api/v1/statuses both publish through
+    // outbox::deliver, and both build a Create with an embedded note. Neither
+    // can be made to carry a foreign id over HTTP any more, so this drives
+    // deliver with each shape directly. The check has to hold for a caller that
+    // forgets to mint.
+    let h = harness().await;
+    let alice = h.user("alice").await;
+    let before = h.graph("alice", &acl_of("alice"));
+    let activity_id = format!("https://alice.{BASE}/~/activities/{}", Uuid::new_v4());
+    let followers = format!("https://alice.{BASE}/followers");
+
+    let outbox_shaped = json!({
+        "type": "Create",
+        "id": activity_id,
+        "actor": actor("alice"),
+        "published": "2026-09-17T12:00:00Z",
+        "to": [PUBLIC],
+        "cc": [],
+        "object": {
+            "type": "Note",
+            "id": acl_of("alice"),
+            "attributedTo": actor("alice"),
+            "content": "outbox",
+        },
+    });
+    let compose_shaped = json!({
+        "type": "Create",
+        "id": activity_id,
+        "actor": actor("alice"),
+        "published": "2026-09-17T12:00:00Z",
+        "to": [PUBLIC],
+        "cc": [followers],
+        "object": {
+            "type": "Note",
+            "id": format!(
+                "https://bob.{BASE}/~/notes/{}",
+                brolly_mastodon::status_id::mint_note_id()
+            ),
+            "attributedTo": actor("alice"),
+            "content": "<p>compose</p>",
+            "to": [PUBLIC],
+            "cc": [followers],
+            "sensitive": false,
+        },
+    });
+
+    for activity in [&outbox_shaped, &compose_shaped] {
+        let result = deliver(&h.state, &alice, &actor("alice"), activity).await;
+        assert!(
+            matches!(result, Err(DeliverError::Refused(Refusal::ObjectId))),
+            "got {result:?} for {activity}"
+        );
+    }
+
+    let mut foreign_activity = outbox_shaped.clone();
+    foreign_activity["id"] = json!(acl_of("alice"));
+    let result = deliver(&h.state, &alice, &actor("alice"), &foreign_activity).await;
+    assert!(
+        matches!(result, Err(DeliverError::Refused(Refusal::ActivityId))),
+        "got {result:?}"
+    );
+
+    assert!(
+        inbox::members(&h.pod("alice"), &outbox_of("alice")).is_empty(),
+        "the author's copy was written before the refusal"
+    );
+    assert_eq!(h.graph("alice", &acl_of("alice")), before);
+}
+
+#[tokio::test]
+async fn an_embedded_object_the_server_cannot_name_is_a_bad_request() {
+    let h = harness().await;
+    let bob = h.login("bob").await;
+
+    let (status, body) = h
+        .publish(
+            "bob",
+            &bob,
+            &json!({"type": "Like", "object": {"type": "Note", "content": "no id"}}),
+        )
+        .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        inbox::members(&h.pod("bob"), &outbox_of("bob")).is_empty(),
+        "a refused activity was stored"
+    );
+}
+
+#[tokio::test]
+async fn a_refusal_by_a_recipient_does_not_fail_the_publish() {
+    // Once `authored` has passed, a recipient's refusal is logged at warn and
+    // never returned (Task 1). The author's copy stands and `deliver` carries
+    // on to every remaining recipient, the instance last.
+    //
+    // Members and the instance run the same origin gate in processor::process,
+    // so no activity is refused by the instance and accepted by a member. What
+    // this can pin is that refusals by a member *and* by the instance still
+    // leave `deliver` returning Ok. `authored` checks ids against the author,
+    // not the activity's own `actor` field, so an activity with no `actor`
+    // passes the outbox and is refused by every recipient's processor.
+    let h = harness().await;
+    let alice = h.user("alice").await;
+    let like = json!({
+        "type": "Like",
+        "id": format!("https://alice.{BASE}/~/activities/{}", Uuid::new_v4()),
+        "object": actor("bob"),
+    });
+
+    let result = deliver(&h.state, &alice, &actor("alice"), &like).await;
+    assert!(
+        result.is_ok(),
+        "a downstream refusal failed the publish: {result:?}"
+    );
+    assert_eq!(
+        inbox::members(&h.pod("alice"), &outbox_of("alice")),
+        vec![like["id"].as_str().unwrap().to_string()],
+        "the author's copy stands"
+    );
+    assert!(
+        inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Like"], 10, None).is_empty(),
+        "setup: Bob's processor should have refused an activity with no actor"
+    );
+    assert_eq!(h.index_count(), 0);
 }

@@ -253,3 +253,51 @@ fn the_index_can_count_its_notes_without_opening_a_pod() {
 
     assert_eq!(brolly_store::index::count_notes(index).unwrap(), 3);
 }
+
+#[test]
+fn a_pointer_keeps_what_it_was_first_recorded_with() {
+    // A later record of the same note, such as a replayed Create, must not add
+    // a second author (anyone who boosts a post could claim it) or a second
+    // published time (the note would be listed twice, at the later time).
+    let (mgr, _dir) = manager();
+    let note = "https://alice.brolly.id/~/notes/1";
+    let pointer = |author: &str, published: &str| NotePointer {
+        note: node(note),
+        author: node(author),
+        published: published.to_string(),
+        audience: node("https://www.w3.org/ns/activitystreams#Public"),
+        in_reply_to: None,
+    };
+
+    assert!(!index::is_indexed(mgr.instance(), &node(note)).unwrap());
+    index::record_note(
+        mgr.instance(),
+        &pointer("https://alice.brolly.id/actor", "2026-09-17T10:00:00Z"),
+    )
+    .unwrap();
+    assert!(index::is_indexed(mgr.instance(), &node(note)).unwrap());
+
+    index::record_note(
+        mgr.instance(),
+        &pointer("https://mallory.brolly.id/actor", "2026-09-17T11:00:00Z"),
+    )
+    .unwrap();
+
+    let values = |predicate: &str| -> Vec<String> {
+        mgr.instance()
+            .quads_for_pattern(None, Some(node(predicate).as_ref()), None, None)
+            .filter_map(Result::ok)
+            .map(|quad| quad.object.to_string())
+            .collect()
+    };
+    assert_eq!(
+        values(index::P_AUTHOR),
+        vec!["<https://alice.brolly.id/actor>".to_string()]
+    );
+    assert_eq!(
+        values(index::P_PUBLISHED),
+        vec!["\"2026-09-17T10:00:00Z\"".to_string()],
+        "a second published literal lists the note twice"
+    );
+    assert_eq!(index::count_notes(mgr.instance()).unwrap(), 1);
+}

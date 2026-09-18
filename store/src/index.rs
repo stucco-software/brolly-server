@@ -65,7 +65,17 @@ fn graph() -> GraphName {
 }
 
 /// Record a note in the public timeline index.
+///
+/// **The first record wins.** If the note is already indexed, nothing is
+/// written. A pointer names one author and one published time. A second author
+/// triple would let anyone who boosts a post claim it, and `count_notes` would
+/// count it twice. A second `published` literal would list the note twice in
+/// [`public_timeline`], once at the later time.
 pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteError> {
+    if is_indexed(store, &pointer.note)? {
+        return Ok(());
+    }
+
     let subject = NamedOrBlankNode::NamedNode(pointer.note.clone());
     let mut quads = vec![
         Quad::new(
@@ -97,6 +107,25 @@ pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteErro
     }
     insert_quads(store, &quads)?;
     Ok(())
+}
+
+/// Is this note on the public timeline?
+///
+/// A pointer always has exactly one author triple, so that is what's checked.
+/// A read, not a write: the ActivityPub processor asks before it lets an
+/// `Announce` touch the index.
+pub fn is_indexed(store: &Store, note: &NamedNode) -> Result<bool, StoreError> {
+    let subject = NamedOrBlankNode::NamedNode(note.clone());
+    let first = store
+        .quads_for_pattern(
+            Some((&subject).into()),
+            Some(iri(P_AUTHOR).as_ref()),
+            None,
+            Some(GraphNameRef::NamedNode(iri(PUBLIC_TIMELINE).as_ref())),
+        )
+        .next()
+        .transpose()?;
+    Ok(first.is_some())
 }
 
 /// Drop a row — used when a dereference 404s, i.e. the pod no longer has it.

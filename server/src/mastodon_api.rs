@@ -808,8 +808,17 @@ pub async fn create_status(
         "object": note.clone(),
     });
 
-    if let Err(response) = crate::outbox::deliver(&state, &user, &actor, &activity).await {
-        return response;
+    match crate::outbox::deliver(&state, &user, &actor, &activity).await {
+        Ok(()) => {}
+        Err(crate::outbox::DeliverError::Refused(refusal)) => {
+            return error(StatusCode::BAD_REQUEST, refusal.describe());
+        }
+        Err(crate::outbox::DeliverError::Failed) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong. Try again.",
+            );
+        }
     }
 
     let author = author_for(&state, &user).await;

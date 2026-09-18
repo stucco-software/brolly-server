@@ -32,8 +32,9 @@ pub const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
 /// Who a delivery is for.
 pub enum Recipient<'a> {
     /// A member. Their inbox is their home timeline (D6), so it holds the
-    /// activity itself.
-    Member { inbox: &'a str },
+    /// activity itself. Their outbox holds their own published activities, and
+    /// a `Delete` has to be able to clear a copy in either.
+    Member { inbox: &'a str, outbox: &'a str },
     /// The instance actor (D4). Records a pointer, never content.
     Instance,
 }
@@ -42,6 +43,10 @@ pub enum Recipient<'a> {
 pub enum ProcessError {
     Inbox(InboxError),
     Store(String),
+    /// The activity's own id, or the id of an object embedded in it, isn't on
+    /// its actor's origin. Delivering it would let one actor write a graph
+    /// another actor owns.
+    ForeignObject,
 }
 
 impl std::fmt::Display for ProcessError {
@@ -49,6 +54,9 @@ impl std::fmt::Display for ProcessError {
         match self {
             ProcessError::Inbox(e) => write!(f, "{e}"),
             ProcessError::Store(e) => write!(f, "storage: {e}"),
+            ProcessError::ForeignObject => {
+                write!(f, "activity names a graph its actor does not own")
+            }
         }
     }
 }
@@ -74,33 +82,59 @@ impl From<brolly_store::write::WriteError> for ProcessError {
 }
 
 /// Handle one delivered activity.
+///
+/// Before anything is written, the activity is refused with
+/// [`ProcessError::ForeignObject`] if its own id, or the id of an object
+/// embedded in it, isn't on its actor's origin. A string `object` is a
+/// reference and may name anyone's IRI: that is what a `Like` or a `Follow` is.
+///
+/// This is where every recipient's copy arrives, whether from local delivery
+/// or, once federation is on, from another server (ADR 0016).
 pub fn process(
     store: &Store,
     recipient: Recipient<'_>,
     activity: &Value,
     received_at: &str,
 ) -> Result<(), ProcessError> {
+    let actor = owning_actor(activity)?;
     match recipient {
-        Recipient::Member { inbox } => process_for_member(store, inbox, activity, received_at),
-        Recipient::Instance => process_for_instance(store, activity),
+        Recipient::Member { inbox, outbox } => {
+            process_for_member(store, inbox, outbox, actor, activity, received_at)
+        }
+        Recipient::Instance => process_for_instance(store, actor, activity),
     }
 }
 
 fn process_for_member(
     store: &Store,
     inbox: &str,
+    outbox: &str,
+    actor: &str,
     activity: &Value,
     received_at: &str,
 ) -> Result<(), ProcessError> {
     if activity["type"] == "Delete" {
-        // Remove what the Delete names, and the activity that carried it in.
-        if let Some(target) = object_id(activity) {
-            for member in inbox::members(store, inbox) {
-                if references(store, &member, target) {
-                    inbox::remove(store, inbox, &member)?;
+        // Remove only what delivery put there: a graph on the actor's origin
+        // that arrived as the embedded object of one of the actor's activities,
+        // in this pod's inbox (a recipient's copy) or outbox (the author's own).
+        //
+        // Origin alone isn't enough. The owner's pod receives the owner's own
+        // activities, so a Delete naming their `/~/.acl` would pass it and clear
+        // the ACL without WAC ever seeing the request. An LDP resource is never
+        // the embedded object of a delivered activity, so this can't reach one.
+        if let Some(target) = object_id(activity)
+            && same_origin(target, actor)
+        {
+            let mut carried = false;
+            for collection in [inbox, outbox] {
+                for carrier in carriers(store, collection, actor, target) {
+                    inbox::remove(store, collection, &carrier)?;
+                    carried = true;
                 }
             }
-            inbox::remove(store, inbox, target)?;
+            if carried {
+                inbox::remove(store, inbox, target)?;
+            }
         }
         return Ok(());
     }
@@ -109,22 +143,61 @@ fn process_for_member(
     Ok(())
 }
 
-/// Does this stored activity carry `target` as its object?
+/// The actor's activities in `collection` that carried `target` in as their
+/// embedded object.
 ///
-/// Used to find the `Create` that delivered a now-deleted note, so a tombstoned
-/// post does not leave a row in the timeline pointing at a cleared graph.
-fn references(store: &Store, activity: &str, target: &str) -> bool {
-    inbox::read_activity(store, activity).is_some_and(|stored| object_id(&stored) == Some(target))
+/// Embedded, not merely named. A `Create` whose `object` is a plain string IRI
+/// names a graph delivery never wrote, so it's no evidence the graph is
+/// delivery's to remove. That's why this doesn't use [`object_id`], which
+/// treats the two alike.
+fn carriers(store: &Store, collection: &str, actor: &str, target: &str) -> Vec<String> {
+    inbox::members(store, collection)
+        .into_iter()
+        .filter(|member| same_origin(member, actor))
+        .filter(|member| {
+            inbox::read_activity(store, member).is_some_and(|stored| {
+                stored["object"].is_object() && stored["object"]["id"].as_str() == Some(target)
+            })
+        })
+        .collect()
 }
 
-fn process_for_instance(store: &Store, activity: &Value) -> Result<(), ProcessError> {
+fn process_for_instance(store: &Store, actor: &str, activity: &Value) -> Result<(), ProcessError> {
     match activity["type"].as_str() {
-        Some("Create") | Some("Announce") => index_note(store, activity),
+        // A Create publishes the actor's own note. Indexing one that names
+        // somebody else's would put it on the public timeline under the wrong
+        // name.
+        Some("Create") => match object_id(activity) {
+            Some(note) if same_origin(note, actor) => index_note(store, activity),
+            _ => Ok(()),
+        },
+        // An Announce names someone else's note by definition, so it can keep a
+        // post on the public timeline but never put one there. A note nobody
+        // indexed may be followers-only or direct, and the Mastodon public
+        // timeline reads whatever a pointer names out of the owner's pod
+        // without checking its audience. Indexing the boost would publish that
+        // post under the booster's name.
+        //
+        // For a note that is indexed, `index::record_note` keeps the pointer as
+        // its Create wrote it: same author, same `published`, same place. So
+        // today this writes nothing new. The guard is what matters.
+        Some("Announce") => {
+            if let Some(note) = object_id(activity)
+                && index::is_indexed(store, &NamedNode::new_unchecked(note))?
+            {
+                index_note(store, activity)?;
+            }
+            Ok(())
+        }
         Some("Delete") => {
             // A delete for something we never saw is normal, not an error: the
             // sender fans out to every follower's instance regardless of what
             // each one happened to store.
-            if let Some(target) = object_id(activity) {
+            //
+            // Only the note's own origin can take it off the public timeline.
+            if let Some(target) = object_id(activity)
+                && same_origin(target, actor)
+            {
                 index::forget_note(store, &NamedNode::new_unchecked(target))?;
             }
             Ok(())
@@ -179,6 +252,46 @@ fn object_id(activity: &Value) -> Option<&str> {
         Value::String(iri) => Some(iri),
         object @ Value::Object(_) => object["id"].as_str(),
         _ => None,
+    }
+}
+
+/// The activity's actor, provided every graph the activity would write is on
+/// that actor's origin.
+///
+/// Strict on shape: no string `actor`, no string `id`, or an embedded object
+/// whose `id` isn't a string, all refuse. Each of them leaves nothing to check
+/// ownership against.
+fn owning_actor(activity: &Value) -> Result<&str, ProcessError> {
+    let actor = activity["actor"]
+        .as_str()
+        .ok_or(ProcessError::ForeignObject)?;
+    let own_id = activity["id"]
+        .as_str()
+        .is_some_and(|id| same_origin(id, actor));
+    let own_object = match activity.get("object") {
+        Some(object @ Value::Object(_)) => object
+            .get("id")
+            .is_none_or(|id| id.as_str().is_some_and(|id| same_origin(id, actor))),
+        _ => true,
+    };
+    if own_id && own_object {
+        Ok(actor)
+    } else {
+        Err(ProcessError::ForeignObject)
+    }
+}
+
+/// Do two IRIs share an origin: scheme, host and port?
+///
+/// False if either doesn't parse, or has an opaque origin (`urn:` and the
+/// like). Nobody owns an origin that can't be compared.
+fn same_origin(a: &str, b: &str) -> bool {
+    match (url::Url::parse(a), url::Url::parse(b)) {
+        (Ok(a), Ok(b)) => {
+            let origin = a.origin();
+            origin.is_tuple() && origin == b.origin()
+        }
+        _ => false,
     }
 }
 
@@ -241,5 +354,40 @@ mod tests {
         assert!(!addressed_publicly(
             &json!({"to": ["https://www.w3.org/ns/activitystreams#PublicIsh"]})
         ));
+    }
+
+    #[test]
+    fn origin_is_scheme_host_and_port() {
+        let actor = "https://alice.brolly.test/actor";
+        assert!(same_origin("https://alice.brolly.test/~/notes/1", actor));
+        assert!(
+            same_origin("https://alice.brolly.test:443/~/notes/1", actor),
+            "the default port is the port"
+        );
+        assert!(
+            same_origin("https://ALICE.brolly.test/~/notes/1", actor),
+            "hosts compare case-insensitively"
+        );
+
+        assert!(
+            !same_origin("https://alice.brolly.test:8443/x", actor),
+            "port"
+        );
+        assert!(!same_origin("http://alice.brolly.test/x", actor), "scheme");
+        assert!(!same_origin("https://bob.brolly.test/x", actor), "host");
+        assert!(
+            !same_origin("https://alice.brolly.test.evil/x", actor),
+            "host suffix"
+        );
+    }
+
+    #[test]
+    fn an_unparseable_or_opaque_iri_has_no_origin_in_common() {
+        let actor = "https://alice.brolly.test/actor";
+        assert!(!same_origin("not a url", actor));
+        assert!(!same_origin(actor, ""));
+        assert!(!same_origin("", ""));
+        // An opaque origin equals nothing, not even itself.
+        assert!(!same_origin("urn:example:a", "urn:example:a"));
     }
 }
