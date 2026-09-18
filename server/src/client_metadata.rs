@@ -6,12 +6,17 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::pin::Pin;
+use std::time::{Duration, Instant};
 
 use brolly_atproto::client_metadata::{
     ClientError, ClientId, ClientMetadata, loopback_metadata, parse_client_id, validate,
 };
-use url::Url;
+use moka::Expiry;
+use moka::future::Cache;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use url::{Host, Url};
 
 /// Why a client's metadata couldn't be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +102,312 @@ impl ClientLookup for StaticClients {
             .ok_or(LookupError::Unreachable);
         Box::pin(std::future::ready(found))
     }
+}
+
+// --- fetching --------------------------------------------------------------------
+
+/// Total time for one fetch: connect, TLS, headers and body.
+const TIMEOUT: Duration = Duration::from_secs(5);
+/// Client metadata is a few hundred bytes. Anything this big isn't metadata.
+const MAX_BODY: usize = 64 * 1024;
+const OK_TTL: Duration = Duration::from_secs(10 * 60);
+/// Failures are cached too, so a bad or slow client can't make every PAR
+/// fetch again.
+const ERR_TTL: Duration = Duration::from_secs(60);
+const CAPACITY: u64 = 1_000;
+/// Static, not per instance: `Fetcher::new` takes no arguments, and the software
+/// and version are what a client operator needs to recognise the fetch in their
+/// logs. Which instance asked is the one their user just signed in to.
+const FETCH_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
+type Cached = Result<ClientMetadata, LookupError>;
+
+/// Why one retrieval failed, in the detail the operator's log needs and the
+/// caller must never see.
+enum Failure {
+    /// Refused without reading a response, or while reading it.
+    Refused(&'static str),
+    /// Any status other than 200.
+    Status(reqwest::StatusCode),
+    /// reqwest's own: https-only, DNS refusal by [`PublicOnly`], connection,
+    /// TLS, timeout, a broken body.
+    Http(reqwest::Error),
+    /// The document was read and broke a rule.
+    Invalid(ClientError),
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Refused(why) => f.write_str(why),
+            Failure::Status(status) => write!(f, "answered {status}"),
+            Failure::Http(e) => e.fmt(f),
+            Failure::Invalid(e) => e.fmt(f),
+        }
+    }
+}
+
+/// Fetches client metadata over the network, from public addresses only, and
+/// caches the answer.
+///
+/// What `main.rs` builds. Every bypass of the address filter is closed where it
+/// happens (S3):
+/// - redirects aren't followed, so a public host can't bounce the fetch inward;
+/// - proxies are off, so an environment proxy can't resolve names the filter
+///   never sees;
+/// - names resolve through [`PublicOnly`], which filters at resolution, leaving
+///   no window between checking an address and connecting to it;
+/// - IP-literal hosts never reach a resolver, so they're refused here (and
+///   `parse_client_id` refuses them before that).
+///
+/// It never calls `ClientBuilder::resolve` or `resolve_to_addrs`: reqwest
+/// applies those overrides on top of the custom resolver.
+pub struct Fetcher {
+    http: reqwest::Client,
+    cache: Cache<String, Cached>,
+    allow_loopback: bool,
+}
+
+impl Fetcher {
+    pub fn new() -> Result<Self, reqwest::Error> {
+        Self::build(false, false, OK_TTL, ERR_TTL)
+    }
+
+    /// For this module's unit tests, which fetch from `http://127.0.0.1:PORT`
+    /// and need cache lifetimes in milliseconds.
+    ///
+    /// `allow_loopback` lets loopback IP literals through and stops
+    /// [`PublicOnly`] dropping loopback addresses. `allow_http` lifts
+    /// https-only.
+    #[cfg(test)]
+    pub fn for_tests(
+        allow_loopback: bool,
+        allow_http: bool,
+        ok_ttl: Duration,
+        err_ttl: Duration,
+    ) -> Self {
+        Self::build(allow_loopback, allow_http, ok_ttl, err_ttl).unwrap()
+    }
+
+    fn build(
+        allow_loopback: bool,
+        allow_http: bool,
+        ok_ttl: Duration,
+        err_ttl: Duration,
+    ) -> Result<Self, reqwest::Error> {
+        // Idempotent. Here as well as in main so no constructor can reach
+        // reqwest's panic for a missing crypto provider.
+        crate::tls::install_crypto_provider();
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .timeout(TIMEOUT)
+            .user_agent(FETCH_USER_AGENT)
+            .https_only(!allow_http)
+            .dns_resolver(PublicOnly { allow_loopback })
+            .build()?;
+        let cache = Cache::builder()
+            .max_capacity(CAPACITY)
+            .expire_after(Lifetimes {
+                ok: ok_ttl,
+                err: err_ttl,
+            })
+            .build();
+        Ok(Self {
+            http,
+            cache,
+            allow_loopback,
+        })
+    }
+
+    /// Would connecting to this URL's host skip the resolver filter?
+    fn host_allowed(&self, url: &Url) -> bool {
+        match url.host() {
+            Some(Host::Domain(_)) => true,
+            Some(Host::Ipv4(ip)) => self.allow_loopback && ip.is_loopback(),
+            Some(Host::Ipv6(ip)) => self.allow_loopback && ip.is_loopback(),
+            None => false,
+        }
+    }
+
+    /// One retrieval, as the cache stores it. The only place a failure is
+    /// logged, so each is logged once, and a cached failure not again.
+    async fn retrieve(&self, url: &Url) -> Cached {
+        self.request(url).await.map_err(|failure| {
+            // The caller gets one description; the operator gets the detail.
+            tracing::info!(client_id = %url, error = %failure, "client metadata lookup failed");
+            match failure {
+                Failure::Invalid(e) => LookupError::Invalid(e),
+                Failure::Refused(_) | Failure::Status(_) | Failure::Http(_) => {
+                    LookupError::Unreachable
+                }
+            }
+        })
+    }
+
+    async fn request(&self, url: &Url) -> Result<ClientMetadata, Failure> {
+        if !self.host_allowed(url) {
+            return Err(Failure::Refused("the host is an IP address"));
+        }
+        let mut response = self
+            .http
+            .get(url.as_str())
+            .header(reqwest::header::ACCEPT, "application/json")
+            .send()
+            .await
+            .map_err(Failure::Http)?;
+        if response.status() != reqwest::StatusCode::OK {
+            return Err(Failure::Status(response.status()));
+        }
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(Failure::Http)? {
+            if body.len() + chunk.len() > MAX_BODY {
+                return Err(Failure::Refused("the body is over 64 KiB"));
+            }
+            body.extend_from_slice(&chunk);
+        }
+
+        validate(&ClientId::Discoverable(url.clone()), &content_type, &body)
+            .map_err(Failure::Invalid)
+    }
+}
+
+impl ClientLookup for Fetcher {
+    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a> {
+        // get_with also collapses concurrent lookups of one client into a
+        // single fetch.
+        Box::pin(async move {
+            self.cache
+                .get_with(url.as_str().to_owned(), self.retrieve(url))
+                .await
+        })
+    }
+}
+
+/// Successes are kept longer than failures.
+struct Lifetimes {
+    ok: Duration,
+    err: Duration,
+}
+
+impl Expiry<String, Cached> for Lifetimes {
+    fn expire_after_create(&self, _key: &String, value: &Cached, _at: Instant) -> Option<Duration> {
+        Some(if value.is_ok() { self.ok } else { self.err })
+    }
+}
+
+// --- address filtering ------------------------------------------------------------
+
+/// A DNS resolver that only returns public addresses.
+///
+/// Resolves with tokio's resolver, then drops every address [`is_public`]
+/// refuses. If none survive, resolution fails, so the connection is never
+/// attempted.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct PublicOnly {
+    allow_loopback: bool,
+}
+
+impl Resolve for PublicOnly {
+    fn resolve(&self, name: Name) -> Resolving {
+        Box::pin(resolve_public(
+            name.as_str().to_owned(),
+            self.allow_loopback,
+        ))
+    }
+}
+
+async fn resolve_public(
+    host: String,
+    allow_loopback: bool,
+) -> Result<Addrs, Box<dyn std::error::Error + Send + Sync>> {
+    let allowed: Vec<SocketAddr> = tokio::net::lookup_host((host.as_str(), 0))
+        .await?
+        .filter(|addr| {
+            is_public(addr.ip()) || (allow_loopback && addr.ip().to_canonical().is_loopback())
+        })
+        .collect();
+    if allowed.is_empty() {
+        return Err(std::io::Error::other("the host has no public address").into());
+    }
+    Ok(Box::new(allowed.into_iter()))
+}
+
+/// May a client metadata fetch connect to this address?
+///
+/// Refuses loopback, private (RFC 1918 / RFC 4193), link-local, unspecified,
+/// multicast, broadcast, CGNAT, documentation and benchmarking ranges, and
+/// IPv6 forms that can carry an IPv4 address. IPv4-mapped, SIIT-translated
+/// and NAT64 are judged by the IPv4 address inside them. IPv4-compatible,
+/// local-use NAT64, 6to4 and Teredo are refused outright.
+fn is_public(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => is_public_v4(v4),
+            None => is_public_v6(v6),
+        },
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let [a, b, c, _] = ip.octets();
+    let refused = a == 0                                  // 0.0.0.0/8, unspecified and "this network"
+        || ip.is_loopback()                               // 127.0.0.0/8
+        || ip.is_private()                                // 10/8, 172.16/12, 192.168/16
+        || ip.is_link_local()                             // 169.254.0.0/16
+        || (a == 100 && (b & 0b1100_0000) == 64)          // 100.64.0.0/10, CGNAT
+        || (a == 192 && b == 0 && c == 0)                 // 192.0.0.0/24, IETF protocol assignments
+        || (a == 192 && b == 88 && c == 99)               // 192.88.99.0/24, 6to4 relay anycast (deprecated)
+        || ip.is_documentation()                          // 192.0.2/24, 198.51.100/24, 203.0.113/24
+        || (a == 198 && (b & 0b1111_1110) == 18)          // 198.18.0.0/15, benchmarking
+        || ip.is_multicast()                              // 224.0.0.0/4
+        || a >= 240; // 240.0.0.0/4 reserved, including 255.255.255.255 broadcast
+    !refused
+}
+
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    let s = ip.segments();
+    // IPv4-compatible (::/96, deprecated), which also covers :: and ::1.
+    if s[..6] == [0; 6] {
+        return false;
+    }
+    // Forms that reach exactly the IPv4 address in their last 32 bits: judge
+    // that address. (IPv4-mapped, ::ffff:0:0/96, is unwrapped in `is_public`.)
+    let embedded = || {
+        let [a, b] = s[6].to_be_bytes();
+        let [c, d] = s[7].to_be_bytes();
+        Ipv4Addr::new(a, b, c, d)
+    };
+    // NAT64 well-known prefix, 64:ff9b::/96 (RFC 6052).
+    if s[0] == 0x0064 && s[1] == 0xff9b && s[2..6] == [0; 4] {
+        return is_public_v4(embedded());
+    }
+    // SIIT IPv4-translated, ::ffff:0:0:0/96 (RFC 7915).
+    if s[..6] == [0, 0, 0, 0, 0xffff, 0] {
+        return is_public_v4(embedded());
+    }
+    // Forms whose destination depends on a translator or relay we can't see,
+    // or that embed IPv4 somewhere other than the last 32 bits: refused
+    // whatever they carry.
+    let refused = (s[0] == 0x0064 && s[1] == 0xff9b && s[2] == 0x0001) // 64:ff9b:1::/48, local-use NAT64 (RFC 8215)
+        || s[0] == 0x2002                               // 2002::/16, 6to4
+        || (s[0] == 0x2001 && s[1] == 0x0000)           // 2001::/32, Teredo
+        || (s[0] == 0x0100 && s[1..4] == [0; 3])        // 100::/64, discard-only (RFC 6666)
+        || (s[0] & 0xfe00) == 0xfc00                    // fc00::/7, unique local (RFC 4193)
+        || (s[0] & 0xffc0) == 0xfe80                    // fe80::/10, link-local
+        || (s[0] & 0xffc0) == 0xfec0                    // fec0::/10, site-local (deprecated)
+        || (s[0] & 0xff00) == 0xff00                    // ff00::/8, multicast
+        || (s[0] == 0x2001 && s[1] == 0x0db8)           // 2001:db8::/32, documentation
+        || (s[0] == 0x2001 && s[1] == 0x0002 && s[2] == 0); // 2001:2::/48, benchmarking
+    !refused
 }
 
 #[cfg(test)]
@@ -193,5 +504,488 @@ mod tests {
             LookupError::Unreachable.to_string(),
             "client metadata could not be retrieved"
         );
+    }
+}
+
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use axum::Router;
+    use axum::http::{StatusCode, header};
+    use axum::routing::get;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const MINUTE: Duration = Duration::from_secs(60);
+
+    fn document(client_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "client_id": client_id,
+            "redirect_uris": ["https://app.example/cb"],
+            "scope": "atproto",
+            "grant_types": ["authorization_code"],
+            "response_types": ["code"],
+            "dpop_bound_access_tokens": true,
+        })
+    }
+
+    /// Serve `app(url)` on an ephemeral loopback port. `url` is the address of
+    /// `/client-metadata.json` on it, which a valid document must repeat.
+    async fn serve(app: impl FnOnce(String) -> Router) -> Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = Url::parse(&format!(
+            "http://{}/client-metadata.json",
+            listener.local_addr().unwrap()
+        ))
+        .unwrap();
+        let router = app(url.to_string());
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+        url
+    }
+
+    /// `/client-metadata.json`, always answering with these, counting hits.
+    fn answering(
+        status: StatusCode,
+        content_type: &'static str,
+        body: String,
+        hits: &Arc<AtomicUsize>,
+    ) -> Router {
+        let hits = hits.clone();
+        Router::new().route(
+            "/client-metadata.json",
+            get(move || {
+                let hits = hits.clone();
+                let body = body.clone();
+                async move {
+                    hits.fetch_add(1, Ordering::SeqCst);
+                    (status, [(header::CONTENT_TYPE, content_type)], body)
+                }
+            }),
+        )
+    }
+
+    fn local_fetcher() -> Fetcher {
+        Fetcher::for_tests(true, true, MINUTE, MINUTE)
+    }
+
+    #[tokio::test]
+    async fn a_valid_document_is_fetched_and_cached() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                document(&url).to_string(),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher = local_fetcher();
+
+        let first = fetcher.fetch(&url).await.unwrap();
+        assert_eq!(first.client_id(), url.as_str());
+        let second = fetcher.fetch(&url).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the second lookup is a cache hit"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_redirect_is_not_followed() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                document(&url).to_string(),
+                &hits,
+            )
+            .route(
+                "/moved.json",
+                get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, "/client-metadata.json")],
+                    )
+                }),
+            )
+        })
+        .await;
+        let moved = url.join("/moved.json").unwrap();
+
+        assert_eq!(
+            local_fetcher().fetch(&moved).await,
+            Err(LookupError::Unreachable)
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the redirect target was never fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_200_is_accepted() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(
+                StatusCode::CREATED,
+                "application/json",
+                document(&url).to_string(),
+                &hits,
+            )
+        })
+        .await;
+        assert_eq!(
+            local_fetcher().fetch(&url).await,
+            Err(LookupError::Unreachable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_body_over_64_kib_is_refused() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            let mut padded = document(&url);
+            padded["padding"] = serde_json::Value::String("x".repeat(70 * 1024));
+            answering(
+                StatusCode::OK,
+                "application/json",
+                padded.to_string(),
+                &hits,
+            )
+        })
+        .await;
+        assert_eq!(
+            local_fetcher().fetch(&url).await,
+            Err(LookupError::Unreachable)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_slow_server_hits_the_timeout() {
+        let url = serve(|url| {
+            let body = document(&url).to_string();
+            Router::new().route(
+                "/client-metadata.json",
+                get(move || {
+                    let body = body.clone();
+                    async move {
+                        tokio::time::sleep(Duration::from_secs(30)).await;
+                        ([(header::CONTENT_TYPE, "application/json")], body)
+                    }
+                }),
+            )
+        })
+        .await;
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            local_fetcher().fetch(&url).await,
+            Err(LookupError::Unreachable)
+        );
+        let waited = started.elapsed();
+        assert!(
+            waited >= Duration::from_secs(4) && waited < Duration::from_secs(10),
+            "gave up after {waited:?}, expected the 5 s timeout"
+        );
+    }
+
+    #[tokio::test]
+    async fn text_html_is_refused() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(
+                StatusCode::OK,
+                "text/html",
+                document(&url).to_string(),
+                &hits,
+            )
+        })
+        .await;
+        assert!(matches!(
+            local_fetcher().fetch(&url).await,
+            Err(LookupError::Invalid(ClientError::InvalidMetadata(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failure_is_cached_for_its_lifetime_then_retried() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|_| {
+            answering(
+                StatusCode::NOT_FOUND,
+                "text/plain",
+                "gone".to_string(),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher = Fetcher::for_tests(true, true, MINUTE, Duration::from_millis(50));
+
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "a failure is cached too");
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "and retried once it expires"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ip_literal_is_refused_unless_loopback_is_allowed() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                document(&url).to_string(),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher = Fetcher::for_tests(false, true, MINUTE, MINUTE);
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "refused before connecting");
+    }
+
+    #[tokio::test]
+    async fn a_name_that_resolves_only_to_loopback_is_refused() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let ip_url = serve(|url| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                document(&url).to_string(),
+                &hits,
+            )
+        })
+        .await;
+        let mut by_name = ip_url.clone();
+        by_name.set_host(Some("localhost")).unwrap();
+
+        let fetcher = Fetcher::for_tests(false, true, MINUTE, MINUTE);
+        assert_eq!(fetcher.fetch(&by_name).await, Err(LookupError::Unreachable));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "PublicOnly dropped every address"
+        );
+    }
+
+    #[tokio::test]
+    async fn plain_http_is_refused_unless_allowed() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                document(&url).to_string(),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher = Fetcher::for_tests(true, false, MINUTE, MINUTE);
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn production_refuses_ip_literals_and_plain_http() {
+        // Pins Fetcher::new, what main.rs builds, to allow_loopback = false and
+        // allow_http = false. `request` rather than `fetch`, so each refusal is
+        // seen to come from its own flag and not from something further on.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                document(&url).to_string(),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher = Fetcher::new().unwrap();
+
+        // http://127.0.0.1:PORT: refused as an IP literal, before connecting.
+        assert!(matches!(
+            fetcher.request(&url).await,
+            Err(Failure::Refused(_))
+        ));
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+
+        // An https IP literal, loopback or public, is refused the same way.
+        let mut https_loopback = url.clone();
+        https_loopback.set_scheme("https").unwrap();
+        assert!(matches!(
+            fetcher.request(&https_loopback).await,
+            Err(Failure::Refused(_))
+        ));
+        let https_public = Url::parse("https://1.1.1.1/client-metadata.json").unwrap();
+        assert!(matches!(
+            fetcher.request(&https_public).await,
+            Err(Failure::Refused(_))
+        ));
+
+        // http by name gets past the literal check and is refused by
+        // https_only, which reqwest reports as a builder error, before any
+        // resolution or connection.
+        let mut http_by_name = url.clone();
+        http_by_name.set_host(Some("localhost")).unwrap();
+        assert!(matches!(
+            fetcher.request(&http_by_name).await,
+            Err(Failure::Http(e)) if e.is_builder()
+        ));
+
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the server");
+    }
+
+    #[tokio::test]
+    async fn the_fetch_names_its_software() {
+        let seen = Arc::new(std::sync::Mutex::new(None::<String>));
+        let url = serve(|url| {
+            let body = document(&url).to_string();
+            let seen = seen.clone();
+            Router::new().route(
+                "/client-metadata.json",
+                get(move |headers: axum::http::HeaderMap| {
+                    let body = body.clone();
+                    let seen = seen.clone();
+                    async move {
+                        *seen.lock().unwrap() = headers
+                            .get(header::USER_AGENT)
+                            .and_then(|v| v.to_str().ok())
+                            .map(str::to_owned);
+                        ([(header::CONTENT_TYPE, "application/json")], body)
+                    }
+                }),
+            )
+        })
+        .await;
+
+        local_fetcher().fetch(&url).await.unwrap();
+        let seen = seen.lock().unwrap().clone();
+        assert_eq!(seen.as_deref(), Some(FETCH_USER_AGENT));
+        assert!(FETCH_USER_AGENT.starts_with("brolly-server/"));
+    }
+
+    // --- PublicOnly -----------------------------------------------------------------
+
+    #[test]
+    fn every_refused_range_is_refused() {
+        for ip in [
+            // IPv4
+            "0.0.0.0",         // unspecified
+            "0.1.2.3",         // "this network"
+            "127.0.0.1",       // loopback
+            "127.255.255.254", // loopback
+            "10.0.0.1",        // RFC 1918
+            "172.16.0.1",      // RFC 1918
+            "172.31.255.255",  // RFC 1918
+            "192.168.1.1",     // RFC 1918
+            "169.254.169.254", // link-local, and the cloud metadata service
+            "100.64.0.1",      // CGNAT
+            "100.127.255.254", // CGNAT
+            "224.0.0.1",       // multicast
+            "239.255.255.255", // multicast
+            "255.255.255.255", // broadcast
+            "240.0.0.1",       // reserved
+            "192.0.2.1",       // documentation
+            "198.51.100.7",    // documentation
+            "203.0.113.9",     // documentation
+            "198.18.0.1",      // benchmarking
+            "198.19.255.254",  // benchmarking
+            "192.0.0.8",       // IETF protocol assignments
+            "192.88.99.1",     // 6to4 relay anycast (deprecated)
+            // IPv6
+            "::",             // unspecified
+            "::1",            // loopback
+            "fc00::1",        // unique local (RFC 4193)
+            "fd12:3456::1",   // unique local (RFC 4193)
+            "fe80::1",        // link-local
+            "fec0::1",        // site-local (deprecated)
+            "ff02::1",        // multicast
+            "2001:db8::1",    // documentation
+            "2001:2::1",      // benchmarking
+            "::127.0.0.1",    // IPv4-compatible (deprecated)
+            "64:ff9b::a00:1", // NAT64 of 10.0.0.1
+            "100::1",         // discard-only (RFC 6666)
+            // local-use NAT64 (RFC 8215), refused whatever it embeds
+            "64:ff9b:1::a00:1",
+            "64:ff9b:1::808:808",
+            // SIIT IPv4-translated (::ffff:0:0:0/96) of refused IPv4 addresses
+            "::ffff:0:0.0.0.0",
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.0.0.1",
+            "::ffff:0:169.254.169.254",
+            "::ffff:0:100.64.0.1",
+            // 6to4 (2002::/16), refused whatever it embeds
+            "2002:a00:1::1",
+            "2002:808:808::1",
+            // Teredo (2001::/32), refused whatever it embeds
+            "2001:0:4136:e378:8000:63bf:3fff:fdd2",
+            "2001::1",
+            // IPv4-mapped IPv6 forms
+            "::ffff:0.0.0.0",
+            "::ffff:127.0.0.1",
+            "::ffff:10.0.0.1",
+            "::ffff:172.16.0.1",
+            "::ffff:192.168.1.1",
+            "::ffff:169.254.169.254",
+            "::ffff:100.64.0.1",
+            "::ffff:224.0.0.1",
+            "::ffff:255.255.255.255",
+            "::ffff:192.0.2.1",
+            "::ffff:198.18.0.1",
+        ] {
+            assert!(!is_public(ip.parse().unwrap()), "{ip} should be refused");
+        }
+    }
+
+    #[test]
+    fn a_public_address_is_allowed() {
+        for ip in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "93.184.215.14",
+            "100.63.255.255", // just below CGNAT
+            "100.128.0.1",    // just above CGNAT
+            "172.15.255.255", // just below RFC 1918
+            "172.32.0.1",     // just above RFC 1918
+            "198.17.255.255", // just below benchmarking
+            "198.20.0.1",     // just above benchmarking
+            "2606:4700:4700::1111",
+            "2a00:1450:4001::1",
+            "::ffff:1.1.1.1",
+            "64:ff9b::808:808",     // NAT64 of 8.8.8.8
+            "::ffff:0:8.8.8.8",     // SIIT of 8.8.8.8
+            "2001:4860:4860::8888", // Google DNS, in 2001::/16 but not Teredo
+            "2003::1",              // just above 6to4
+            "100:0:0:1::1",         // just outside the discard 100::/64
+        ] {
+            assert!(is_public(ip.parse().unwrap()), "{ip} should be allowed");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_resolver_drops_loopback_unless_told_otherwise() {
+        let refused = PublicOnly::default()
+            .resolve("localhost".parse().unwrap())
+            .await;
+        assert!(refused.is_err(), "localhost has no public address");
+
+        let allowed = PublicOnly {
+            allow_loopback: true,
+        }
+        .resolve("localhost".parse().unwrap())
+        .await;
+        assert!(allowed.is_ok_and(|mut addrs| addrs.next().is_some()));
     }
 }

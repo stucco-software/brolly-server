@@ -107,8 +107,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .0,
         plc_client,
-        // Nothing reads this yet. The next commit replaces it with the fetcher.
-        clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
+        // ATProto OAuth clients are identified by a URL serving their
+        // metadata. Fetched from public addresses only, validated, cached.
+        clients: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::new()?),
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

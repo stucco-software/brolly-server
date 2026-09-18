@@ -59,6 +59,9 @@ url = "2.5.8"
 sha2 = "0.11.0"
 base64 = "0.23.1"
 uuid = { version = "1.25.0", features = ["v4"] }
+# Client metadata cache for ATProto PAR. `future` because lookups happen
+# inside handlers; store already takes moka with `sync`, and the two unify.
+moka = { version = "0.12.16", features = ["future"] }
 
 [dev-dependencies]
 brolly-solid.workspace = true
