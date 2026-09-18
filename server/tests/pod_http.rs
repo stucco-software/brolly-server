@@ -692,3 +692,195 @@ async fn the_headers_ldp_depends_on_are_exposed() {
         assert!(exposed.contains(wanted), "{wanted} not exposed: {exposed}");
     }
 }
+
+// --- ACL resources -------------------------------------------------------------
+
+/// Another member with a live session, for requests made by someone other
+/// than the pod's owner.
+async fn member_session(h: &Harness, username: &str) -> String {
+    let user = db::create_user(
+        &h._db.pool,
+        username,
+        None,
+        "correct-horse-battery",
+        "member",
+    )
+    .await
+    .unwrap();
+    db::create_session(&h._db.pool, user.id, time::Duration::hours(1), None)
+        .await
+        .unwrap()
+}
+
+/// [`Harness::send`], as whoever holds `session`.
+async fn send_as(
+    h: &Harness,
+    session: &str,
+    method: &str,
+    path: &str,
+    body: Option<(&str, &str)>,
+) -> (StatusCode, String, axum::http::HeaderMap) {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, format!("brolly_session={session}"));
+    if let Some((content_type, _)) = body {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    let request = builder
+        .body(body.map_or(Body::empty(), |(_, b)| Body::from(b.to_string())))
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let text = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    (status, text, headers)
+}
+
+const BOB_WEBID: &str = "https://bob.brolly.test/profile#me";
+
+/// `/~/shared/.acl`: Alice controls `/~/shared/`; Bob may read and write
+/// everything inside it through `acl:default`, and holds no Control.
+fn share_with_bob(h: &Harness) {
+    let pod = h.stores.pod(h.user).unwrap();
+    let shared = format!("{ROOT}shared/");
+    let g = format!("{shared}.acl");
+    let owner = format!("{g}#owner");
+    let bob = format!("{g}#bob");
+    insert_quads(
+        &pod,
+        &[
+            t(&g, &owner, &format!("{ACL}accessTo"), &shared),
+            t(&g, &owner, &format!("{ACL}default"), &shared),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Control")),
+            t(
+                &g,
+                &owner,
+                &format!("{ACL}agent"),
+                &format!("{BASE}/profile#me"),
+            ),
+            t(&g, &bob, &format!("{ACL}default"), &shared),
+            t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            t(&g, &bob, &format!("{ACL}agent"), BOB_WEBID),
+        ],
+    )
+    .unwrap();
+}
+
+/// The takeover over the wire: inherited Write used to be enough to PATCH the
+/// container's ACL and grant yourself Control.
+#[tokio::test]
+async fn bob_cannot_patch_an_acl_he_does_not_control() {
+    let h = harness().await;
+    share_with_bob(&h);
+    let bob = member_session(&h, "bob").await;
+
+    let bob_auth = format!("{ROOT}shared/.acl#bob");
+    let grab = format!("INSERT DATA {{ <{bob_auth}> <{ACL}mode> <{ACL}Control> }}");
+    let (status, _, _) = send_as(
+        &h,
+        &bob,
+        "PATCH",
+        "/~/shared/.acl",
+        Some(("application/sparql-update", &grab)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let pod = h.stores.pod(h.user).unwrap();
+    let granted = pod
+        .contains(&t(
+            &format!("{ROOT}shared/.acl"),
+            &bob_auth,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Control"),
+        ))
+        .unwrap();
+    assert!(!granted, "the refused PATCH must not have landed");
+}
+
+/// The same takeover by replacing the whole document. `ldp::put` refuses with
+/// `Forbidden`, which `pod.rs::ldp_error` answers with 403.
+#[tokio::test]
+async fn bob_cannot_put_an_acl_he_does_not_control() {
+    let h = harness().await;
+    share_with_bob(&h);
+    let bob = member_session(&h, "bob").await;
+
+    let shared = format!("{ROOT}shared/");
+    let takeover = format!(
+        "@prefix acl: <{ACL}> .\n\
+         <#bob> acl:agent <{BOB_WEBID}> ; acl:accessTo <{shared}> ; acl:default <{shared}> ;\n\
+           acl:mode acl:Read, acl:Write, acl:Control .\n"
+    );
+    let (status, _, _) = send_as(
+        &h,
+        &bob,
+        "PUT",
+        "/~/shared/.acl",
+        Some(("text/turtle", &takeover)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let pod = h.stores.pod(h.user).unwrap();
+    let g = format!("{shared}.acl");
+    let control = |auth: &str| {
+        pod.contains(&t(
+            &g,
+            auth,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Control"),
+        ))
+        .unwrap()
+    };
+    assert!(!control(&format!("{g}#bob")), "the refused PUT landed");
+    assert!(control(&format!("{g}#owner")), "Alice's grant was replaced");
+}
+
+/// Deleting the container's ACL would drop Alice's grants on `/~/shared/` and
+/// fall back to the root ACL. `ldp::delete` refuses with `Forbidden` before it
+/// looks for the resource, so this is a 403, not a 404.
+#[tokio::test]
+async fn bob_cannot_delete_an_acl_he_does_not_control() {
+    let h = harness().await;
+    share_with_bob(&h);
+    let bob = member_session(&h, "bob").await;
+
+    let (status, _, _) = send_as(&h, &bob, "DELETE", "/~/shared/.acl", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let pod = h.stores.pod(h.user).unwrap();
+    assert!(
+        storage::exists(&pod, &format!("{ROOT}shared/.acl")),
+        "the refused DELETE landed"
+    );
+}
+
+#[tokio::test]
+async fn wac_allow_on_an_acl_names_nothing_for_bob() {
+    let h = harness().await;
+    share_with_bob(&h);
+    let bob = member_session(&h, "bob").await;
+
+    let (status, _, headers) = send_as(&h, &bob, "GET", "/~/shared/.acl", None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "existence is a disclosure");
+    // A refusal carries no WAC-Allow at all, and an empty one would do too.
+    // What must never appear is a mode.
+    let allowed = headers
+        .get("wac-allow")
+        .map(|v| v.to_str().unwrap().to_string());
+    assert!(
+        matches!(allowed.as_deref(), None | Some("user=\"\"")),
+        "got {allowed:?}"
+    );
+
+    let (status, _, headers) = h.send("GET", "/~/shared/.acl", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["wac-allow"], "user=\"read write append control\"");
+}

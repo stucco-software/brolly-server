@@ -24,6 +24,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 pub struct TestDb {
     _container: ContainerAsync<Postgres>,
     pub pool: PgPool,
+    /// The connection string, for tests that spawn a subprocess rather than
+    /// using the pool. `brolly-admin` connects with `DATABASE_URL`.
+    pub url: String,
 }
 
 /// Start a Postgres container and connect to it.
@@ -49,5 +52,6 @@ pub async fn postgres() -> TestDb {
     TestDb {
         _container: container,
         pool,
+        url,
     }
 }

@@ -127,7 +127,29 @@ fn iri(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
 }
 
+/// The resource an ACL resource governs, or `None` if `path` is not one.
+///
+/// A path is an ACL resource when it ends in `.acl`. Every trailing `.acl`
+/// comes off, so `/~/x.acl.acl` governs `/~/x`. Stopping after one would make
+/// `/~/x.acl` the governed resource, and whoever holds Control over *that*
+/// (which is anyone with Control over `/~/x`'s container, not over `/~/x`)
+/// could reach it. Only the suffix is examined, so this works on a full IRI as
+/// well as on a path.
+pub fn governed(path: &str) -> Option<&str> {
+    let mut resource = path.strip_suffix(".acl")?;
+    while let Some(shorter) = resource.strip_suffix(".acl") {
+        resource = shorter;
+    }
+    Some(resource)
+}
+
 /// Resolve and evaluate the ACL governing `resource`.
+///
+/// An ACL resource is the exception (stage 0, A2). Whatever mode is asked for,
+/// it needs `acl:Control` on the resource it [`governed`]s, from that
+/// resource's own ACL or an ancestor's `acl:default`. Without this, a caller
+/// with inherited Write could rewrite the ACL above them and grant themselves
+/// anything, and one with inherited Read could list who else has access.
 fn check(
     store: &Store,
     base: &str,
@@ -135,6 +157,10 @@ fn check(
     subject: &Subject,
     mode: AccessMode,
 ) -> Result<bool, LdpError> {
+    let (path, mode) = match governed(path) {
+        Some(resource) => (resource, AccessMode::Control),
+        None => (path, mode),
+    };
     let Some(acl) = effective_acl(store, base, path).map_err(|e| LdpError::Store(e.to_string()))?
     else {
         // No ACL anywhere in the hierarchy grants nothing. The storage root is
@@ -145,19 +171,33 @@ fn check(
     authorize(store, &acl, &subject.agent(), mode).map_err(|e| LdpError::Store(e.to_string()))
 }
 
-fn granted_modes(store: &Store, base: &str, path: &str, subject: &Subject) -> Vec<AccessMode> {
-    let Ok(Some(acl)) = effective_acl(store, base, path) else {
-        return Vec::new();
-    };
-    [
+/// Modes `subject` holds on `path`, for the `WAC-Allow` header.
+///
+/// On an ACL resource this is all or nothing. Every mode needs Control on the
+/// governed resource, so holding it grants all four and lacking it grants none.
+/// Reporting the governed resource's own modes instead would advertise an edit
+/// affordance the request would then refuse.
+pub fn granted_modes(store: &Store, base: &str, path: &str, subject: &Subject) -> Vec<AccessMode> {
+    const ALL: [AccessMode; 4] = [
         AccessMode::Read,
         AccessMode::Write,
         AccessMode::Append,
         AccessMode::Control,
-    ]
-    .into_iter()
-    .filter(|mode| matches!(authorize(store, &acl, &subject.agent(), *mode), Ok(true)))
-    .collect()
+    ];
+
+    if governed(path).is_some() {
+        return match check(store, base, path, subject, AccessMode::Control) {
+            Ok(true) => ALL.to_vec(),
+            _ => Vec::new(),
+        };
+    }
+
+    let Ok(Some(acl)) = effective_acl(store, base, path) else {
+        return Vec::new();
+    };
+    ALL.into_iter()
+        .filter(|mode| matches!(authorize(store, &acl, &subject.agent(), *mode), Ok(true)))
+        .collect()
 }
 
 /// `GET` / `HEAD` an LDP resource.
@@ -271,12 +311,27 @@ pub fn put(
                 .remove(&previous)
                 .map_err(|e| LdpError::Store(e.to_string()))?;
         }
-        storage::add_containment(store, &resource, storage_root)?;
+        contain(store, &resource, storage_root)?;
         return Ok(());
     };
 
     replace_graph(store, &iri(&resource), &quads)?;
-    storage::add_containment(store, &resource, storage_root)?;
+    contain(store, &resource, storage_root)?;
+    Ok(())
+}
+
+/// Record `resource` as a member of its container, unless it is an ACL.
+///
+/// ACL resources are auxiliary resources and aren't contained (Solid Protocol
+/// §4.3). Skipping the whole walk up the tree, not just the last step, is what
+/// stops a write to `/~/newdir/.acl` from creating `/~/newdir/` as a side
+/// effect. The ACL may exist before the resource it governs, and WAC applies it
+/// once that resource does.
+fn contain(store: &Store, resource: &str, storage_root: &str) -> Result<(), LdpError> {
+    if governed(resource).is_some() {
+        return Ok(());
+    }
+    storage::add_containment(store, resource, storage_root)?;
     Ok(())
 }
 
@@ -375,13 +430,13 @@ pub fn append(
             store,
             &blob_quads(&target, &digest, content_type, body.len()),
         )?;
-        storage::add_containment(store, &target, storage_root)?;
+        contain(store, &target, storage_root)?;
         return Ok(target);
     }
 
     let quads = parse_into_graph(body, syntax::read_format(content_type)?, &target)?;
     insert_quads(store, &quads)?;
-    storage::add_containment(store, &target, storage_root)?;
+    contain(store, &target, storage_root)?;
     Ok(target)
 }
 
@@ -431,6 +486,16 @@ pub fn delete(
     store.clear_graph(GraphNameRef::NamedNode(iri(&resource).as_ref()))?;
     storage::remove_containment(store, &resource, storage_root)?;
 
+    // Deleting a resource deletes its ACL (Solid Protocol §5.4). Now that an
+    // ACL isn't a member, a container that has one can be deleted, and
+    // recreating it would otherwise quietly bring the old grants back.
+    //
+    // After the resource, not before: if this fails, the resource is already
+    // gone. The other order could leave a live resource with its own ACL
+    // stripped and falling back to an ancestor's broader default.
+    let acl = format!("{resource}.acl");
+    store.clear_graph(GraphNameRef::NamedNode(iri(&acl).as_ref()))?;
+
     if let Some(digest) = digest
         && !digest_still_referenced(store, &digest, &resource)
         && let Some(blobs) = blobs
@@ -473,4 +538,33 @@ pub fn served_types() -> &'static [WriteFormat] {
         WriteFormat::JsonLd,
         WriteFormat::RdfXml,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::governed;
+
+    /// The table in spec A2, row for row.
+    #[test]
+    fn an_acl_governs_its_path_without_the_suffix() {
+        assert_eq!(governed("/~/notes/.acl"), Some("/~/notes/"));
+        assert_eq!(governed("/~/notes/first.acl"), Some("/~/notes/first"));
+        // An ACL of an ACL is still guarded by Control on the thing at the
+        // bottom, not by the ACL above it.
+        assert_eq!(governed("/~/x.acl.acl"), Some("/~/x"));
+    }
+
+    #[test]
+    fn other_paths_are_not_acl_resources() {
+        assert_eq!(governed("/~/notes"), None);
+        assert_eq!(governed("/~/x.aclx"), None);
+    }
+
+    #[test]
+    fn a_full_iri_works_the_same_way() {
+        assert_eq!(
+            governed("https://alice.brolly.id/~/notes/.acl"),
+            Some("https://alice.brolly.id/~/notes/")
+        );
+    }
 }

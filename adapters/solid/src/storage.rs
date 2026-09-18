@@ -127,6 +127,45 @@ pub fn members(store: &Store, container: &str) -> Vec<String> {
         .collect()
 }
 
+/// Remove every `ldp:contains` triple that names an ACL resource.
+///
+/// ACL resources are auxiliary and aren't members of their container (Solid
+/// Protocol §4.3), but `ldp::put` recorded them as members until stage 0. This
+/// is the repair `brolly-admin acl-uncontain` runs on each pod. It returns how
+/// many triples it removed, so a second run reports zero.
+pub fn uncontain_acls(store: &Store) -> Result<usize, oxigraph::store::StorageError> {
+    let stale = store
+        .quads_for_pattern(None, Some(iri(LDP_CONTAINS).as_ref()), None, None)
+        .filter_map(|quad| match quad {
+            Ok(quad) => is_acl_containment(&quad).then_some(Ok(quad)),
+            Err(e) => Some(Err(e)),
+        })
+        .collect::<Result<Vec<Quad>, _>>()?;
+    for quad in &stale {
+        store.remove(quad)?;
+    }
+    Ok(stale.len())
+}
+
+/// The shape [`add_containment`] writes, naming an ACL: a container's own
+/// graph saying it contains an `.acl` resource.
+///
+/// Matching the graph as well as the predicate leaves a member's own documents
+/// alone, even if they happen to use `ldp:contains`.
+fn is_acl_containment(quad: &Quad) -> bool {
+    let (
+        NamedOrBlankNode::NamedNode(container),
+        Term::NamedNode(member),
+        GraphName::NamedNode(graph),
+    ) = (&quad.subject, &quad.object, &quad.graph_name)
+    else {
+        return false;
+    };
+    container == graph
+        && is_container(container.as_str())
+        && crate::ldp::governed(member.as_str()).is_some()
+}
+
 /// Does a resource exist, as a graph with any triples?
 pub fn exists(store: &Store, resource: &str) -> bool {
     let node = iri(resource);
