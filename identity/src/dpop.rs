@@ -21,6 +21,18 @@
 //!   appears on *resource* requests only; a proof sent to the token endpoint has
 //!   no access token to bind to yet. Requiring it everywhere breaks login;
 //!   never requiring it lets a proof for one token be replayed with another.
+//!
+//! A proof is also **single-use**. `verify` can't know whether it has seen a
+//! proof before, because that needs the database. So it returns [`Unspent`],
+//! and the only way to reach the value inside is [`Unspent::spend`], which
+//! records the proof's `jti`. A call site can't read the key thumbprint, or a
+//! bound Solid token's claims, without spending the proof first.
+//!
+//! That guarantee covers only what arrives inside the `Unspent`. A caller that
+//! learns something from elsewhere before checking the proof is not held to it
+//! by the compiler: XRPC's `token_caller` gets the grant, and so the `user_id`,
+//! from `brolly_atproto::oauth::verify_token` before any proof is looked at,
+//! and spends only by convention. Closing that is a stage 2 follow-up.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -28,12 +40,21 @@ use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 
 /// How far a proof's `iat` may drift from our clock, in seconds.
 ///
 /// RFC 9449 leaves this to the server. Sixty seconds tolerates ordinary clock
 /// skew without leaving a replay window wide enough to matter.
 pub const MAX_AGE_SECONDS: i64 = 60;
+
+/// The longest `jti` a proof may carry, in bytes.
+///
+/// RFC 9449 sets no limit. This one keeps the `(jkt, jti)` primary key of
+/// `dpop_jti` well inside a btree index row, so an oversized `jti` is refused
+/// here as `Malformed` instead of failing the insert and being logged as a
+/// storage fault.
+pub const MAX_JTI_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DpopError {
@@ -50,6 +71,13 @@ pub enum DpopError {
     Expired,
     /// `ath` missing, or not the hash of the presented access token.
     TokenBindingFailed,
+    /// This key has already presented a proof with this `jti`.
+    Replayed,
+    /// The proof could not be recorded, so it is not accepted.
+    ///
+    /// Holds the message rather than the `sqlx::Error`, so this enum can stay
+    /// `Clone` and `Eq`. Call sites log it and must not send it to the client.
+    Storage(String),
 }
 
 impl std::fmt::Display for DpopError {
@@ -64,6 +92,8 @@ impl std::fmt::Display for DpopError {
             }
             DpopError::Expired => write!(f, "DPoP proof is outside the freshness window"),
             DpopError::TokenBindingFailed => write!(f, "DPoP proof is not bound to this token"),
+            DpopError::Replayed => write!(f, "DPoP proof has already been used"),
+            DpopError::Storage(e) => write!(f, "could not record the DPoP proof: {e}"),
         }
     }
 }
@@ -90,7 +120,6 @@ pub struct PublicJwk {
 struct Claims {
     htm: String,
     htu: String,
-    #[allow(dead_code)]
     jti: String,
     iat: i64,
     #[serde(default)]
@@ -106,6 +135,124 @@ pub struct VerifiedProof {
     /// must name the same key or the token was not presented by its holder.
     pub thumbprint: String,
     pub jwk: PublicJwk,
+}
+
+/// A verified value that can't be used until its proof has been recorded.
+///
+/// The fields are private, and [`Unspent::spend`] is the only way to get the
+/// value out. There is no `map`, because a closure could copy the value out.
+/// Nor is there `Clone`, `Debug` or `PartialEq`, because each of those would
+/// reach the value some other way.
+///
+/// Spending hands the value over:
+///
+/// ```
+/// use brolly_identity::dpop::{DpopError, Unspent, VerifiedProof};
+///
+/// async fn thumbprint_of(
+///     proof: Unspent<VerifiedProof>,
+///     pool: &sqlx::PgPool,
+///     now: i64,
+/// ) -> Result<String, DpopError> {
+///     let verified = proof.spend(pool, now).await?;
+///     Ok(verified.thumbprint)
+/// }
+/// ```
+///
+/// Reaching past `spend` doesn't compile. This is the example above with that
+/// one line changed, so it fails because the field is private, not because of a
+/// typo:
+///
+/// ```compile_fail,E0616
+/// use brolly_identity::dpop::{DpopError, Unspent, VerifiedProof};
+///
+/// async fn thumbprint_of(
+///     proof: Unspent<VerifiedProof>,
+///     pool: &sqlx::PgPool,
+///     now: i64,
+/// ) -> Result<String, DpopError> {
+///     let verified = proof.value;
+///     Ok(verified.thumbprint)
+/// }
+/// ```
+#[must_use = "a verified proof proves nothing until it is spent"]
+pub struct Unspent<T> {
+    value: T,
+    /// Thumbprint of the key that signed the proof.
+    jkt: String,
+    jti: String,
+    iat: i64,
+}
+
+/// Record a proof and prune expired ones, in one statement.
+///
+/// `$3` is the row's expiry and `$4` the prune cutoff. Both come from the
+/// application's clock. No row back means the `(jkt, jti)` pair already existed.
+const SPEND_JTI: &str = "\
+    WITH pruned AS (DELETE FROM dpop_jti WHERE expires_at < to_timestamp($4)) \
+    INSERT INTO dpop_jti (jkt, jti, expires_at) \
+    VALUES ($1, $2, to_timestamp($3)) \
+    ON CONFLICT DO NOTHING \
+    RETURNING jti";
+
+impl<T> Unspent<T> {
+    /// Record this proof's `jti` and hand over the value.
+    ///
+    /// **A proof is spent as soon as it is verified, even if the request then
+    /// fails**, for example a PAR refused for its client metadata, or a token
+    /// request with a bad code. RFC 9449 counts a `jti` as used once it has been
+    /// presented. Don't move spending to after the request succeeds: a captured
+    /// proof could then be retried until one attempt worked.
+    ///
+    /// `now` is the application's clock. It sets the row's expiry and decides
+    /// which rows are pruned. The database's clock is never used: `verify`
+    /// judges freshness by the application's clock, and pruning by a database
+    /// clock running ahead would forget a proof that is still fresh.
+    ///
+    /// Returns [`DpopError::Replayed`] if this key has already used this `jti`,
+    /// and [`DpopError::Storage`] if the proof couldn't be recorded. Callers
+    /// must treat both as a refusal.
+    ///
+    /// Concurrent spends are safe for replay: the primary key lets exactly one
+    /// insert of a `(jkt, jti)` pair win. Their prune `DELETE`s can overlap,
+    /// though, and two of them locking expired rows in different orders can
+    /// rarely deadlock. Postgres aborts one; that spend comes back as
+    /// `Storage` and its request is refused, so a deadlock fails closed.
+    pub async fn spend(self, pool: &PgPool, now: i64) -> Result<T, DpopError> {
+        let recorded: Option<String> = sqlx::query_scalar(SPEND_JTI)
+            .bind(self.jkt.as_str())
+            .bind(self.jti.as_str())
+            .bind(self.iat.saturating_add(MAX_AGE_SECONDS))
+            .bind(now.saturating_sub(MAX_AGE_SECONDS))
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| DpopError::Storage(e.to_string()))?;
+        match recorded {
+            Some(_) => Ok(self.value),
+            None => Err(DpopError::Replayed),
+        }
+    }
+
+    /// Swap the wrapped value for another, keeping the proof that must be
+    /// spent. The old value is dropped unread.
+    ///
+    /// `verify_access` uses this to turn `Unspent<VerifiedProof>` into
+    /// `Unspent<AccessClaims>`, because the claims come from the token, not
+    /// the proof.
+    pub fn replace<U>(self, value: U) -> Unspent<U> {
+        Unspent {
+            value,
+            jkt: self.jkt,
+            jti: self.jti,
+            iat: self.iat,
+        }
+    }
+
+    /// Whether the proof was signed by the key with this thumbprint, without
+    /// giving the thumbprint out.
+    pub fn bound_to(&self, jkt: &str) -> bool {
+        self.jkt == jkt
+    }
 }
 
 fn decode_part<T: for<'de> Deserialize<'de>>(part: &str) -> Result<T, DpopError> {
@@ -163,13 +310,16 @@ fn verifying_key(jwk: &PublicJwk) -> Result<VerifyingKey, DpopError> {
 /// `access_token` is `Some` for resource requests, where the proof must carry a
 /// matching `ath`, and `None` at the token endpoint, where there is no token to
 /// bind to yet.
+///
+/// Passing every check here doesn't make the proof usable yet. It has not been
+/// checked for replay, so it comes back [`Unspent`].
 pub fn verify(
     proof: &str,
     method: &str,
     url: &str,
     access_token: Option<&str>,
     now: i64,
-) -> Result<VerifiedProof, DpopError> {
+) -> Result<Unspent<VerifiedProof>, DpopError> {
     let mut parts = proof.split('.');
     let (Some(header_b64), Some(claims_b64), Some(signature_b64), None) =
         (parts.next(), parts.next(), parts.next(), parts.next())
@@ -200,6 +350,14 @@ pub fn verify(
 
     let claims: Claims = decode_part(claims_b64)?;
 
+    // An empty jti can't be told apart from the next one, and an oversized one
+    // would fail the dpop_jti insert as a storage error rather than a client's.
+    if claims.jti.is_empty() || claims.jti.len() > MAX_JTI_BYTES {
+        return Err(DpopError::Malformed(format!(
+            "jti must be 1 to {MAX_JTI_BYTES} bytes"
+        )));
+    }
+
     if !claims.htm.eq_ignore_ascii_case(method) {
         return Err(DpopError::WrongTarget {
             expected: method.to_string(),
@@ -223,9 +381,15 @@ pub fn verify(
         (None, _) => {}
     }
 
-    Ok(VerifiedProof {
-        thumbprint: thumbprint(&header.jwk),
-        jwk: header.jwk,
+    let jkt = thumbprint(&header.jwk);
+    Ok(Unspent {
+        value: VerifiedProof {
+            thumbprint: jkt.clone(),
+            jwk: header.jwk,
+        },
+        jkt,
+        jti: claims.jti,
+        iat: claims.iat,
     })
 }
 
@@ -251,6 +415,18 @@ mod tests {
         ath: Option<&str>,
         typ: &str,
     ) -> String {
+        make_proof_with_jti(key, method, url, iat, ath, typ, "unique")
+    }
+
+    fn make_proof_with_jti(
+        key: &SigningKey,
+        method: &str,
+        url: &str,
+        iat: i64,
+        ath: Option<&str>,
+        typ: &str,
+        jti: &str,
+    ) -> String {
         // SEC1 uncompressed: 0x04 || x || y.
         let sec1 = key.verifying_key().to_sec1_bytes();
         assert_eq!(sec1[0], 0x04, "expected an uncompressed point");
@@ -262,7 +438,7 @@ mod tests {
         });
         let header = serde_json::json!({"alg": "ES256", "typ": typ, "jwk": jwk});
         let mut claims = serde_json::json!({
-            "htm": method, "htu": url, "jti": "unique", "iat": iat
+            "htm": method, "htu": url, "jti": jti, "iat": iat
         });
         if let Some(ath) = ath {
             claims["ath"] = serde_json::Value::String(ath.to_string());
@@ -282,6 +458,18 @@ mod tests {
         SigningKey::from_bytes(&[7u8; 32].into()).unwrap()
     }
 
+    /// RFC 7638 for a P-256 key, written out here instead of calling
+    /// `thumbprint`, so the assertions below test the thumbprint too.
+    fn jkt_of(key: &SigningKey) -> String {
+        let sec1 = key.verifying_key().to_sec1_bytes();
+        let canonical = format!(
+            r#"{{"crv":"P-256","kty":"EC","x":"{}","y":"{}"}}"#,
+            B64.encode(&sec1[1..33]),
+            B64.encode(&sec1[33..65])
+        );
+        B64.encode(Sha256::digest(canonical.as_bytes()))
+    }
+
     const URL: &str = "https://alice.brolly.id/~/note";
 
     #[test]
@@ -296,7 +484,7 @@ mod tests {
             "dpop+jwt",
         );
         let verified = verify(&proof, "GET", URL, Some(token), 1000).unwrap();
-        assert!(!verified.thumbprint.is_empty());
+        assert!(verified.bound_to(&jkt_of(&key())));
     }
 
     #[test]
@@ -326,8 +514,8 @@ mod tests {
     fn a_resource_proof_without_ath_is_refused() {
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
         assert_eq!(
-            verify(&proof, "GET", URL, Some("access-token"), 1000),
-            Err(DpopError::TokenBindingFailed)
+            verify(&proof, "GET", URL, Some("access-token"), 1000).err(),
+            Some(DpopError::TokenBindingFailed)
         );
     }
 
@@ -344,8 +532,8 @@ mod tests {
             "dpop+jwt",
         );
         assert_eq!(
-            verify(&proof, "GET", URL, Some("access-token"), 1000),
-            Err(DpopError::TokenBindingFailed)
+            verify(&proof, "GET", URL, Some("access-token"), 1000).err(),
+            Some(DpopError::TokenBindingFailed)
         );
     }
 
@@ -373,18 +561,21 @@ mod tests {
     fn a_stale_or_future_proof_is_refused() {
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
         assert_eq!(
-            verify(&proof, "GET", URL, None, 5000),
-            Err(DpopError::Expired)
+            verify(&proof, "GET", URL, None, 5000).err(),
+            Some(DpopError::Expired)
         );
-        assert_eq!(verify(&proof, "GET", URL, None, 0), Err(DpopError::Expired));
+        assert_eq!(
+            verify(&proof, "GET", URL, None, 0).err(),
+            Some(DpopError::Expired)
+        );
     }
 
     #[test]
     fn a_plain_jwt_is_not_a_proof() {
         let proof = make_proof(&key(), "GET", URL, 1000, None, "JWT");
         assert_eq!(
-            verify(&proof, "GET", URL, None, 1000),
-            Err(DpopError::WrongType)
+            verify(&proof, "GET", URL, None, 1000).err(),
+            Some(DpopError::WrongType)
         );
     }
 
@@ -400,22 +591,80 @@ mod tests {
         );
         parts[1] = &forged;
         assert_eq!(
-            verify(&parts.join("."), "DELETE", URL, None, 1000),
-            Err(DpopError::BadSignature)
+            verify(&parts.join("."), "DELETE", URL, None, 1000).err(),
+            Some(DpopError::BadSignature)
         );
     }
 
     #[test]
     fn thumbprints_are_stable_and_key_specific() {
-        let a = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
-        let first = verify(&a, "GET", URL, None, 1000).unwrap().thumbprint;
-        let second = verify(&a, "GET", URL, None, 1000).unwrap().thumbprint;
-        assert_eq!(first, second);
-
+        let mine = jkt_of(&key());
         let other = SigningKey::from_bytes(&[9u8; 32].into()).unwrap();
+        let theirs = jkt_of(&other);
+        assert_ne!(mine, theirs, "the jkt must identify the key");
+
+        let a = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
+        assert!(verify(&a, "GET", URL, None, 1000).unwrap().bound_to(&mine));
+        assert!(verify(&a, "GET", URL, None, 1000).unwrap().bound_to(&mine));
+
         let b = make_proof(&other, "GET", URL, 1000, None, "dpop+jwt");
-        let different = verify(&b, "GET", URL, None, 1000).unwrap().thumbprint;
-        assert_ne!(first, different, "the jkt must identify the key");
+        let different = verify(&b, "GET", URL, None, 1000).unwrap();
+        assert!(different.bound_to(&theirs));
+        assert!(!different.bound_to(&mine));
+    }
+
+    #[test]
+    fn a_verified_proof_carries_what_spending_it_needs() {
+        let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
+        let unspent = verify(&proof, "GET", URL, None, 1000).unwrap();
+        assert_eq!(unspent.jti, "unique");
+        assert_eq!(unspent.iat, 1000);
+        assert_eq!(unspent.jkt, jkt_of(&key()));
+    }
+
+    #[test]
+    fn replace_swaps_the_value_and_keeps_the_proof() {
+        // What verify_access relies on: the claims come from the token, but
+        // the proof that has to be spent is still this one.
+        let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
+        let replaced = verify(&proof, "GET", URL, None, 1000)
+            .unwrap()
+            .replace("claims");
+        assert_eq!(replaced.value, "claims");
+        assert_eq!(replaced.jti, "unique");
+        assert_eq!(replaced.iat, 1000);
+        assert!(replaced.bound_to(&jkt_of(&key())));
+    }
+
+    #[test]
+    fn an_empty_jti_is_malformed() {
+        // Nothing to record, so nothing to stop a replay.
+        let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", "");
+        assert!(matches!(
+            verify(&proof, "GET", URL, None, 1000),
+            Err(DpopError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn a_jti_of_exactly_the_limit_is_accepted() {
+        let jti = "j".repeat(MAX_JTI_BYTES);
+        let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", &jti);
+        let unspent = verify(&proof, "GET", URL, None, 1000).unwrap();
+        assert_eq!(unspent.jti, jti);
+    }
+
+    #[test]
+    fn a_jti_over_the_limit_is_malformed() {
+        // Otherwise it reaches the (jkt, jti) primary key, overflows the btree
+        // row, and comes back as Storage: a client's mistake logged as a
+        // server fault.
+        let jti = "j".repeat(MAX_JTI_BYTES + 1);
+        let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", &jti);
+        assert!(matches!(
+            verify(&proof, "GET", URL, None, 1000),
+            Err(DpopError::Malformed(_))
+        ));
     }
 
     #[test]
@@ -429,8 +678,8 @@ mod tests {
         let der = B64.encode(signature.to_der().as_bytes());
         let rebuilt = format!("{}.{}.{}", parts[0], parts[1], der);
         assert_eq!(
-            verify(&rebuilt, "GET", URL, None, 1000),
-            Err(DpopError::BadSignature)
+            verify(&rebuilt, "GET", URL, None, 1000).err(),
+            Some(DpopError::BadSignature)
         );
     }
 

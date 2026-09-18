@@ -9,6 +9,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use brolly_identity::db::{self, User};
+use brolly_identity::dpop::DpopError;
 use brolly_identity::routing::{SubdomainRoute, subdomain_route};
 use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
 use brolly_solid::ldp::{self, LdpError};
@@ -131,9 +132,13 @@ pub(crate) async fn subject_for(
             // `cnf.jkt` does not match the proof was not presented by its holder,
             // and a bound token with no proof is refused rather than downgraded
             // to bearer semantics.
+            //
+            // A bound token's claims arrive `Unspent`. Spending records the proof
+            // so it can't be sent again. A replay, or a failure to record the
+            // proof, leaves the caller anonymous, like any other bad proof.
             let proof = (!proof.is_empty()).then_some(proof);
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
-            match tokens::verify_access(
+            let claims = match tokens::verify_access(
                 &state.provider_key,
                 &token,
                 proof.as_deref(),
@@ -141,12 +146,24 @@ pub(crate) async fn subject_for(
                 url,
                 now,
             ) {
-                Ok(claims) => solid_subject(state, claims).await.unwrap_or(anonymous),
+                Ok(tokens::Access::Bearer(claims)) => claims,
+                Ok(tokens::Access::Bound(unspent)) => match unspent.spend(&state.pool, now).await {
+                    Ok(claims) => claims,
+                    Err(DpopError::Storage(e)) => {
+                        tracing::error!(error = %e, "recording a DPoP proof failed");
+                        return anonymous;
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "Solid access token proof refused");
+                        return anonymous;
+                    }
+                },
                 Err(e) => {
                     tracing::debug!(error = %e, "Solid access token rejected");
-                    anonymous
+                    return anonymous;
                 }
-            }
+            };
+            solid_subject(state, claims).await.unwrap_or(anonymous)
         }
         // Mastodon's bearer tokens. Note what is *not* happening here: a
         // Solid access token presented as a bearer does not resolve, because

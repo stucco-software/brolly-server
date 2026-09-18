@@ -114,12 +114,26 @@ pub fn issue_id_token(
     Ok(key.sign(&claims)?)
 }
 
+/// What [`verify_access`] found.
+pub enum Access {
+    /// A token without `cnf.jkt`. Nothing to prove, so nothing to spend.
+    Bearer(AccessClaims),
+    /// A DPoP-bound token whose proof checked out and was signed by the
+    /// token's key. The claims stay wrapped until the proof is spent. Spending
+    /// needs the database, and keeping it out of this function keeps this
+    /// function synchronous.
+    Bound(dpop::Unspent<AccessClaims>),
+}
+
 /// Verify an access token **and** the proof that it belongs to this caller.
 ///
 /// Both or neither: a token whose `cnf.jkt` does not match the proof's key was
 /// not presented by its holder, and a bound token with no proof at all is
 /// refused rather than downgraded to bearer semantics. Downgrading is the
 /// mistake that makes DPoP decorative.
+///
+/// A bound token comes back as [`Access::Bound`]. Its claims are reachable only
+/// by spending the proof, so the caller can't skip the replay check.
 pub fn verify_access(
     key: &ProviderKey,
     token: &str,
@@ -127,25 +141,26 @@ pub fn verify_access(
     method: &str,
     url: &str,
     now: i64,
-) -> Result<AccessClaims, TokenError> {
+) -> Result<Access, TokenError> {
     let claims = key.verify(token, now)?;
-
-    let bound_to = claims["cnf"]["jkt"].as_str();
-    if let Some(jkt) = bound_to {
-        let Some(proof) = proof else {
-            return Err(TokenError::ProofRequired);
-        };
-        let verified = dpop::verify(proof, method, url, Some(token), now)?;
-        if verified.thumbprint != jkt {
-            return Err(TokenError::WrongHolder);
-        }
-    }
-
-    Ok(AccessClaims {
+    let access = AccessClaims {
         webid: claims["webid"].as_str().unwrap_or_default().to_string(),
         client_id: claims["client_id"].as_str().unwrap_or_default().to_string(),
         scope: claims["scope"].as_str().unwrap_or_default().to_string(),
-    })
+    };
+
+    let Some(jkt) = claims["cnf"]["jkt"].as_str() else {
+        return Ok(Access::Bearer(access));
+    };
+    let Some(proof) = proof else {
+        return Err(TokenError::ProofRequired);
+    };
+    let verified = dpop::verify(proof, method, url, Some(token), now)?;
+    if !verified.bound_to(jkt) {
+        return Err(TokenError::WrongHolder);
+    }
+    // The proof's own value is dropped unread; the claims are the token's.
+    Ok(Access::Bound(verified.replace(access)))
 }
 
 /// The `/.well-known/openid-configuration` document.
@@ -257,9 +272,13 @@ mod tests {
         .unwrap();
         let proof = proof_for(&client, "GET", URL, Some(&token), 1000);
 
-        let claims = verify_access(&p, &token, Some(&proof), "GET", URL, 1000).unwrap();
-        assert_eq!(claims.webid, WEBID);
-        assert_eq!(claims.scope, "webid");
+        let Access::Bound(unspent) =
+            verify_access(&p, &token, Some(&proof), "GET", URL, 1000).unwrap()
+        else {
+            panic!("a token with cnf.jkt must come back bound to its proof");
+        };
+        // The claims stay wrapped until the pod spends the proof.
+        assert!(unspent.bound_to(&jkt_of(&client)));
     }
 
     #[test]
@@ -349,6 +368,29 @@ mod tests {
             verify_access(&p, &token, Some(&proof), "GET", URL, later),
             Err(TokenError::Jwt(JwtError::Expired))
         ));
+    }
+
+    #[test]
+    fn a_token_without_a_binding_is_bearer_and_its_claims_are_readable() {
+        // Unchanged behaviour: only cnf.jkt makes a proof necessary, so there
+        // is nothing to spend.
+        let p = provider();
+        let token = p
+            .sign(&json!({
+                "webid": WEBID,
+                "client_id": "urn:uuid:c",
+                "scope": "webid",
+                "exp": 1000 + ACCESS_TOKEN_TTL,
+            }))
+            .unwrap();
+
+        let Access::Bearer(claims) = verify_access(&p, &token, None, "GET", URL, 1000).unwrap()
+        else {
+            panic!("a token without cnf.jkt has no proof to spend");
+        };
+        assert_eq!(claims.webid, WEBID);
+        assert_eq!(claims.client_id, "urn:uuid:c");
+        assert_eq!(claims.scope, "webid");
     }
 
     #[test]

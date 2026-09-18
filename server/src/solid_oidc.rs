@@ -424,10 +424,32 @@ pub async fn token(
             "this endpoint requires a DPoP proof",
         );
     };
-    let jkt = match dpop::verify(proof, "POST", &url, None, now()) {
-        Ok(verified) => verified.thumbprint,
+    let at = now();
+    let unspent = match dpop::verify(proof, "POST", &url, None, at) {
+        Ok(unspent) => unspent,
         Err(e) => {
             tracing::warn!(error = %e, "DPoP proof rejected at the token endpoint");
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_dpop_proof",
+                &e.to_string(),
+            );
+        }
+    };
+    // Spent before the grant is looked at: a request that fails later has still
+    // used its proof (see `Unspent::spend`).
+    let jkt = match unspent.spend(&state.pool, at).await {
+        Ok(verified) => verified.thumbprint,
+        Err(dpop::DpopError::Storage(e)) => {
+            tracing::error!(error = %e, "recording a DPoP proof failed");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "could not check the DPoP proof",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "DPoP proof refused at the token endpoint");
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_dpop_proof",

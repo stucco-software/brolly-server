@@ -95,22 +95,27 @@ async fn token_caller(state: &AppState, headers: &HeaderMap) -> Option<User> {
         .ok()
         .flatten()?;
 
-    // The proof must be for this request and must name the key the token was
-    // issued to.
+    // The proof must be for this request, must name the key the token was
+    // issued to, and must not have been presented before.
     let proof = headers.get("dpop").and_then(|h| h.to_str().ok())?;
     let url = format!("https://{}/xrpc/", state.base_domain);
     let method = "POST";
-    let verified = brolly_identity::dpop::verify(
-        proof,
-        method,
-        &url,
-        Some(&token),
-        time::OffsetDateTime::now_utc().unix_timestamp(),
-    )
-    .ok()?;
-    if verified.thumbprint != grant.dpop_jkt {
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let unspent = brolly_identity::dpop::verify(proof, method, &url, Some(&token), now).ok()?;
+    if !unspent.bound_to(&grant.dpop_jkt) {
         tracing::warn!("an ATProtocol token was presented by a key it was not issued to");
         return None;
+    }
+    match unspent.spend(&state.pool, now).await {
+        Ok(_) => {}
+        Err(brolly_identity::dpop::DpopError::Storage(e)) => {
+            tracing::error!(error = %e, "recording a DPoP proof failed");
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "an ATProtocol DPoP proof was refused");
+            return None;
+        }
     }
 
     db::find_by_id(&state.pool, grant.user_id)

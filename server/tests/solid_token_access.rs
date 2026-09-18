@@ -477,3 +477,29 @@ async fn an_anonymous_request_still_gets_the_default_deny() {
     let (status, _) = send(&harness, read_note(None, None)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn a_resource_proof_is_good_for_one_request() {
+    // `ath` binds a proof to the token and `htu` to the resource, but neither
+    // stops the identical request being sent again. Only the jti does.
+    let harness = harness().await;
+    let key = client_key();
+    let token = access_token(&harness, &key).await;
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let authorization = format!("DPoP {token}");
+
+    let proof = dpop_proof(&key, "GET", NOTE, Some(&ath));
+    let (status, body) = send(&harness, read_note(Some(&authorization), Some(&proof))).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+
+    let (status, _) = send(&harness, read_note(Some(&authorization), Some(&proof))).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "a replayed proof must leave the caller anonymous"
+    );
+
+    let fresh = dpop_proof(&key, "GET", NOTE, Some(&ath));
+    let (status, _) = send(&harness, read_note(Some(&authorization), Some(&fresh))).await;
+    assert_eq!(status, StatusCode::OK, "the token itself is still good");
+}

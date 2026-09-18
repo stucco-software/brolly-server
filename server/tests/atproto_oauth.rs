@@ -162,6 +162,17 @@ fn urlencode(s: &str) -> String {
 }
 
 async fn push(h: &Harness, key: &SigningKey, challenge: &str) -> Reply {
+    let dpop = proof(
+        key,
+        "POST",
+        &format!("https://{BASE}/oauth/atproto/par"),
+        None,
+    );
+    push_with_proof(h, &dpop, challenge).await
+}
+
+/// PAR with a proof the caller supplies, so a test can present one twice.
+async fn push_with_proof(h: &Harness, dpop: &str, challenge: &str) -> Reply {
     let body = form_urlencoded::Serializer::new(String::new())
         .append_pair("client_id", CLIENT)
         .append_pair("redirect_uri", REDIRECT)
@@ -179,15 +190,7 @@ async fn push(h: &Harness, key: &SigningKey, challenge: &str) -> Reply {
             .uri("/oauth/atproto/par")
             .header(header::HOST, BASE)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .header(
-                "DPoP",
-                proof(
-                    key,
-                    "POST",
-                    &format!("https://{BASE}/oauth/atproto/par"),
-                    None,
-                ),
-            )
+            .header("DPoP", dpop)
             .body(Body::from(body))
             .unwrap(),
     )
@@ -436,6 +439,36 @@ async fn a_client_id_that_is_not_a_fetchable_url_is_refused() {
     .await;
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn a_par_proof_is_good_for_one_request() {
+    // PAR is where the key is pledged. A replayed proof would let anyone who
+    // saw one push requests pledged to a key they don't hold.
+    let h = harness().await;
+    let key = client_key();
+    let (_, challenge) = pkce();
+    let dpop = proof(
+        &key,
+        "POST",
+        &format!("https://{BASE}/oauth/atproto/par"),
+        None,
+    );
+
+    let first = push_with_proof(&h, &dpop, &challenge).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+
+    let replayed = push_with_proof(&h, &dpop, &challenge).await;
+    assert_eq!(
+        replayed.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        replayed.body
+    );
+    assert_eq!(replayed.json()["error"], "invalid_dpop_proof");
+
+    let fresh = push(&h, &key, &challenge).await;
+    assert_eq!(fresh.status, StatusCode::CREATED, "{}", fresh.body);
 }
 
 #[tokio::test]

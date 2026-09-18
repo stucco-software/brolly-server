@@ -10,10 +10,14 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
 use brolly_server::{AppState, app};
 use http_body_util::BodyExt;
+use p256::ecdsa::signature::Signer;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 
@@ -464,6 +468,223 @@ async fn a_deleted_record_is_gone_from_the_repo() {
     )
     .await;
     assert_eq!(fetched.status, StatusCode::NOT_FOUND);
+}
+
+// --- DPoP-bound callers ------------------------------------------------------------
+
+// Chunk 5 (B) makes PAR look these up in the harness's `StaticClients`. It must
+// register exactly this client, redirect and scope there. See the note below.
+const OAUTH_CLIENT: &str = "https://app.example/client-metadata.json";
+const OAUTH_REDIRECT: &str = "https://app.example/cb";
+const OAUTH_SCOPE: &str = "atproto transition:generic";
+
+/// A DPoP proof, as a real client produces one.
+fn dpop_proof(key: &p256::ecdsa::SigningKey, method: &str, url: &str, ath: Option<&str>) -> String {
+    let sec1 = key.verifying_key().to_sec1_bytes();
+    let header = json!({
+        "alg": "ES256", "typ": "dpop+jwt",
+        "jwk": {"kty": "EC", "crv": "P-256",
+                "x": B64.encode(&sec1[1..33]), "y": B64.encode(&sec1[33..65])},
+    });
+    let mut claims = json!({
+        "htm": method, "htu": url,
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "iat": time::OffsetDateTime::now_utc().unix_timestamp(),
+    });
+    if let Some(ath) = ath {
+        claims["ath"] = json!(ath);
+    }
+    let signed = format!(
+        "{}.{}",
+        B64.encode(serde_json::to_vec(&header).unwrap()),
+        B64.encode(serde_json::to_vec(&claims).unwrap())
+    );
+    let signature: p256::ecdsa::Signature = key.sign(signed.as_bytes());
+    format!("{signed}.{}", B64.encode(signature.to_bytes()))
+}
+
+/// Take `cookie`'s member through ATProto OAuth and return an access token
+/// bound to `key`: PAR, consent, decision, token, each through the router.
+async fn atproto_access_token(h: &Harness, cookie: &str, key: &p256::ecdsa::SigningKey) -> String {
+    let verifier = "a-high-entropy-value-for-the-xrpc-dpop-replay-test-0123456789";
+    let challenge = B64.encode(Sha256::digest(verifier.as_bytes()));
+
+    let par = form_urlencoded::Serializer::new(String::new())
+        .append_pair("client_id", OAUTH_CLIENT)
+        .append_pair("redirect_uri", OAUTH_REDIRECT)
+        .append_pair("response_type", "code")
+        .append_pair("scope", OAUTH_SCOPE)
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .finish();
+    let pushed = send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/par")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                dpop_proof(
+                    key,
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/par"),
+                    None,
+                ),
+            )
+            .body(Body::from(par))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "par: {}", pushed.text());
+    let request_uri = pushed.json()["request_uri"].as_str().unwrap().to_string();
+
+    let authorize = form_urlencoded::Serializer::new(String::new())
+        .append_pair("client_id", OAUTH_CLIENT)
+        .append_pair("request_uri", &request_uri)
+        .finish();
+    let consent = send(
+        h,
+        Request::builder()
+            .uri(format!("/oauth/atproto/authorize?{authorize}"))
+            .header(header::HOST, BASE)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        consent.status,
+        StatusCode::OK,
+        "authorize: {}",
+        consent.text()
+    );
+    let html = consent.text();
+    let marker = r#"name="request" value=""#;
+    let start = html.find(marker).expect("a consent form") + marker.len();
+    let request_token = html[start..].split('"').next().unwrap().to_string();
+
+    // Straight through the router: `send` does not keep `Location`.
+    let decision = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/oauth/atproto/authorize")
+                .header(header::HOST, BASE)
+                .header(header::COOKIE, cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(
+                    form_urlencoded::Serializer::new(String::new())
+                        .append_pair("request", &request_token)
+                        .append_pair("decision", "allow")
+                        .finish(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let location = decision
+        .headers()
+        .get(header::LOCATION)
+        .expect("a redirect back to the client")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let code = form_urlencoded::parse(location.split_once('?').unwrap().1.as_bytes())
+        .find(|(k, _)| k == "code")
+        .map(|(_, v)| v.into_owned())
+        .expect("a code");
+
+    let exchange = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("code", &code)
+        .append_pair("redirect_uri", OAUTH_REDIRECT)
+        .append_pair("client_id", OAUTH_CLIENT)
+        .append_pair("code_verifier", verifier)
+        .finish();
+    let token = send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/token")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                dpop_proof(
+                    key,
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/token"),
+                    None,
+                ),
+            )
+            .body(Body::from(exchange))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(token.status, StatusCode::OK, "token: {}", token.text());
+    token.json()["access_token"].as_str().unwrap().to_string()
+}
+
+/// `createRecord` authenticated by nothing but a DPoP-bound token.
+///
+/// The proof has to sign `POST https://<base>/xrpc/`, because that fixed target
+/// is what `token_caller` checks today. Stage 2 changes it to the method's
+/// real URL.
+async fn create_with_token(h: &Harness, token: &str, proof: &str, rkey: &str) -> Reply {
+    send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.repo.createRecord")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("DPoP {token}"))
+            .header("DPoP", proof)
+            .body(Body::from(
+                json!({
+                    "repo": format!("alice.{BASE}"),
+                    "collection": "app.bsky.feed.post",
+                    "rkey": rkey,
+                    "record": {"$type": "app.bsky.feed.post", "text": "signed once"},
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_xrpc_write_proof_is_good_for_one_request() {
+    // A write is the costliest thing to replay: each replay is another record.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key).await;
+    let target = format!("https://{BASE}/xrpc/");
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+
+    let proof = dpop_proof(&key, "POST", &target, Some(&ath));
+    let first = create_with_token(&h, &token, &proof, "3kaaaaaaaaaab").await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+
+    // A different record, so the only thing this request repeats is the proof.
+    let replayed = create_with_token(&h, &token, &proof, "3kaaaaaaaaaac").await;
+    assert_eq!(
+        replayed.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        replayed.text()
+    );
+    assert_eq!(replayed.json()["error"], "AuthenticationRequired");
+
+    let fresh = dpop_proof(&key, "POST", &target, Some(&ath));
+    let third = create_with_token(&h, &token, &fresh, "3kaaaaaaaaaac").await;
+    assert_eq!(third.status, StatusCode::OK, "{}", third.text());
 }
 
 // --- hygiene ---------------------------------------------------------------------------

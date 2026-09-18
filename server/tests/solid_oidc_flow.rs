@@ -902,3 +902,64 @@ async fn a_refresh_token_cannot_be_used_by_a_different_key() {
     assert_eq!(reply.status, StatusCode::BAD_REQUEST);
     assert_eq!(reply.json()["error"], "invalid_grant");
 }
+
+#[tokio::test]
+async fn a_token_endpoint_proof_is_good_for_one_request() {
+    // RFC 9449: a proof's jti is used once. Otherwise a proof captured in
+    // transit works for its whole freshness window, at any endpoint where the
+    // attacker holds something else worth presenting — here, a refresh token.
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (verifier, challenge) = pkce();
+    let code = a_code(&harness, &client_id, &challenge, &cookie).await;
+
+    let key = client_key();
+    let url = format!("https://{BASE}/oauth/solid/token");
+    let token_request = |body: String, proof: &str| {
+        builder("POST", "/oauth/solid/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("DPoP", proof)
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let proof = dpop_proof(&key, "POST", &url, None);
+    let exchange = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("code", &code)
+        .append_pair("redirect_uri", REDIRECT)
+        .append_pair("client_id", &client_id)
+        .append_pair("code_verifier", &verifier)
+        .finish();
+    let first = send(&harness, token_request(exchange, &proof)).await;
+    assert_eq!(first.status, StatusCode::OK, "token: {}", first.body);
+    let refresh = first.json()["refresh_token"]
+        .as_str()
+        .expect("offline_access was requested")
+        .to_string();
+
+    let refresh_body = || {
+        form_urlencoded::Serializer::new(String::new())
+            .append_pair("grant_type", "refresh_token")
+            .append_pair("refresh_token", &refresh)
+            .append_pair("client_id", &client_id)
+            .finish()
+    };
+
+    // A valid refresh, carrying the proof the exchange already spent.
+    let replayed = send(&harness, token_request(refresh_body(), &proof)).await;
+    assert_eq!(
+        replayed.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        replayed.body
+    );
+    assert_eq!(replayed.json()["error"], "invalid_dpop_proof");
+
+    // Refused before the grant was touched, so the refresh token still
+    // rotates once the client signs a new proof.
+    let fresh = dpop_proof(&key, "POST", &url, None);
+    let rotated = send(&harness, token_request(refresh_body(), &fresh)).await;
+    assert_eq!(rotated.status, StatusCode::OK, "refresh: {}", rotated.body);
+}

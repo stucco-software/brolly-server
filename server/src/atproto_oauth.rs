@@ -24,8 +24,9 @@ use axum::{Json, Router};
 use axum_extra::extract::CookieJar;
 use brolly_atproto::oauth;
 use brolly_identity::db::{self, User};
+use brolly_identity::dpop::{self, DpopError};
+use brolly_identity::extract;
 use brolly_identity::oauth::Protocol;
-use brolly_identity::{dpop, extract};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -58,12 +59,17 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
-/// Verify the DPoP proof on a request to one of these endpoints.
+/// Verify and spend the DPoP proof on a request to one of these endpoints.
 ///
 /// Returns the key thumbprint the token will be bound to.
 /// `Option`, not `Result<_, Response>`: a `Response` is a large `Err` to
 /// carry, and both callers want the same error anyway — [`missing_proof`].
-fn proof_thumbprint(
+///
+/// The proof is spent before anything else about the request is checked, so a
+/// request refused later has still used it (see `Unspent::spend`). A failure to
+/// record the proof refuses the request too. It is logged at `error` so it
+/// isn't mistaken for a client's mistake.
+async fn proof_thumbprint(
     state: &AppState,
     headers: &HeaderMap,
     method: &str,
@@ -71,10 +77,22 @@ fn proof_thumbprint(
 ) -> Option<String> {
     let proof = headers.get("dpop").and_then(|h| h.to_str().ok())?;
     let url = format!("https://{}{path}", state.base_domain);
-    match dpop::verify(proof, method, &url, None, now()) {
-        Ok(verified) => Some(verified.thumbprint),
+    let at = now();
+    let unspent = match dpop::verify(proof, method, &url, None, at) {
+        Ok(unspent) => unspent,
         Err(e) => {
             tracing::warn!(error = %e, "DPoP proof rejected");
+            return None;
+        }
+    };
+    match unspent.spend(&state.pool, at).await {
+        Ok(verified) => Some(verified.thumbprint),
+        Err(DpopError::Storage(e)) => {
+            tracing::error!(error = %e, "recording a DPoP proof failed");
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "DPoP proof refused");
             None
         }
     }
@@ -147,7 +165,7 @@ pub async fn par(
     if wrong_host(&state, &headers) {
         return not_found();
     }
-    let Some(jkt) = proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/par") else {
+    let Some(jkt) = proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/par").await else {
         return missing_proof();
     };
 
@@ -446,7 +464,7 @@ pub async fn token(
     if wrong_host(&state, &headers) {
         return not_found();
     }
-    let Some(jkt) = proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/token") else {
+    let Some(jkt) = proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/token").await else {
         return missing_proof();
     };
     let form: TokenForm = serde_urlencoded::from_bytes(&body).unwrap_or_default();
