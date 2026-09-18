@@ -22,6 +22,9 @@ atrium-repo = "0.1.8"
 atrium-xrpc = "0.12.4"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# client_id and redirect_uri checks are URL-structural (host kind, port,
+# userinfo, origin); string prefixes are how is_valid_client_id went wrong.
+url = "2.5.8"
 sha2 = "0.11.0"
 oxigraph = "0.5.9"
 # The DID is derived from the DAG-CBOR of the genesis operation, so the same
