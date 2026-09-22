@@ -201,6 +201,10 @@ fn append(&mut self, resource: &str, quads: &[Quad]) -> Result<ResourceMeta, Sto
 fn remove(&mut self, resource: &str) -> Result<bool, StoreError>;
 fn create_root(&mut self, root: &str) -> Result<(), StoreError>;   // provisioning only
 fn release_blob(&mut self, digest: &str);
+/// Replace a binary's description triples (today: Mastodon alt text) and bump
+/// its version. Replaces rather than appends, so a second description doesn't
+/// pile up beside the first.
+fn set_description(&mut self, resource: &str, quads: &[Quad]) -> Result<ResourceMeta, StoreError>;
 
 pub enum Content<'a> {
     Rdf(&'a [Quad]),            // may be empty
@@ -309,7 +313,7 @@ Existence comes from metadata for every kind: `meta(..).is_some()`.
 - **The inner `put_in`, `append_in` and `delete_in` take `&mut PodWrite`** and
   check WAC against the transaction's snapshot. A caller composing several
   operations in one transaction uses these. `upload_media`, for example, calls
-  `put_in` and then the alt-text `append` in one closure, after its multipart
+  `put_in` and then the alt-text `set_description` in one closure, after its multipart
   awaits have finished.
 
 **Callers updated:**
@@ -378,8 +382,8 @@ single-query approach are unchanged. The query reads the metadata graph through
 | `If-Match: *` | PUT, PATCH, DELETE, POST (to the container) | fails if the resource doesn't exist |
 | `If-Match: "a", "b"` | same | strong comparison; a `W/` tag never matches |
 | `If-None-Match: *` | PUT, PATCH | fails if the resource exists |
-| `If-None-Match: "a"` | PUT, PATCH, DELETE | fails if the current version matches |
-| `If-None-Match: "a"` | GET, HEAD | 304 with `ETag` if the current version matches |
+| `If-None-Match: "a"` | PUT, PATCH, DELETE | fails if the current version matches (weak comparison, RFC 9110 §13.1.2) |
+| `If-None-Match: "a"` | GET, HEAD | 304 with `ETag` if the current version matches (weak comparison) |
 | `If-Modified-Since`, `If-Unmodified-Since` | all | ignored; the ETag is authoritative |
 
 **Write failures and snapshots:**
@@ -412,7 +416,7 @@ With no bare `Store` reachable, every pod writer moves onto `Pod::write`:
 | `adapters/activitypub/src/inbox.rs`, `follows.rs`, `processor.rs` | writers take `&mut PodWrite`, and readers take `&impl PodRead`. `inbox::deliver`/`remove` decide from the IRI, against the pod's metadata root, whether a graph is a resource under the root (`put`/`remove`) or protocol state (outside-root methods). `processor::process` splits into `process_member(&mut PodWrite)` and `process_instance(&InstanceStore)`. |
 | `adapters/atproto/src/ingest.rs` | `at://` graphs and canonical profile triples use the outside-root methods |
 | `server/src/outbox.rs` | the author's copy and its outbox entry, and the author's `Delete`, in one `Pod::write`, closed before the recipient loop's `.await`s; each recipient's delivery in its own `Pod::write` |
-| `server/src/mastodon_api.rs` | uploads with alt text in one closure; alt text updates via `append`; blob reads from metadata |
+| `server/src/mastodon_api.rs` | uploads with alt text in one closure; alt text updates via `set_description`, replacing the old text; blob reads from metadata |
 | `server/src/provision.rs` | `create_root`, then the root ACL as `Content::Auxiliary` |
 | `server/src/account.rs` (export) | reads through `ReadStore`; includes `urn:brolly:resources` |
 
@@ -618,7 +622,7 @@ metadata, and export still names blobs by digest (ADR 0013).
 **server/tests/auth_flow.rs:** a new registration's pod ends at layout 2, and
 its first open logs no `error`.
 
-**server/tests/mastodon_*.rs:** media get, update and attach work, and alt text
+**server/tests/mastodon_*.rs:** media get, update and attach work, a second description replaces the first, and alt text
 survives in the same upload.
 
 **server/tests/federation_flows.rs:**
