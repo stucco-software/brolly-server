@@ -9,15 +9,24 @@
 
 use brolly_identity::{Scope, Subject, Via};
 use brolly_solid::{ldp, storage};
-use brolly_store::{StoreManager, index, insert_quads};
+use brolly_store::resources::{Pod, PodRead};
+use brolly_store::{StoreManager, index};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
-use oxigraph::store::Store;
 use std::sync::Arc;
 use uuid::Uuid;
 
 const BASE: &str = "https://alice.brolly.id";
 const ROOT: &str = "https://alice.brolly.id/~/";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
+
+/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
+/// so it doesn't depend on the code under test.
+fn seed(target: &Pod, quads: &[Quad]) {
+    let store = target.raw_store();
+    for quad in quads {
+        store.insert(quad).unwrap();
+    }
+}
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -45,7 +54,7 @@ fn alice() -> Subject {
 struct Fixture {
     _dir: tempfile::TempDir,
     manager: StoreManager,
-    pod: Arc<Store>,
+    pod: Arc<Pod>,
 }
 
 fn fixture() -> Fixture {
@@ -53,10 +62,10 @@ fn fixture() -> Fixture {
     let manager = StoreManager::open(dir.path(), 4, 60).unwrap();
     let pod = manager.pod(Uuid::new_v4()).unwrap();
 
-    storage::init_storage_root(&pod, ROOT).unwrap();
+    pod.write(|w| storage::init_storage_root(w, ROOT)).unwrap();
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    insert_quads(
+    seed(
         &pod,
         &[
             t(&g, &a, &format!("{ACL}default"), ROOT),
@@ -69,8 +78,7 @@ fn fixture() -> Fixture {
                 "https://alice.brolly.id/profile#me",
             ),
         ],
-    )
-    .unwrap();
+    );
 
     Fixture {
         _dir: dir,

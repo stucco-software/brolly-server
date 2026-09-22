@@ -12,8 +12,8 @@
 //! module adds on arrival — membership and a sort key — are what close that.
 
 use brolly_domain::faithful;
-use brolly_store::Store;
-use brolly_store::write::{WriteError, insert_quads};
+use brolly_store::StoreError;
+use brolly_store::resources::{PodRead, PodWrite};
 use oxigraph::model::{GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde_json::Value;
 
@@ -58,8 +58,8 @@ impl std::fmt::Display for InboxError {
 
 impl std::error::Error for InboxError {}
 
-impl From<WriteError> for InboxError {
-    fn from(e: WriteError) -> Self {
+impl From<StoreError> for InboxError {
+    fn from(e: StoreError) -> Self {
         InboxError::Store(e.to_string())
     }
 }
@@ -74,21 +74,21 @@ fn iri(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
 }
 
-/// Store an activity in the recipient's inbox.
+/// Store an activity in the recipient's inbox, inside the caller's write.
 ///
 /// Idempotent: a remote instance may deliver to both the shared inbox and the
 /// personal one, and arriving twice must not show the post twice. The graph is
 /// named by the activity IRI and containment is a single triple, so a repeat
 /// delivery rewrites the same quads rather than adding more.
 pub fn deliver(
-    store: &Store,
+    w: &mut PodWrite<'_>,
     inbox: &str,
     activity: &Value,
     received_at: &str,
 ) -> Result<String, InboxError> {
     let id = activity["id"].as_str().ok_or(InboxError::NoId)?.to_string();
 
-    write_record(store, &id, activity)?;
+    write_record(w, &id, activity)?;
 
     // An embedded object gets its own graph too, so a later Like or Delete can
     // name the note directly and the note is dereferenceable without unwrapping
@@ -97,7 +97,7 @@ pub fn deliver(
         && object.is_object()
         && let Some(object_id) = object["id"].as_str()
     {
-        write_record(store, object_id, object)?;
+        write_record(w, object_id, object)?;
     }
 
     let inbox_graph = GraphName::NamedNode(iri(inbox));
@@ -106,43 +106,44 @@ pub fn deliver(
 
     // Re-delivery must not leave two sort keys behind, so the old one goes
     // before the new one lands.
-    clear_received_at(store, inbox, &id)?;
+    clear_received_at(w, inbox, &id)?;
 
-    insert_quads(
-        store,
-        &[
-            Quad::new(
-                subject,
-                iri(LDP_CONTAINS),
-                Term::NamedNode(activity_node.clone()),
-                inbox_graph.clone(),
-            ),
-            Quad::new(
-                NamedOrBlankNode::NamedNode(activity_node),
-                iri(RECEIVED_AT),
-                // RFC 3339, stored as a string because it sorts
-                // lexicographically and the cursor is a plain comparison.
-                Term::Literal(Literal::new_simple_literal(received_at)),
-                inbox_graph,
-            ),
-        ],
-    )?;
+    // The collection is protocol state outside the storage root.
+    w.insert(&[
+        Quad::new(
+            subject,
+            iri(LDP_CONTAINS),
+            Term::NamedNode(activity_node.clone()),
+            inbox_graph.clone(),
+        ),
+        Quad::new(
+            NamedOrBlankNode::NamedNode(activity_node),
+            iri(RECEIVED_AT),
+            // RFC 3339, stored as a string because it sorts
+            // lexicographically and the cursor is a plain comparison.
+            Term::Literal(Literal::new_simple_literal(received_at)),
+            inbox_graph,
+        ),
+    ])?;
 
     Ok(id)
 }
 
-fn write_record(store: &Store, id: &str, record: &Value) -> Result<(), InboxError> {
+fn write_record(w: &mut PodWrite<'_>, id: &str, record: &Value) -> Result<(), InboxError> {
     let node = iri(id);
     let quads = faithful::encode(record, &node, &node, AS2).map_err(InboxError::Encode)?;
     // Replace rather than merge: a redelivered activity that lost a field
     // should not keep the old value alongside the new one.
-    store.clear_graph(GraphNameRef::NamedNode(node.as_ref()))?;
-    insert_quads(store, &quads)?;
+    //
+    // The record may be the author's own post, under their storage root, or a
+    // recipient's copy of someone else's. Until the pod keeps resource
+    // metadata, both are written the way they always were.
+    w.legacy_under_root().replace_graph(id, &quads)?;
     Ok(())
 }
 
-fn clear_received_at(store: &Store, inbox: &str, activity: &str) -> Result<(), InboxError> {
-    let existing: Vec<Quad> = store
+fn clear_received_at(w: &mut PodWrite<'_>, inbox: &str, activity: &str) -> Result<(), InboxError> {
+    let existing: Vec<Quad> = w
         .quads_for_pattern(
             Some((&NamedOrBlankNode::NamedNode(iri(activity))).into()),
             Some(iri(RECEIVED_AT).as_ref()),
@@ -151,27 +152,23 @@ fn clear_received_at(store: &Store, inbox: &str, activity: &str) -> Result<(), I
         )
         .filter_map(Result::ok)
         .collect();
-    for quad in &existing {
-        store.remove(quad)?;
-    }
+    w.remove_quads(&existing)?;
     Ok(())
 }
 
-/// Drop an activity from an inbox, graph and all.
+/// Drop an activity from an inbox, graph and all, inside the caller's write.
 ///
 /// Both halves matter: a membership row left pointing at a cleared graph is a
 /// hole in every timeline that tries to render it.
-pub fn remove(store: &Store, inbox: &str, activity: &str) -> Result<(), InboxError> {
+pub fn remove(w: &mut PodWrite<'_>, inbox: &str, activity: &str) -> Result<(), InboxError> {
     let inbox_node = iri(inbox);
-    let activity_node = iri(activity);
-
-    store.remove(&Quad::new(
+    w.remove_quads(&[Quad::new(
         NamedOrBlankNode::NamedNode(inbox_node.clone()),
         iri(LDP_CONTAINS),
-        Term::NamedNode(activity_node.clone()),
+        Term::NamedNode(iri(activity)),
         GraphName::NamedNode(inbox_node),
-    ))?;
-    clear_received_at(store, inbox, activity)?;
-    store.clear_graph(GraphNameRef::NamedNode(activity_node.as_ref()))?;
+    )])?;
+    clear_received_at(w, inbox, activity)?;
+    w.legacy_under_root().clear_graph(activity)?;
     Ok(())
 }

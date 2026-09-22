@@ -15,14 +15,31 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError, Weak};
 
 use moka::sync::Cache;
-use oxigraph::store::Store;
 use uuid::Uuid;
+
+use crate::index::InstanceStore;
+use crate::resources::Pod;
 
 #[derive(Debug, Clone)]
 pub enum StoreError {
     Io(String),
     Backend(String),
     NotFound,
+    /// An outside-root write named a graph under the storage root, or the
+    /// metadata graph itself. Those change only through `put` and `remove`.
+    UnderRoot,
+    /// `put` named a resource outside the pod's storage root.
+    NotUnderRoot,
+    /// The pod has no storage root recorded, so there is nothing to put under.
+    NoRoot,
+    /// `remove` of a container that still has members.
+    ContainerNotEmpty,
+    /// `Content::Binary` named a digest whose bytes aren't in the blob store.
+    /// Write the bytes again and retry once.
+    BlobMissing,
+    /// A write the store refuses as malformed: content that doesn't fit its
+    /// IRI, a quad outside the resource's graph, removing the storage root.
+    Invalid(String),
 }
 
 impl std::fmt::Display for StoreError {
@@ -31,6 +48,12 @@ impl std::fmt::Display for StoreError {
             StoreError::Io(e) => write!(f, "io: {e}"),
             StoreError::Backend(e) => write!(f, "store backend: {e}"),
             StoreError::NotFound => write!(f, "store not found"),
+            StoreError::UnderRoot => write!(f, "graph is under the storage root"),
+            StoreError::NotUnderRoot => write!(f, "resource is outside the storage root"),
+            StoreError::NoRoot => write!(f, "pod has no storage root"),
+            StoreError::ContainerNotEmpty => write!(f, "container is not empty"),
+            StoreError::BlobMissing => write!(f, "blob bytes are missing"),
+            StoreError::Invalid(e) => write!(f, "invalid write: {e}"),
         }
     }
 }
@@ -58,7 +81,7 @@ impl From<oxigraph::store::LoaderError> for StoreError {
 /// Opens and caches per-user pods, and owns the instance store.
 pub struct StoreManager {
     base: PathBuf,
-    pods: Cache<Uuid, Arc<Store>>,
+    pods: Cache<Uuid, Arc<Pod>>,
     /// Every pod handle still alive anywhere, cached or not.
     ///
     /// RocksDB lets a process open a directory once. The cache can evict a pod
@@ -66,8 +89,12 @@ pub struct StoreManager {
     /// that directory is then refused by the lock. So a cache miss looks here
     /// first and hands back the live handle. The lock covers only the map;
     /// concurrent opens of one pod are deduplicated by the cache itself.
-    live: Mutex<HashMap<Uuid, Weak<Store>>>,
-    instance: Arc<Store>,
+    ///
+    /// Handing back the same `Pod` also hands back the same write lock (R6):
+    /// two `Pod`s over one database would each serialise their own writers and
+    /// not each other's.
+    live: Mutex<HashMap<Uuid, Weak<Pod>>>,
+    instance: InstanceStore,
 }
 
 impl StoreManager {
@@ -86,7 +113,7 @@ impl StoreManager {
         std::fs::create_dir_all(&instance_dir)?;
 
         Ok(Self {
-            instance: Arc::new(Store::open(&instance_dir)?),
+            instance: InstanceStore::open(&instance_dir)?,
             pods: Cache::builder()
                 .max_capacity(max_open)
                 .time_to_idle(std::time::Duration::from_secs(idle_secs))
@@ -120,7 +147,7 @@ impl StoreManager {
     }
 
     /// The user's pod, opening it if necessary. Creates on first use.
-    pub fn pod(&self, user: Uuid) -> Result<Arc<Store>, StoreError> {
+    pub fn pod(&self, user: Uuid) -> Result<Arc<Pod>, StoreError> {
         // `try_get_with` runs `open_pod` at most once per user at a time, and
         // concurrent requests for that user wait for its result. Requests for
         // different users open in parallel: opening costs milliseconds (ADR
@@ -133,33 +160,31 @@ impl StoreManager {
 
     /// Hand back the live handle if the cache evicted one a request still
     /// holds, and open the database only when nothing does.
-    fn open_pod(&self, user: Uuid) -> Result<Arc<Store>, StoreError> {
-        if let Some(store) = self.live_handles().get(&user).and_then(Weak::upgrade) {
-            return Ok(store);
+    fn open_pod(&self, user: Uuid) -> Result<Arc<Pod>, StoreError> {
+        if let Some(pod) = self.live_handles().get(&user).and_then(Weak::upgrade) {
+            return Ok(pod);
         }
-        // The graph lives in its own subdirectory: Oxigraph owns that
-        // directory's layout, and `blobs/` alongside it would be a stray
-        // directory inside a database it manages.
-        let dir = self.pod_dir(user).join("rdf");
-        std::fs::create_dir_all(&dir)?;
-        let store = Arc::new(Store::open(&dir)?);
+        let pod = Arc::new(Pod::open(&self.pod_dir(user))?);
         let mut live = self.live_handles();
         // Drop entries whose pods have closed, so the map tracks what is open
         // rather than everyone who was ever served.
         live.retain(|_, handle| handle.strong_count() > 0);
-        live.insert(user, Arc::downgrade(&store));
-        Ok(store)
+        live.insert(user, Arc::downgrade(&pod));
+        Ok(pod)
     }
 
     /// The live-handle map. A poisoned lock only means another thread panicked
     /// while holding it; the map holds weak handles, so nothing in it can be
     /// half-written.
-    fn live_handles(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Weak<Store>>> {
+    fn live_handles(&self) -> std::sync::MutexGuard<'_, HashMap<Uuid, Weak<Pod>>> {
         self.live.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// The server agent's own store — the cross-user query surface (ADR 0005).
-    pub fn instance(&self) -> &Arc<Store> {
+    ///
+    /// Not a `Pod`: it has no storage root, is never upgraded, and only
+    /// `index` writes it (R15).
+    pub fn instance(&self) -> &InstanceStore {
         &self.instance
     }
 

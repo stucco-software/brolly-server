@@ -19,13 +19,54 @@
 //! recipient like any other and its processor writes the row. Rebuilding is the
 //! repair path, not the normal one.
 
+use std::path::Path;
+
 use oxigraph::model::Variable;
-use oxigraph::model::{GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-use oxigraph::store::Store;
+use oxigraph::model::{
+    GraphName, GraphNameRef, Literal, NamedNode, NamedNodeRef, NamedOrBlankNode,
+    NamedOrBlankNodeRef, Quad, Term, TermRef,
+};
+use oxigraph::sparql::{PreparedSparqlQuery, QueryResults, SparqlEvaluator};
+use oxigraph::store::{QuadIter, Store};
 
 use crate::manager::StoreError;
+use crate::resources::{PodRead, read_only};
 use crate::write::{WriteError, insert_quads};
+
+/// The server agent's own store (ADR 0005).
+///
+/// Its own type rather than a `Pod` (R15): it has no storage root and no
+/// resource metadata, it is never upgraded, and the functions in this module
+/// are the only things that write it. Everything else reads it through
+/// [`PodRead`].
+pub struct InstanceStore {
+    store: Store,
+}
+
+impl InstanceStore {
+    pub(crate) fn open(dir: &Path) -> Result<Self, StoreError> {
+        Ok(Self {
+            store: Store::open(dir)?,
+        })
+    }
+}
+
+impl PodRead for InstanceStore {
+    fn quads_for_pattern(
+        &self,
+        subject: Option<NamedOrBlankNodeRef<'_>>,
+        predicate: Option<NamedNodeRef<'_>>,
+        object: Option<TermRef<'_>>,
+        graph_name: Option<GraphNameRef<'_>>,
+    ) -> QuadIter<'_> {
+        self.store
+            .quads_for_pattern(subject, predicate, object, graph_name)
+    }
+
+    fn evaluate(&self, query: PreparedSparqlQuery) -> Result<QueryResults<'_>, StoreError> {
+        read_only(query.on_store(&self.store).execute())
+    }
+}
 
 /// Graph holding the public/local timeline index (ADR 0005 R1).
 pub const PUBLIC_TIMELINE: &str = "https://brolly.id/index/public";
@@ -71,7 +112,7 @@ fn graph() -> GraphName {
 /// triple would let anyone who boosts a post claim it, and `count_notes` would
 /// count it twice. A second `published` literal would list the note twice in
 /// [`public_timeline`], once at the later time.
-pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteError> {
+pub fn record_note(store: &InstanceStore, pointer: &NotePointer) -> Result<(), StoreError> {
     // Check-then-write has to be atomic, or two first records of one note (a
     // redelivered Create racing its original) would both write. A process-wide
     // lock is enough: RocksDB lets only one process open the instance store.
@@ -115,7 +156,12 @@ pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteErro
             graph(),
         ));
     }
-    insert_quads(store, &quads)?;
+    // A pointer carries no faithful record, so the only failure left is the
+    // store's.
+    insert_quads(&store.store, &quads).map_err(|e| match e {
+        WriteError::Store(e) => e,
+        WriteError::Encode(e) => StoreError::Backend(e.to_string()),
+    })?;
     Ok(())
 }
 
@@ -124,7 +170,7 @@ pub fn record_note(store: &Store, pointer: &NotePointer) -> Result<(), WriteErro
 /// A pointer always has exactly one author triple, so that is what's checked.
 /// A read, not a write: the ActivityPub processor asks before it lets an
 /// `Announce` touch the index.
-pub fn is_indexed(store: &Store, note: &NamedNode) -> Result<bool, StoreError> {
+pub fn is_indexed(store: &InstanceStore, note: &NamedNode) -> Result<bool, StoreError> {
     let subject = NamedOrBlankNode::NamedNode(note.clone());
     let first = store
         .quads_for_pattern(
@@ -139,9 +185,10 @@ pub fn is_indexed(store: &Store, note: &NamedNode) -> Result<bool, StoreError> {
 }
 
 /// Drop a row — used when a dereference 404s, i.e. the pod no longer has it.
-pub fn forget_note(store: &Store, note: &NamedNode) -> Result<(), StoreError> {
+pub fn forget_note(store: &InstanceStore, note: &NamedNode) -> Result<(), StoreError> {
     let subject = NamedOrBlankNode::NamedNode(note.clone());
     let stale: Vec<Quad> = store
+        .store
         .quads_for_pattern(
             Some((&subject).into()),
             None,
@@ -151,7 +198,7 @@ pub fn forget_note(store: &Store, note: &NamedNode) -> Result<(), StoreError> {
         .filter_map(Result::ok)
         .collect();
     for quad in &stale {
-        store.remove(quad)?;
+        store.store.remove(quad)?;
     }
     Ok(())
 }
@@ -166,7 +213,7 @@ pub const PUBLIC_AUDIENCE: &str = "https://www.w3.org/ns/activitystreams#Public"
 /// engine stays an implementation detail of this crate, which is the same
 /// reason `Store` is re-exported rather than imported everywhere.
 pub fn public_note_iris(
-    store: &Store,
+    store: &InstanceStore,
     limit: usize,
     before: Option<&str>,
 ) -> Result<Vec<String>, StoreError> {
@@ -187,7 +234,7 @@ pub fn public_note_iris(
 /// Counts rows, not triples: `P_AUTHOR` appears exactly once per note, where a
 /// bare graph count would inflate by however many optional predicates each row
 /// happened to carry.
-pub fn count_notes(store: &Store) -> Result<i64, StoreError> {
+pub fn count_notes(store: &InstanceStore) -> Result<i64, StoreError> {
     Ok(store
         .quads_for_pattern(
             None,
@@ -200,8 +247,10 @@ pub fn count_notes(store: &Store) -> Result<i64, StoreError> {
 }
 
 /// Wipe the index. The first half of a rebuild.
-pub fn clear(store: &Store) -> Result<(), StoreError> {
-    store.clear_graph(GraphNameRef::NamedNode(iri(PUBLIC_TIMELINE).as_ref()))?;
+pub fn clear(store: &InstanceStore) -> Result<(), StoreError> {
+    store
+        .store
+        .clear_graph(GraphNameRef::NamedNode(iri(PUBLIC_TIMELINE).as_ref()))?;
     Ok(())
 }
 
@@ -221,7 +270,7 @@ pub fn clear(store: &Store) -> Result<(), StoreError> {
 /// why `?audience` and `?cursor` are projected even though the caller never
 /// reads those columns.
 pub fn public_timeline(
-    store: &Store,
+    store: &InstanceStore,
     audience: &NamedNode,
     limit: usize,
     before: Option<&str>,
@@ -256,7 +305,7 @@ pub fn public_timeline(
             Variable::new("cursor").map_err(|e| StoreError::Backend(e.to_string()))?,
             cursor,
         )
-        .on_store(store)
+        .on_store(&store.store)
         .execute()
         .map_err(|e| StoreError::Backend(e.to_string()))?;
 

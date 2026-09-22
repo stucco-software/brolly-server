@@ -15,6 +15,7 @@ use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
 use brolly_solid::ldp::{self, LdpError};
 use brolly_solid::oidc::tokens;
 use brolly_solid::patch;
+use brolly_store::resources::{Pod, PodWrite};
 use std::sync::Arc;
 
 use crate::AppState;
@@ -23,7 +24,7 @@ use crate::AppState;
 pub struct PodRequest {
     pub user: User,
     pub subject: Subject,
-    pub store: Arc<brolly_store::Store>,
+    pub pod: Arc<Pod>,
     /// This pod's binary storage, for LDP-NR.
     pub blobs: brolly_store::BlobStore,
     pub base: String,
@@ -58,8 +59,8 @@ async fn resolve(
         }
     };
 
-    let store = match state.stores.pod(user.id) {
-        Ok(store) => store,
+    let pod = match state.stores.pod(user.id) {
+        Ok(pod) => pod,
         Err(e) => {
             tracing::error!(error = %e, user = %user.id, "pod store unavailable");
             return Err(StatusCode::INTERNAL_SERVER_ERROR.into_response());
@@ -81,7 +82,7 @@ async fn resolve(
         base,
         user,
         subject,
-        store,
+        pod,
         blobs,
     })
 }
@@ -260,7 +261,7 @@ pub async fn get(
     let accept = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
 
     match ldp::read(
-        &request.store,
+        &request.pod,
         Some(&request.blobs),
         &request.base,
         &path,
@@ -305,7 +306,7 @@ pub async fn put(
         .unwrap_or("text/turtle");
 
     match ldp::put(
-        &request.store,
+        &request.pod,
         Some(&request.blobs),
         &request.base,
         &path,
@@ -337,7 +338,7 @@ pub async fn post(
         .unwrap_or("text/turtle");
 
     match ldp::append(
-        &request.store,
+        &request.pod,
         Some(&request.blobs),
         &request.base,
         &path,
@@ -369,7 +370,12 @@ pub async fn patch(
     }
 
     // A patch mutates, so it needs Write.
-    match ldp::may_write(&request.store, &request.base, &path, &request.subject) {
+    match ldp::may_write(
+        &request.pod.read_store(),
+        &request.base,
+        &path,
+        &request.subject,
+    ) {
         Ok(true) => {}
         Ok(false) => return ldp_error(LdpError::Forbidden),
         Err(e) => return ldp_error(e),
@@ -381,9 +387,11 @@ pub async fn patch(
         .unwrap_or_default();
 
     let result = match content_type.split(';').next().unwrap_or_default().trim() {
-        "text/n3" => patch::apply_n3_patch(&request.store, &resource, &body),
+        "text/n3" => patch_in(&request.pod, |w| patch::apply_n3_patch(w, &resource, &body)),
         "application/sparql-update" => match std::str::from_utf8(&body) {
-            Ok(sparql) => patch::apply_sparql_update(&request.store, &resource, sparql),
+            Ok(sparql) => patch_in(&request.pod, |w| {
+                patch::apply_sparql_update(w, &resource, sparql)
+            }),
             Err(_) => {
                 return (StatusCode::BAD_REQUEST, "body is not UTF-8").into_response();
             }
@@ -415,6 +423,19 @@ pub async fn patch(
     }
 }
 
+/// Apply a patch in one `Pod::write`.
+///
+/// A refused patch comes back inside `Ok`, so the transaction commits, but
+/// every refusal happens before the patch writes anything.
+fn patch_in(
+    pod: &Pod,
+    apply: impl FnOnce(&mut PodWrite<'_>) -> Result<(), patch::PatchError>,
+) -> Result<(), patch::PatchError> {
+    pod.write(|w| Ok(apply(w)))
+        .map_err(|e| patch::PatchError::Store(e.to_string()))
+        .flatten()
+}
+
 /// `DELETE /~/*path`
 pub async fn delete(
     State(state): State<AppState>,
@@ -427,7 +448,7 @@ pub async fn delete(
         Err(response) => return response,
     };
     match ldp::delete(
-        &request.store,
+        &request.pod,
         Some(&request.blobs),
         &request.base,
         &path,

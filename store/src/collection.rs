@@ -15,8 +15,9 @@
 
 use brolly_domain::faithful;
 use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
-use oxigraph::store::Store;
 use serde_json::Value;
+
+use crate::resources::PodRead;
 
 /// The lexicon marker naming AS2's term space in the faithful layer.
 ///
@@ -49,7 +50,7 @@ pub struct Entry {
 }
 
 /// Everything in this collection.
-pub fn members(store: &Store, collection: &str) -> Vec<String> {
+pub fn members(store: &impl PodRead, collection: &str) -> Vec<String> {
     let node = iri(collection);
     store
         .quads_for_pattern(
@@ -67,7 +68,7 @@ pub fn members(store: &Store, collection: &str) -> Vec<String> {
 }
 
 /// When this collection received an activity.
-pub fn received_at(store: &Store, collection: &str, activity: &str) -> Option<String> {
+pub fn received_at(store: &impl PodRead, collection: &str, activity: &str) -> Option<String> {
     store
         .quads_for_pattern(
             Some((&NamedOrBlankNode::NamedNode(iri(activity))).into()),
@@ -87,7 +88,12 @@ pub fn received_at(store: &Store, collection: &str, activity: &str) -> Option<St
 /// The explicit-graph form. A profile triple lives in the *profile document's*
 /// graph while its subject is the WebID, so the two differ and the caller has
 /// to say which it means.
-pub fn literal_in(store: &Store, subject: &str, predicate: &str, graph: &str) -> Option<String> {
+pub fn literal_in(
+    store: &impl PodRead,
+    subject: &str,
+    predicate: &str,
+    graph: &str,
+) -> Option<String> {
     store
         .quads_for_pattern(
             Some((&NamedOrBlankNode::NamedNode(iri(subject))).into()),
@@ -107,7 +113,7 @@ pub fn literal_in(store: &Store, subject: &str, predicate: &str, graph: &str) ->
 /// The small read that sits under "what media type is this blob" and "what is
 /// this attachment's alt text" — both of which are single triples on a resource
 /// rather than records to decode.
-pub fn literal(store: &Store, subject: &str, predicate: &str) -> Option<String> {
+pub fn literal(store: &impl PodRead, subject: &str, predicate: &str) -> Option<String> {
     let node = iri(subject);
     store
         .quads_for_pattern(
@@ -124,7 +130,7 @@ pub fn literal(store: &Store, subject: &str, predicate: &str) -> Option<String> 
 }
 
 /// Read a stored record back as the wire format it arrived in.
-pub fn read_record(store: &Store, id: &str) -> Option<Value> {
+pub fn read_record(store: &impl PodRead, id: &str) -> Option<Value> {
     let node = iri(id);
     let quads: Vec<Quad> = store
         .quads_for_pattern(
@@ -146,7 +152,7 @@ pub fn read_record(store: &Store, id: &str) -> Option<Value> {
 /// Read from the **faithful** layer's term space (`at://as2#type`), not the
 /// canonical AS2 namespace. Filtering on the canonical predicate would silently
 /// match nothing for every activity type outside the mapping table (D7).
-pub fn record_type(store: &Store, activity: &str) -> Option<String> {
+pub fn record_type(store: &impl PodRead, activity: &str) -> Option<String> {
     let node = iri(activity);
     let predicate = iri(&brolly_domain::nsid::predicate(AS2, "type"));
     store
@@ -176,7 +182,7 @@ pub fn record_type(store: &Store, activity: &str) -> Option<String> {
 /// `before` is an exclusive cursor: passing the last row of a page returns the
 /// next page without repeating the boundary.
 pub fn timeline(
-    store: &Store,
+    store: &impl PodRead,
     collection: &str,
     types: &[&str],
     limit: usize,

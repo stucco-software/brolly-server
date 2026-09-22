@@ -504,14 +504,13 @@ pub async fn create_record(
 
     // And into the pod, faithfully, so the other protocols can see it.
     let uri = ingest::at_uri(&did_of(&user, &state), &input.collection, &rkey);
+    let webid = webid::webid(&user.username, &state.base_domain);
+    let document = webid::profile_document(&user.username, &state.base_domain);
     if let Ok(pod) = state.stores.pod(user.id)
-        && let Err(e) = ingest::ingest(
-            &pod,
-            &record,
-            &uri,
-            &webid::webid(&user.username, &state.base_domain),
-            &webid::profile_document(&user.username, &state.base_domain),
-        )
+        && let Err(e) = pod
+            .write(|w| Ok(ingest::ingest(w, &record, &uri, &webid, &document)))
+            .map_err(ingest::IngestError::from)
+            .flatten()
     {
         tracing::error!(error = %e, "faithful ingest failed after a repo write");
     }

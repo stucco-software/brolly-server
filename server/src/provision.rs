@@ -12,7 +12,8 @@
 use brolly_identity::db::{self, DbError};
 use brolly_identity::{routing, webid};
 use brolly_solid::storage;
-use brolly_store::write::{WriteError, insert_quads};
+use brolly_store::StoreError;
+use brolly_store::resources::Pod;
 use oxigraph_model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -38,35 +39,32 @@ fn triple(graph: &str, subject: &str, predicate: &str, object: &str) -> Quad {
 /// governs the container itself, the second governs everything inside it. They
 /// are distinct scopes, and conflating them is how an ACL silently grants more
 /// or less than intended.
-pub fn pod(
-    store: &brolly_store::Store,
-    username: &str,
-    base_domain: &str,
-) -> Result<(), WriteError> {
+pub fn pod(pod: &Pod, username: &str, base_domain: &str) -> Result<(), StoreError> {
     let root = routing::storage_root(username, base_domain);
-    storage::init_storage_root(store, &root)?;
-
     let acl = format!("{root}.acl");
     let owner = format!("{acl}#owner");
     let member = webid::webid(username, base_domain);
+    let grant = [
+        triple(&acl, &owner, &format!("{ACL}accessTo"), &root),
+        triple(&acl, &owner, &format!("{ACL}default"), &root),
+        triple(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        triple(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        triple(
+            &acl,
+            &owner,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Control"),
+        ),
+        triple(&acl, &owner, &format!("{ACL}agent"), &member),
+    ];
 
-    insert_quads(
-        store,
-        &[
-            triple(&acl, &owner, &format!("{ACL}accessTo"), &root),
-            triple(&acl, &owner, &format!("{ACL}default"), &root),
-            triple(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
-            triple(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
-            triple(
-                &acl,
-                &owner,
-                &format!("{ACL}mode"),
-                &format!("{ACL}Control"),
-            ),
-            triple(&acl, &owner, &format!("{ACL}agent"), &member),
-        ],
-    )?;
-    Ok(())
+    // The root and its ACL in one write, so a pod never has a root its owner
+    // can't write to. Both are under the storage root and are written the way
+    // they always were until the pod keeps resource metadata.
+    pod.write(|w| {
+        storage::init_storage_root(w, &root)?;
+        w.legacy_under_root().insert(&grant)
+    })
 }
 
 // --- ATProtocol identity ---------------------------------------------------

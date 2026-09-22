@@ -101,7 +101,7 @@ async fn member_actor(state: &AppState, username: &str) -> Response {
     // a view of the WebID's triples, never a second copy of them.
     let profile = match state.stores.pod(user.id) {
         Ok(pod) => brolly_solid::profile::read(
-            &pod,
+            &pod.read_store(),
             &webid::webid(&user.username, &state.base_domain),
             &webid::profile_document(&user.username, &state.base_domain),
         ),
@@ -245,11 +245,11 @@ async fn follow_collection(state: &AppState, headers: &HeaderMap, which: Which) 
     let (id, items) = match which {
         Which::Followers => (
             webid::followers(&username, &state.base_domain),
-            brolly_activitypub::follows::followers(&pod, &actor),
+            brolly_activitypub::follows::followers(&pod.read_store(), &actor),
         ),
         Which::Following => (
             webid::following(&username, &state.base_domain),
-            brolly_activitypub::follows::following(&pod, &actor),
+            brolly_activitypub::follows::following(&pod.read_store(), &actor),
         ),
     };
     json_response(ACTIVITY_JSON, ordered_collection(&id, items))
@@ -296,6 +296,6 @@ pub async fn inbox_collection(State(state): State<AppState>, headers: HeaderMap)
         return server_error();
     };
 
-    let items = brolly_store::collection::members(&pod, &inbox);
+    let items = brolly_store::collection::members(&pod.read_store(), &inbox);
     json_response(ACTIVITY_JSON, ordered_collection(&inbox, items))
 }

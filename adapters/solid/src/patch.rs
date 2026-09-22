@@ -16,7 +16,7 @@
 //! Those are checked first, so a client is never told a patch applied when it
 //! did not.
 
-use brolly_store::write::replace_graph;
+use brolly_store::resources::{PodRead, PodWrite};
 use oxigraph::model::{GraphNameRef, NamedNode, Quad};
 use oxigraph::sparql::SparqlEvaluator;
 use oxigraph::store::Store;
@@ -194,7 +194,7 @@ pub fn is_graph_safe(sparql: &str) -> bool {
 ///
 /// The resource's triples are copied into a scratch in-memory store as its
 /// **default graph**, the update runs there verbatim, and the result replaces
-/// the resource's named graph through the normal write path.
+/// the resource's named graph inside the caller's write.
 ///
 /// This avoids rewriting the client's SPARQL. Wrapping text in `WITH <g>` only
 /// works for the `DELETE/INSERT … WHERE` form — `INSERT DATA`, which is what
@@ -202,13 +202,12 @@ pub fn is_graph_safe(sparql: &str) -> bool {
 /// instead. Doing that by string surgery on a user-supplied query is exactly
 /// the kind of parser-by-regex this codebase should not contain.
 ///
-/// Two properties fall out for free: the write goes through
-/// `brolly_store::write::replace_graph`, so IRIs are canonicalized like any
-/// other write rather than needing a fix-up pass afterwards; and the swap is
-/// computed before it is applied, so a failing update leaves the resource
-/// untouched.
+/// Two properties fall out for free: the result goes through the pod's
+/// canonicalising write path, so IRIs are canonicalized like any other write
+/// rather than needing a fix-up pass afterwards; and the swap is computed
+/// before it is applied, so a failing update leaves the resource untouched.
 fn apply_scoped(
-    store: &Store,
+    w: &mut PodWrite<'_>,
     resource: &str,
     update: &str,
     precondition: impl Fn(&Store) -> Result<(), PatchError>,
@@ -216,7 +215,7 @@ fn apply_scoped(
     let graph = NamedNode::new_unchecked(resource);
 
     let scratch = Store::new().map_err(|e| PatchError::Store(e.to_string()))?;
-    for quad in store.quads_for_pattern(
+    for quad in w.quads_for_pattern(
         None,
         None,
         None,
@@ -242,7 +241,10 @@ fn apply_scoped(
         .map(|q| Quad::new(q.subject, q.predicate, q.object, graph.clone()))
         .collect();
 
-    replace_graph(store, &graph, &patched).map_err(|e| PatchError::Store(e.to_string()))?;
+    // Every PATCH target is under the storage root (`pod.rs` refuses the rest).
+    w.legacy_under_root()
+        .replace_graph(resource, &patched)
+        .map_err(|e| PatchError::Store(e.to_string()))?;
     Ok(())
 }
 
@@ -303,21 +305,25 @@ fn run_update(store: &Store, update: &str) -> Result<(), PatchError> {
         .map_err(|e| PatchError::Store(e.to_string()))
 }
 
-/// Apply an N3 Patch to a resource.
-pub fn apply_n3_patch(store: &Store, resource: &str, body: &[u8]) -> Result<(), PatchError> {
+/// Apply an N3 Patch to a resource, inside the caller's write.
+pub fn apply_n3_patch(w: &mut PodWrite<'_>, resource: &str, body: &[u8]) -> Result<(), PatchError> {
     let patch = parse_n3_patch(body, resource)?;
     let update = n3_patch_to_sparql(&patch);
-    apply_scoped(store, resource, &update, |scratch| {
+    apply_scoped(w, resource, &update, |scratch| {
         check_preconditions(scratch, &patch)
     })
 }
 
-/// Apply a SPARQL Update to a resource.
-pub fn apply_sparql_update(store: &Store, resource: &str, sparql: &str) -> Result<(), PatchError> {
+/// Apply a SPARQL Update to a resource, inside the caller's write.
+pub fn apply_sparql_update(
+    w: &mut PodWrite<'_>,
+    resource: &str,
+    sparql: &str,
+) -> Result<(), PatchError> {
     if !is_graph_safe(sparql) {
         return Err(PatchError::EscapesGraph);
     }
-    apply_scoped(store, resource, sparql, |_| Ok(()))
+    apply_scoped(w, resource, sparql, |_| Ok(()))
 }
 
 #[cfg(test)]

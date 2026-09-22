@@ -103,16 +103,19 @@ async fn an_atproto_profile_write_is_visible_to_activitypub() {
     brolly_server::provision::pod(&pod, "alice", BASE).unwrap();
 
     let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-    brolly_atproto::ingest::ingest(
-        &pod,
-        &json!({
-            "$type": "app.bsky.actor.profile",
-            "displayName": "Alice Example",
-        }),
-        &brolly_atproto::ingest::at_uri(did, "app.bsky.actor.profile", "self"),
-        &webid::webid("alice", BASE),
-        &webid::profile_document("alice", BASE),
-    )
+    pod.write(|w| {
+        Ok(brolly_atproto::ingest::ingest(
+            w,
+            &json!({
+                "$type": "app.bsky.actor.profile",
+                "displayName": "Alice Example",
+            }),
+            &brolly_atproto::ingest::at_uri(did, "app.bsky.actor.profile", "self"),
+            &webid::webid("alice", BASE),
+            &webid::profile_document("alice", BASE),
+        ))
+    })
+    .unwrap()
     .expect("ingest");
 
     let actor = get_json(&h, &format!("alice.{BASE}"), "/actor").await;
@@ -133,16 +136,18 @@ async fn a_solid_profile_write_is_visible_to_activitypub() {
     let pod = h.stores.pod(user.id).unwrap();
     brolly_server::provision::pod(&pod, "alice", BASE).unwrap();
 
-    brolly_solid::profile::write(
-        &pod,
-        &webid::webid("alice", BASE),
-        &webid::profile_document("alice", BASE),
-        &brolly_solid::profile::Profile {
-            display_name: "Written Through Solid".into(),
-            bio: "and read through ActivityPub".into(),
-            ..brolly_solid::profile::Profile::blank()
-        },
-    )
+    pod.write(|w| {
+        brolly_solid::profile::write(
+            w,
+            &webid::webid("alice", BASE),
+            &webid::profile_document("alice", BASE),
+            &brolly_solid::profile::Profile {
+                display_name: "Written Through Solid".into(),
+                bio: "and read through ActivityPub".into(),
+                ..brolly_solid::profile::Profile::blank()
+            },
+        )
+    })
     .unwrap();
 
     let actor = get_json(&h, &format!("alice.{BASE}"), "/actor").await;
@@ -162,28 +167,33 @@ async fn an_unmapped_lexicon_does_not_touch_the_shared_profile() {
     let pod = h.stores.pod(user.id).unwrap();
     brolly_server::provision::pod(&pod, "alice", BASE).unwrap();
 
-    brolly_solid::profile::write(
-        &pod,
-        &webid::webid("alice", BASE),
-        &webid::profile_document("alice", BASE),
-        &brolly_solid::profile::Profile {
-            display_name: "The Real Name".into(),
-            ..brolly_solid::profile::Profile::blank()
-        },
-    )
+    pod.write(|w| {
+        brolly_solid::profile::write(
+            w,
+            &webid::webid("alice", BASE),
+            &webid::profile_document("alice", BASE),
+            &brolly_solid::profile::Profile {
+                display_name: "The Real Name".into(),
+                ..brolly_solid::profile::Profile::blank()
+            },
+        )
+    })
     .unwrap();
 
     let did = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
-    brolly_atproto::ingest::ingest(
-        &pod,
-        &json!({
-            "$type": "site.standard.doc",
-            "displayName": "An Impostor",
-        }),
-        &brolly_atproto::ingest::at_uri(did, "site.standard.doc", "3kaaa"),
-        &webid::webid("alice", BASE),
-        &webid::profile_document("alice", BASE),
-    )
+    pod.write(|w| {
+        Ok(brolly_atproto::ingest::ingest(
+            w,
+            &json!({
+                "$type": "site.standard.doc",
+                "displayName": "An Impostor",
+            }),
+            &brolly_atproto::ingest::at_uri(did, "site.standard.doc", "3kaaa"),
+            &webid::webid("alice", BASE),
+            &webid::profile_document("alice", BASE),
+        ))
+    })
+    .unwrap()
     .expect("an unmapped lexicon still ingests");
 
     let actor = get_json(&h, &format!("alice.{BASE}"), "/actor").await;
@@ -194,7 +204,7 @@ async fn an_unmapped_lexicon_does_not_touch_the_shared_profile() {
 
     // But it is still stored, faithfully, in its own space.
     let stored = brolly_atproto::ingest::read(
-        &pod,
+        &pod.read_store(),
         &brolly_atproto::ingest::at_uri(did, "site.standard.doc", "3kaaa"),
     );
     assert_eq!(stored.unwrap()["displayName"], "An Impostor");

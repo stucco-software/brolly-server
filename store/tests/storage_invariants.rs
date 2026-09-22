@@ -3,7 +3,7 @@
 
 use brolly_domain::iri::{iris_in, is_canonical};
 use brolly_store::index::{self, NotePointer};
-use brolly_store::{StoreManager, insert_quads, insert_record};
+use brolly_store::{InstanceStore, PodRead, StoreManager};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde_json::json;
 use uuid::Uuid;
@@ -34,9 +34,10 @@ fn non_canonical_iris_cannot_survive_the_write_path() {
         Term::NamedNode(node("http://www.w3.org/ns/activitystreams#Public")),
         GraphName::NamedNode(graph.clone()),
     )];
-    insert_quads(&pod, &hostile).unwrap();
+    pod.write(|w| w.insert(&hostile)).unwrap();
 
     let stored: Vec<Quad> = pod
+        .read_store()
         .quads_for_pattern(
             None,
             None,
@@ -66,9 +67,12 @@ fn records_round_trip_through_a_real_store() {
         "langs": ["en"],
         "reply": {"root": {"uri": "at://x/1"}}
     });
-    insert_record(&pod, &record, &subject, &subject, "app.bsky.feed.post").unwrap();
+    let encoded =
+        brolly_domain::faithful::encode(&record, &subject, &subject, "app.bsky.feed.post").unwrap();
+    pod.write(|w| w.insert(&encoded)).unwrap();
 
     let quads: Vec<Quad> = pod
+        .read_store()
         .quads_for_pattern(
             None,
             None,
@@ -91,18 +95,24 @@ fn pods_are_isolated_and_delete_is_rm_rf() {
     let bob = Uuid::new_v4();
     let subject = node("https://alice.brolly.id/records/1");
 
-    insert_record(
-        &mgr.pod(alice).unwrap(),
+    let encoded = brolly_domain::faithful::encode(
         &json!({"text": "alice's"}),
         &subject,
         &subject,
         "test.note",
     )
     .unwrap();
+    mgr.pod(alice)
+        .unwrap()
+        .write(|w| w.insert(&encoded))
+        .unwrap();
 
     let bob_pod = mgr.pod(bob).unwrap();
     assert_eq!(
-        bob_pod.quads_for_pattern(None, None, None, None).count(),
+        bob_pod
+            .read_store()
+            .quads_for_pattern(None, None, None, None)
+            .count(),
         0,
         "one user's write must not appear in another's pod"
     );
@@ -115,7 +125,7 @@ fn pods_are_isolated_and_delete_is_rm_rf() {
 
 // --- the index holds pointers, never content --------------------------------
 
-fn seed_index(store: &oxigraph::store::Store) {
+fn seed_index(store: &InstanceStore) {
     for (n, when) in [("1", "2026-08-18T10:00:00Z"), ("2", "2026-08-18T11:00:00Z")] {
         index::record_note(
             store,
@@ -307,19 +317,19 @@ fn concurrent_first_records_of_one_note_write_one_pointer() {
     // A redelivered Create can race its original. Both see the note unindexed
     // unless check-then-write is atomic, and the pointer gets two authors.
     let (stores, _dir) = manager();
-    let instance = std::sync::Arc::clone(stores.instance());
+    let stores = std::sync::Arc::new(stores);
     let note = node("https://alice.brolly.test/~/notes/01J8Z0000000000000000000A1");
 
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
     let writers: Vec<_> = (0..8)
         .map(|i| {
-            let instance = std::sync::Arc::clone(&instance);
+            let stores = std::sync::Arc::clone(&stores);
             let barrier = std::sync::Arc::clone(&barrier);
             let note = note.clone();
             std::thread::spawn(move || {
                 barrier.wait();
                 index::record_note(
-                    &instance,
+                    stores.instance(),
                     &NotePointer {
                         note,
                         author: node(&format!("https://member{i}.brolly.test/actor")),
@@ -335,5 +345,5 @@ fn concurrent_first_records_of_one_note_write_one_pointer() {
         writer.join().unwrap().unwrap();
     }
 
-    assert_eq!(index::count_notes(&instance).unwrap(), 1);
+    assert_eq!(index::count_notes(stores.instance()).unwrap(), 1);
 }

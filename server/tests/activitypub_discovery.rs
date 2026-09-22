@@ -41,7 +41,8 @@ async fn harness() -> Harness {
         .await
         .unwrap();
     let pod = stores.pod(alice.id).unwrap();
-    storage::init_storage_root(&pod, ALICE_ROOT).unwrap();
+    pod.write(|w| storage::init_storage_root(w, ALICE_ROOT))
+        .unwrap();
 
     let router = app(
         AppState {
@@ -195,16 +196,18 @@ async fn the_actor_name_comes_from_the_pod() {
     // that one node. The actor document is a projection, not a second copy.
     let h = harness().await;
     let pod = h.stores.pod(h.alice).unwrap();
-    brolly_solid::profile::write(
-        &pod,
-        "https://alice.brolly.test/profile#me",
-        "https://alice.brolly.test/profile",
-        &brolly_solid::profile::Profile {
-            display_name: "Alice Example".into(),
-            bio: "Testing in production".into(),
-            ..brolly_solid::profile::Profile::blank()
-        },
-    )
+    pod.write(|w| {
+        brolly_solid::profile::write(
+            w,
+            "https://alice.brolly.test/profile#me",
+            "https://alice.brolly.test/profile",
+            &brolly_solid::profile::Profile {
+                display_name: "Alice Example".into(),
+                bio: "Testing in production".into(),
+                ..brolly_solid::profile::Profile::blank()
+            },
+        )
+    })
     .unwrap();
 
     let actor = get(&h, ALICE_HOST, "/actor", Some(AS2)).await.json();

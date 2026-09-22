@@ -8,7 +8,8 @@
 
 use brolly_identity::{Scope, Subject, Via};
 use brolly_solid::{ldp, storage};
-use brolly_store::{BlobStore, Store, insert_quads};
+use brolly_store::BlobStore;
+use brolly_store::resources::PodRead;
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use uuid::Uuid;
 
@@ -17,6 +18,15 @@ const ROOT: &str = "https://alice.brolly.test/~/";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
 const WEBID: &str = "https://alice.brolly.test/profile#me";
 const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR pretend this is an image";
+
+/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
+/// so it doesn't depend on the code under test.
+fn seed(target: &brolly_store::resources::Pod, quads: &[Quad]) {
+    let store = target.raw_store();
+    for quad in quads {
+        store.insert(quad).unwrap();
+    }
+}
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -33,7 +43,7 @@ fn t(g: &str, s: &str, p: &str, o: &str) -> Quad {
 
 struct Pod {
     _dir: tempfile::TempDir,
-    store: std::sync::Arc<Store>,
+    store: std::sync::Arc<brolly_store::resources::Pod>,
     blobs: BlobStore,
 }
 
@@ -45,10 +55,12 @@ fn pod() -> Pod {
     let store = manager.pod(user).unwrap();
     let blobs = manager.blobs(user).unwrap();
 
-    storage::init_storage_root(&store, ROOT).unwrap();
+    store
+        .write(|w| storage::init_storage_root(w, ROOT))
+        .unwrap();
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    insert_quads(
+    seed(
         &store,
         &[
             t(&g, &a, &format!("{ACL}default"), ROOT),
@@ -57,8 +69,7 @@ fn pod() -> Pod {
             t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
             t(&g, &a, &format!("{ACL}agent"), WEBID),
         ],
-    )
-    .unwrap();
+    );
 
     Pod {
         _dir: dir,
@@ -138,6 +149,7 @@ fn a_binary_is_typed_as_a_non_rdf_source() {
     let resource = format!("{BASE}/~/avatar.png");
     let types: Vec<String> = pod
         .store
+        .read_store()
         .quads_for_pattern(
             Some((&NamedOrBlankNode::NamedNode(n(&resource))).into()),
             Some(n("http://www.w3.org/1999/02/22-rdf-syntax-ns#type").as_ref()),
@@ -172,7 +184,7 @@ fn a_binary_is_listed_by_its_container() {
     )
     .unwrap();
 
-    let members = storage::members(&pod.store, &format!("{BASE}/~/media/"));
+    let members = storage::members(&pod.store.read_store(), &format!("{BASE}/~/media/"));
     assert!(
         members.contains(&format!("{BASE}/~/media/avatar.png")),
         "a binary must appear in its container like any other resource: {members:?}"
@@ -267,8 +279,9 @@ fn deleting_a_binary_removes_its_bytes() {
         ROOT,
     )
     .unwrap();
-    let digest = brolly_solid::ldp::blob_digest(&pod.store, &format!("{BASE}/~/avatar.png"))
-        .expect("a digest was recorded");
+    let digest =
+        brolly_solid::ldp::blob_digest(&pod.store.read_store(), &format!("{BASE}/~/avatar.png"))
+            .expect("a digest was recorded");
 
     ldp::delete(
         &pod.store,
@@ -367,7 +380,7 @@ fn turtle_still_goes_to_the_graph_and_not_the_blob_store() {
     .unwrap();
 
     assert!(
-        ldp::blob_digest(&pod.store, &format!("{BASE}/~/note")).is_none(),
+        ldp::blob_digest(&pod.store.read_store(), &format!("{BASE}/~/note")).is_none(),
         "an RDF source must not acquire a blob"
     );
     let outcome = ldp::read(
@@ -398,6 +411,6 @@ fn posting_a_binary_to_a_container_mints_a_member() {
     .unwrap();
 
     assert!(created.starts_with(&format!("{BASE}/~/media/")));
-    let members = storage::members(&pod.store, &format!("{BASE}/~/media/"));
+    let members = storage::members(&pod.store.read_store(), &format!("{BASE}/~/media/"));
     assert!(members.contains(&created));
 }

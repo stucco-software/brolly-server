@@ -9,7 +9,8 @@ use brolly_authz::AccessMode;
 use brolly_identity::{Scope, Subject, Via};
 use brolly_solid::ldp::{self, LdpError};
 use brolly_solid::storage;
-use brolly_store::{StoreManager, insert_quads};
+use brolly_store::StoreManager;
+use brolly_store::resources::Pod;
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use uuid::Uuid;
 
@@ -17,6 +18,15 @@ const BASE: &str = "https://alice.brolly.id";
 const ROOT: &str = "https://alice.brolly.id/~/";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
 const FOAF: &str = "http://xmlns.com/foaf/0.1/";
+
+/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
+/// so it doesn't depend on the code under test.
+fn seed(target: &Pod, quads: &[Quad]) {
+    let store = target.raw_store();
+    for quad in quads {
+        store.insert(quad).unwrap();
+    }
+}
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -62,16 +72,14 @@ fn stranger() -> Subject {
 }
 
 /// A pod whose root ACL grants Alice full control and nothing to anyone else.
-fn pod() -> (
-    StoreManager,
-    tempfile::TempDir,
-    std::sync::Arc<oxigraph::store::Store>,
-) {
+fn pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let dir = tempfile::tempdir().unwrap();
     let mgr = StoreManager::open(dir.path(), 4, 60).unwrap();
     let store = mgr.pod(Uuid::new_v4()).unwrap();
 
-    storage::init_storage_root(&store, ROOT).unwrap();
+    store
+        .write(|w| storage::init_storage_root(w, ROOT))
+        .unwrap();
 
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
@@ -88,7 +96,7 @@ fn pod() -> (
             "https://alice.brolly.id/profile#me",
         ),
     ];
-    insert_quads(&store, &quads).unwrap();
+    seed(&store, &quads);
     (mgr, dir, store)
 }
 
@@ -134,7 +142,7 @@ fn rdf_xml_is_refused_on_write_and_not_stored_as_a_blob() {
 
     assert!(matches!(err, LdpError::Syntax(_)), "got {err:?}");
     assert!(
-        !storage::exists(&store, &format!("{ROOT}note")),
+        !storage::exists(&store.read_store(), &format!("{ROOT}note")),
         "a refused write must not leave a resource behind"
     );
 }
@@ -248,10 +256,10 @@ fn a_body_cannot_write_into_another_resources_graph() {
     .unwrap();
 
     assert!(
-        !storage::exists(&store, &format!("{ROOT}other")),
+        !storage::exists(&store.read_store(), &format!("{ROOT}other")),
         "a PUT must only write its own named graph"
     );
-    assert!(storage::exists(&store, &format!("{ROOT}note")));
+    assert!(storage::exists(&store.read_store(), &format!("{ROOT}note")));
 }
 
 #[test]
@@ -269,9 +277,15 @@ fn containment_is_maintained_up_the_tree() {
     )
     .unwrap();
 
-    assert!(storage::members(&store, &format!("{ROOT}a/b/")).contains(&format!("{ROOT}a/b/c")));
-    assert!(storage::members(&store, &format!("{ROOT}a/")).contains(&format!("{ROOT}a/b/")));
-    assert!(storage::members(&store, ROOT).contains(&format!("{ROOT}a/")));
+    assert!(
+        storage::members(&store.read_store(), &format!("{ROOT}a/b/"))
+            .contains(&format!("{ROOT}a/b/c"))
+    );
+    assert!(
+        storage::members(&store.read_store(), &format!("{ROOT}a/"))
+            .contains(&format!("{ROOT}a/b/"))
+    );
+    assert!(storage::members(&store.read_store(), ROOT).contains(&format!("{ROOT}a/")));
 }
 
 #[test]
@@ -290,7 +304,7 @@ fn posting_to_a_container_mints_a_member() {
     .unwrap();
 
     assert!(created.starts_with(ROOT));
-    assert!(storage::members(&store, ROOT).contains(&created));
+    assert!(storage::members(&store.read_store(), ROOT).contains(&created));
 }
 
 #[test]
@@ -307,11 +321,14 @@ fn delete_removes_the_resource_and_its_containment() {
         ROOT,
     )
     .unwrap();
-    assert!(storage::exists(&store, &format!("{ROOT}note")));
+    assert!(storage::exists(&store.read_store(), &format!("{ROOT}note")));
 
     ldp::delete(&store, None, BASE, "/~/note", &alice(), ROOT).unwrap();
-    assert!(!storage::exists(&store, &format!("{ROOT}note")));
-    assert!(!storage::members(&store, ROOT).contains(&format!("{ROOT}note")));
+    assert!(!storage::exists(
+        &store.read_store(),
+        &format!("{ROOT}note")
+    ));
+    assert!(!storage::members(&store.read_store(), ROOT).contains(&format!("{ROOT}note")));
 }
 
 #[test]
@@ -343,7 +360,7 @@ fn append_permission_does_not_confer_replace() {
     // Bob gets Append on the root, and nothing else.
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#bob");
-    insert_quads(
+    seed(
         &store,
         &[
             t(&g, &a, &format!("{ACL}default"), ROOT),
@@ -355,8 +372,7 @@ fn append_permission_does_not_confer_replace() {
                 "https://bob.example/profile#me",
             ),
         ],
-    )
-    .unwrap();
+    );
 
     let bob = Subject::local(
         Uuid::new_v4(),
@@ -415,15 +431,14 @@ fn public_read_works_for_anonymous_callers() {
 
     let g = format!("{ROOT}public.acl");
     let a = format!("{g}#public");
-    insert_quads(
+    seed(
         &store,
         &[
             t(&g, &a, &format!("{ACL}accessTo"), &format!("{ROOT}public")),
             t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
             t(&g, &a, &format!("{ACL}agentClass"), &format!("{FOAF}Agent")),
         ],
-    )
-    .unwrap();
+    );
 
     let out = ldp::read(&store, None, BASE, "/~/public", &anonymous(), None).unwrap();
     assert!(!out.body.is_empty());

@@ -69,3 +69,77 @@ pub const FOAF_PERSONAL_PROFILE_DOCUMENT: &str =
 pub const FOAF_PRIMARY_TOPIC: &str = "http://xmlns.com/foaf/0.1/primaryTopic";
 pub const SOLID_OIDC_ISSUER: &str = "http://www.w3.org/ns/solid/terms#oidcIssuer";
 pub const SPACE_STORAGE: &str = "http://www.w3.org/ns/pim/space#storage";
+
+// --- LDP resources and server-managed metadata (stage 5a) -------------------
+//
+// `store::resources` writes these into each pod's `urn:brolly:resources`
+// graph. They describe resources the server manages, so no client write can
+// reach them there.
+
+/// `r` exists. In the metadata graph this triple *is* existence.
+pub const LDP_RESOURCE: &str = "http://www.w3.org/ns/ldp#Resource";
+pub const LDP_CONTAINER: &str = "http://www.w3.org/ns/ldp#Container";
+pub const LDP_BASIC_CONTAINER: &str = "http://www.w3.org/ns/ldp#BasicContainer";
+pub const LDP_RDF_SOURCE: &str = "http://www.w3.org/ns/ldp#RDFSource";
+pub const LDP_NON_RDF_SOURCE: &str = "http://www.w3.org/ns/ldp#NonRDFSource";
+pub const LDP_CONTAINS: &str = "http://www.w3.org/ns/ldp#contains";
+/// The class of a storage root. The same namespace as [`SPACE`]; Solid calls
+/// it `pim:`.
+pub const PIM_STORAGE: &str = "http://www.w3.org/ns/pim/space#Storage";
+
+pub const DCTERMS: &str = "http://purl.org/dc/terms/";
+pub const DCTERMS_MODIFIED: &str = "http://purl.org/dc/terms/modified";
+pub const XSD_DATE_TIME: &str = "http://www.w3.org/2001/XMLSchema#dateTime";
+
+/// An auxiliary resource (today only an `.acl`). Recorded, never contained.
+pub const BROLLY_AUXILIARY: &str = "https://brolly.id/ns#Auxiliary";
+/// A resource's version: a new ULID on every change, served as its `ETag`.
+pub const BROLLY_VERSION: &str = "https://brolly.id/ns#version";
+/// The pod's metadata layout version.
+pub const BROLLY_LAYOUT: &str = "https://brolly.id/ns#layout";
+/// Binary metadata (ADR 0013). No standard vocabulary names a
+/// content-addressed blob; the digest is the join to the blob store.
+pub const BROLLY_BLOB_DIGEST: &str = "https://brolly.id/ns#blobDigest";
+pub const BROLLY_MEDIA_TYPE: &str = "https://brolly.id/ns#mediaType";
+pub const BROLLY_BYTE_SIZE: &str = "https://brolly.id/ns#byteSize";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_terms_live_in_their_namespaces() {
+        for term in [
+            LDP_RESOURCE,
+            LDP_CONTAINER,
+            LDP_BASIC_CONTAINER,
+            LDP_RDF_SOURCE,
+            LDP_NON_RDF_SOURCE,
+            LDP_CONTAINS,
+        ] {
+            assert!(term.starts_with(LDP), "{term}");
+        }
+        assert!(PIM_STORAGE.starts_with(SPACE));
+        assert!(DCTERMS_MODIFIED.starts_with(DCTERMS));
+        assert!(XSD_DATE_TIME.starts_with(XSD));
+        for term in [
+            BROLLY_AUXILIARY,
+            BROLLY_VERSION,
+            BROLLY_LAYOUT,
+            BROLLY_BLOB_DIGEST,
+            BROLLY_MEDIA_TYPE,
+            BROLLY_BYTE_SIZE,
+        ] {
+            assert!(term.starts_with(BROLLY), "{term}");
+        }
+    }
+
+    #[test]
+    fn the_blob_terms_keep_the_iris_already_stored() {
+        // ADR 0013 pods already hold triples with these IRIs; the upgrade reads
+        // them back, so moving the constants must not rename them.
+        assert_eq!(BROLLY_BLOB_DIGEST, "https://brolly.id/ns#blobDigest");
+        assert_eq!(BROLLY_MEDIA_TYPE, "https://brolly.id/ns#mediaType");
+        assert_eq!(BROLLY_BYTE_SIZE, "https://brolly.id/ns#byteSize");
+    }
+}

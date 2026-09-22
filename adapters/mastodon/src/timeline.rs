@@ -16,8 +16,8 @@
 //!
 //! Nothing here writes. `server/tests/architecture.rs` enforces that.
 
-use brolly_store::Store;
 use brolly_store::collection;
+use brolly_store::resources::PodRead;
 use serde_json::Value;
 
 /// Activity types a timeline renders. A `Follow` or a `Like` belongs in
@@ -50,7 +50,7 @@ fn embedded_object(activity: &Value) -> Option<Value> {
 ///
 /// `before` is an exclusive cursor — pass the last row of a page to get the
 /// next one without repeating the boundary.
-pub fn home(store: &Store, inbox: &str, limit: usize, before: Option<&str>) -> Vec<Row> {
+pub fn home(store: &impl PodRead, inbox: &str, limit: usize, before: Option<&str>) -> Vec<Row> {
     collection::timeline(store, inbox, &RENDERABLE, limit, before)
         .into_iter()
         .filter_map(|entry| {

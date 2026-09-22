@@ -15,12 +15,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use brolly_mastodon::timeline;
-use brolly_store::Store;
+use brolly_store::resources::Pod;
 use serde_json::{Value, json};
 
 const ALICE_INBOX: &str = "https://alice.brolly.test/inbox";
 
-fn store() -> (tempfile::TempDir, std::sync::Arc<Store>) {
+fn store() -> (tempfile::TempDir, std::sync::Arc<Pod>) {
     let dir = tempfile::tempdir().unwrap();
     let manager = brolly_store::StoreManager::open(dir.path(), 4, 60).unwrap();
     let store = manager.pod(uuid::Uuid::new_v4()).unwrap();
@@ -49,8 +49,18 @@ fn create(author_host: &str, note: &str, content: &str) -> Value {
     })
 }
 
-fn deliver(store: &Store, activity: &Value, at: &str) {
-    brolly_activitypub::inbox::deliver(store, ALICE_INBOX, activity, at).expect("deliver");
+fn deliver(store: &Pod, activity: &Value, at: &str) {
+    store
+        .write(|w| {
+            Ok(brolly_activitypub::inbox::deliver(
+                w,
+                ALICE_INBOX,
+                activity,
+                at,
+            ))
+        })
+        .expect("write")
+        .expect("deliver");
 }
 
 // --- the regression that motivates the whole phase ---------------------------
@@ -74,7 +84,7 @@ fn the_home_timeline_includes_remote_authors() {
         "2026-08-26T12:00:02Z",
     );
 
-    let page = timeline::home(&store, ALICE_INBOX, 20, None);
+    let page = timeline::home(&store.read_store(), ALICE_INBOX, 20, None);
 
     assert_eq!(page.len(), 2, "a remote author's post was dropped");
     let contents: Vec<&str> = page
@@ -97,7 +107,7 @@ fn the_home_timeline_reads_one_store() {
         "2026-08-26T12:00:01Z",
     );
 
-    let page = timeline::home(&store, ALICE_INBOX, 20, None);
+    let page = timeline::home(&store.read_store(), ALICE_INBOX, 20, None);
     assert_eq!(page.len(), 1);
     assert_eq!(page[0].author_actor, "https://bob.brolly.test/actor");
 }
@@ -113,7 +123,7 @@ fn the_home_timeline_unwraps_the_note_from_its_activity() {
         "2026-08-26T12:00:01Z",
     );
 
-    let page = timeline::home(&store, ALICE_INBOX, 20, None);
+    let page = timeline::home(&store.read_store(), ALICE_INBOX, 20, None);
     assert_eq!(page[0].note["type"], "Note");
     assert_eq!(page[0].note["content"], "hello");
     assert_eq!(
@@ -133,7 +143,7 @@ fn the_home_timeline_is_newest_first() {
         );
     }
 
-    let page = timeline::home(&store, ALICE_INBOX, 20, None);
+    let page = timeline::home(&store.read_store(), ALICE_INBOX, 20, None);
     let contents: Vec<&str> = page
         .iter()
         .map(|e| e.note["content"].as_str().unwrap())
@@ -178,7 +188,7 @@ fn the_home_timeline_shows_posts_and_boosts_but_not_follows() {
         "2026-08-26T12:00:03Z",
     );
 
-    let page = timeline::home(&store, ALICE_INBOX, 20, None);
+    let page = timeline::home(&store.read_store(), ALICE_INBOX, 20, None);
     assert_eq!(page.len(), 2, "expected the post and the boost only");
     assert!(
         page.iter().all(|e| e.note["type"] == "Note"),
@@ -197,11 +207,11 @@ fn the_home_timeline_paginates_without_repeating_the_boundary() {
         );
     }
 
-    let first = timeline::home(&store, ALICE_INBOX, 2, None);
+    let first = timeline::home(&store.read_store(), ALICE_INBOX, 2, None);
     assert_eq!(first.len(), 2);
     assert_eq!(first[0].note["content"], "post 5");
 
-    let second = timeline::home(&store, ALICE_INBOX, 2, Some(&first[1].cursor));
+    let second = timeline::home(&store.read_store(), ALICE_INBOX, 2, Some(&first[1].cursor));
     assert_eq!(second.len(), 2);
     assert_eq!(
         second[0].note["content"], "post 3",
@@ -212,7 +222,7 @@ fn the_home_timeline_paginates_without_repeating_the_boundary() {
 #[test]
 fn an_empty_inbox_is_an_empty_timeline_not_an_error() {
     let (_dir, store) = store();
-    assert!(timeline::home(&store, ALICE_INBOX, 20, None).is_empty());
+    assert!(timeline::home(&store.read_store(), ALICE_INBOX, 20, None).is_empty());
 }
 
 #[test]
@@ -231,7 +241,7 @@ fn an_activity_whose_object_is_only_a_reference_is_skipped() {
         "2026-08-26T12:00:01Z",
     );
 
-    assert!(timeline::home(&store, ALICE_INBOX, 20, None).is_empty());
+    assert!(timeline::home(&store.read_store(), ALICE_INBOX, 20, None).is_empty());
 }
 
 // --- public timeline ---------------------------------------------------------

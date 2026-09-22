@@ -359,12 +359,15 @@ async fn a_posted_status_is_delivered_to_followers() {
     // Bob follows alice.
     let bob_pod = h.stores.pod(bob_id).unwrap();
     let alice_pod = h.stores.pod(alice_id).unwrap();
-    brolly_activitypub::follows::record(
-        &alice_pod,
-        &brolly_identity::webid::actor("bob", BASE),
-        &brolly_identity::webid::actor("alice", BASE),
-    )
-    .unwrap();
+    alice_pod
+        .write(|w| {
+            brolly_activitypub::follows::record(
+                w,
+                &brolly_identity::webid::actor("bob", BASE),
+                &brolly_identity::webid::actor("alice", BASE),
+            )
+        })
+        .unwrap();
 
     let reply = post_form(
         &h,
@@ -376,7 +379,7 @@ async fn a_posted_status_is_delivered_to_followers() {
     assert_eq!(reply.status, StatusCode::OK, "body: {}", reply.body);
 
     let bob_inbox = brolly_identity::webid::inbox("bob", BASE);
-    let delivered = brolly_store::collection::members(&bob_pod, &bob_inbox);
+    let delivered = brolly_store::collection::members(&bob_pod.read_store(), &bob_inbox);
     assert!(
         !delivered.is_empty(),
         "the post reached nobody — this is the dropped-table defect"

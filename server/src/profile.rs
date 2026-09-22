@@ -100,8 +100,13 @@ pub async fn profile_document(State(state): State<AppState>, headers: HeaderMap)
         return html(&state, &user, &id, &issuer, &pod);
     }
 
-    let quads =
-        brolly_solid::profile::document(&pod, &id.webid, &id.document, &id.storage_root, &issuer);
+    let quads = brolly_solid::profile::document(
+        &pod.read_store(),
+        &id.webid,
+        &id.document,
+        &id.storage_root,
+        &issuer,
+    );
     let format = syntax::negotiate(accept);
     match syntax::serialize(&quads, format) {
         Ok(body) => (
@@ -121,9 +126,9 @@ fn html(
     user: &User,
     id: &Identity,
     issuer: &str,
-    pod: &brolly_store::Store,
+    pod: &brolly_store::resources::Pod,
 ) -> Response {
-    let profile = brolly_solid::profile::read(pod, &id.webid, &id.document);
+    let profile = brolly_solid::profile::read(&pod.read_store(), &id.webid, &id.document);
     render(&ProfileDocument {
         chrome: state.chrome(),
         username: &user.username,

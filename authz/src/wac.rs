@@ -1,9 +1,9 @@
 //! WAC evaluation.
 
 use brolly_domain::vocab;
-use oxigraph::model::{NamedNode, Variable};
-use oxigraph::sparql::{QueryResults, SparqlEvaluator};
-use oxigraph::store::Store;
+use brolly_store::PodRead;
+use oxigraph::model::{NamedNode, Term};
+use oxigraph::sparql::QueryResults;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthzError {
@@ -109,7 +109,7 @@ fn acl_candidates(base: &str, path: &str) -> Vec<String> {
 /// the most specific. The predecessor issued a `resource_exists` round trip per
 /// hierarchy level.
 pub fn effective_acl(
-    store: &Store,
+    store: &impl PodRead,
     base: &str,
     path: &str,
 ) -> Result<Option<EffectiveAcl>, AuthzError> {
@@ -157,7 +157,7 @@ pub fn effective_acl(
 /// the predecessor derived the group's graph by stripping the IRI fragment,
 /// which only worked when the group document was named the way it expected.
 pub fn authorize(
-    store: &Store,
+    store: &impl PodRead,
     acl: &EffectiveAcl,
     agent: &Agent,
     mode: AccessMode,
@@ -212,9 +212,9 @@ pub fn authorize(
         "#
     );
 
-    let mut bindings: Vec<(&str, NamedNode)> = vec![("target", acl.scope.clone())];
+    let mut bindings: Vec<(&str, Term)> = vec![("target", Term::NamedNode(acl.scope.clone()))];
     if let Agent::Authenticated(webid) = agent {
-        bindings.push(("agent", NamedNode::new_unchecked(webid)));
+        bindings.push(("agent", Term::NamedNode(NamedNode::new_unchecked(webid))));
     }
 
     let rows = select_iris(store, &query, "target", &bindings)?;
@@ -222,24 +222,17 @@ pub fn authorize(
 }
 
 /// Run a SELECT with substituted IRI bindings, returning one projected column.
+///
+/// The bindings go through `PodRead::query_with`, which substitutes them into
+/// the prepared query, so no IRI is ever written into the query text.
 fn select_iris(
-    store: &Store,
+    store: &impl PodRead,
     query: &str,
     column: &str,
-    bindings: &[(&str, NamedNode)],
+    bindings: &[(&str, Term)],
 ) -> Result<Vec<String>, AuthzError> {
-    let mut prepared = SparqlEvaluator::new()
-        .parse_query(query)
-        .map_err(|e| AuthzError::Query(e.to_string()))?;
-
-    for (name, value) in bindings {
-        let variable = Variable::new(*name).map_err(|e| AuthzError::Query(e.to_string()))?;
-        prepared = prepared.substitute_variable(variable, value.clone());
-    }
-
-    let results = prepared
-        .on_store(store)
-        .execute()
+    let results = store
+        .query_with(query, bindings)
         .map_err(|e| AuthzError::Query(e.to_string()))?;
 
     let QueryResults::Solutions(solutions) = results else {

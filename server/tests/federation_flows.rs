@@ -8,11 +8,12 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
-use brolly_activitypub::processor::{self, ProcessError, Recipient};
+use brolly_activitypub::processor::{self, ProcessError};
 use brolly_activitypub::{follows, inbox};
 use brolly_identity::db;
 use brolly_server::outbox::{DeliverError, Refusal, deliver};
 use brolly_server::{AppState, app};
+use brolly_store::resources::PodRead;
 use brolly_store::{StoreManager, index};
 use http_body_util::BodyExt;
 use oxigraph::model::NamedNode;
@@ -150,7 +151,7 @@ impl Harness {
             .unwrap()
     }
 
-    fn pod(&self, username: &str) -> std::sync::Arc<brolly_store::Store> {
+    fn pod(&self, username: &str) -> std::sync::Arc<brolly_store::resources::Pod> {
         self.stores.pod(self.ids[username]).unwrap()
     }
 
@@ -162,6 +163,7 @@ impl Harness {
     /// compares content and not only size.
     fn graph(&self, username: &str, graph: &str) -> std::collections::BTreeSet<String> {
         self.pod(username)
+            .read_store()
             .quads_for_pattern(
                 None,
                 None,
@@ -231,18 +233,24 @@ async fn a_follow_is_delivered_and_recorded_on_both_sides() {
     // Alice's pod knows she has a follower — this is what delivery resolves
     // recipients from.
     assert_eq!(
-        follows::followers(&h.pod("alice"), &actor("alice")),
+        follows::followers(&h.pod("alice").read_store(), &actor("alice")),
         vec![actor("bob")]
     );
     // And bob's pod knows who he follows.
     assert_eq!(
-        follows::following(&h.pod("bob"), &actor("bob")),
+        follows::following(&h.pod("bob").read_store(), &actor("bob")),
         vec![actor("alice")]
     );
 
     // The Follow itself reached alice's inbox, so it can be shown as a
     // notification.
-    let notifications = inbox::timeline(&h.pod("alice"), &inbox_of("alice"), &["Follow"], 10, None);
+    let notifications = inbox::timeline(
+        &h.pod("alice").read_store(),
+        &inbox_of("alice"),
+        &["Follow"],
+        10,
+        None,
+    );
     assert_eq!(notifications.len(), 1);
 }
 
@@ -281,10 +289,16 @@ async fn a_post_reaches_followers_and_the_public_index() {
     );
 
     // Bob's home timeline is his own inbox — one store, no fan-out.
-    let timeline = inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Create"], 10, None);
+    let timeline = inbox::timeline(
+        &h.pod("bob").read_store(),
+        &inbox_of("bob"),
+        &["Create"],
+        10,
+        None,
+    );
     assert_eq!(timeline.len(), 1, "the follower did not receive the post");
     assert_eq!(
-        inbox::read_activity(&h.pod("bob"), note).expect("the note")["content"],
+        inbox::read_activity(&h.pod("bob").read_store(), note).expect("the note")["content"],
         "hello from alice"
     );
 
@@ -314,7 +328,14 @@ async fn a_non_follower_does_not_receive_the_post() {
     .await;
 
     assert!(
-        inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Create"], 10, None).is_empty(),
+        inbox::timeline(
+            &h.pod("bob").read_store(),
+            &inbox_of("bob"),
+            &["Create"],
+            10,
+            None
+        )
+        .is_empty(),
         "delivery must go to followers, not to everyone"
     );
     // The instance still indexes it — that is what makes a public timeline
@@ -346,7 +367,14 @@ async fn a_private_post_reaches_followers_but_not_the_public_index() {
     .await;
 
     assert_eq!(
-        inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Create"], 10, None).len(),
+        inbox::timeline(
+            &h.pod("bob").read_store(),
+            &inbox_of("bob"),
+            &["Create"],
+            10,
+            None
+        )
+        .len(),
         1,
         "a follower must still receive it"
     );
@@ -379,7 +407,13 @@ async fn a_like_reaches_the_author() {
         .await;
     assert_eq!(status, StatusCode::CREATED);
 
-    let notifications = inbox::timeline(&h.pod("alice"), &inbox_of("alice"), &["Like"], 10, None);
+    let notifications = inbox::timeline(
+        &h.pod("alice").read_store(),
+        &inbox_of("alice"),
+        &["Like"],
+        10,
+        None,
+    );
     assert_eq!(notifications.len(), 1, "the author was not notified");
     // A Like is not a post.
     assert_eq!(h.index_count(), 1, "a Like must not add a timeline row");
@@ -420,11 +454,18 @@ async fn a_delete_reaches_everyone_the_post_did() {
 
     assert_eq!(h.index_count(), 0, "the public timeline still shows it");
     assert!(
-        inbox::read_activity(&h.pod("bob"), &note).is_none(),
+        inbox::read_activity(&h.pod("bob").read_store(), &note).is_none(),
         "the follower's copy survived the delete"
     );
     assert!(
-        inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Create"], 10, None).is_empty(),
+        inbox::timeline(
+            &h.pod("bob").read_store(),
+            &inbox_of("bob"),
+            &["Create"],
+            10,
+            None
+        )
+        .is_empty(),
         "a deleted post left a hole in the timeline"
     );
 }
@@ -537,12 +578,9 @@ async fn remote_delivery_is_suppressed_while_federation_is_off() {
     let alice = h.login("alice").await;
 
     // A remote follower, as an inbound Follow would have left behind.
-    follows::record(
-        &h.pod("alice"),
-        "https://mastodon.social/users/carol",
-        &actor("alice"),
-    )
-    .unwrap();
+    h.pod("alice")
+        .write(|w| follows::record(w, "https://mastodon.social/users/carol", &actor("alice")))
+        .unwrap();
 
     let (status, _) = h
         .publish(
@@ -576,7 +614,7 @@ async fn publishing_stores_the_post_in_the_authors_own_pod() {
     let note = created["object"]["id"].as_str().unwrap();
 
     assert!(
-        inbox::read_activity(&h.pod("alice"), note).is_some(),
+        inbox::read_activity(&h.pod("alice").read_store(), note).is_some(),
         "the author must hold their own post"
     );
 
@@ -650,10 +688,10 @@ async fn a_delete_of_your_own_note_removes_every_copy() {
     let create = created["id"].as_str().unwrap().to_string();
 
     // Setup: every copy exists, or the assertions below prove nothing.
-    assert!(inbox::read_activity(&h.pod("alice"), &note).is_some());
-    assert!(inbox::read_activity(&h.pod("mallory"), &note).is_some());
+    assert!(inbox::read_activity(&h.pod("alice").read_store(), &note).is_some());
+    assert!(inbox::read_activity(&h.pod("mallory").read_store(), &note).is_some());
     assert_eq!(
-        inbox::members(&h.pod("mallory"), &outbox_of("mallory")),
+        inbox::members(&h.pod("mallory").read_store(), &outbox_of("mallory")),
         vec![create.clone()]
     );
     assert_eq!(h.index_count(), 1);
@@ -668,23 +706,30 @@ async fn a_delete_of_your_own_note_removes_every_copy() {
     assert_eq!(status, StatusCode::CREATED);
 
     assert!(
-        inbox::read_activity(&h.pod("alice"), &note).is_none(),
+        inbox::read_activity(&h.pod("alice").read_store(), &note).is_none(),
         "the follower's copy survived"
     );
     assert!(
-        inbox::timeline(&h.pod("alice"), &inbox_of("alice"), &["Create"], 10, None).is_empty(),
+        inbox::timeline(
+            &h.pod("alice").read_store(),
+            &inbox_of("alice"),
+            &["Create"],
+            10,
+            None
+        )
+        .is_empty(),
         "a deleted post left a hole in the follower's timeline"
     );
     assert!(
-        inbox::read_activity(&h.pod("mallory"), &note).is_none(),
+        inbox::read_activity(&h.pod("mallory").read_store(), &note).is_none(),
         "the author's own note survived"
     );
     assert!(
-        inbox::read_activity(&h.pod("mallory"), &create).is_none(),
+        inbox::read_activity(&h.pod("mallory").read_store(), &create).is_none(),
         "the author's Create survived"
     );
     assert!(
-        inbox::members(&h.pod("mallory"), &outbox_of("mallory")).is_empty(),
+        inbox::members(&h.pod("mallory").read_store(), &outbox_of("mallory")).is_empty(),
         "the author's outbox still lists the deleted post"
     );
     assert_eq!(h.index_count(), 0, "the public timeline still shows it");
@@ -820,7 +865,7 @@ async fn a_public_announce_does_not_publish_a_followers_only_note() {
         .await;
     let note = created["object"]["id"].as_str().unwrap().to_string();
     assert!(
-        inbox::read_activity(&h.pod("mallory"), &note).is_some(),
+        inbox::read_activity(&h.pod("mallory").read_store(), &note).is_some(),
         "setup: mallory received the post"
     );
     assert_eq!(
@@ -890,7 +935,7 @@ async fn a_create_claiming_another_members_acl_gets_a_minted_id() {
         "{note}"
     );
     assert!(
-        inbox::read_activity(&h.pod("alice"), note).is_some(),
+        inbox::read_activity(&h.pod("alice").read_store(), note).is_some(),
         "the post is still delivered, under the id the server chose"
     );
 
@@ -970,10 +1015,19 @@ async fn a_delete_of_an_embedded_tombstone_removes_the_note_everywhere() {
         "the Tombstone is named by id"
     );
 
-    assert!(inbox::read_activity(&h.pod("bob"), &note).is_none());
-    assert!(inbox::timeline(&h.pod("bob"), &inbox_of("bob"), &["Create"], 10, None).is_empty());
-    assert!(inbox::read_activity(&h.pod("alice"), &note).is_none());
-    assert!(inbox::members(&h.pod("alice"), &outbox_of("alice")).is_empty());
+    assert!(inbox::read_activity(&h.pod("bob").read_store(), &note).is_none());
+    assert!(
+        inbox::timeline(
+            &h.pod("bob").read_store(),
+            &inbox_of("bob"),
+            &["Create"],
+            10,
+            None
+        )
+        .is_empty()
+    );
+    assert!(inbox::read_activity(&h.pod("alice").read_store(), &note).is_none());
+    assert!(inbox::members(&h.pod("alice").read_store(), &outbox_of("alice")).is_empty());
     assert_eq!(h.index_count(), 0);
 }
 
@@ -1004,9 +1058,15 @@ async fn an_undo_embedding_a_follow_names_it_by_id() {
     assert_eq!(status, StatusCode::CREATED, "{undo}");
     assert_eq!(undo["object"], json!(follow_id));
 
-    let undos = inbox::timeline(&h.pod("alice"), &inbox_of("alice"), &["Undo"], 10, None);
+    let undos = inbox::timeline(
+        &h.pod("alice").read_store(),
+        &inbox_of("alice"),
+        &["Undo"],
+        10,
+        None,
+    );
     assert_eq!(undos.len(), 1, "the Undo did not reach Alice");
-    let stored = inbox::read_activity(&h.pod("alice"), &undos[0].activity).unwrap();
+    let stored = inbox::read_activity(&h.pod("alice").read_store(), &undos[0].activity).unwrap();
     assert_eq!(stored["object"], json!(follow_id));
 }
 
@@ -1049,20 +1109,23 @@ async fn a_create_embedding_another_members_acl_is_refused_at_both_ends() {
         "got {refused:?}"
     );
     assert!(
-        inbox::members(&h.pod("mallory"), &outbox_of("mallory")).is_empty(),
+        inbox::members(&h.pod("mallory").read_store(), &outbox_of("mallory")).is_empty(),
         "the author's copy was written before the refusal"
     );
 
     // ...and so does the processor, for the day it arrives from another server.
-    let processed = processor::process(
-        &h.pod("alice"),
-        Recipient::Member {
-            inbox: &inbox_of("alice"),
-            outbox: &outbox_of("alice"),
-        },
-        &attack,
-        "2026-09-17T12:00:00Z",
-    );
+    let processed = h
+        .pod("alice")
+        .write(|w| {
+            Ok(processor::process_member(
+                w,
+                &inbox_of("alice"),
+                &outbox_of("alice"),
+                &attack,
+                "2026-09-17T12:00:00Z",
+            ))
+        })
+        .unwrap();
     assert!(
         matches!(processed, Err(ProcessError::ForeignObject)),
         "got {processed:?}"
@@ -1137,7 +1200,7 @@ async fn every_publishing_path_refuses_an_id_it_did_not_mint() {
     );
 
     assert!(
-        inbox::members(&h.pod("alice"), &outbox_of("alice")).is_empty(),
+        inbox::members(&h.pod("alice").read_store(), &outbox_of("alice")).is_empty(),
         "the author's copy was written before the refusal"
     );
     assert_eq!(h.graph("alice", &acl_of("alice")), before);
@@ -1158,7 +1221,7 @@ async fn an_embedded_object_the_server_cannot_name_is_a_bad_request() {
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(
-        inbox::members(&h.pod("bob"), &outbox_of("bob")).is_empty(),
+        inbox::members(&h.pod("bob").read_store(), &outbox_of("bob")).is_empty(),
         "a refused activity was stored"
     );
 }
@@ -1190,11 +1253,11 @@ async fn deliver_refuses_an_activity_whose_actor_is_not_its_author() {
     }
 
     assert!(
-        inbox::members(&h.pod("alice"), &outbox_of("alice")).is_empty(),
+        inbox::members(&h.pod("alice").read_store(), &outbox_of("alice")).is_empty(),
         "a refused activity was stored"
     );
     assert!(
-        follows::followers(&h.pod("mallory"), &actor("mallory")).is_empty(),
+        follows::followers(&h.pod("mallory").read_store(), &actor("mallory")).is_empty(),
         "a refused Follow was recorded"
     );
 }
@@ -1226,6 +1289,6 @@ async fn a_post_is_attributed_to_whoever_published_it() {
     assert_eq!(status, StatusCode::CREATED, "{created}");
     assert_eq!(created["object"]["attributedTo"], json!(actor("mallory")));
     let note = created["object"]["id"].as_str().unwrap();
-    let stored = inbox::read_activity(&h.pod("mallory"), note).expect("the note");
+    let stored = inbox::read_activity(&h.pod("mallory").read_store(), note).expect("the note");
     assert_eq!(stored["attributedTo"], json!(actor("mallory")));
 }

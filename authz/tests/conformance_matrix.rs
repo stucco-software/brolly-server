@@ -13,7 +13,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use brolly_authz::{AccessMode, Agent, EffectiveAcl, authorize, effective_acl};
-use brolly_store::{StoreManager, insert_quads};
+use brolly_store::StoreManager;
+use brolly_store::resources::{Content, Pod, PodRead};
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use uuid::Uuid;
 
@@ -60,7 +61,7 @@ const SURFACES: [Surface; 4] = [
 /// never in a replacement for this call.
 fn surface_allows(
     _surface: Surface,
-    store: &oxigraph::store::Store,
+    store: &impl PodRead,
     path: &str,
     agent: &Agent,
     mode: AccessMode,
@@ -71,11 +72,16 @@ fn surface_allows(
     authorize(store, &acl, agent, mode).expect("authorize")
 }
 
-fn fixture() -> (
-    StoreManager,
-    tempfile::TempDir,
-    std::sync::Arc<oxigraph::store::Store>,
-) {
+/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
+/// so it doesn't depend on the code under test.
+fn seed(target: &Pod, quads: &[Quad]) {
+    let store = target.raw_store();
+    for quad in quads {
+        store.insert(quad).unwrap();
+    }
+}
+
+fn fixture() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mgr = StoreManager::open(dir.path(), 4, 60).expect("manager");
     let store = mgr.pod(Uuid::new_v4()).expect("pod");
@@ -177,7 +183,7 @@ fn fixture() -> (
         &format!("{ACL}AuthenticatedAgent"),
     ));
 
-    insert_quads(&store, &quads).expect("seed acls");
+    seed(&store, &quads);
     (mgr, dir, store)
 }
 
@@ -292,7 +298,7 @@ fn every_surface_reaches_the_same_verdict() {
             .map(|s| {
                 (
                     *s,
-                    surface_allows(*s, &store, case.path, &case.agent, case.mode),
+                    surface_allows(*s, &store.read_store(), case.path, &case.agent, case.mode),
                 )
             })
             .collect();
@@ -319,7 +325,7 @@ fn direct_acl_wins_over_inherited() {
     let (_mgr, _dir, store) = fixture();
 
     // /notes/first has no ACL of its own, so it inherits /notes/.acl.
-    let acl = effective_acl(&store, BASE, "/notes/first")
+    let acl = effective_acl(&store.read_store(), BASE, "/notes/first")
         .unwrap()
         .unwrap();
     assert_eq!(acl.graph.as_str(), format!("{BASE}/notes/.acl"));
@@ -331,7 +337,9 @@ fn direct_acl_wins_over_inherited() {
     );
 
     // /public has its own.
-    let acl = effective_acl(&store, BASE, "/public").unwrap().unwrap();
+    let acl = effective_acl(&store.read_store(), BASE, "/public")
+        .unwrap()
+        .unwrap();
     assert_eq!(acl.graph.as_str(), format!("{BASE}/public.acl"));
     assert!(acl.direct, "a resource's own ACL matches acl:accessTo");
 }
@@ -348,9 +356,51 @@ fn an_accessto_grant_does_not_leak_through_inheritance() {
         direct: false,
         scope: n(&format!("{BASE}/public")),
     };
-    let allowed = authorize(&store, &as_inherited, &Agent::Anonymous, AccessMode::Read).unwrap();
+    let allowed = authorize(
+        &store.read_store(),
+        &as_inherited,
+        &Agent::Anonymous,
+        AccessMode::Read,
+    )
+    .unwrap();
     assert!(
         !allowed,
         "acl:accessTo must not satisfy an acl:default lookup"
     );
+}
+
+/// A reader inside a write sees that write's own changes. Commit 2 checks WAC
+/// inside the transaction a PUT is about to change, so this is what it relies
+/// on. The ACL goes in as a resource, not raw quads, so the test holds once
+/// ACLs exist by metadata too.
+#[test]
+fn an_acl_written_earlier_in_the_same_write_governs() {
+    const ROOT: &str = "https://alice.brolly.id/~/";
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mgr = StoreManager::open(dir.path(), 4, 60).expect("manager");
+    let pod = mgr.pod(Uuid::new_v4()).expect("pod");
+
+    let g = format!("{ROOT}draft.acl");
+    let a = format!("{g}#public");
+    let acl = [
+        t(&g, &a, &format!("{ACL}accessTo"), &format!("{ROOT}draft")),
+        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&g, &a, &format!("{ACL}agentClass"), &format!("{FOAF}Agent")),
+    ];
+
+    let (found, allowed) = pod
+        .write(|w| {
+            w.create_root(ROOT)?;
+            w.put(&g, Content::Auxiliary(&acl))?;
+            let governing = effective_acl(&*w, BASE, "/~/draft")
+                .expect("effective acl")
+                .expect("an ACL governs /~/draft");
+            let allowed =
+                authorize(&*w, &governing, &Agent::Anonymous, AccessMode::Read).expect("authorize");
+            Ok((governing.graph.as_str().to_string(), allowed))
+        })
+        .expect("write");
+
+    assert_eq!(found, g, "the reader missed the write's own ACL");
+    assert!(allowed, "the ACL written in this write didn't grant");
 }

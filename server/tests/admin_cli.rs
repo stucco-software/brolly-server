@@ -43,7 +43,8 @@ async fn acl_uncontain_sweeps_the_configured_data_dir_and_is_safe_to_rerun() {
         let stores = StoreManager::open(dir.path(), 4, 60).unwrap();
         let pod = stores.pod(alice.id).unwrap();
         brolly_server::provision::pod(&pod, "alice", "brolly.test").unwrap();
-        storage::add_containment(&pod, &acl, &root).unwrap();
+        pod.write(|w| storage::add_containment(w, &acl, &root))
+            .unwrap();
     }
 
     let first = acl_uncontain(&db.url, dir.path());
@@ -56,8 +57,11 @@ async fn acl_uncontain_sweeps_the_configured_data_dir_and_is_safe_to_rerun() {
 
     let stores = StoreManager::open(dir.path(), 4, 60).unwrap();
     let pod = stores.pod(alice.id).unwrap();
-    assert!(!storage::members(&pod, &root).contains(&acl));
-    assert!(storage::exists(&pod, &acl), "the ACL itself stays");
+    assert!(!storage::members(&pod.read_store(), &root).contains(&acl));
+    assert!(
+        storage::exists(&pod.read_store(), &acl),
+        "the ACL itself stays"
+    );
 }
 
 /// An unset or mistyped `BROLLY_DATA_DIR` must not "succeed". `StoreManager::open`

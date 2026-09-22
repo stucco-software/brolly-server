@@ -26,7 +26,8 @@ async fn acl_uncontain_sweeps_every_pod_and_a_rerun_is_a_no_op() {
         brolly_server::provision::pod(&pod, username, BASE_DOMAIN).unwrap();
         // What an old `put` of the root ACL left behind.
         let root = routing::storage_root(username, BASE_DOMAIN);
-        storage::add_containment(&pod, &format!("{root}.acl"), &root).unwrap();
+        pod.write(|w| storage::add_containment(w, &format!("{root}.acl"), &root))
+            .unwrap();
         seeded.push((user.id, root));
     }
     sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'carol'")
@@ -55,9 +56,9 @@ async fn acl_uncontain_sweeps_every_pod_and_a_rerun_is_a_no_op() {
 
     for (user, root) in &seeded {
         let pod = stores.pod(*user).unwrap();
-        assert!(!storage::members(&pod, root).contains(&format!("{root}.acl")));
+        assert!(!storage::members(&pod.read_store(), root).contains(&format!("{root}.acl")));
         assert!(
-            storage::exists(&pod, &format!("{root}.acl")),
+            storage::exists(&pod.read_store(), &format!("{root}.acl")),
             "the ACL stays"
         );
     }

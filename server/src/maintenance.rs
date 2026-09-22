@@ -47,7 +47,8 @@ pub async fn acl_uncontain(pool: &PgPool, stores: &StoreManager) -> Result<AclUn
                 .pod(user.id)
                 .map_err(|e| e.to_string())
                 .and_then(|pod| {
-                    brolly_solid::storage::uncontain_acls(&pod).map_err(|e| e.to_string())
+                    pod.write(brolly_solid::storage::uncontain_acls)
+                        .map_err(|e| e.to_string())
                 });
             PodSweep {
                 username: user.username,

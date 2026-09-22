@@ -16,7 +16,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
 use brolly_server::{AppState, app};
 use brolly_solid::storage;
-use brolly_store::{StoreManager, insert_quads};
+use brolly_store::StoreManager;
+use brolly_store::resources::Pod;
 use http_body_util::BodyExt;
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use p256::ecdsa::SigningKey;
@@ -31,6 +32,15 @@ const ROOT: &str = "https://alice.brolly.test/~/";
 const NOTE: &str = "https://alice.brolly.test/~/note";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
 const REDIRECT: &str = "https://app.example/cb";
+
+/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
+/// so it doesn't depend on the code under test.
+fn seed(target: &Pod, quads: &[Quad]) {
+    let store = target.raw_store();
+    for quad in quads {
+        store.insert(quad).unwrap();
+    }
+}
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -62,10 +72,10 @@ async fn harness() -> Harness {
         .unwrap();
 
     let pod = stores.pod(user.id).unwrap();
-    storage::init_storage_root(&pod, ROOT).unwrap();
+    pod.write(|w| storage::init_storage_root(w, ROOT)).unwrap();
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    insert_quads(
+    seed(
         &pod,
         &[
             t(&g, &a, &format!("{ACL}default"), ROOT),
@@ -81,8 +91,7 @@ async fn harness() -> Harness {
                 "https://example.org/a",
             ),
         ],
-    )
-    .unwrap();
+    );
 
     let router = app(
         AppState {

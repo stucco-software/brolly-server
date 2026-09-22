@@ -356,10 +356,10 @@ async fn an_unlocked_account_accepts_a_follow_immediately() {
     let alice_pod = h.stores.pod(alice_id).unwrap();
     let actor = brolly_identity::webid::actor("alice", BASE);
     assert_eq!(
-        brolly_activitypub::follows::followers(&alice_pod, &actor).len(),
+        brolly_activitypub::follows::followers(&alice_pod.read_store(), &actor).len(),
         1
     );
-    assert!(brolly_activitypub::follows::pending(&alice_pod, &actor).is_empty());
+    assert!(brolly_activitypub::follows::pending(&alice_pod.read_store(), &actor).is_empty());
 }
 
 #[tokio::test]
@@ -384,11 +384,11 @@ async fn a_locked_account_holds_the_follow_for_approval() {
     let alice_pod = h.stores.pod(alice_id).unwrap();
     let actor = brolly_identity::webid::actor("alice", BASE);
     assert!(
-        brolly_activitypub::follows::followers(&alice_pod, &actor).is_empty(),
+        brolly_activitypub::follows::followers(&alice_pod.read_store(), &actor).is_empty(),
         "a locked account let a follower straight in"
     );
     assert_eq!(
-        brolly_activitypub::follows::pending(&alice_pod, &actor).len(),
+        brolly_activitypub::follows::pending(&alice_pod.read_store(), &actor).len(),
         1,
         "the follow should be waiting for approval"
     );
@@ -437,12 +437,12 @@ async fn a_pending_request_is_listed_and_can_be_approved() {
     let alice_pod = h.stores.pod(alice_id).unwrap();
     let actor = brolly_identity::webid::actor("alice", BASE);
     assert_eq!(
-        brolly_activitypub::follows::followers(&alice_pod, &actor).len(),
+        brolly_activitypub::follows::followers(&alice_pod.read_store(), &actor).len(),
         1,
         "approval should produce a follower"
     );
     assert!(
-        brolly_activitypub::follows::pending(&alice_pod, &actor).is_empty(),
+        brolly_activitypub::follows::pending(&alice_pod.read_store(), &actor).is_empty(),
         "an approved request must stop being pending, or it shows up twice"
     );
 }
@@ -477,8 +477,8 @@ async fn a_rejected_request_leaves_no_follower_and_no_request() {
 
     let alice_pod = h.stores.pod(alice_id).unwrap();
     let actor = brolly_identity::webid::actor("alice", BASE);
-    assert!(brolly_activitypub::follows::followers(&alice_pod, &actor).is_empty());
-    assert!(brolly_activitypub::follows::pending(&alice_pod, &actor).is_empty());
+    assert!(brolly_activitypub::follows::followers(&alice_pod.read_store(), &actor).is_empty());
+    assert!(brolly_activitypub::follows::pending(&alice_pod.read_store(), &actor).is_empty());
 }
 
 #[tokio::test]
@@ -501,7 +501,7 @@ async fn approving_someone_who_never_asked_manufactures_nothing() {
     let alice_pod = h.stores.pod(alice_id).unwrap();
     let actor = brolly_identity::webid::actor("alice", BASE);
     assert!(
-        brolly_activitypub::follows::followers(&alice_pod, &actor).is_empty(),
+        brolly_activitypub::follows::followers(&alice_pod.read_store(), &actor).is_empty(),
         "approving a request nobody made invented a follower"
     );
 }

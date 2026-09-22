@@ -33,4 +33,5 @@ oxigraph = "0.5.9"
 workspace = true
 
 [dev-dependencies]
+brolly-store = { workspace = true, features = ["test-fixtures"] }
 tempfile = "3.27.0"

@@ -11,9 +11,10 @@
 //! instance's stores a pointer and never content (D5).
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use brolly_activitypub::inbox;
-use brolly_activitypub::processor::{self, ProcessError, Recipient};
-use brolly_store::{Store, StoreManager, index};
+use brolly_activitypub::inbox::{self, InboxError};
+use brolly_activitypub::processor::{self, ProcessError};
+use brolly_store::resources::{Pod, PodRead};
+use brolly_store::{StoreManager, index};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde_json::{Value, json};
 
@@ -52,8 +53,28 @@ fn create(audience: &str, content: &str) -> Value {
     })
 }
 
+/// Deliver to a member in one write, as `outbox` does.
+fn member(
+    pod: &Pod,
+    inbox: &str,
+    outbox: &str,
+    activity: &Value,
+    at: &str,
+) -> Result<(), ProcessError> {
+    pod.write(|w| Ok(processor::process_member(w, inbox, outbox, activity, at)))
+        .map_err(ProcessError::from)
+        .flatten()
+}
+
+/// Store an author's copy straight into a collection, as `outbox::deliver` does.
+fn deliver(pod: &Pod, collection: &str, activity: &Value, at: &str) -> Result<String, InboxError> {
+    pod.write(|w| Ok(inbox::deliver(w, collection, activity, at)))
+        .map_err(InboxError::from)
+        .flatten()
+}
+
 /// Every literal anywhere in a store, for the "no content" assertion.
-fn literals(store: &Store) -> Vec<String> {
+fn literals(store: &impl PodRead) -> Vec<String> {
     store
         .quads_for_pattern(None, None, None, None)
         .filter_map(Result::ok)
@@ -65,24 +86,24 @@ fn literals(store: &Store) -> Vec<String> {
 }
 
 /// Put one quad in `name`, standing in for a resource someone would attack.
-fn seed(store: &Store, name: &str) {
-    brolly_store::insert_quads(
-        store,
-        &[Quad::new(
+/// Straight into the store (`test-fixtures`), so the setup doesn't depend on
+/// the code under test.
+fn seed(pod: &Pod, name: &str) {
+    pod.raw_store()
+        .insert(&Quad::new(
             NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(format!("{name}#owner"))),
             NamedNode::new_unchecked("http://www.w3.org/ns/auth/acl#mode"),
             Term::NamedNode(NamedNode::new_unchecked(
                 "http://www.w3.org/ns/auth/acl#Control",
             )),
             GraphName::NamedNode(NamedNode::new_unchecked(name)),
-        )],
-    )
-    .unwrap();
+        ))
+        .unwrap();
 }
 
 /// Every quad in one graph, as sorted text, so "untouched" compares content
 /// and not only size.
-fn graph(store: &Store, name: &str) -> Vec<String> {
+fn graph(store: &impl PodRead, name: &str) -> Vec<String> {
     let mut quads: Vec<String> = store
         .quads_for_pattern(
             None,
@@ -106,23 +127,21 @@ fn a_create_delivered_to_a_member_lands_in_their_inbox() {
     let (_dir, manager) = stores();
     let pod = manager.pod(uuid::Uuid::new_v4()).unwrap();
 
-    processor::process(
+    member(
         &pod,
-        Recipient::Member {
-            inbox: ALICE_INBOX,
-            outbox: ALICE_OUTBOX,
-        },
+        ALICE_INBOX,
+        ALICE_OUTBOX,
         &create(PUBLIC, "hello"),
         "2026-08-26T12:00:01Z",
     )
     .expect("process");
 
-    let timeline = inbox::timeline(&pod, ALICE_INBOX, &["Create"], 10, None);
+    let timeline = inbox::timeline(&pod.read_store(), ALICE_INBOX, &["Create"], 10, None);
     assert_eq!(timeline.len(), 1);
     assert_eq!(timeline[0].activity, ACTIVITY);
 
     // The member's copy is the content itself — this is their home timeline.
-    let note = inbox::read_activity(&pod, NOTE).expect("the note");
+    let note = inbox::read_activity(&pod.read_store(), NOTE).expect("the note");
     assert_eq!(note["content"], "hello");
 }
 
@@ -133,13 +152,7 @@ fn a_public_create_delivered_to_the_instance_becomes_a_pointer() {
     let (_dir, manager) = stores();
     let index_store = manager.instance();
 
-    processor::process(
-        index_store,
-        Recipient::Instance,
-        &create(PUBLIC, "hello"),
-        "2026-08-26T12:00:01Z",
-    )
-    .expect("process");
+    processor::process_instance(index_store, &create(PUBLIC, "hello")).expect("process");
 
     let page = index::public_timeline(index_store, &NamedNode::new_unchecked(PUBLIC), 10, None)
         .expect("query");
@@ -158,11 +171,9 @@ fn the_instance_stores_a_pointer_and_never_content() {
     let (_dir, manager) = stores();
     let index_store = manager.instance();
 
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &create(PUBLIC, "a distinctive body nobody else would write"),
-        "2026-08-26T12:00:01Z",
     )
     .expect("process");
 
@@ -203,11 +214,9 @@ fn a_private_post_never_reaches_the_public_index() {
     let (_dir, manager) = stores();
     let index_store = manager.instance();
 
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &create("https://bob.brolly.test/followers", "just for followers"),
-        "2026-08-26T12:00:01Z",
     )
     .expect("process");
 
@@ -230,27 +239,19 @@ fn a_like_is_a_notification_and_not_a_timeline_entry() {
         "object": NOTE,
     });
 
-    processor::process(
+    member(
         &pod,
-        Recipient::Member {
-            inbox: ALICE_INBOX,
-            outbox: ALICE_OUTBOX,
-        },
+        ALICE_INBOX,
+        ALICE_OUTBOX,
         &like,
         "2026-08-26T12:00:01Z",
     )
     .expect("member");
-    processor::process(
-        index_store,
-        Recipient::Instance,
-        &like,
-        "2026-08-26T12:00:01Z",
-    )
-    .expect("instance");
+    processor::process_instance(index_store, &like).expect("instance");
 
     // The member sees it — that is a notification.
     assert_eq!(
-        inbox::timeline(&pod, ALICE_INBOX, &["Like"], 10, None).len(),
+        inbox::timeline(&pod.read_store(), ALICE_INBOX, &["Like"], 10, None).len(),
         1
     );
     // The public timeline does not — a Like is not a post.
@@ -267,9 +268,8 @@ fn an_announce_is_indexed_like_a_create() {
     let (_dir, manager) = stores();
     let index_store = manager.instance();
 
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &json!({
             "type": "Create",
             "id": "https://carol.example/notes/9/activity",
@@ -278,13 +278,11 @@ fn an_announce_is_indexed_like_a_create() {
             "to": [PUBLIC],
             "object": {"type": "Note", "id": CAROL_NOTE, "attributedTo": CAROL_ACTOR},
         }),
-        "2026-08-26T12:00:01Z",
     )
     .expect("setup: carol's post is public");
 
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &json!({
             "type": "Announce",
             "id": "https://bob.brolly.test/~/boosts/1",
@@ -293,7 +291,6 @@ fn an_announce_is_indexed_like_a_create() {
             "to": [PUBLIC],
             "object": CAROL_NOTE,
         }),
-        "2026-08-26T12:05:01Z",
     )
     .expect("process");
 
@@ -323,13 +320,7 @@ fn a_reply_records_what_it_replies_to() {
     reply["object"]["id"] = json!("https://bob.brolly.test/~/notes/2");
     reply["object"]["inReplyTo"] = json!(NOTE);
 
-    processor::process(
-        index_store,
-        Recipient::Instance,
-        &reply,
-        "2026-08-26T12:00:01Z",
-    )
-    .expect("process");
+    processor::process_instance(index_store, &reply).expect("process");
 
     let page = index::public_timeline(index_store, &NamedNode::new_unchecked(PUBLIC), 10, None)
         .expect("query");
@@ -347,9 +338,8 @@ fn a_create_naming_someone_elses_note_is_not_indexed() {
     let (_dir, manager) = stores();
     let index_store = manager.instance();
 
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &json!({
             "type": "Create",
             "id": "https://mallory.brolly.test/~/activities/1",
@@ -357,7 +347,6 @@ fn a_create_naming_someone_elses_note_is_not_indexed() {
             "to": [PUBLIC],
             "object": NOTE,
         }),
-        "2026-08-26T12:00:01Z",
     )
     .unwrap();
 
@@ -372,11 +361,9 @@ fn an_announce_of_a_note_nobody_indexed_is_not_indexed() {
     // show it to everyone.
     let (_dir, manager) = stores();
     let index_store = manager.instance();
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &create("https://bob.brolly.test/followers", "just for followers"),
-        "2026-08-26T12:00:01Z",
     )
     .unwrap();
     assert!(
@@ -384,9 +371,8 @@ fn an_announce_of_a_note_nobody_indexed_is_not_indexed() {
         "setup"
     );
 
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &json!({
             "type": "Announce",
             "id": "https://mallory.brolly.test/~/activities/1",
@@ -395,7 +381,6 @@ fn an_announce_of_a_note_nobody_indexed_is_not_indexed() {
             "to": [PUBLIC],
             "object": NOTE,
         }),
-        "2026-08-26T12:05:01Z",
     )
     .unwrap();
 
@@ -419,19 +404,12 @@ fn an_announce_of_an_indexed_note_keeps_its_author_and_its_place() {
     later["object"]["id"] = json!(LATER);
     later["object"]["published"] = json!("2026-08-26T12:03:00Z");
     for activity in [create(PUBLIC, "hello"), later] {
-        processor::process(
-            index_store,
-            Recipient::Instance,
-            &activity,
-            "2026-08-26T12:03:01Z",
-        )
-        .unwrap();
+        processor::process_instance(index_store, &activity).unwrap();
     }
 
     // Mallory boosts the older one at 12:05.
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &json!({
             "type": "Announce",
             "id": "https://mallory.brolly.test/~/activities/1",
@@ -440,7 +418,6 @@ fn an_announce_of_an_indexed_note_keeps_its_author_and_its_place() {
             "to": [PUBLIC],
             "object": NOTE,
         }),
-        "2026-08-26T12:05:01Z",
     )
     .unwrap();
 
@@ -480,18 +457,15 @@ fn a_delete_removes_both_the_members_copy_and_the_pointer() {
     let pod = manager.pod(uuid::Uuid::new_v4()).unwrap();
     let activity = create(PUBLIC, "regrettable");
 
-    for (store, recipient) in [
-        (
-            &pod,
-            Recipient::Member {
-                inbox: ALICE_INBOX,
-                outbox: ALICE_OUTBOX,
-            },
-        ),
-        (index_store, Recipient::Instance),
-    ] {
-        processor::process(store, recipient, &activity, "2026-08-26T12:00:01Z").unwrap();
-    }
+    member(
+        &pod,
+        ALICE_INBOX,
+        ALICE_OUTBOX,
+        &activity,
+        "2026-08-26T12:00:01Z",
+    )
+    .unwrap();
+    processor::process_instance(index_store, &activity).unwrap();
     assert_eq!(index::count_notes(index_store).unwrap(), 1);
 
     let delete = json!({
@@ -500,23 +474,15 @@ fn a_delete_removes_both_the_members_copy_and_the_pointer() {
         "actor": BOB_ACTOR,
         "object": NOTE,
     });
-    processor::process(
+    member(
         &pod,
-        Recipient::Member {
-            inbox: ALICE_INBOX,
-            outbox: ALICE_OUTBOX,
-        },
+        ALICE_INBOX,
+        ALICE_OUTBOX,
         &delete,
         "2026-08-26T12:01:00Z",
     )
     .unwrap();
-    processor::process(
-        index_store,
-        Recipient::Instance,
-        &delete,
-        "2026-08-26T12:01:00Z",
-    )
-    .unwrap();
+    processor::process_instance(index_store, &delete).unwrap();
 
     assert_eq!(
         index::count_notes(index_store).unwrap(),
@@ -524,11 +490,11 @@ fn a_delete_removes_both_the_members_copy_and_the_pointer() {
         "the pointer must go"
     );
     assert!(
-        inbox::read_activity(&pod, NOTE).is_none(),
+        inbox::read_activity(&pod.read_store(), NOTE).is_none(),
         "the member's copy must go"
     );
     assert!(
-        inbox::timeline(&pod, ALICE_INBOX, &["Create"], 10, None).is_empty(),
+        inbox::timeline(&pod.read_store(), ALICE_INBOX, &["Create"], 10, None).is_empty(),
         "and it must leave no hole in the timeline"
     );
 }
@@ -540,16 +506,14 @@ fn a_delete_for_something_we_never_had_is_not_an_error() {
     let (_dir, manager) = stores();
     let index_store = manager.instance();
 
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &json!({
             "type": "Delete",
             "id": "https://bob.brolly.test/~/deletes/1",
             "actor": BOB_ACTOR,
             "object": "https://bob.brolly.test/~/notes/never-seen",
         }),
-        "2026-08-26T12:01:00Z",
     )
     .expect("a delete for an unknown object must be a no-op, not a failure");
 }
@@ -559,14 +523,12 @@ fn a_delete_of_a_graph_on_another_origin_removes_nothing() {
     let (_dir, manager) = stores();
     let pod = manager.pod(uuid::Uuid::new_v4()).unwrap();
     seed(&pod, ALICE_ACL);
-    let before = graph(&pod, ALICE_ACL);
+    let before = graph(&pod.read_store(), ALICE_ACL);
 
-    processor::process(
+    member(
         &pod,
-        Recipient::Member {
-            inbox: ALICE_INBOX,
-            outbox: ALICE_OUTBOX,
-        },
+        ALICE_INBOX,
+        ALICE_OUTBOX,
         &json!({
             "type": "Delete",
             "id": "https://bob.brolly.test/~/activities/9",
@@ -578,7 +540,7 @@ fn a_delete_of_a_graph_on_another_origin_removes_nothing() {
     .unwrap();
 
     assert_eq!(
-        graph(&pod, ALICE_ACL),
+        graph(&pod.read_store(), ALICE_ACL),
         before,
         "Bob's Delete cleared Alice's ACL"
     );
@@ -591,10 +553,10 @@ fn a_delete_removes_only_what_arrived_embedded() {
     let (_dir, manager) = stores();
     let pod = manager.pod(uuid::Uuid::new_v4()).unwrap();
     seed(&pod, BOB_ACL);
-    let before = graph(&pod, BOB_ACL);
+    let before = graph(&pod.read_store(), BOB_ACL);
 
     // Named, not embedded: a string object is a graph delivery never wrote.
-    inbox::deliver(
+    deliver(
         &pod,
         BOB_OUTBOX,
         &json!({
@@ -608,12 +570,10 @@ fn a_delete_removes_only_what_arrived_embedded() {
     )
     .unwrap();
 
-    processor::process(
+    member(
         &pod,
-        Recipient::Member {
-            inbox: BOB_INBOX,
-            outbox: BOB_OUTBOX,
-        },
+        BOB_INBOX,
+        BOB_OUTBOX,
         &json!({
             "type": "Delete",
             "id": "https://bob.brolly.test/~/activities/2",
@@ -625,7 +585,7 @@ fn a_delete_removes_only_what_arrived_embedded() {
     .unwrap();
 
     assert_eq!(
-        graph(&pod, BOB_ACL),
+        graph(&pod.read_store(), BOB_ACL),
         before,
         "a Delete reached an LDP resource"
     );
@@ -638,7 +598,7 @@ fn a_delete_also_clears_the_authors_outbox_copy() {
 
     // Stored the way outbox::deliver stores the author's copy: straight into
     // the outbox, not through `process`.
-    inbox::deliver(
+    deliver(
         &pod,
         BOB_OUTBOX,
         &create(PUBLIC, "regrettable"),
@@ -646,12 +606,10 @@ fn a_delete_also_clears_the_authors_outbox_copy() {
     )
     .unwrap();
 
-    processor::process(
+    member(
         &pod,
-        Recipient::Member {
-            inbox: BOB_INBOX,
-            outbox: BOB_OUTBOX,
-        },
+        BOB_INBOX,
+        BOB_OUTBOX,
         &json!({
             "type": "Delete",
             "id": "https://bob.brolly.test/~/activities/2",
@@ -663,15 +621,15 @@ fn a_delete_also_clears_the_authors_outbox_copy() {
     .unwrap();
 
     assert!(
-        inbox::read_activity(&pod, NOTE).is_none(),
+        inbox::read_activity(&pod.read_store(), NOTE).is_none(),
         "the note survived"
     );
     assert!(
-        inbox::read_activity(&pod, ACTIVITY).is_none(),
+        inbox::read_activity(&pod.read_store(), ACTIVITY).is_none(),
         "the Create that carried it survived"
     );
     assert!(
-        inbox::members(&pod, BOB_OUTBOX).is_empty(),
+        inbox::members(&pod.read_store(), BOB_OUTBOX).is_empty(),
         "the outbox still lists a deleted post"
     );
 }
@@ -680,24 +638,16 @@ fn a_delete_also_clears_the_authors_outbox_copy() {
 fn a_delete_from_another_origin_leaves_the_pointer() {
     let (_dir, manager) = stores();
     let index_store = manager.instance();
-    processor::process(
-        index_store,
-        Recipient::Instance,
-        &create(PUBLIC, "hello"),
-        "2026-08-26T12:00:01Z",
-    )
-    .unwrap();
+    processor::process_instance(index_store, &create(PUBLIC, "hello")).unwrap();
 
-    processor::process(
+    processor::process_instance(
         index_store,
-        Recipient::Instance,
         &json!({
             "type": "Delete",
             "id": "https://mallory.brolly.test/~/activities/2",
             "actor": MALLORY_ACTOR,
             "object": NOTE,
         }),
-        "2026-08-26T12:01:00Z",
     )
     .unwrap();
 
@@ -719,12 +669,10 @@ fn the_index_only_ever_grows_by_delivery() {
     let pod = manager.pod(uuid::Uuid::new_v4()).unwrap();
 
     // A member's pod filling up must not move the index by itself.
-    processor::process(
+    member(
         &pod,
-        Recipient::Member {
-            inbox: ALICE_INBOX,
-            outbox: ALICE_OUTBOX,
-        },
+        ALICE_INBOX,
+        ALICE_OUTBOX,
         &create(PUBLIC, "hello"),
         "2026-08-26T12:00:01Z",
     )
@@ -746,17 +694,15 @@ fn an_embedded_object_on_another_origin_is_refused_and_writes_nothing() {
     let (_dir, manager) = stores();
     let pod = manager.pod(uuid::Uuid::new_v4()).unwrap();
     seed(&pod, ALICE_ACL);
-    let before = graph(&pod, ALICE_ACL);
+    let before = graph(&pod.read_store(), ALICE_ACL);
 
     let mut attack = create(PUBLIC, "bob holds acl:Control now");
     attack["object"]["id"] = json!(ALICE_ACL);
 
-    let delivered = processor::process(
+    let delivered = member(
         &pod,
-        Recipient::Member {
-            inbox: ALICE_INBOX,
-            outbox: ALICE_OUTBOX,
-        },
+        ALICE_INBOX,
+        ALICE_OUTBOX,
         &attack,
         "2026-08-26T12:00:01Z",
     );
@@ -765,21 +711,16 @@ fn an_embedded_object_on_another_origin_is_refused_and_writes_nothing() {
         "got {delivered:?}"
     );
     assert_eq!(
-        graph(&pod, ALICE_ACL),
+        graph(&pod.read_store(), ALICE_ACL),
         before,
         "the ACL graph was rewritten"
     );
     assert!(
-        inbox::members(&pod, ALICE_INBOX).is_empty(),
+        inbox::members(&pod.read_store(), ALICE_INBOX).is_empty(),
         "a refused activity must not be delivered at all"
     );
 
-    let indexed = processor::process(
-        manager.instance(),
-        Recipient::Instance,
-        &attack,
-        "2026-08-26T12:00:01Z",
-    );
+    let indexed = processor::process_instance(manager.instance(), &attack);
     assert!(
         matches!(indexed, Err(ProcessError::ForeignObject)),
         "got {indexed:?}"
@@ -792,17 +733,15 @@ fn an_activity_whose_own_id_is_on_another_origin_is_refused() {
     let (_dir, manager) = stores();
     let pod = manager.pod(uuid::Uuid::new_v4()).unwrap();
     seed(&pod, ALICE_ACL);
-    let before = graph(&pod, ALICE_ACL);
+    let before = graph(&pod.read_store(), ALICE_ACL);
 
     let mut attack = create(PUBLIC, "hello");
     attack["id"] = json!(ALICE_ACL);
 
-    let result = processor::process(
+    let result = member(
         &pod,
-        Recipient::Member {
-            inbox: ALICE_INBOX,
-            outbox: ALICE_OUTBOX,
-        },
+        ALICE_INBOX,
+        ALICE_OUTBOX,
         &attack,
         "2026-08-26T12:00:01Z",
     );
@@ -810,7 +749,7 @@ fn an_activity_whose_own_id_is_on_another_origin_is_refused() {
         matches!(result, Err(ProcessError::ForeignObject)),
         "got {result:?}"
     );
-    assert_eq!(graph(&pod, ALICE_ACL), before);
+    assert_eq!(graph(&pod.read_store(), ALICE_ACL), before);
 }
 
 #[test]
@@ -822,12 +761,10 @@ fn an_activity_without_an_actor_is_refused() {
     let mut anonymous = create(PUBLIC, "hello");
     anonymous.as_object_mut().unwrap().remove("actor");
 
-    let result = processor::process(
+    let result = member(
         &pod,
-        Recipient::Member {
-            inbox: ALICE_INBOX,
-            outbox: ALICE_OUTBOX,
-        },
+        ALICE_INBOX,
+        ALICE_OUTBOX,
         &anonymous,
         "2026-08-26T12:00:01Z",
     );
@@ -858,17 +795,62 @@ fn a_reference_may_name_anyone() {
             "object": "https://alice.brolly.test/actor",
         }),
     ] {
-        processor::process(
+        member(
             &pod,
-            Recipient::Member {
-                inbox: ALICE_INBOX,
-                outbox: ALICE_OUTBOX,
-            },
+            ALICE_INBOX,
+            ALICE_OUTBOX,
             &activity,
             "2026-08-26T12:00:01Z",
         )
         .expect("a reference is not a foreign object");
     }
 
-    assert_eq!(inbox::members(&pod, ALICE_INBOX).len(), 2);
+    assert_eq!(inbox::members(&pod.read_store(), ALICE_INBOX).len(), 2);
+}
+
+// --- reads inside a write ---------------------------------------------------
+
+#[test]
+fn a_reader_inside_a_write_sees_that_writes_own_changes() {
+    // The carrier check reads the collection it is about to change. Inside one
+    // write it has to see the author's copy stored earlier in the same closure,
+    // or a Delete composed with its Create would find nothing to remove.
+    let (_dir, manager) = stores();
+    let pod = manager.pod(uuid::Uuid::new_v4()).unwrap();
+    let delete = json!({
+        "type": "Delete",
+        "id": "https://bob.brolly.test/~/activities/2",
+        "actor": BOB_ACTOR,
+        "object": NOTE,
+    });
+
+    let (stored, deleted) = pod
+        .write(|w| {
+            let stored = inbox::deliver(
+                w,
+                BOB_OUTBOX,
+                &create(PUBLIC, "short-lived"),
+                "2026-08-26T12:00:00Z",
+            );
+            let deleted = processor::process_member(
+                w,
+                BOB_INBOX,
+                BOB_OUTBOX,
+                &delete,
+                "2026-08-26T12:00:01Z",
+            );
+            Ok((stored, deleted))
+        })
+        .unwrap();
+    stored.unwrap();
+    deleted.unwrap();
+
+    assert!(
+        inbox::read_activity(&pod.read_store(), NOTE).is_none(),
+        "the note survived"
+    );
+    assert!(
+        inbox::members(&pod.read_store(), BOB_OUTBOX).is_empty(),
+        "the outbox still lists it"
+    );
 }

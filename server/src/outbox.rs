@@ -16,9 +16,10 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum_extra::extract::CookieJar;
 use brolly_activitypub::follows;
-use brolly_activitypub::processor::{self, ProcessError, Recipient};
+use brolly_activitypub::processor::{self, ProcessError};
 use brolly_identity::db::{self, User};
 use brolly_identity::{extract, webid};
+use brolly_store::resources::PodRead;
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -269,40 +270,49 @@ pub async fn deliver(
     let Ok(author_pod) = state.stores.pod(author.id) else {
         return Err(DeliverError::Failed);
     };
+    let author_inbox = webid::inbox(&author.username, &state.base_domain);
+    let author_outbox = webid::outbox(&author.username, &state.base_domain);
 
-    // The author holds their own post — content lives in exactly one place (D2)
-    // and this is it. A Delete removes rather than stores.
-    if activity["type"] == "Delete" {
-        if let Err(e) = processor::process(
-            &author_pod,
-            Recipient::Member {
-                inbox: &webid::inbox(&author.username, &state.base_domain),
-                outbox: &webid::outbox(&author.username, &state.base_domain),
-            },
-            activity,
-            &received,
-        ) {
-            tracing::error!(error = %e, "removing the author's copy failed");
+    // The author's copy, and a Follow's bookkeeping, in one write. It closes
+    // before the recipient loop awaits anything: the write holds the pod's
+    // lock, and every other writer to this pod waits on it.
+    let stored = author_pod.write(|w| {
+        // The author holds their own post — content lives in exactly one place
+        // (D2) and this is it. A Delete removes rather than stores.
+        if activity["type"] == "Delete" {
+            if let Err(e) =
+                processor::process_member(w, &author_inbox, &author_outbox, activity, &received)
+            {
+                tracing::error!(error = %e, "removing the author's copy failed");
+                return Ok(false);
+            }
+        } else if let Err(e) =
+            brolly_activitypub::inbox::deliver(w, &author_outbox, activity, &received)
+        {
+            tracing::error!(error = %e, "storing the author's copy failed");
+            return Ok(false);
+        }
+
+        // A Follow is also a relationship, not only a notification.
+        if activity["type"] == "Follow"
+            && let Some(target) = activity["object"].as_str()
+        {
+            let _ = follows::record_following(w, actor, target);
+        }
+        Ok(true)
+    });
+    match stored {
+        Ok(true) => {}
+        Ok(false) => return Err(DeliverError::Failed),
+        Err(e) => {
+            tracing::error!(error = %e, "storing the author's copy failed");
             return Err(DeliverError::Failed);
         }
-    } else if let Err(e) = brolly_activitypub::inbox::deliver(
-        &author_pod,
-        &webid::outbox(&author.username, &state.base_domain),
-        activity,
-        &received,
-    ) {
-        tracing::error!(error = %e, "storing the author's copy failed");
-        return Err(DeliverError::Failed);
     }
 
-    // A Follow is also a relationship, not only a notification.
-    if activity["type"] == "Follow"
-        && let Some(target) = activity["object"].as_str()
-    {
-        let _ = follows::record_following(&author_pod, actor, target);
-    }
-
-    for inbox in recipients(state, &author_pod, actor, activity) {
+    // Bound before the loop, so no read of the pod is held across its awaits.
+    let inboxes = recipients(state, &author_pod.read_store(), actor, activity);
+    for inbox in inboxes {
         let Ok(url) = url::Url::parse(&inbox) else {
             continue;
         };
@@ -316,12 +326,7 @@ pub async fn deliver(
 
     // The instance is a recipient like any other (D4), and its processor writes
     // the pointer row. This is the only way anything reaches the public index.
-    match processor::process(
-        state.stores.instance(),
-        Recipient::Instance,
-        activity,
-        &received,
-    ) {
+    match processor::process_instance(state.stores.instance(), activity) {
         Ok(()) => {}
         Err(e @ ProcessError::ForeignObject) => tracing::warn!(error = %e, "indexing refused"),
         Err(e) => tracing::error!(error = %e, "indexing failed"),
@@ -333,7 +338,7 @@ pub async fn deliver(
 /// Which inboxes this activity is for.
 fn recipients(
     state: &AppState,
-    author_pod: &brolly_store::Store,
+    author_pod: &impl PodRead,
     actor: &str,
     activity: &Value,
 ) -> Vec<String> {
@@ -406,39 +411,40 @@ async fn deliver_locally(
     // the follow unconditionally, so the flag did nothing. It did nothing
     // invisibly, too: the profile still rendered the lock.
     //
-    // FEDERATION: this writes before `processor::process` applies its origin
-    // check (stage 0, A1). That is only safe while every activity here came
-    // through `outbox::deliver` with an actor the server set. Revisit when
+    // FEDERATION: this writes before `processor::process_member` applies its
+    // origin check (stage 0, A1). That is only safe while every activity here
+    // came through `outbox::deliver` with an actor the server set. Revisit when
     // federation is enabled (ADR 0016): an inbound Follow's `actor` must be
     // verified before it is recorded as a follower.
     if activity["type"] == "Follow"
         && let Some(target) = activity["object"].as_str()
         && let Some(follower) = activity["actor"].as_str()
     {
-        let profile = brolly_solid::profile::read(
-            &pod,
-            &webid::webid(&user.username, &state.base_domain),
-            &webid::profile_document(&user.username, &state.base_domain),
-        );
-        let _ = if profile.locked {
-            follows::record_request(&pod, follower, target)
-        } else {
-            follows::record(&pod, follower, target)
-        };
+        let webid = webid::webid(&user.username, &state.base_domain);
+        let document = webid::profile_document(&user.username, &state.base_domain);
+        // The lock is read in the same write that records the follow, so the
+        // two can't disagree.
+        let _ = pod.write(|w| {
+            if brolly_solid::profile::read(&*w, &webid, &document).locked {
+                follows::record_request(w, follower, target)
+            } else {
+                follows::record(w, follower, target)
+            }
+        });
     }
 
     // A refusal isn't a failure: the activity named a graph its actor doesn't
     // own. Delivery to every other recipient carries on either way.
     let outbox = webid::outbox(&user.username, &state.base_domain);
-    match processor::process(
-        &pod,
-        Recipient::Member {
-            inbox,
-            outbox: &outbox,
-        },
-        activity,
-        received,
-    ) {
+    match pod
+        .write(|w| {
+            Ok(processor::process_member(
+                w, inbox, &outbox, activity, received,
+            ))
+        })
+        .map_err(ProcessError::from)
+        .flatten()
+    {
         Ok(()) => {}
         Err(e @ ProcessError::ForeignObject) => {
             tracing::warn!(error = %e, %inbox, "local delivery refused");

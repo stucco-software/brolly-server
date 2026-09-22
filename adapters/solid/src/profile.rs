@@ -10,8 +10,8 @@
 //! profile with two names, and every reader downstream has to pick one.
 
 use brolly_domain::vocab;
-use brolly_store::Store;
-use brolly_store::write::{WriteError, insert_quads};
+use brolly_store::StoreError;
+use brolly_store::resources::{PodRead, PodWrite};
 use oxigraph::model::{GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 
 fn iri(s: &str) -> NamedNode {
@@ -47,7 +47,7 @@ impl Profile {
 }
 
 /// Read the profile triples for `webid` out of `document`.
-pub fn read(store: &Store, webid: &str, document: &str) -> Profile {
+pub fn read(store: &impl PodRead, webid: &str, document: &str) -> Profile {
     Profile {
         display_name: literal(store, webid, document, vocab::FOAF_NAME),
         bio: literal(store, webid, document, vocab::VCARD_NOTE),
@@ -63,7 +63,7 @@ pub fn read(store: &Store, webid: &str, document: &str) -> Profile {
 /// The distinction matters: `discoverable` defaults true when absent, so
 /// collapsing absent into false would quietly de-list every member who has
 /// never touched their settings.
-fn flag(store: &Store, webid: &str, document: &str, predicate: &str) -> Option<bool> {
+fn flag(store: &impl PodRead, webid: &str, document: &str, predicate: &str) -> Option<bool> {
     let raw = literal(store, webid, document, predicate);
     match raw.as_str() {
         "true" => Some(true),
@@ -72,7 +72,7 @@ fn flag(store: &Store, webid: &str, document: &str, predicate: &str) -> Option<b
     }
 }
 
-fn literal(store: &Store, webid: &str, document: &str, predicate: &str) -> String {
+fn literal(store: &impl PodRead, webid: &str, document: &str, predicate: &str) -> String {
     let graph = iri(document);
     store
         .quads_for_pattern(
@@ -94,15 +94,19 @@ fn literal(store: &Store, webid: &str, document: &str, predicate: &str) -> Strin
 /// Only `foaf:name` and `vcard:note` are touched: the profile document also
 /// holds `space:storage`, keys and type triples that this form knows nothing
 /// about, so clearing the graph would delete them.
+///
+/// The profile document is protocol state outside the storage root, so it is
+/// written with `PodWrite`'s outside-root methods.
 pub fn write(
-    store: &Store,
+    w: &mut PodWrite<'_>,
     webid: &str,
     document: &str,
     profile: &Profile,
-) -> Result<(), WriteError> {
+) -> Result<(), StoreError> {
     let graph = iri(document);
     let subject = NamedOrBlankNode::NamedNode(iri(webid));
 
+    let mut existing: Vec<Quad> = Vec::new();
     for predicate in [
         vocab::FOAF_NAME,
         vocab::VCARD_NOTE,
@@ -110,21 +114,17 @@ pub fn write(
         vocab::MASTODON_BOT,
         vocab::MASTODON_DISCOVERABLE,
     ] {
-        let existing: Vec<Quad> = store
-            .quads_for_pattern(
+        existing.extend(
+            w.quads_for_pattern(
                 Some((&subject).into()),
                 Some(iri(predicate).as_ref()),
                 None,
                 Some(GraphNameRef::NamedNode(graph.as_ref())),
             )
-            .filter_map(Result::ok)
-            .collect();
-        for quad in existing {
-            store
-                .remove(&quad)
-                .map_err(brolly_store::StoreError::from)?;
-        }
+            .filter_map(Result::ok),
+        );
     }
+    w.remove_quads(&existing)?;
 
     // An empty field means "no value", not an empty string: a blank
     // `foaf:name` reads as a person literally named "".
@@ -163,7 +163,7 @@ pub fn write(
     }
 
     if !quads.is_empty() {
-        insert_quads(store, &quads)?;
+        w.insert(&quads)?;
     }
     Ok(())
 }
@@ -187,7 +187,7 @@ pub fn write(
 /// the member to authenticate; without it there is no way in, however well the
 /// OIDC endpoints themselves work.
 pub fn document(
-    store: &Store,
+    store: &impl PodRead,
     webid: &str,
     document: &str,
     storage_root: &str,

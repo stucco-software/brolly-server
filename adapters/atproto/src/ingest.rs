@@ -18,8 +18,8 @@
 //! nothing to accept.
 
 use brolly_domain::{canonical, faithful};
-use brolly_store::Store;
-use brolly_store::write::{WriteError, insert_quads};
+use brolly_store::StoreError;
+use brolly_store::resources::{PodRead, PodWrite};
 use oxigraph::model::NamedNode;
 use serde_json::Value;
 
@@ -29,7 +29,7 @@ pub enum IngestError {
     /// have nowhere to land that would not collide with another lexicon's.
     NoType,
     Encode(faithful::FaithfulError),
-    Store(WriteError),
+    Store(StoreError),
 }
 
 impl std::fmt::Display for IngestError {
@@ -50,8 +50,8 @@ impl From<faithful::FaithfulError> for IngestError {
     }
 }
 
-impl From<WriteError> for IngestError {
-    fn from(e: WriteError) -> Self {
+impl From<StoreError> for IngestError {
+    fn from(e: StoreError) -> Self {
         IngestError::Store(e)
     }
 }
@@ -86,7 +86,7 @@ pub fn record_type(record: &Value) -> Option<&str> {
 ///   instead would be tidy, correct-looking, and invisible to every reader
 ///   that matters.
 pub fn ingest(
-    store: &Store,
+    w: &mut PodWrite<'_>,
     record: &Value,
     at_uri: &str,
     webid: &str,
@@ -109,28 +109,40 @@ pub fn ingest(
         &NamedNode::new_unchecked(profile_document),
     ));
 
-    Ok(insert_quads(store, &quads)?)
+    // Both graphs are protocol state outside the storage root: the record's
+    // `at://` graph and the profile document.
+    w.insert(&quads)?;
+    Ok(quads.len())
 }
 
 /// Read a record back out of the pod, as the wire format it arrived in.
-pub fn read(store: &Store, at_uri: &str) -> Option<Value> {
+pub fn read(store: &impl PodRead, at_uri: &str) -> Option<Value> {
     brolly_store::collection::read_record(store, at_uri)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brolly_store::resources::Pod;
     use serde_json::json;
 
     const DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
     const WEBID: &str = "https://alice.brolly.test/profile#me";
     const PROFILE: &str = "https://alice.brolly.test/profile";
 
-    fn store() -> (tempfile::TempDir, std::sync::Arc<Store>) {
+    fn store() -> (tempfile::TempDir, std::sync::Arc<Pod>) {
         let dir = tempfile::tempdir().unwrap();
         let manager = brolly_store::StoreManager::open(dir.path(), 4, 60).unwrap();
         let store = manager.pod(uuid::Uuid::new_v4()).unwrap();
         (dir, store)
+    }
+
+    /// Ingest in one write, as `xrpc.rs` does.
+    fn put(store: &Pod, record: &Value, uri: &str) -> Result<usize, IngestError> {
+        store
+            .write(|w| Ok(ingest(w, record, uri, WEBID, PROFILE)))
+            .map_err(IngestError::from)
+            .flatten()
     }
 
     #[test]
@@ -145,9 +157,9 @@ mod tests {
         });
         let uri = at_uri(DID, "site.standard.doc", "3kaaa");
 
-        let written = ingest(&store, &record, &uri, WEBID, PROFILE).expect("ingest");
+        let written = put(&store, &record, &uri).expect("ingest");
         assert!(written > 0);
-        assert_eq!(read(&store, &uri), Some(record));
+        assert_eq!(read(&store.read_store(), &uri), Some(record));
     }
 
     #[test]
@@ -159,25 +171,27 @@ mod tests {
         let bsky_uri = at_uri(DID, "app.bsky.feed.post", "3kaaa");
         let doc_uri = at_uri(DID, "site.standard.doc", "3kbbb");
 
-        ingest(
+        put(
             &store,
             &json!({"$type": "app.bsky.feed.post", "text": "the bsky one"}),
             &bsky_uri,
-            WEBID,
-            PROFILE,
         )
         .unwrap();
-        ingest(
+        put(
             &store,
             &json!({"$type": "site.standard.doc", "text": "the other one"}),
             &doc_uri,
-            WEBID,
-            PROFILE,
         )
         .unwrap();
 
-        assert_eq!(read(&store, &bsky_uri).unwrap()["text"], "the bsky one");
-        assert_eq!(read(&store, &doc_uri).unwrap()["text"], "the other one");
+        assert_eq!(
+            read(&store.read_store(), &bsky_uri).unwrap()["text"],
+            "the bsky one"
+        );
+        assert_eq!(
+            read(&store.read_store(), &doc_uri).unwrap()["text"],
+            "the other one"
+        );
     }
 
     #[test]
@@ -204,8 +218,8 @@ mod tests {
         });
         let uri = at_uri(DID, "site.standard.doc", "3kaaa");
 
-        ingest(&store, &record, &uri, WEBID, PROFILE).unwrap();
-        assert_eq!(read(&store, &uri), Some(record));
+        put(&store, &record, &uri).unwrap();
+        assert_eq!(read(&store.read_store(), &uri), Some(record));
     }
 
     #[test]
@@ -216,7 +230,7 @@ mod tests {
         let (_dir, store) = store();
         let uri = at_uri(DID, "site.standard.doc", "3kaaa");
         assert!(matches!(
-            ingest(&store, &json!({"text": "orphan"}), &uri, WEBID, PROFILE),
+            put(&store, &json!({"text": "orphan"}), &uri),
             Err(IngestError::NoType)
         ));
     }
@@ -232,13 +246,13 @@ mod tests {
         });
         let uri = at_uri(DID, "app.bsky.actor.profile", "self");
 
-        ingest(&store, &record, &uri, WEBID, PROFILE).unwrap();
+        put(&store, &record, &uri).unwrap();
 
         // Read the way `profile::read` does — subject WebID, graph profile
         // document — so this asserts the integration and not just that some
         // triple exists somewhere.
         let name = brolly_store::collection::literal_in(
-            &store,
+            &store.read_store(),
             WEBID,
             brolly_domain::vocab::FOAF_NAME,
             PROFILE,
@@ -254,18 +268,16 @@ mod tests {
     fn an_unmapped_type_asserts_nothing_canonical_and_that_is_fine() {
         let (_dir, store) = store();
         let uri = at_uri(DID, "site.standard.doc", "3kaaa");
-        ingest(
+        put(
             &store,
             &json!({"$type": "site.standard.doc", "displayName": "not a profile"}),
             &uri,
-            WEBID,
-            PROFILE,
         )
         .expect("unmapped is the normal case, not an error");
 
         assert_eq!(
             brolly_store::collection::literal_in(
-                &store,
+                &store.read_store(),
                 WEBID,
                 brolly_domain::vocab::FOAF_NAME,
                 PROFILE
@@ -294,24 +306,20 @@ mod tests {
         let first = at_uri(DID, "app.bsky.feed.post", "3kaaa");
         let second = at_uri(DID, "app.bsky.feed.post", "3kbbb");
 
-        ingest(
+        put(
             &store,
             &json!({"$type": "app.bsky.feed.post", "text": "one"}),
             &first,
-            WEBID,
-            PROFILE,
         )
         .unwrap();
-        ingest(
+        put(
             &store,
             &json!({"$type": "app.bsky.feed.post", "text": "two"}),
             &second,
-            WEBID,
-            PROFILE,
         )
         .unwrap();
 
-        assert_eq!(read(&store, &first).unwrap()["text"], "one");
-        assert_eq!(read(&store, &second).unwrap()["text"], "two");
+        assert_eq!(read(&store.read_store(), &first).unwrap()["text"], "one");
+        assert_eq!(read(&store.read_store(), &second).unwrap()["text"], "two");
     }
 }

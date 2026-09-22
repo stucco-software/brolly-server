@@ -9,7 +9,7 @@
 
 use std::time::Instant;
 
-use brolly_store::{StoreManager, insert_record};
+use brolly_store::StoreManager;
 use oxigraph::model::NamedNode;
 use serde_json::json;
 use uuid::Uuid;
@@ -29,14 +29,14 @@ fn main() {
         let pod = mgr.pod(*user).expect("open pod");
         for i in 0..RECORDS_PER_POD {
             let subject = NamedNode::new_unchecked(format!("https://u.brolly.id/notes/{i}"));
-            insert_record(
-                &pod,
+            let quads = brolly_domain::faithful::encode(
                 &json!({"$type": "app.bsky.feed.post", "text": "benchmark record", "i": i}),
                 &subject,
                 &subject,
                 "app.bsky.feed.post",
             )
-            .expect("write");
+            .expect("encode");
+            pod.write(|w| w.insert(&quads)).expect("write");
         }
     }
     let create = start.elapsed();

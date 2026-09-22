@@ -19,7 +19,8 @@
 //! source of truth nobody remembers is derived.
 
 use brolly_store::index::{self, NotePointer};
-use brolly_store::{Store, StoreError};
+use brolly_store::resources::{PodRead, PodWrite};
+use brolly_store::{InstanceStore, StoreError};
 use oxigraph::model::NamedNode;
 use serde_json::Value;
 
@@ -28,16 +29,6 @@ use crate::inbox::{self, InboxError};
 /// The public audience. A post addressed here is on the public timeline; one
 /// addressed anywhere else is not, and indexing it would publish it.
 pub const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
-
-/// Who a delivery is for.
-pub enum Recipient<'a> {
-    /// A member. Their inbox is their home timeline (D6), so it holds the
-    /// activity itself. Their outbox holds their own published activities, and
-    /// a `Delete` has to be able to clear a copy in either.
-    Member { inbox: &'a str, outbox: &'a str },
-    /// The instance actor (D4). Records a pointer, never content.
-    Instance,
-}
 
 #[derive(Debug)]
 pub enum ProcessError {
@@ -75,44 +66,27 @@ impl From<StoreError> for ProcessError {
     }
 }
 
-impl From<brolly_store::write::WriteError> for ProcessError {
-    fn from(e: brolly_store::write::WriteError) -> Self {
-        ProcessError::Store(e.to_string())
-    }
-}
-
-/// Handle one delivered activity.
+/// Handle one activity delivered to a member, inside the caller's write.
 ///
 /// Before anything is written, the activity is refused with
 /// [`ProcessError::ForeignObject`] if its own id, or the id of an object
 /// embedded in it, isn't on its actor's origin. A string `object` is a
 /// reference and may name anyone's IRI: that is what a `Like` or a `Follow` is.
 ///
+/// The member's inbox is their home timeline (D6), so it holds the activity
+/// itself. Their outbox holds their own published activities, and a `Delete`
+/// has to be able to clear a copy in either.
+///
 /// This is where every recipient's copy arrives, whether from local delivery
 /// or, once federation is on, from another server (ADR 0016).
-pub fn process(
-    store: &Store,
-    recipient: Recipient<'_>,
+pub fn process_member(
+    w: &mut PodWrite<'_>,
+    inbox: &str,
+    outbox: &str,
     activity: &Value,
     received_at: &str,
 ) -> Result<(), ProcessError> {
     let actor = owning_actor(activity)?;
-    match recipient {
-        Recipient::Member { inbox, outbox } => {
-            process_for_member(store, inbox, outbox, actor, activity, received_at)
-        }
-        Recipient::Instance => process_for_instance(store, actor, activity),
-    }
-}
-
-fn process_for_member(
-    store: &Store,
-    inbox: &str,
-    outbox: &str,
-    actor: &str,
-    activity: &Value,
-    received_at: &str,
-) -> Result<(), ProcessError> {
     if activity["type"] == "Delete" {
         // Remove only what delivery put there: a graph on the actor's origin
         // that arrived as the embedded object of one of the actor's activities,
@@ -127,20 +101,28 @@ fn process_for_member(
         {
             let mut carried = false;
             for collection in [inbox, outbox] {
-                for carrier in carriers(store, collection, actor, target) {
-                    inbox::remove(store, collection, &carrier)?;
+                for carrier in carriers(&*w, collection, actor, target) {
+                    inbox::remove(w, collection, &carrier)?;
                     carried = true;
                 }
             }
             if carried {
-                inbox::remove(store, inbox, target)?;
+                inbox::remove(w, inbox, target)?;
             }
         }
         return Ok(());
     }
 
-    inbox::deliver(store, inbox, activity, received_at)?;
+    inbox::deliver(w, inbox, activity, received_at)?;
     Ok(())
+}
+
+/// Handle one activity delivered to the instance actor (D4). It records a
+/// pointer, never content, and applies the same origin rule as
+/// [`process_member`] first.
+pub fn process_instance(instance: &InstanceStore, activity: &Value) -> Result<(), ProcessError> {
+    let actor = owning_actor(activity)?;
+    process_for_instance(instance, actor, activity)
 }
 
 /// The actor's activities in `collection` that carried `target` in as their
@@ -150,7 +132,7 @@ fn process_for_member(
 /// names a graph delivery never wrote, so it's no evidence the graph is
 /// delivery's to remove. That's why this doesn't use [`object_id`], which
 /// treats the two alike.
-fn carriers(store: &Store, collection: &str, actor: &str, target: &str) -> Vec<String> {
+fn carriers(store: &impl PodRead, collection: &str, actor: &str, target: &str) -> Vec<String> {
     inbox::members(store, collection)
         .into_iter()
         .filter(|member| same_origin(member, actor))
@@ -162,13 +144,17 @@ fn carriers(store: &Store, collection: &str, actor: &str, target: &str) -> Vec<S
         .collect()
 }
 
-fn process_for_instance(store: &Store, actor: &str, activity: &Value) -> Result<(), ProcessError> {
+fn process_for_instance(
+    instance: &InstanceStore,
+    actor: &str,
+    activity: &Value,
+) -> Result<(), ProcessError> {
     match activity["type"].as_str() {
         // A Create publishes the actor's own note. Indexing one that names
         // somebody else's would put it on the public timeline under the wrong
         // name.
         Some("Create") => match object_id(activity) {
-            Some(note) if same_origin(note, actor) => index_note(store, activity),
+            Some(note) if same_origin(note, actor) => index_note(instance, activity),
             _ => Ok(()),
         },
         // An Announce names someone else's note by definition, so it can keep a
@@ -183,9 +169,9 @@ fn process_for_instance(store: &Store, actor: &str, activity: &Value) -> Result<
         // today this writes nothing new. The guard is what matters.
         Some("Announce") => {
             if let Some(note) = object_id(activity)
-                && index::is_indexed(store, &NamedNode::new_unchecked(note))?
+                && index::is_indexed(instance, &NamedNode::new_unchecked(note))?
             {
-                index_note(store, activity)?;
+                index_note(instance, activity)?;
             }
             Ok(())
         }
@@ -198,7 +184,7 @@ fn process_for_instance(store: &Store, actor: &str, activity: &Value) -> Result<
             if let Some(target) = object_id(activity)
                 && same_origin(target, actor)
             {
-                index::forget_note(store, &NamedNode::new_unchecked(target))?;
+                index::forget_note(instance, &NamedNode::new_unchecked(target))?;
             }
             Ok(())
         }
@@ -208,7 +194,7 @@ fn process_for_instance(store: &Store, actor: &str, activity: &Value) -> Result<
     }
 }
 
-fn index_note(store: &Store, activity: &Value) -> Result<(), ProcessError> {
+fn index_note(instance: &InstanceStore, activity: &Value) -> Result<(), ProcessError> {
     // Public only. The index backs the public timeline, so indexing a
     // followers-only post would publish it.
     if !addressed_publicly(activity) {
@@ -234,7 +220,7 @@ fn index_note(store: &Store, activity: &Value) -> Result<(), ProcessError> {
         .map(NamedNode::new_unchecked);
 
     index::record_note(
-        store,
+        instance,
         &NotePointer {
             note: NamedNode::new_unchecked(note),
             author: NamedNode::new_unchecked(author),

@@ -11,10 +11,9 @@
 use brolly_authz::{AccessMode, authorize, effective_acl};
 use brolly_domain::syntax::{self, ReadFormat, SyntaxError, WriteFormat};
 use brolly_identity::Subject;
-use brolly_store::BlobStore;
-use brolly_store::write::{WriteError, insert_quads, replace_graph};
+use brolly_store::resources::{Pod, PodRead, PodWrite};
+use brolly_store::{BlobStore, StoreError};
 use oxigraph::model::{GraphNameRef, NamedNode, Quad};
-use oxigraph::store::Store;
 
 use crate::storage;
 
@@ -50,8 +49,8 @@ impl From<SyntaxError> for LdpError {
     }
 }
 
-impl From<WriteError> for LdpError {
-    fn from(e: WriteError) -> Self {
+impl From<StoreError> for LdpError {
+    fn from(e: StoreError) -> Self {
         LdpError::Store(e.to_string())
     }
 }
@@ -76,11 +75,11 @@ pub const BLOB_SIZE: &str = "https://brolly.id/ns#byteSize";
 /// The presence of this triple is what makes a resource an LDP-NR: reads and
 /// deletes branch on it rather than on the request, so a binary behaves the
 /// same however it is reached.
-pub fn blob_digest(store: &Store, resource: &str) -> Option<String> {
+pub fn blob_digest(store: &impl PodRead, resource: &str) -> Option<String> {
     literal_object(store, resource, BLOB_DIGEST)
 }
 
-fn literal_object(store: &Store, resource: &str, predicate: &str) -> Option<String> {
+fn literal_object(store: &impl PodRead, resource: &str, predicate: &str) -> Option<String> {
     let node = iri(resource);
     store
         .quads_for_pattern(
@@ -100,7 +99,7 @@ fn literal_object(store: &Store, resource: &str, predicate: &str) -> Option<Stri
 ///
 /// Content addressing means two resources can name one blob, so deleting either
 /// must not blank the other.
-fn digest_still_referenced(store: &Store, digest: &str, excluding: &str) -> bool {
+fn digest_still_referenced(store: &impl PodRead, digest: &str, excluding: &str) -> bool {
     store
         .quads_for_pattern(None, Some(iri(BLOB_DIGEST).as_ref()), None, None)
         .filter_map(Result::ok)
@@ -151,7 +150,7 @@ pub fn governed(path: &str) -> Option<&str> {
 /// with inherited Write could rewrite the ACL above them and grant themselves
 /// anything, and one with inherited Read could list who else has access.
 fn check(
-    store: &Store,
+    store: &impl PodRead,
     base: &str,
     path: &str,
     subject: &Subject,
@@ -177,7 +176,12 @@ fn check(
 /// governed resource, so holding it grants all four and lacking it grants none.
 /// Reporting the governed resource's own modes instead would advertise an edit
 /// affordance the request would then refuse.
-pub fn granted_modes(store: &Store, base: &str, path: &str, subject: &Subject) -> Vec<AccessMode> {
+pub fn granted_modes(
+    store: &impl PodRead,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+) -> Vec<AccessMode> {
     const ALL: [AccessMode; 4] = [
         AccessMode::Read,
         AccessMode::Write,
@@ -206,13 +210,14 @@ pub fn granted_modes(store: &Store, base: &str, path: &str, subject: &Subject) -
 /// unauthorized caller that a resource exists is itself a disclosure, and the
 /// predecessor's WAC leaked existence this way.
 pub fn read(
-    store: &Store,
+    pod: &Pod,
     blobs: Option<&BlobStore>,
     base: &str,
     path: &str,
     subject: &Subject,
     accept: Option<&str>,
 ) -> Result<LdpOutcome, LdpError> {
+    let store = &pod.read_store();
     let resource = format!("{base}{path}");
 
     if !check(store, base, path, subject, AccessMode::Read)? {
@@ -269,7 +274,7 @@ pub fn read(
 /// Requires Write. Replacing is not Append: a client that may only add triples
 /// must not be able to erase the ones already there.
 pub fn put(
-    store: &Store,
+    pod: &Pod,
     blobs: Option<&BlobStore>,
     base: &str,
     path: &str,
@@ -282,7 +287,7 @@ pub fn put(
     if !resource.starts_with(storage_root) {
         return Err(LdpError::OutsideStorage);
     }
-    if !check(store, base, path, subject, AccessMode::Write)? {
+    if !check(&pod.read_store(), base, path, subject, AccessMode::Write)? {
         return Err(LdpError::Forbidden);
     }
 
@@ -291,32 +296,35 @@ pub fn put(
     // has to name RDF/XML specifically — `read_format` errors for all of them.
     refuse_rdf_xml(content_type)?;
 
-    let quads = if syntax::is_parseable_rdf(content_type) {
-        parse_into_graph(body, syntax::read_format(content_type)?, &resource)?
-    } else {
-        let blobs = blobs.ok_or_else(|| LdpError::Store("no blob store for this pod".into()))?;
-        // The previous bytes are released only after the new ones land, so a
-        // failed write leaves the old resource intact.
-        let previous = blob_digest(store, &resource);
-        let digest = blobs
-            .put(body)
-            .map_err(|e| LdpError::Store(e.to_string()))?;
-        let quads = blob_quads(&resource, &digest, content_type, body.len());
-        replace_graph(store, &iri(&resource), &quads)?;
-        if let Some(previous) = previous
-            && previous != digest
-            && !digest_still_referenced(store, &previous, &resource)
-        {
-            blobs
-                .remove(&previous)
-                .map_err(|e| LdpError::Store(e.to_string()))?;
-        }
-        contain(store, &resource, storage_root)?;
+    if syntax::is_parseable_rdf(content_type) {
+        let quads = parse_into_graph(body, syntax::read_format(content_type)?, &resource)?;
+        pod.write(|w| {
+            w.legacy_under_root().replace_graph(&resource, &quads)?;
+            contain(w, &resource, storage_root)
+        })?;
         return Ok(());
-    };
+    }
 
-    replace_graph(store, &iri(&resource), &quads)?;
-    contain(store, &resource, storage_root)?;
+    let blobs = blobs.ok_or_else(|| LdpError::Store("no blob store for this pod".into()))?;
+    // The new bytes land before the write, and the previous bytes are released
+    // only after it commits, so a failed write leaves the old resource intact.
+    let digest = blobs
+        .put(body)
+        .map_err(|e| LdpError::Store(e.to_string()))?;
+    let quads = blob_quads(&resource, &digest, content_type, body.len());
+    let released = pod.write(|w| {
+        let previous = blob_digest(&*w, &resource);
+        w.legacy_under_root().replace_graph(&resource, &quads)?;
+        contain(w, &resource, storage_root)?;
+        Ok(previous.filter(|previous| {
+            *previous != digest && !digest_still_referenced(&*w, previous, &resource)
+        }))
+    })?;
+    if let Some(previous) = released {
+        blobs
+            .remove(&previous)
+            .map_err(|e| LdpError::Store(e.to_string()))?;
+    }
     Ok(())
 }
 
@@ -327,12 +335,11 @@ pub fn put(
 /// stops a write to `/~/newdir/.acl` from creating `/~/newdir/` as a side
 /// effect. The ACL may exist before the resource it governs, and WAC applies it
 /// once that resource does.
-fn contain(store: &Store, resource: &str, storage_root: &str) -> Result<(), LdpError> {
+fn contain(w: &mut PodWrite<'_>, resource: &str, storage_root: &str) -> Result<(), StoreError> {
     if governed(resource).is_some() {
         return Ok(());
     }
-    storage::add_containment(store, resource, storage_root)?;
-    Ok(())
+    storage::add_containment(w, resource, storage_root)
 }
 
 /// ADR 0007: we serve RDF/XML but never parse it, and it must not become an
@@ -394,7 +401,7 @@ fn blob_quads(resource: &str, digest: &str, media_type: &str, size: usize) -> Ve
 ///
 /// Requires Append, which Write satisfies (`acl:Write` implies `acl:Append`).
 pub fn append(
-    store: &Store,
+    pod: &Pod,
     blobs: Option<&BlobStore>,
     base: &str,
     path: &str,
@@ -407,7 +414,7 @@ pub fn append(
     if !container.starts_with(storage_root) {
         return Err(LdpError::OutsideStorage);
     }
-    if !check(store, base, path, subject, AccessMode::Append)? {
+    if !check(&pod.read_store(), base, path, subject, AccessMode::Append)? {
         return Err(LdpError::Forbidden);
     }
 
@@ -421,22 +428,20 @@ pub fn append(
     // A binary member is created rather than appended to: there are no triples
     // to merge into.
     refuse_rdf_xml(content_type)?;
-    if !syntax::is_parseable_rdf(content_type) {
+    let quads = if syntax::is_parseable_rdf(content_type) {
+        parse_into_graph(body, syntax::read_format(content_type)?, &target)?
+    } else {
         let blobs = blobs.ok_or_else(|| LdpError::Store("no blob store for this pod".into()))?;
         let digest = blobs
             .put(body)
             .map_err(|e| LdpError::Store(e.to_string()))?;
-        insert_quads(
-            store,
-            &blob_quads(&target, &digest, content_type, body.len()),
-        )?;
-        contain(store, &target, storage_root)?;
-        return Ok(target);
-    }
+        blob_quads(&target, &digest, content_type, body.len())
+    };
 
-    let quads = parse_into_graph(body, syntax::read_format(content_type)?, &target)?;
-    insert_quads(store, &quads)?;
-    contain(store, &target, storage_root)?;
+    pod.write(|w| {
+        w.legacy_under_root().insert(&quads)?;
+        contain(w, &target, storage_root)
+    })?;
     Ok(target)
 }
 
@@ -445,7 +450,7 @@ pub fn append(
 /// Exposed for `PATCH`, which mutates through the SPARQL engine rather than
 /// through [`put`] and so cannot borrow its check.
 pub fn may_write(
-    store: &Store,
+    store: &impl PodRead,
     base: &str,
     path: &str,
     subject: &Subject,
@@ -455,7 +460,7 @@ pub fn may_write(
 
 /// `DELETE`.
 pub fn delete(
-    store: &Store,
+    pod: &Pod,
     blobs: Option<&BlobStore>,
     base: &str,
     path: &str,
@@ -466,38 +471,42 @@ pub fn delete(
     if !resource.starts_with(storage_root) {
         return Err(LdpError::OutsideStorage);
     }
-    if !check(store, base, path, subject, AccessMode::Write)? {
-        return Err(LdpError::Forbidden);
-    }
-    if !storage::exists(store, &resource) {
-        return Err(LdpError::NotFound);
-    }
-
-    // Refusing to delete a non-empty container is LDP's rule, and it is the
-    // difference between removing a resource and silently orphaning a subtree.
-    if storage::is_container(&resource) && !storage::members(store, &resource).is_empty() {
+    if !check(&pod.read_store(), base, path, subject, AccessMode::Write)? {
         return Err(LdpError::Forbidden);
     }
 
-    // Read the digest before the graph goes, then release the bytes only if no
-    // other resource still names them — content addressing means two resources
-    // can share one blob.
-    let digest = blob_digest(store, &resource);
-    store.clear_graph(GraphNameRef::NamedNode(iri(&resource).as_ref()))?;
-    storage::remove_containment(store, &resource, storage_root)?;
+    let released = pod.write(|w| {
+        if !storage::exists(&*w, &resource) {
+            return Ok(Err(LdpError::NotFound));
+        }
 
-    // Deleting a resource deletes its ACL (Solid Protocol §5.4). Now that an
-    // ACL isn't a member, a container that has one can be deleted, and
-    // recreating it would otherwise quietly bring the old grants back.
-    //
-    // After the resource, not before: if this fails, the resource is already
-    // gone. The other order could leave a live resource with its own ACL
-    // stripped and falling back to an ancestor's broader default.
-    let acl = format!("{resource}.acl");
-    store.clear_graph(GraphNameRef::NamedNode(iri(&acl).as_ref()))?;
+        // Refusing to delete a non-empty container is LDP's rule, and it is the
+        // difference between removing a resource and silently orphaning a
+        // subtree.
+        if storage::is_container(&resource) && !storage::members(&*w, &resource).is_empty() {
+            return Ok(Err(LdpError::Forbidden));
+        }
 
-    if let Some(digest) = digest
-        && !digest_still_referenced(store, &digest, &resource)
+        // Read the digest before the graph goes, then release the bytes only if
+        // no other resource still names them — content addressing means two
+        // resources can share one blob.
+        let digest = blob_digest(&*w, &resource);
+        w.legacy_under_root().clear_graph(&resource)?;
+        storage::remove_containment(w, &resource, storage_root)?;
+
+        // Deleting a resource deletes its ACL (Solid Protocol §5.4). Now that an
+        // ACL isn't a member, a container that has one can be deleted, and
+        // recreating it would otherwise quietly bring the old grants back. Both
+        // go in one transaction, so a failure leaves both.
+        w.legacy_under_root()
+            .clear_graph(&format!("{resource}.acl"))?;
+
+        Ok(Ok(digest.filter(|digest| {
+            !digest_still_referenced(&*w, digest, &resource)
+        })))
+    })??;
+
+    if let Some(digest) = released
         && let Some(blobs) = blobs
     {
         blobs

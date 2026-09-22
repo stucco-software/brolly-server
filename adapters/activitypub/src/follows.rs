@@ -10,9 +10,12 @@
 //! the predicates the actor document already advertises as collections, so a
 //! Solid client reading the pod sees the same graph a fediverse client sees
 //! through the collection endpoints.
+//!
+//! `#social` is protocol state outside the storage root, so it is written with
+//! `PodWrite`'s outside-root methods.
 
-use brolly_store::Store;
-use brolly_store::write::{WriteError, insert_quads};
+use brolly_store::StoreError;
+use brolly_store::resources::{PodRead, PodWrite};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 
 pub const AS_FOLLOWERS: &str = "https://www.w3.org/ns/activitystreams#followers";
@@ -38,33 +41,29 @@ fn graph_for(actor: &str) -> NamedNode {
 ///
 /// Idempotent — a Follow re-sent after a missed Accept must not produce a
 /// duplicate follower.
-pub fn record(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
+pub fn record(w: &mut PodWrite<'_>, follower: &str, followee: &str) -> Result<(), StoreError> {
     let graph = graph_for(followee);
-    insert_quads(
-        store,
-        &[Quad::new(
-            NamedOrBlankNode::NamedNode(iri(followee)),
-            iri(AS_FOLLOWERS),
-            Term::NamedNode(iri(follower)),
-            GraphName::NamedNode(graph),
-        )],
-    )?;
-    Ok(())
+    w.insert(&[Quad::new(
+        NamedOrBlankNode::NamedNode(iri(followee)),
+        iri(AS_FOLLOWERS),
+        Term::NamedNode(iri(follower)),
+        GraphName::NamedNode(graph),
+    )])
 }
 
 /// Record that `follower` follows `followee`, from the follower's side.
-pub fn record_following(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
+pub fn record_following(
+    w: &mut PodWrite<'_>,
+    follower: &str,
+    followee: &str,
+) -> Result<(), StoreError> {
     let graph = graph_for(follower);
-    insert_quads(
-        store,
-        &[Quad::new(
-            NamedOrBlankNode::NamedNode(iri(follower)),
-            iri(AS_FOLLOWING),
-            Term::NamedNode(iri(followee)),
-            GraphName::NamedNode(graph),
-        )],
-    )?;
-    Ok(())
+    w.insert(&[Quad::new(
+        NamedOrBlankNode::NamedNode(iri(follower)),
+        iri(AS_FOLLOWING),
+        Term::NamedNode(iri(followee)),
+        GraphName::NamedNode(graph),
+    )])
 }
 
 /// A follow waiting for its subject to decide.
@@ -73,22 +72,22 @@ pub fn record_following(store: &Store, follower: &str, followee: &str) -> Result
 /// whole of what "locked" means. The predecessor accepted the flag and then
 /// recorded the follow unconditionally, so locking an account did nothing —
 /// and did nothing *invisibly*, since the profile still showed the lock.
-pub fn record_request(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
+pub fn record_request(
+    w: &mut PodWrite<'_>,
+    follower: &str,
+    followee: &str,
+) -> Result<(), StoreError> {
     let graph = graph_for(followee);
-    insert_quads(
-        store,
-        &[Quad::new(
-            NamedOrBlankNode::NamedNode(iri(followee)),
-            iri(PENDING),
-            Term::NamedNode(iri(follower)),
-            GraphName::NamedNode(graph),
-        )],
-    )?;
-    Ok(())
+    w.insert(&[Quad::new(
+        NamedOrBlankNode::NamedNode(iri(followee)),
+        iri(PENDING),
+        Term::NamedNode(iri(follower)),
+        GraphName::NamedNode(graph),
+    )])
 }
 
 /// Everyone waiting on `actor` to approve them.
-pub fn pending(store: &Store, actor: &str) -> Vec<String> {
+pub fn pending(store: &impl PodRead, actor: &str) -> Vec<String> {
     objects(store, actor, PENDING)
 }
 
@@ -96,41 +95,37 @@ pub fn pending(store: &Store, actor: &str) -> Vec<String> {
 ///
 /// Both halves in one call, because a request left pending *and* followed shows
 /// up twice in the UI, and one that is neither has silently vanished.
-pub fn approve(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
-    drop_request(store, follower, followee)?;
-    record(store, follower, followee)
+pub fn approve(w: &mut PodWrite<'_>, follower: &str, followee: &str) -> Result<(), StoreError> {
+    drop_request(w, follower, followee)?;
+    record(w, follower, followee)
 }
 
 /// Refuse a pending follow. The follower is not recorded.
-pub fn reject(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
-    drop_request(store, follower, followee)
+pub fn reject(w: &mut PodWrite<'_>, follower: &str, followee: &str) -> Result<(), StoreError> {
+    drop_request(w, follower, followee)
 }
 
-fn drop_request(store: &Store, follower: &str, followee: &str) -> Result<(), WriteError> {
+fn drop_request(w: &mut PodWrite<'_>, follower: &str, followee: &str) -> Result<(), StoreError> {
     let graph = graph_for(followee);
-    let quad = Quad::new(
+    w.remove_quads(&[Quad::new(
         NamedOrBlankNode::NamedNode(iri(followee)),
         iri(PENDING),
         Term::NamedNode(iri(follower)),
         GraphName::NamedNode(graph),
-    );
-    store
-        .remove(&quad)
-        .map_err(brolly_store::StoreError::from)?;
-    Ok(())
+    )])
 }
 
 /// Everyone following `actor`. The recipient list for a post.
-pub fn followers(store: &Store, actor: &str) -> Vec<String> {
+pub fn followers(store: &impl PodRead, actor: &str) -> Vec<String> {
     objects(store, actor, AS_FOLLOWERS)
 }
 
 /// Everyone `actor` follows.
-pub fn following(store: &Store, actor: &str) -> Vec<String> {
+pub fn following(store: &impl PodRead, actor: &str) -> Vec<String> {
     objects(store, actor, AS_FOLLOWING)
 }
 
-fn objects(store: &Store, actor: &str, predicate: &str) -> Vec<String> {
+fn objects(store: &impl PodRead, actor: &str, predicate: &str) -> Vec<String> {
     let graph = graph_for(actor);
     let mut out: Vec<String> = store
         .quads_for_pattern(
@@ -153,34 +148,32 @@ fn objects(store: &Store, actor: &str, predicate: &str) -> Vec<String> {
 }
 
 /// Undo a follow.
-pub fn remove(
-    store: &Store,
-    follower: &str,
-    followee: &str,
-) -> Result<(), oxigraph::store::StorageError> {
-    store.remove(&Quad::new(
-        NamedOrBlankNode::NamedNode(iri(followee)),
-        iri(AS_FOLLOWERS),
-        Term::NamedNode(iri(follower)),
-        GraphName::NamedNode(graph_for(followee)),
-    ))?;
-    store.remove(&Quad::new(
-        NamedOrBlankNode::NamedNode(iri(follower)),
-        iri(AS_FOLLOWING),
-        Term::NamedNode(iri(followee)),
-        GraphName::NamedNode(graph_for(follower)),
-    ))?;
-    Ok(())
+pub fn remove(w: &mut PodWrite<'_>, follower: &str, followee: &str) -> Result<(), StoreError> {
+    w.remove_quads(&[
+        Quad::new(
+            NamedOrBlankNode::NamedNode(iri(followee)),
+            iri(AS_FOLLOWERS),
+            Term::NamedNode(iri(follower)),
+            GraphName::NamedNode(graph_for(followee)),
+        ),
+        Quad::new(
+            NamedOrBlankNode::NamedNode(iri(follower)),
+            iri(AS_FOLLOWING),
+            Term::NamedNode(iri(followee)),
+            GraphName::NamedNode(graph_for(follower)),
+        ),
+    ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brolly_store::resources::Pod;
 
     const ALICE: &str = "https://alice.brolly.test/actor";
     const BOB: &str = "https://bob.brolly.test/actor";
 
-    fn store() -> (tempfile::TempDir, std::sync::Arc<Store>) {
+    fn store() -> (tempfile::TempDir, std::sync::Arc<Pod>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let manager = brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores");
         let store = manager.pod(uuid::Uuid::new_v4()).expect("pod");
@@ -190,42 +183,44 @@ mod tests {
     #[test]
     fn a_follower_is_recorded_and_listed() {
         let (_dir, store) = store();
-        record(&store, BOB, ALICE).expect("record");
-        assert_eq!(followers(&store, ALICE), vec![BOB.to_string()]);
+        store.write(|w| record(w, BOB, ALICE)).expect("record");
+        assert_eq!(followers(&store.read_store(), ALICE), vec![BOB.to_string()]);
     }
 
     #[test]
     fn recording_the_same_follow_twice_yields_one_follower() {
         // A Follow re-sent after a missed Accept is normal.
         let (_dir, store) = store();
-        record(&store, BOB, ALICE).expect("first");
-        record(&store, BOB, ALICE).expect("second");
-        assert_eq!(followers(&store, ALICE).len(), 1);
+        store.write(|w| record(w, BOB, ALICE)).expect("first");
+        store.write(|w| record(w, BOB, ALICE)).expect("second");
+        assert_eq!(followers(&store.read_store(), ALICE).len(), 1);
     }
 
     #[test]
     fn the_two_directions_are_independent() {
         let (_dir, store) = store();
-        record(&store, BOB, ALICE).expect("record");
+        store.write(|w| record(w, BOB, ALICE)).expect("record");
 
-        assert_eq!(followers(&store, ALICE), vec![BOB.to_string()]);
+        assert_eq!(followers(&store.read_store(), ALICE), vec![BOB.to_string()]);
         assert!(
-            followers(&store, BOB).is_empty(),
+            followers(&store.read_store(), BOB).is_empty(),
             "following someone must not make them follow you"
         );
-        assert!(following(&store, ALICE).is_empty());
+        assert!(following(&store.read_store(), ALICE).is_empty());
     }
 
     #[test]
     fn an_unfollow_removes_both_sides() {
         let (_dir, store) = store();
-        record(&store, BOB, ALICE).expect("record");
-        record_following(&store, BOB, ALICE).expect("record");
+        store.write(|w| record(w, BOB, ALICE)).expect("record");
+        store
+            .write(|w| record_following(w, BOB, ALICE))
+            .expect("record");
 
-        remove(&store, BOB, ALICE).expect("remove");
+        store.write(|w| remove(w, BOB, ALICE)).expect("remove");
 
-        assert!(followers(&store, ALICE).is_empty());
-        assert!(following(&store, BOB).is_empty());
+        assert!(followers(&store.read_store(), ALICE).is_empty());
+        assert!(following(&store.read_store(), BOB).is_empty());
     }
 
     #[test]
@@ -233,10 +228,10 @@ mod tests {
         // Both can live in one store during tests, and in principle a pod could
         // hold more than one actor's graph.
         let (_dir, store) = store();
-        record(&store, BOB, ALICE).expect("record");
-        record(&store, ALICE, BOB).expect("record");
+        store.write(|w| record(w, BOB, ALICE)).expect("record");
+        store.write(|w| record(w, ALICE, BOB)).expect("record");
 
-        assert_eq!(followers(&store, ALICE), vec![BOB.to_string()]);
-        assert_eq!(followers(&store, BOB), vec![ALICE.to_string()]);
+        assert_eq!(followers(&store.read_store(), ALICE), vec![BOB.to_string()]);
+        assert_eq!(followers(&store.read_store(), BOB), vec![ALICE.to_string()]);
     }
 }

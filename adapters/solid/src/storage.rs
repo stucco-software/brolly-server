@@ -1,9 +1,13 @@
 //! The storage root and container bookkeeping.
+//!
+//! Everything here is under the storage root, so it writes through
+//! `legacy_under_root`, exactly as it always has, until the pod keeps its own
+//! resource metadata (stage 5a).
 
 use brolly_domain::vocab;
-use brolly_store::write::{WriteError, insert_quads};
+use brolly_store::StoreError;
+use brolly_store::resources::{PodRead, PodWrite};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
-use oxigraph::store::Store;
 
 pub const LDP_CONTAINS: &str = "http://www.w3.org/ns/ldp#contains";
 pub const LDP_BASIC_CONTAINER: &str = "http://www.w3.org/ns/ldp#BasicContainer";
@@ -18,7 +22,7 @@ fn iri(s: &str) -> NamedNode {
 /// Create the user's storage root: an `ldp:BasicContainer` that is also a
 /// `pim:Storage`, which is what makes it discoverable as *the* pod root rather
 /// than just another container.
-pub fn init_storage_root(store: &Store, root: &str) -> Result<(), WriteError> {
+pub fn init_storage_root(w: &mut PodWrite<'_>, root: &str) -> Result<(), StoreError> {
     let node = iri(root);
     let quads = vec![
         Quad::new(
@@ -40,8 +44,7 @@ pub fn init_storage_root(store: &Store, root: &str) -> Result<(), WriteError> {
             GraphName::NamedNode(node),
         ),
     ];
-    insert_quads(store, &quads)?;
-    Ok(())
+    w.legacy_under_root().insert(&quads)
 }
 
 /// The container that directly holds `resource`.
@@ -63,27 +66,24 @@ pub fn parent_container(resource: &str, root: &str) -> Option<String> {
 /// Containment is maintained on write rather than derived on read, because an
 /// LDP `GET` on a container must list its members and walking the whole pod to
 /// find them would be the outbox-walking mistake in another costume.
-pub fn add_containment(store: &Store, resource: &str, root: &str) -> Result<(), WriteError> {
+pub fn add_containment(w: &mut PodWrite<'_>, resource: &str, root: &str) -> Result<(), StoreError> {
     let mut child = resource.to_string();
     while let Some(parent) = parent_container(&child, root) {
         let parent_node = iri(&parent);
-        insert_quads(
-            store,
-            &[
-                Quad::new(
-                    NamedOrBlankNode::NamedNode(parent_node.clone()),
-                    iri(LDP_CONTAINS),
-                    Term::NamedNode(iri(&child)),
-                    GraphName::NamedNode(parent_node.clone()),
-                ),
-                Quad::new(
-                    NamedOrBlankNode::NamedNode(parent_node.clone()),
-                    iri(vocab::RDF_TYPE),
-                    Term::NamedNode(iri(LDP_BASIC_CONTAINER)),
-                    GraphName::NamedNode(parent_node),
-                ),
-            ],
-        )?;
+        w.legacy_under_root().insert(&[
+            Quad::new(
+                NamedOrBlankNode::NamedNode(parent_node.clone()),
+                iri(LDP_CONTAINS),
+                Term::NamedNode(iri(&child)),
+                GraphName::NamedNode(parent_node.clone()),
+            ),
+            Quad::new(
+                NamedOrBlankNode::NamedNode(parent_node.clone()),
+                iri(vocab::RDF_TYPE),
+                Term::NamedNode(iri(LDP_BASIC_CONTAINER)),
+                GraphName::NamedNode(parent_node),
+            ),
+        ])?;
         child = parent;
     }
     Ok(())
@@ -91,10 +91,10 @@ pub fn add_containment(store: &Store, resource: &str, root: &str) -> Result<(), 
 
 /// Remove a containment triple when a resource is deleted.
 pub fn remove_containment(
-    store: &Store,
+    w: &mut PodWrite<'_>,
     resource: &str,
     root: &str,
-) -> Result<(), oxigraph::store::StorageError> {
+) -> Result<(), StoreError> {
     let Some(parent) = parent_container(resource, root) else {
         return Ok(());
     };
@@ -105,12 +105,11 @@ pub fn remove_containment(
         Term::NamedNode(iri(resource)),
         GraphName::NamedNode(parent_node),
     );
-    store.remove(&quad)?;
-    Ok(())
+    w.legacy_under_root().remove(&[quad])
 }
 
 /// Members of a container.
-pub fn members(store: &Store, container: &str) -> Vec<String> {
+pub fn members(store: &impl PodRead, container: &str) -> Vec<String> {
     let node = iri(container);
     store
         .quads_for_pattern(
@@ -133,17 +132,15 @@ pub fn members(store: &Store, container: &str) -> Vec<String> {
 /// Protocol §4.3), but `ldp::put` recorded them as members until stage 0. This
 /// is the repair `brolly-admin acl-uncontain` runs on each pod. It returns how
 /// many triples it removed, so a second run reports zero.
-pub fn uncontain_acls(store: &Store) -> Result<usize, oxigraph::store::StorageError> {
-    let stale = store
+pub fn uncontain_acls(w: &mut PodWrite<'_>) -> Result<usize, StoreError> {
+    let stale = w
         .quads_for_pattern(None, Some(iri(LDP_CONTAINS).as_ref()), None, None)
         .filter_map(|quad| match quad {
             Ok(quad) => is_acl_containment(&quad).then_some(Ok(quad)),
             Err(e) => Some(Err(e)),
         })
         .collect::<Result<Vec<Quad>, _>>()?;
-    for quad in &stale {
-        store.remove(quad)?;
-    }
+    w.legacy_under_root().remove(&stale)?;
     Ok(stale.len())
 }
 
@@ -167,7 +164,7 @@ fn is_acl_containment(quad: &Quad) -> bool {
 }
 
 /// Does a resource exist, as a graph with any triples?
-pub fn exists(store: &Store, resource: &str) -> bool {
+pub fn exists(store: &impl PodRead, resource: &str) -> bool {
     let node = iri(resource);
     store
         .quads_for_pattern(

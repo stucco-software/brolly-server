@@ -11,7 +11,8 @@ use brolly_authz::AccessMode;
 use brolly_identity::{Scope, Subject, Via};
 use brolly_solid::ldp::{self, LdpError};
 use brolly_solid::storage;
-use brolly_store::{StoreManager, insert_quads};
+use brolly_store::StoreManager;
+use brolly_store::resources::Pod;
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use uuid::Uuid;
 
@@ -30,6 +31,15 @@ const ALL: [AccessMode; 4] = [
     AccessMode::Append,
     AccessMode::Control,
 ];
+
+/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
+/// so it doesn't depend on the code under test.
+fn seed(target: &Pod, quads: &[Quad]) {
+    let store = target.raw_store();
+    for quad in quads {
+        store.insert(quad).unwrap();
+    }
+}
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -67,19 +77,17 @@ fn carol() -> Subject {
 }
 
 /// A pod whose root ACL gives Alice Read, Write and Control over everything.
-fn pod() -> (
-    StoreManager,
-    tempfile::TempDir,
-    std::sync::Arc<oxigraph::store::Store>,
-) {
+fn pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let dir = tempfile::tempdir().unwrap();
     let mgr = StoreManager::open(dir.path(), 4, 60).unwrap();
     let store = mgr.pod(Uuid::new_v4()).unwrap();
-    storage::init_storage_root(&store, ROOT).unwrap();
+    store
+        .write(|w| storage::init_storage_root(w, ROOT))
+        .unwrap();
 
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    insert_quads(
+    seed(
         &store,
         &[
             t(&g, &a, &format!("{ACL}default"), ROOT),
@@ -89,8 +97,7 @@ fn pod() -> (
             t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Control")),
             t(&g, &a, &format!("{ACL}agent"), ALICE),
         ],
-    )
-    .unwrap();
+    );
     (mgr, dir, store)
 }
 
@@ -99,17 +106,13 @@ fn pod() -> (
 ///
 /// Written straight into the store so the setup doesn't depend on the code
 /// under test.
-fn shared_pod() -> (
-    StoreManager,
-    tempfile::TempDir,
-    std::sync::Arc<oxigraph::store::Store>,
-) {
+fn shared_pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let (mgr, dir, store) = pod();
     let shared = format!("{ROOT}shared/");
     let g = format!("{shared}.acl");
     let owner = format!("{g}#owner");
     let bob = format!("{g}#bob");
-    insert_quads(
+    seed(
         &store,
         &[
             t(&g, &owner, &format!("{ACL}accessTo"), &shared),
@@ -123,8 +126,7 @@ fn shared_pod() -> (
             t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Write")),
             t(&g, &bob, &format!("{ACL}agent"), BOB),
         ],
-    )
-    .unwrap();
+    );
     (mgr, dir, store)
 }
 
@@ -180,7 +182,7 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
         Err(LdpError::Forbidden)
     ));
     assert!(
-        !ldp::may_write(&store, BASE, "/~/shared/.acl", &bob()).unwrap(),
+        !ldp::may_write(&store.read_store(), BASE, "/~/shared/.acl", &bob()).unwrap(),
         "PATCH goes through may_write"
     );
     assert!(matches!(
@@ -190,7 +192,7 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
 
     // Nothing above landed: Bob still holds exactly what he was given.
     assert_eq!(
-        ldp::granted_modes(&store, BASE, "/~/shared/doc", &bob()),
+        ldp::granted_modes(&store.read_store(), BASE, "/~/shared/doc", &bob()),
         vec![AccessMode::Read, AccessMode::Write, AccessMode::Append]
     );
 }
@@ -231,7 +233,10 @@ fn bob_cannot_create_the_acl_of_a_document_he_can_write() {
         ),
         "Write on a document must not let Bob create its ACL"
     );
-    assert!(!storage::exists(&store, &format!("{ROOT}shared/doc.acl")));
+    assert!(!storage::exists(
+        &store.read_store(),
+        &format!("{ROOT}shared/doc.acl")
+    ));
 }
 
 #[test]
@@ -288,7 +293,7 @@ fn the_owner_can_do_all_of_it() {
     let doc = format!("{ROOT}shared/doc");
 
     assert!(ldp::read(&store, None, BASE, "/~/shared/.acl", &alice(), None).is_ok());
-    assert!(ldp::may_write(&store, BASE, "/~/shared/.acl", &alice()).unwrap());
+    assert!(ldp::may_write(&store.read_store(), BASE, "/~/shared/.acl", &alice()).unwrap());
 
     ldp::put(
         &store,
@@ -331,7 +336,7 @@ fn the_owner_can_do_all_of_it() {
     // refuse the delete for a reason that has nothing to do with this fix.
     ldp::delete(&store, None, BASE, "/~/shared/doc.acl.acl", &alice(), ROOT).unwrap();
     ldp::delete(&store, None, BASE, "/~/shared/doc.acl", &alice(), ROOT).unwrap();
-    assert!(!storage::exists(&store, &format!("{doc}.acl")));
+    assert!(!storage::exists(&store.read_store(), &format!("{doc}.acl")));
 
     ldp::put(
         &store,
@@ -357,15 +362,14 @@ fn wac_allow_on_an_acl_is_all_or_nothing() {
     // enough to manage its ACL.
     let g = format!("{ROOT}shared/.acl");
     let c = format!("{g}#carol");
-    insert_quads(
+    seed(
         &store,
         &[
             t(&g, &c, &format!("{ACL}accessTo"), &format!("{ROOT}shared/")),
             t(&g, &c, &format!("{ACL}mode"), &format!("{ACL}Control")),
             t(&g, &c, &format!("{ACL}agent"), CAROL),
         ],
-    )
-    .unwrap();
+    );
 
     let owner = ldp::read(&store, None, BASE, "/~/shared/.acl", &alice(), None).unwrap();
     assert_eq!(owner.granted, ALL.to_vec());
@@ -373,7 +377,7 @@ fn wac_allow_on_an_acl_is_all_or_nothing() {
     let carol = ldp::read(&store, None, BASE, "/~/shared/.acl", &carol(), None).unwrap();
     assert_eq!(carol.granted, ALL.to_vec());
 
-    assert!(ldp::granted_modes(&store, BASE, "/~/shared/.acl", &bob()).is_empty());
+    assert!(ldp::granted_modes(&store.read_store(), BASE, "/~/shared/.acl", &bob()).is_empty());
 }
 
 /// ACLs are auxiliary resources, not members of their container
@@ -418,7 +422,7 @@ fn an_acl_is_not_a_member_of_its_container() {
     .unwrap();
     assert_eq!(appended, format!("{ROOT}shared/.acl"));
 
-    let members = storage::members(&store, &format!("{ROOT}shared/"));
+    let members = storage::members(&store.read_store(), &format!("{ROOT}shared/"));
     assert!(
         members.contains(&doc),
         "an ordinary resource is still contained"
@@ -452,9 +456,15 @@ fn an_acl_does_not_create_the_container_it_governs() {
     )
     .unwrap();
 
-    assert!(storage::exists(&store, &format!("{newdir}.acl")));
-    assert!(!storage::exists(&store, &newdir), "/~/newdir/ was created");
-    assert!(!storage::members(&store, ROOT).contains(&newdir));
+    assert!(storage::exists(
+        &store.read_store(),
+        &format!("{newdir}.acl")
+    ));
+    assert!(
+        !storage::exists(&store.read_store(), &newdir),
+        "/~/newdir/ was created"
+    );
+    assert!(!storage::members(&store.read_store(), ROOT).contains(&newdir));
 }
 
 /// Solid Protocol §5.4: deleting a resource deletes its auxiliary resources.
@@ -488,8 +498,8 @@ fn deleting_a_resource_deletes_its_acl() {
 
     ldp::delete(&store, None, BASE, "/~/shared/doc", &alice(), ROOT).unwrap();
 
-    assert!(!storage::exists(&store, &doc));
-    assert!(!storage::exists(&store, &format!("{doc}.acl")));
+    assert!(!storage::exists(&store.read_store(), &doc));
+    assert!(!storage::exists(&store.read_store(), &format!("{doc}.acl")));
 }
 
 /// A container with an ACL can now be deleted, because the ACL isn't a
@@ -529,12 +539,16 @@ fn a_recreated_container_does_not_get_its_old_grants_back() {
     )
     .unwrap();
     assert!(
-        ldp::granted_modes(&store, BASE, "/~/shared/doc", &bob()).contains(&AccessMode::Write),
+        ldp::granted_modes(&store.read_store(), BASE, "/~/shared/doc", &bob())
+            .contains(&AccessMode::Write),
         "precondition: Bob was granted Write"
     );
 
     ldp::delete(&store, None, BASE, "/~/shared/", &alice(), ROOT).unwrap();
-    assert!(!storage::exists(&store, &format!("{shared}.acl")));
+    assert!(!storage::exists(
+        &store.read_store(),
+        &format!("{shared}.acl")
+    ));
 
     ldp::put(
         &store,
@@ -548,7 +562,7 @@ fn a_recreated_container_does_not_get_its_old_grants_back() {
     )
     .unwrap();
     assert!(
-        ldp::granted_modes(&store, BASE, "/~/shared/doc", &bob()).is_empty(),
+        ldp::granted_modes(&store.read_store(), BASE, "/~/shared/doc", &bob()).is_empty(),
         "the old grants came back with the container"
     );
 }
@@ -570,21 +584,32 @@ fn stale_acl_containment_is_swept_and_a_rerun_removes_nothing() {
     .unwrap();
 
     // The triples an old `put` of each ACL would have left behind.
-    storage::add_containment(&store, &format!("{ROOT}.acl"), ROOT).unwrap();
-    storage::add_containment(&store, &format!("{ROOT}shared/.acl"), ROOT).unwrap();
+    store
+        .write(|w| {
+            storage::add_containment(w, &format!("{ROOT}.acl"), ROOT)?;
+            storage::add_containment(w, &format!("{ROOT}shared/.acl"), ROOT)
+        })
+        .unwrap();
 
-    assert_eq!(storage::uncontain_acls(&store).unwrap(), 2);
+    assert_eq!(store.write(storage::uncontain_acls).unwrap(), 2);
     assert_eq!(
-        storage::members(&store, &format!("{ROOT}shared/")),
+        storage::members(&store.read_store(), &format!("{ROOT}shared/")),
         vec![format!("{ROOT}shared/doc")]
     );
-    let root = storage::members(&store, ROOT);
+    let root = storage::members(&store.read_store(), ROOT);
     assert!(!root.contains(&format!("{ROOT}.acl")), "got {root:?}");
     assert!(root.contains(&format!("{ROOT}shared/")), "got {root:?}");
 
     // The ACLs themselves are untouched; only their membership goes.
-    assert!(storage::exists(&store, &format!("{ROOT}.acl")));
-    assert!(storage::exists(&store, &format!("{ROOT}shared/.acl")));
+    assert!(storage::exists(&store.read_store(), &format!("{ROOT}.acl")));
+    assert!(storage::exists(
+        &store.read_store(),
+        &format!("{ROOT}shared/.acl")
+    ));
 
-    assert_eq!(storage::uncontain_acls(&store).unwrap(), 0, "idempotent");
+    assert_eq!(
+        store.write(storage::uncontain_acls).unwrap(),
+        0,
+        "idempotent"
+    );
 }

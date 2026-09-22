@@ -6,7 +6,8 @@ use axum::http::{Request, StatusCode, header};
 use brolly_identity::db;
 use brolly_server::{AppState, app};
 use brolly_solid::storage;
-use brolly_store::{StoreManager, insert_quads};
+use brolly_store::StoreManager;
+use brolly_store::resources::{Pod, PodRead};
 use http_body_util::BodyExt;
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use tower::ServiceExt;
@@ -15,6 +16,28 @@ const HOST: &str = "alice.brolly.test";
 const BASE: &str = "https://alice.brolly.test";
 const ROOT: &str = "https://alice.brolly.test/~/";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
+
+/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
+/// so it doesn't depend on the code under test.
+fn seed(target: &Pod, quads: &[Quad]) {
+    let store = target.raw_store();
+    for quad in quads {
+        store.insert(quad).unwrap();
+    }
+}
+
+/// Does the pod hold exactly this quad?
+fn holds(pod: &Pod, quad: &Quad) -> bool {
+    pod.read_store()
+        .quads_for_pattern(
+            Some(quad.subject.as_ref()),
+            Some(quad.predicate.as_ref()),
+            Some(quad.object.as_ref()),
+            Some(quad.graph_name.as_ref()),
+        )
+        .next()
+        .is_some()
+}
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -55,10 +78,10 @@ async fn harness() -> Harness {
 
     // Seed the pod: storage root plus an ACL granting Alice everything.
     let pod = stores.pod(user.id).unwrap();
-    storage::init_storage_root(&pod, ROOT).unwrap();
+    pod.write(|w| storage::init_storage_root(w, ROOT)).unwrap();
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    insert_quads(
+    seed(
         &pod,
         &[
             // A real pod root ACL carries both: acl:default governs the
@@ -76,8 +99,7 @@ async fn harness() -> Harness {
                 &format!("{BASE}/profile#me"),
             ),
         ],
-    )
-    .unwrap();
+    );
 
     let router = app(
         AppState {
@@ -506,15 +528,17 @@ async fn the_members_own_triples_are_still_there() {
     let pod = h.stores.pod(h.user).unwrap();
     let document = format!("{BASE}/profile");
     let me = format!("{document}#me");
-    brolly_solid::profile::write(
-        &pod,
-        &me,
-        &document,
-        &brolly_solid::profile::Profile {
-            display_name: "Alice Example".into(),
-            ..brolly_solid::profile::Profile::blank()
-        },
-    )
+    pod.write(|w| {
+        brolly_solid::profile::write(
+            w,
+            &me,
+            &document,
+            &brolly_solid::profile::Profile {
+                display_name: "Alice Example".into(),
+                ..brolly_solid::profile::Profile::blank()
+            },
+        )
+    })
     .unwrap();
 
     let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
@@ -750,7 +774,7 @@ fn share_with_bob(h: &Harness) {
     let g = format!("{shared}.acl");
     let owner = format!("{g}#owner");
     let bob = format!("{g}#bob");
-    insert_quads(
+    seed(
         &pod,
         &[
             t(&g, &owner, &format!("{ACL}accessTo"), &shared),
@@ -769,8 +793,7 @@ fn share_with_bob(h: &Harness) {
             t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Write")),
             t(&g, &bob, &format!("{ACL}agent"), BOB_WEBID),
         ],
-    )
-    .unwrap();
+    );
 }
 
 /// The takeover over the wire: inherited Write used to be enough to PATCH the
@@ -794,14 +817,15 @@ async fn bob_cannot_patch_an_acl_he_does_not_control() {
     assert_eq!(status, StatusCode::FORBIDDEN);
 
     let pod = h.stores.pod(h.user).unwrap();
-    let granted = pod
-        .contains(&t(
+    let granted = holds(
+        &pod,
+        &t(
             &format!("{ROOT}shared/.acl"),
             &bob_auth,
             &format!("{ACL}mode"),
             &format!("{ACL}Control"),
-        ))
-        .unwrap();
+        ),
+    );
     assert!(!granted, "the refused PATCH must not have landed");
 }
 
@@ -832,13 +856,10 @@ async fn bob_cannot_put_an_acl_he_does_not_control() {
     let pod = h.stores.pod(h.user).unwrap();
     let g = format!("{shared}.acl");
     let control = |auth: &str| {
-        pod.contains(&t(
-            &g,
-            auth,
-            &format!("{ACL}mode"),
-            &format!("{ACL}Control"),
-        ))
-        .unwrap()
+        holds(
+            &pod,
+            &t(&g, auth, &format!("{ACL}mode"), &format!("{ACL}Control")),
+        )
     };
     assert!(!control(&format!("{g}#bob")), "the refused PUT landed");
     assert!(control(&format!("{g}#owner")), "Alice's grant was replaced");
@@ -858,7 +879,7 @@ async fn bob_cannot_delete_an_acl_he_does_not_control() {
 
     let pod = h.stores.pod(h.user).unwrap();
     assert!(
-        storage::exists(&pod, &format!("{ROOT}shared/.acl")),
+        storage::exists(&pod.read_store(), &format!("{ROOT}shared/.acl")),
         "the refused DELETE landed"
     );
 }

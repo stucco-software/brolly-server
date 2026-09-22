@@ -5,14 +5,18 @@
 //! stored, five reader modules had to match both, and a production bug shipped
 //! when one of them matched only the `https` form.
 //!
-//! There is exactly one `insert` in this crate, it canonicalizes, and
-//! `tests/canonical_on_write.rs` asserts that non-canonical input cannot
-//! survive a round trip through storage.
+//! There is exactly one insert per target in this crate, a store and a
+//! transaction, both canonicalize, and `tests/storage_invariants.rs` asserts
+//! that non-canonical input cannot survive a round trip through storage.
+//!
+//! The functions are crate-internal. Everything outside `store` writes a pod
+//! through `Pod::write` and the instance through `index`, and both land here.
+//! `WriteError` stays public for the adapters' error conversions.
 
-use brolly_domain::faithful::{self, FaithfulError};
+use brolly_domain::faithful::FaithfulError;
 use brolly_domain::iri::canonicalize_quad;
-use oxigraph::model::{NamedNode, Quad};
-use oxigraph::store::Store;
+use oxigraph::model::Quad;
+use oxigraph::store::{Store, Transaction};
 
 use crate::manager::StoreError;
 
@@ -47,8 +51,9 @@ impl From<FaithfulError> for WriteError {
 
 /// Insert quads, normalizing every IRI on the way in.
 ///
-/// The only insertion point in the workspace. Returns the number written.
-pub fn insert_quads(store: &Store, quads: &[Quad]) -> Result<usize, WriteError> {
+/// The insertion point for a bare store: today only the instance index.
+/// Returns the number written.
+pub(crate) fn insert_quads(store: &Store, quads: &[Quad]) -> Result<usize, WriteError> {
     for quad in quads {
         store
             .insert(&canonicalize_quad(quad))
@@ -57,31 +62,22 @@ pub fn insert_quads(store: &Store, quads: &[Quad]) -> Result<usize, WriteError> 
     Ok(quads.len())
 }
 
-/// Encode a protocol record into its graph, faithfully, then write it.
-///
-/// `lexicon` names the term space: an ATProtocol `$type`, or `"as2"` for
-/// ActivityStreams. Unknown lexicons are fine — the faithful layer needs no
-/// mapping table, which is what keeps export complete.
-pub fn insert_record(
-    store: &Store,
-    record: &serde_json::Value,
-    subject: &NamedNode,
-    graph: &NamedNode,
-    lexicon: &str,
-) -> Result<usize, WriteError> {
-    let quads = faithful::encode(record, subject, graph, lexicon)?;
-    insert_quads(store, &quads)
+/// Insert quads inside an open transaction, normalizing every IRI on the way
+/// in. The pod's insertion point: `PodWrite` and `resources` reach the
+/// transaction only through here. Returns the number written.
+pub(crate) fn insert_quads_in(transaction: &mut Transaction<'_>, quads: &[Quad]) -> usize {
+    for quad in quads {
+        transaction.insert(&canonicalize_quad(quad));
+    }
+    quads.len()
 }
 
-/// Replace a graph's contents with `quads`, atomically from a reader's point of
-/// view within this process. Used by PUT-shaped writes.
-pub fn replace_graph(
-    store: &Store,
-    graph: &NamedNode,
-    quads: &[Quad],
-) -> Result<usize, WriteError> {
-    store
-        .clear_graph(graph.as_ref())
-        .map_err(|e| WriteError::Store(StoreError::from(e)))?;
-    insert_quads(store, quads)
+/// Remove quads inside an open transaction.
+///
+/// Canonicalized like an insert, so removing the `http` spelling of a quad
+/// removes the `https` one that was actually stored.
+pub(crate) fn remove_quads_in(transaction: &mut Transaction<'_>, quads: &[Quad]) {
+    for quad in quads {
+        transaction.remove(&canonicalize_quad(quad));
+    }
 }

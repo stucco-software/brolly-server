@@ -74,7 +74,7 @@ tokio-tungstenite = "0.24"
 futures-util = "0.3"
 brolly-activitypub.workspace = true
 brolly-identity.workspace = true
-brolly-store.workspace = true
+brolly-store = { workspace = true, features = ["test-fixtures"] }
 brolly-test-support.workspace = true
 http-body-util = "0.1.5"
 oxigraph = "0.5.9"

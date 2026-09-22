@@ -19,6 +19,7 @@ use brolly_identity::db::{self, DbError, User};
 use brolly_identity::{routing, webid};
 use brolly_solid::oidc::store as oidc_store;
 use brolly_solid::profile::{self, Profile};
+use brolly_store::resources::PodRead;
 use serde::Deserialize;
 
 use crate::auth::SESSION_COOKIE;
@@ -175,7 +176,7 @@ pub async fn profile_form(
     };
     let id = webid::webid(&session.user.username, &state.base_domain);
     let document = webid::profile_document(&session.user.username, &state.base_domain);
-    let current = profile::read(&pod, &id, &document);
+    let current = profile::read(&pod.read_store(), &id, &document);
 
     render(&ProfilePage {
         chrome: state.chrome(),
@@ -208,22 +209,24 @@ pub async fn profile_submit(
     let id = webid::webid(&session.user.username, &state.base_domain);
     let document = webid::profile_document(&session.user.username, &state.base_domain);
 
-    // Read before writing, so this form edits only the two fields it owns.
-    // `profile::write` replaces every predicate it manages, so passing defaults
-    // for the flags would silently unlock a locked account from a page that
-    // never mentions locking.
-    let existing = profile::read(&pod, &id, &document);
-
-    match profile::write(
-        &pod,
-        &id,
-        &document,
-        &Profile {
-            display_name: form.display_name,
-            bio: form.bio,
-            ..existing
-        },
-    ) {
+    // Read before writing, in the same write, so this form edits only the two
+    // fields it owns. `profile::write` replaces every predicate it manages, so
+    // passing defaults for the flags would silently unlock a locked account
+    // from a page that never mentions locking.
+    let written = pod.write(|w| {
+        let existing = profile::read(&*w, &id, &document);
+        profile::write(
+            w,
+            &id,
+            &document,
+            &Profile {
+                display_name: form.display_name,
+                bio: form.bio,
+                ..existing
+            },
+        )
+    });
+    match written {
         Ok(()) => Redirect::to("/account/profile?saved=true").into_response(),
         Err(e) => {
             tracing::error!(error = %e, "profile write failed");
@@ -435,7 +438,9 @@ pub async fn export(State(state): State<AppState>, jar: CookieJar) -> Response {
     let Ok(pod) = state.stores.pod(session.user.id) else {
         return server_error();
     };
+    // Every graph in the pod, through a read of the committed store.
     let quads: Vec<_> = pod
+        .read_store()
         .quads_for_pattern(None, None, None, None)
         .filter_map(Result::ok)
         .collect();

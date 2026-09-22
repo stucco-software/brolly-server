@@ -21,6 +21,7 @@ use brolly_identity::db::{self, User};
 use brolly_identity::{extract, webid};
 use brolly_mastodon::oauth::Grant;
 use brolly_mastodon::{compose, instance, oauth, status_id, timeline, translate};
+use brolly_store::resources::{Pod, PodRead};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -84,7 +85,7 @@ async fn authenticated(state: &AppState, headers: &HeaderMap) -> Option<(User, G
 async fn author_for(state: &AppState, user: &User) -> translate::Author {
     let profile = match state.stores.pod(user.id) {
         Ok(pod) => brolly_solid::profile::read(
-            &pod,
+            &pod.read_store(),
             &webid::webid(&user.username, &state.base_domain),
             &webid::profile_document(&user.username, &state.base_domain),
         ),
@@ -306,7 +307,7 @@ pub async fn home_timeline(
     // time. Translating between them is a lookup of the row it names.
     let cursor = query.max_id.as_deref().and_then(|id| {
         let inbox = webid::inbox(&user.username, &state.base_domain);
-        timeline::home(&pod, &inbox, MAX_LIMIT * 4, None)
+        timeline::home(&pod.read_store(), &inbox, MAX_LIMIT * 4, None)
             .into_iter()
             .find(|row| {
                 status_id::note_id_from_iri(row.note["id"].as_str().unwrap_or_default())
@@ -317,7 +318,12 @@ pub async fn home_timeline(
     });
 
     let inbox = webid::inbox(&user.username, &state.base_domain);
-    let rows = timeline::home(&pod, &inbox, page_limit(query.limit), cursor.as_deref());
+    let rows = timeline::home(
+        &pod.read_store(),
+        &inbox,
+        page_limit(query.limit),
+        cursor.as_deref(),
+    );
 
     let mut statuses = Vec::with_capacity(rows.len());
     for row in rows {
@@ -386,7 +392,7 @@ async fn fetch_note(state: &AppState, iri: &str) -> Option<Value> {
         .flatten()
         .filter(User::is_active)?;
     let pod = state.stores.pod(user.id).ok()?;
-    brolly_store::collection::read_record(&pod, iri)
+    brolly_store::collection::read_record(&pod.read_store(), iri)
 }
 
 // --- statuses ------------------------------------------------------------------
@@ -417,7 +423,7 @@ pub async fn status(
     let Ok(pod) = state.stores.pod(user.id) else {
         return not_found();
     };
-    let Some(note) = brolly_store::collection::read_record(&pod, &iri) else {
+    let Some(note) = brolly_store::collection::read_record(&pod.read_store(), &iri) else {
         return not_found();
     };
 
@@ -559,7 +565,7 @@ pub async fn upload_media(
         .into_response()
 }
 
-fn set_alt_text(pod: &brolly_store::Store, iri: &str, text: &str) {
+fn set_alt_text(pod: &Pod, iri: &str, text: &str) {
     use oxigraph_model::{Literal, NamedNode, NamedOrBlankNode, Quad, Term};
     let node = NamedNode::new_unchecked(iri);
     let quad = Quad::new(
@@ -568,12 +574,14 @@ fn set_alt_text(pod: &brolly_store::Store, iri: &str, text: &str) {
         Term::Literal(Literal::new_simple_literal(text)),
         oxigraph_model::GraphName::NamedNode(node),
     );
-    if let Err(e) = brolly_store::insert_quads(pod, &[quad]) {
+    // The media resource is under the storage root, so this is written the
+    // way it always was until the pod keeps resource metadata.
+    if let Err(e) = pod.write(|w| w.legacy_under_root().insert(&[quad])) {
         tracing::warn!(error = %e, "storing alt text failed");
     }
 }
 
-fn alt_text(pod: &brolly_store::Store, iri: &str) -> Option<String> {
+fn alt_text(pod: &impl PodRead, iri: &str) -> Option<String> {
     brolly_store::collection::literal(pod, iri, ALT_TEXT)
 }
 
@@ -618,7 +626,7 @@ pub async fn update_media(
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
     };
     let iri = media_iri(&user.username, &state.base_domain, &local_id);
-    if brolly_solid::ldp::blob_digest(&pod, &iri).is_none() {
+    if brolly_solid::ldp::blob_digest(&pod.read_store(), &iri).is_none() {
         return not_found();
     }
 
@@ -626,14 +634,17 @@ pub async fn update_media(
         set_alt_text(&pod, &iri, text);
     }
 
-    let media_type =
-        brolly_store::collection::literal(&pod, &iri, brolly_solid::ldp::BLOB_MEDIA_TYPE)
-            .unwrap_or_else(|| "application/octet-stream".into());
+    let media_type = brolly_store::collection::literal(
+        &pod.read_store(),
+        &iri,
+        brolly_solid::ldp::BLOB_MEDIA_TYPE,
+    )
+    .unwrap_or_else(|| "application/octet-stream".into());
     Json(media_json(
         &id,
         &iri,
         &media_type,
-        alt_text(&pod, &iri).as_deref(),
+        alt_text(&pod.read_store(), &iri).as_deref(),
     ))
     .into_response()
 }
@@ -660,17 +671,20 @@ pub async fn get_media(
         return not_found();
     };
     let iri = media_iri(&user.username, &state.base_domain, &local_id);
-    if brolly_solid::ldp::blob_digest(&pod, &iri).is_none() {
+    if brolly_solid::ldp::blob_digest(&pod.read_store(), &iri).is_none() {
         return not_found();
     }
-    let media_type =
-        brolly_store::collection::literal(&pod, &iri, brolly_solid::ldp::BLOB_MEDIA_TYPE)
-            .unwrap_or_else(|| "application/octet-stream".into());
+    let media_type = brolly_store::collection::literal(
+        &pod.read_store(),
+        &iri,
+        brolly_solid::ldp::BLOB_MEDIA_TYPE,
+    )
+    .unwrap_or_else(|| "application/octet-stream".into());
     Json(media_json(
         &id,
         &iri,
         &media_type,
-        alt_text(&pod, &iri).as_deref(),
+        alt_text(&pod.read_store(), &iri).as_deref(),
     ))
     .into_response()
 }
@@ -739,7 +753,7 @@ pub async fn create_status(
             );
         }
         let iri = media_iri(&user.username, &state.base_domain, &local_id);
-        let Some(_) = brolly_solid::ldp::blob_digest(&pod, &iri) else {
+        let Some(_) = brolly_solid::ldp::blob_digest(&pod.read_store(), &iri) else {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Validation failed: Media attachment not found",
@@ -747,12 +761,12 @@ pub async fn create_status(
         };
         attachments.push(compose::Attachment {
             media_type: brolly_store::collection::literal(
-                &pod,
+                &pod.read_store(),
                 &iri,
                 brolly_solid::ldp::BLOB_MEDIA_TYPE,
             )
             .unwrap_or_else(|| "application/octet-stream".into()),
-            description: alt_text(&pod, &iri),
+            description: alt_text(&pod.read_store(), &iri),
             url: iri,
         });
     }
@@ -874,26 +888,29 @@ pub async fn update_credentials(
     let id = webid::webid(&user.username, &state.base_domain);
     let document = webid::profile_document(&user.username, &state.base_domain);
 
-    // Merge onto what is stored, so an absent field is untouched rather than
-    // reset. The predecessor's version of this is where `locked` went to die.
-    let mut profile = brolly_solid::profile::read(&pod, &id, &document);
-    if let Some(name) = update.display_name {
-        profile.display_name = name;
-    }
-    if let Some(note) = update.note {
-        profile.bio = note;
-    }
-    if let Some(locked) = update.locked {
-        profile.locked = locked;
-    }
-    if let Some(bot) = update.bot {
-        profile.bot = bot;
-    }
-    if let Some(discoverable) = update.discoverable {
-        profile.discoverable = discoverable;
-    }
-
-    if let Err(e) = brolly_solid::profile::write(&pod, &id, &document, &profile) {
+    let written = pod.write(|w| {
+        // Merge onto what is stored, so an absent field is untouched rather
+        // than reset. The predecessor's version of this is where `locked` went
+        // to die. Read in the same write, so nothing lands in between.
+        let mut profile = brolly_solid::profile::read(&*w, &id, &document);
+        if let Some(name) = update.display_name {
+            profile.display_name = name;
+        }
+        if let Some(note) = update.note {
+            profile.bio = note;
+        }
+        if let Some(locked) = update.locked {
+            profile.locked = locked;
+        }
+        if let Some(bot) = update.bot {
+            profile.bot = bot;
+        }
+        if let Some(discoverable) = update.discoverable {
+            profile.discoverable = discoverable;
+        }
+        brolly_solid::profile::write(w, &id, &document, &profile)
+    });
+    if let Err(e) = written {
         tracing::error!(error = %e, "profile update failed");
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Update failed");
     }
@@ -915,8 +932,10 @@ pub async fn follow_requests(State(state): State<AppState>, headers: HeaderMap) 
     };
 
     let actor = webid::actor(&user.username, &state.base_domain);
+    // Bound before the loop, so no read of the pod is held across its awaits.
+    let pending = brolly_activitypub::follows::pending(&pod.read_store(), &actor);
     let mut accounts = Vec::new();
-    for follower in brolly_activitypub::follows::pending(&pod, &actor) {
+    for follower in pending {
         if let Some(author) = local_author(&state, &follower).await {
             accounts.push(translate::account(&author, &state.base_domain));
         }
@@ -952,15 +971,17 @@ async fn resolve_request(
 
     // Only a *pending* request can be resolved. Approving something nobody
     // asked for would manufacture a follower.
-    if !brolly_activitypub::follows::pending(&pod, &actor).contains(&follower) {
+    if !brolly_activitypub::follows::pending(&pod.read_store(), &actor).contains(&follower) {
         return not_found();
     }
 
-    let outcome = if approve {
-        brolly_activitypub::follows::approve(&pod, &follower, &actor)
-    } else {
-        brolly_activitypub::follows::reject(&pod, &follower, &actor)
-    };
+    let outcome = pod.write(|w| {
+        if approve {
+            brolly_activitypub::follows::approve(w, &follower, &actor)
+        } else {
+            brolly_activitypub::follows::reject(w, &follower, &actor)
+        }
+    });
     if let Err(e) = outcome {
         tracing::error!(error = %e, "resolving a follow request failed");
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Update failed");

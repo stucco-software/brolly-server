@@ -16,6 +16,7 @@ use brolly_identity::db;
 use brolly_server::{AppState, app};
 use brolly_solid::storage;
 use brolly_store::StoreManager;
+use brolly_store::resources::PodRead;
 use http_body_util::BodyExt;
 use p256::ecdsa::SigningKey;
 use p256::ecdsa::signature::Signer;
@@ -46,7 +47,7 @@ async fn harness() -> Harness {
         .await
         .unwrap();
     let pod = stores.pod(user.id).unwrap();
-    storage::init_storage_root(&pod, ROOT).unwrap();
+    pod.write(|w| storage::init_storage_root(w, ROOT)).unwrap();
 
     let router = app(
         AppState {
@@ -246,6 +247,7 @@ async fn the_profile_form_writes_to_the_pod_and_not_to_postgres() {
 
     let pod = h.stores.pod(h.user).unwrap();
     let triples: Vec<String> = pod
+        .read_store()
         .quads_for_pattern(None, None, None, None)
         .filter_map(Result::ok)
         .map(|q| q.to_string())

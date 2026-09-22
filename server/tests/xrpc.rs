@@ -236,7 +236,7 @@ async fn a_write_lands_in_both_the_repo_and_the_pod() {
     // And in the pod, faithfully.
     let pod = h.stores.pod(user_id).unwrap();
     let uri = created.json()["uri"].as_str().unwrap().to_string();
-    let stored = brolly_atproto::ingest::read(&pod, &uri).expect("the pod copy");
+    let stored = brolly_atproto::ingest::read(&pod.read_store(), &uri).expect("the pod copy");
     assert_eq!(stored["text"], "in both places");
 }
 
@@ -260,7 +260,7 @@ async fn an_unmapped_lexicon_writes_through_xrpc_too() {
 
     let pod = h.stores.pod(user_id).unwrap();
     let uri = created.json()["uri"].as_str().unwrap().to_string();
-    let stored = brolly_atproto::ingest::read(&pod, &uri).unwrap();
+    let stored = brolly_atproto::ingest::read(&pod.read_store(), &uri).unwrap();
     assert_eq!(stored["n"]["deep"], json!([1, 2]));
 }
 
@@ -287,7 +287,7 @@ async fn a_record_without_a_type_is_given_its_collection() {
     let pod = h.stores.pod(user_id).unwrap();
     let uri = created.json()["uri"].as_str().unwrap().to_string();
     assert_eq!(
-        brolly_atproto::ingest::read(&pod, &uri).unwrap()["$type"],
+        brolly_atproto::ingest::read(&pod.read_store(), &uri).unwrap()["$type"],
         "app.bsky.feed.post"
     );
 }

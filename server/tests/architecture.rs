@@ -233,16 +233,16 @@ fn app_is_defined_only_in_the_server_crate() {
 /// Postgres with a backfill job. When a projection is allowed to write, the
 /// thing it writes becomes a second source of truth that nothing can retire.
 ///
-/// A pure lint rather than a type-level guarantee: the store API takes `&Store`
-/// everywhere, so there is no `&mut` to withhold. Checking the call names is
-/// what is actually available.
+/// A pure lint rather than a type-level guarantee. Writes need a `PodWrite`,
+/// which only `Pod::write` hands out, so a `.write(|` call is what to look
+/// for, alongside the index writers and raw oxigraph calls.
 #[test]
 fn the_mastodon_crate_never_writes_to_a_store() {
     /// Every mutation entry point in `brolly-store`, plus the raw oxigraph
     /// calls that would bypass it. Kept in sync by hand — but a *new* store
     /// mutator that this list misses is a `brolly-store` review question, and
     /// `store::write`'s own docs say there is exactly one insert.
-    const MUTATORS: [&str; 11] = [
+    const MUTATORS: [&str; 14] = [
         // brolly-store's write path.
         "insert_quads",
         "insert_record",
@@ -250,6 +250,10 @@ fn the_mastodon_crate_never_writes_to_a_store() {
         "record_note",
         "forget_note",
         "index::clear",
+        // The pod handle's only way in, and its escape hatches.
+        ".write(|",
+        "legacy_under_root",
+        "raw_store",
         // Raw oxigraph, which would sidestep canonicalization entirely.
         ".insert(",
         ".remove(",
