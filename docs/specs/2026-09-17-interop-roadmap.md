@@ -1,6 +1,6 @@
 # Interop roadmap: Bluesky, ATProto apps, Solid apps
 
-**Status:** In progress. Stage 0 done 2026-09-18.
+**Status:** In progress. Stage 0 done 2026-09-18. Solid stages (5–7) next.
 **Scope:** Umbrella. It sets the finish line and orders the work. Each stage
 gets its own spec and plan.
 **Supersedes in priority:** `docs/specs/2026-09-16-mycorhizza-migration.md`,
@@ -84,8 +84,13 @@ a constant (trunk-based), the way `FEDERATION_ENABLED` does.
 | 7 | **Notifications** | Solid Notifications Protocol, WebSocketChannel2023, and whether to also support legacy `solid-0.1` `Updates-Via` for SolidOS. | The Solid Protocol requires it (§7.1), and SolidOS uses it for live updates. It comes last because apps still work without it, just without live refresh. |
 
 Stages 0–3 are ordered by what they depend on. Stage 4 needs stage 1's blob
-links and stage 3's surface. Stages 5–7 are independent of the ATProto stages
-and could run in parallel with them.
+links and stage 3's surface. Stages 5–7 are independent of the ATProto stages.
+
+**Order of work (decided 2026-09-22):** Solid first. After stage 0, the stages
+run 5, 6, 7, then 1, 2, 3, then 4. Stage 4's media model still covers Solid
+uploads, but it waits for the ATProto blob work it shares a design with. Until
+then, Solid binaries keep today's behaviour: stored and served, owner-only by
+default like everything else under `/~/`.
 
 ## Not in scope
 
