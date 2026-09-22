@@ -938,3 +938,47 @@ fn a_description_replaces_the_one_before_it() {
         "got {refused:?}"
     );
 }
+
+#[test]
+fn modified_moves_past_a_stored_time_oxigraph_shortened() {
+    // Oxigraph normalises an xsd:dateTime on the way in: `.750Z` reads back as
+    // `.75Z`, `.000Z` as `Z`. The floor that keeps `modified` increasing has to
+    // read those forms, and what `meta` returns has to be fixed width again.
+    let (_dir, stores) = manager(60);
+    let pod = provisioned(&stores);
+    pod.write(|w| w.put(&at("doc"), Content::Rdf(&[]))).unwrap();
+
+    // Plant a far-future modified time in the shortened form, so the floor,
+    // not the clock, decides the next value.
+    let subject = NamedOrBlankNode::NamedNode(node(&at("doc")));
+    let predicate = node(brolly_domain::vocab::DCTERMS_MODIFIED);
+    let graph = GraphName::NamedNode(node(METADATA_GRAPH));
+    let raw = pod.raw_store();
+    let stale: Vec<Quad> = raw
+        .quads_for_pattern(
+            Some((&subject).into()),
+            Some(predicate.as_ref()),
+            None,
+            Some(graph.as_ref()),
+        )
+        .map(Result::unwrap)
+        .collect();
+    for quad in &stale {
+        raw.remove(quad).unwrap();
+    }
+    raw.insert(&Quad::new(
+        subject.clone(),
+        predicate.clone(),
+        Term::Literal(Literal::new_typed_literal(
+            "2999-01-01T00:00:00.750Z",
+            node("http://www.w3.org/2001/XMLSchema#dateTime"),
+        )),
+        graph,
+    ))
+    .unwrap();
+    let planted = pod.read_store().meta(&at("doc")).unwrap().unwrap().modified;
+    assert_eq!(planted, "2999-01-01T00:00:00.750Z", "read back fixed width");
+
+    let next = pod.write(|w| w.put(&at("doc"), Content::Rdf(&[]))).unwrap();
+    assert_eq!(next.modified, "2999-01-01T00:00:00.751Z");
+}

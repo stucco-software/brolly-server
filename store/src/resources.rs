@@ -591,7 +591,9 @@ fn read_meta<R: PodRead + ?Sized>(
                 }
                 _ => {}
             },
-            (vocab::DCTERMS_MODIFIED, Term::Literal(value)) => modified = value.value().into(),
+            (vocab::DCTERMS_MODIFIED, Term::Literal(value)) => {
+                modified = normalise_modified(value.value());
+            }
             (vocab::BROLLY_VERSION, Term::Literal(value)) => version = value.value().into(),
             (vocab::BROLLY_BLOB_DIGEST, Term::Literal(value)) => {
                 digest = Some(value.value().into())
@@ -1068,9 +1070,23 @@ fn format_modified(ms: i64) -> Result<String, StoreError> {
         .map_err(|e| StoreError::Backend(e.to_string()))
 }
 
+/// Read a stored `modified` back as milliseconds.
+///
+/// Any RFC 3339 form, not only the fixed-width one written: Oxigraph normalises
+/// an `xsd:dateTime` on the way in, so `.750Z` comes back as `.75Z` and `.000Z`
+/// as `Z`. Reading only three fractional digits would lose the floor that keeps
+/// `modified` increasing, about one write in ten.
 fn parse_modified(text: &str) -> Option<i64> {
-    let at = time::PrimitiveDateTime::parse(text, MODIFIED_FORMAT).ok()?;
-    Some((at.assume_utc().unix_timestamp_nanos() / 1_000_000) as i64)
+    let at =
+        time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()?;
+    i64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()
+}
+
+/// A stored `modified`, in the fixed-width form every reader gets.
+fn normalise_modified(stored: &str) -> String {
+    parse_modified(stored)
+        .and_then(|ms| format_modified(ms).ok())
+        .unwrap_or_else(|| stored.to_owned())
 }
 
 /// A ULID over `ms` and fresh randomness: 26 Crockford base32 characters,
