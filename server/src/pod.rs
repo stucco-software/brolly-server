@@ -6,12 +6,13 @@
 //! it cannot shadow a protocol endpoint.
 
 use axum::extract::{Path, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use brolly_identity::db::{self, User};
 use brolly_identity::dpop::DpopError;
 use brolly_identity::routing::{SubdomainRoute, subdomain_route};
 use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
+use brolly_solid::conditional::{self, Preconditions};
 use brolly_solid::ldp::{self, LdpError};
 use brolly_solid::oidc::tokens;
 use brolly_solid::patch;
@@ -240,6 +241,9 @@ fn ldp_error(error: LdpError) -> Response {
             tracing::error!("a blob was released under a write that still needed it");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
+        LdpError::PreconditionFailed => {
+            (StatusCode::PRECONDITION_FAILED, "precondition failed").into_response()
+        }
         LdpError::Store(e) => {
             tracing::error!(error = %e, "ldp storage failure");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -261,7 +265,33 @@ fn wac_allow(granted: &[brolly_authz::AccessMode]) -> String {
     format!("user=\"{}\"", names.join(" "))
 }
 
-/// `GET /~/*path`
+/// A request's `If-Match` and `If-None-Match`.
+///
+/// Each header may arrive on several lines, which mean the same as one line
+/// joined with commas (RFC 9110 §5.3). Bytes that aren't UTF-8 go in lossily.
+/// They can't match a version, which is ASCII, so an `If-Match` made only of
+/// them fails, and an `If-None-Match` made only of them holds.
+fn preconditions(headers: &HeaderMap) -> Preconditions {
+    let field = |name: header::HeaderName| -> Option<String> {
+        let lines: Vec<String> = headers
+            .get_all(name)
+            .iter()
+            .map(|value| String::from_utf8_lossy(value.as_bytes()).into_owned())
+            .collect();
+        (!lines.is_empty()).then(|| lines.join(", "))
+    };
+    Preconditions::from_fields(
+        field(header::IF_MATCH).as_deref(),
+        field(header::IF_NONE_MATCH).as_deref(),
+    )
+}
+
+/// `GET /~/*path`, and `HEAD`, which axum routes here without the body.
+///
+/// Sends `ETag` (the resource's version) and `Last-Modified`, and answers 304
+/// to an `If-None-Match` naming the current version. Only here: a write's
+/// response carries no `ETag`, because the server transforms what it stores
+/// (RFC 9110 §9.3.4).
 pub async fn get(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -274,7 +304,7 @@ pub async fn get(
     };
     let accept = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
 
-    match ldp::read(
+    let outcome = match ldp::read(
         &request.pod,
         Some(&request.blobs),
         &request.base,
@@ -282,24 +312,43 @@ pub async fn get(
         &request.subject,
         accept,
     ) {
-        Ok(outcome) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, outcome.media_type.clone()),
-                (
-                    header::HeaderName::from_static("wac-allow"),
-                    wac_allow(&outcome.granted),
-                ),
-                (
-                    header::LINK,
-                    format!("<{}{path}.acl>; rel=\"acl\"", request.base),
-                ),
-            ],
-            outcome.body,
-        )
-            .into_response(),
-        Err(e) => ldp_error(e),
+        Ok(outcome) => outcome,
+        Err(e) => return ldp_error(e),
+    };
+
+    // After `read` succeeded, so after the Read check, and against the version
+    // from the same snapshot as the body. A caller without Read got 404 above
+    // whatever they sent.
+    let etag = conditional::etag(&outcome.version);
+    if preconditions(&headers).not_modified(&outcome.version) {
+        // RFC 9110 §15.4.5: a 304 carries the ETag and no body.
+        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
     }
+
+    let mut response = (
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, outcome.media_type.clone()),
+            (
+                header::HeaderName::from_static("wac-allow"),
+                wac_allow(&outcome.granted),
+            ),
+            (
+                header::LINK,
+                format!("<{}{path}.acl>; rel=\"acl\"", request.base),
+            ),
+            (header::ETAG, etag),
+        ],
+        outcome.body,
+    )
+        .into_response();
+    // Omitted rather than wrong if the stored time isn't one we can render.
+    if let Some(date) = conditional::http_date(&outcome.modified)
+        && let Ok(value) = HeaderValue::from_str(&date)
+    {
+        response.headers_mut().insert(header::LAST_MODIFIED, value);
+    }
+    response
 }
 
 /// `PUT /~/*path`
@@ -319,7 +368,7 @@ pub async fn put(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("text/turtle");
 
-    match ldp::put(
+    match ldp::put_if(
         &request.pod,
         Some(&request.blobs),
         &request.base,
@@ -328,6 +377,7 @@ pub async fn put(
         &body,
         content_type,
         &request.storage_root,
+        &preconditions(&headers),
     ) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => ldp_error(e),
@@ -351,7 +401,7 @@ pub async fn post(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("text/turtle");
 
-    match ldp::append(
+    match ldp::append_if(
         &request.pod,
         Some(&request.blobs),
         &request.base,
@@ -360,6 +410,7 @@ pub async fn post(
         &body,
         content_type,
         &request.storage_root,
+        &preconditions(&headers),
     ) {
         Ok(created) => (StatusCode::CREATED, [(header::LOCATION, created)]).into_response(),
         Err(e) => ldp_error(e),
@@ -400,18 +451,24 @@ pub async fn patch(
         }
     };
 
-    // WAC, the patch and the write, in one transaction.
-    match ldp::patch(
+    // WAC, the preconditions, the patch and the write, in one transaction.
+    // The two content-type refusals above come first: RFC 9110 §13.2.1
+    // evaluates a precondition only when the request would otherwise succeed.
+    match ldp::patch_if(
         &request.pod,
         &request.base,
         &path,
         &request.subject,
         patch_body,
         &request.storage_root,
+        &preconditions(&headers),
     ) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(patch::PatchError::Ldp(e)) => ldp_error(e),
         Err(patch::PatchError::Precondition(m)) => (StatusCode::CONFLICT, m).into_response(),
+        Err(patch::PatchError::NotCurrent) => {
+            (StatusCode::PRECONDITION_FAILED, "precondition failed").into_response()
+        }
         Err(patch::PatchError::EscapesGraph) => (
             StatusCode::FORBIDDEN,
             "a PATCH may not name a GRAPH or WITH",
@@ -438,12 +495,13 @@ pub async fn delete(
         Ok(r) => r,
         Err(response) => return response,
     };
-    match ldp::delete(
+    match ldp::delete_if(
         &request.pod,
         &request.base,
         &path,
         &request.subject,
         &request.storage_root,
+        &preconditions(&headers),
     ) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => ldp_error(e),

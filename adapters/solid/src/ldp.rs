@@ -15,6 +15,12 @@
 //! snapshot, for callers composing several operations in one transaction
 //! (Mastodon's upload and its alt text).
 //!
+//! **Conditional requests.** Each write has an `_if` form ([`put_if`],
+//! [`append_if`], [`delete_if`], [`patch_if`]) taking a
+//! [`Preconditions`](crate::conditional::Preconditions); the plain names are
+//! wrappers passing none. The `_in` functions evaluate it after WAC and before
+//! any write, in the caller's transaction, so nothing can land in between.
+//!
 //! **Server-managed state comes from metadata** (`store::resources`):
 //! existence, kind, containment and a binary's blob. None of it is read from
 //! the graph a client writes, so an `ldp:contains` or `brolly:blobDigest`
@@ -32,6 +38,7 @@ use brolly_store::resources::{
 use brolly_store::{BlobStore, StoreError};
 use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 
+use crate::conditional::{self, PreconditionFailed, Preconditions};
 use crate::patch::{self, PatchError};
 use crate::storage;
 
@@ -56,6 +63,9 @@ pub enum LdpError {
     /// concurrent delete released identical bytes. Prepare again and retry
     /// once (spec 5a, R12).
     BlobMissing,
+    /// An `If-Match` or `If-None-Match` didn't hold (412). Evaluated after WAC,
+    /// so only a caller holding the needed mode can see it.
+    PreconditionFailed,
 }
 
 impl std::fmt::Display for LdpError {
@@ -72,11 +82,18 @@ impl std::fmt::Display for LdpError {
                 "a container's members change only by creating or deleting them"
             ),
             LdpError::BlobMissing => write!(f, "the blob was released before it was recorded"),
+            LdpError::PreconditionFailed => write!(f, "precondition failed"),
         }
     }
 }
 
 impl std::error::Error for LdpError {}
+
+impl From<PreconditionFailed> for LdpError {
+    fn from(_: PreconditionFailed) -> Self {
+        LdpError::PreconditionFailed
+    }
+}
 
 impl From<SyntaxError> for LdpError {
     fn from(e: SyntaxError) -> Self {
@@ -123,6 +140,11 @@ pub struct LdpOutcome {
     /// the answer by failing.
     pub granted: Vec<AccessMode>,
     pub is_container: bool,
+    /// `brolly:version` from the same snapshot as `body`: the `ETag`.
+    pub version: String,
+    /// `dcterms:modified` from the same snapshot, as stored (`xsd:dateTime`):
+    /// the `Last-Modified`.
+    pub modified: String,
 }
 
 fn iri(s: &str) -> NamedNode {
@@ -240,6 +262,10 @@ pub fn read_in(
         return Err(LdpError::NotFound);
     };
     let granted = granted_modes(r, base, path, subject);
+    // The validators come from this snapshot's metadata, the one the body is
+    // read from, so an `ETag` always describes the bytes it goes out with.
+    let version = meta.version.clone();
+    let modified = meta.modified.clone();
 
     // A binary answers with its bytes. The ACL check above already ran, so
     // there is no path to the blob store that skips authorization.
@@ -257,6 +283,8 @@ pub fn read_in(
             media_type: blob.media_type,
             granted,
             is_container: false,
+            version,
+            modified,
         });
     }
 
@@ -281,6 +309,8 @@ pub fn read_in(
         media_type: format.media_type().to_string(),
         granted,
         is_container,
+        version,
+        modified,
     })
 }
 
@@ -379,7 +409,14 @@ impl Target<'_> {
 ///
 /// Requires Write. Replacing is not Append: a client that may only add triples
 /// must not be able to erase the ones already there.
-pub fn put(
+///
+/// `preconditions` is evaluated in [`put_in`], after the WAC check and before
+/// anything is written.
+// One over `clippy.toml`'s threshold. `put` keeps the old eight for every
+// caller that isn't HTTP; folding the request into a struct is 5b's
+// HTTP-surface work.
+#[allow(clippy::too_many_arguments)]
+pub fn put_if(
     pod: &Pod,
     blobs: Option<&BlobStore>,
     base: &str,
@@ -388,6 +425,7 @@ pub fn put(
     body: &[u8],
     content_type: &str,
     storage_root: &str,
+    preconditions: &Preconditions,
 ) -> Result<(), LdpError> {
     let resource = format!("{base}{path}");
     let rdf_only = storage::is_container(&resource) || governed(&resource).is_some();
@@ -400,7 +438,11 @@ pub fn put(
     };
     let attempt = || -> Result<(), LdpError> {
         let body = target.prepare(blobs, rdf_only, AccessMode::Write, body, content_type)?;
-        in_write(pod, |w| put_in(w, base, path, subject, &body, storage_root))
+        let written = in_write(pod, |w| {
+            put_in(w, base, path, subject, &body, storage_root, preconditions)
+        });
+        release_refused_bytes(pod, &body, &written);
+        written
     };
     // Identical bytes released by a concurrent delete between `prepare` and
     // the write: write them again and retry, once (spec 5a, R12).
@@ -408,6 +450,50 @@ pub fn put(
         Err(LdpError::BlobMissing) => attempt(),
         other => other,
     }
+}
+
+/// [`put_if`] with no preconditions.
+pub fn put(
+    pod: &Pod,
+    blobs: Option<&BlobStore>,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    body: &[u8],
+    content_type: &str,
+    storage_root: &str,
+) -> Result<(), LdpError> {
+    put_if(
+        pod,
+        blobs,
+        base,
+        path,
+        subject,
+        body,
+        content_type,
+        storage_root,
+        &Preconditions::NONE,
+    )
+}
+
+/// Give back the bytes a refused binary write left in the blob store.
+///
+/// [`prepare`] writes a binary body before the lock is taken, and a failed
+/// precondition then records no digest, so the file would sit there
+/// unreferenced. Under the lock, `release_blob` deletes it only if nothing
+/// references it: bytes identical to a live resource (this one's own, sent
+/// with a stale tag, say) survive, and a concurrent upload of the same bytes
+/// either committed first or gets `BlobMissing` and writes them again (R12).
+/// A failure here leaves an orphan file, not a wrong answer, so the 412 still
+/// stands.
+fn release_refused_bytes<T>(pod: &Pod, body: &Body, written: &Result<T, LdpError>) {
+    let (Err(LdpError::PreconditionFailed), Body::Binary(blob)) = (written, body) else {
+        return;
+    };
+    let _swept: Result<(), StoreError> = pod.write(|w| {
+        w.release_blob(&blob.digest);
+        Ok(())
+    });
 }
 
 /// [`put`] inside the caller's write. Checks WAC against the transaction's
@@ -421,6 +507,11 @@ pub fn put(
 /// - a binary: `Content::Binary`, then the previous blob, if any, is released.
 ///
 /// Every refusal comes before the first write.
+///
+/// `preconditions` is evaluated after the WAC check and before anything is
+/// written, against this transaction's view of the resource, so no other write
+/// can land between the check and this one. Pass `Preconditions::NONE` when not
+/// answering an HTTP request.
 pub fn put_in(
     w: &mut PodWrite<'_>,
     base: &str,
@@ -428,6 +519,7 @@ pub fn put_in(
     subject: &Subject,
     body: &Body,
     storage_root: &str,
+    preconditions: &Preconditions,
 ) -> Result<(), LdpError> {
     let resource = format!("{base}{path}");
     if !resource.starts_with(storage_root) {
@@ -436,6 +528,8 @@ pub fn put_in(
     if !check(&*w, base, path, subject, AccessMode::Write)? {
         return Err(LdpError::Forbidden);
     }
+    let current = w.meta(&resource)?.map(|meta| meta.version);
+    preconditions.check_write(conditional::Method::Put, current.as_deref())?;
 
     if governed(&resource).is_some() {
         let quads = rdf_quads(body, &resource)?;
@@ -584,7 +678,15 @@ fn refuse_rdf_xml(content_type: &str) -> Result<(), LdpError> {
 /// `POST` — create a member of a container, or append triples to a document.
 ///
 /// Requires Append, which Write satisfies (`acl:Write` implies `acl:Append`).
-pub fn append(
+///
+/// `preconditions` is evaluated in [`append_in`], after the WAC check and
+/// before anything is written. It is about the container posted to (or the
+/// document appended to), not the member a POST mints.
+// One over `clippy.toml`'s threshold. `append` keeps the old eight for every
+// caller that isn't HTTP; folding the request into a struct is 5b's
+// HTTP-surface work.
+#[allow(clippy::too_many_arguments)]
+pub fn append_if(
     pod: &Pod,
     blobs: Option<&BlobStore>,
     base: &str,
@@ -593,6 +695,7 @@ pub fn append(
     body: &[u8],
     content_type: &str,
     storage_root: &str,
+    preconditions: &Preconditions,
 ) -> Result<String, LdpError> {
     // Appending to a document takes RDF; a container's new member may be a
     // binary.
@@ -606,9 +709,11 @@ pub fn append(
     };
     let attempt = || -> Result<String, LdpError> {
         let body = target.prepare(blobs, rdf_only, AccessMode::Append, body, content_type)?;
-        in_write(pod, |w| {
-            append_in(w, base, path, subject, &body, storage_root)
-        })
+        let written = in_write(pod, |w| {
+            append_in(w, base, path, subject, &body, storage_root, preconditions)
+        });
+        release_refused_bytes(pod, &body, &written);
+        written
     };
     match attempt() {
         Err(LdpError::BlobMissing) => attempt(),
@@ -616,10 +721,39 @@ pub fn append(
     }
 }
 
+/// [`append_if`] with no preconditions.
+pub fn append(
+    pod: &Pod,
+    blobs: Option<&BlobStore>,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    body: &[u8],
+    content_type: &str,
+    storage_root: &str,
+) -> Result<String, LdpError> {
+    append_if(
+        pod,
+        blobs,
+        base,
+        path,
+        subject,
+        body,
+        content_type,
+        storage_root,
+        &Preconditions::NONE,
+    )
+}
+
 /// [`append`] inside the caller's write.
 ///
 /// POST to a container is a `put` of the minted member. POST to a document is
 /// stage 0's append, unchanged until 5c, and takes RDF only.
+///
+/// `preconditions` is evaluated after the WAC check and before anything is
+/// written, against this transaction's view of the target, so no other write
+/// can land between the check and this one. Pass `Preconditions::NONE` when not
+/// answering an HTTP request.
 pub fn append_in(
     w: &mut PodWrite<'_>,
     base: &str,
@@ -627,6 +761,7 @@ pub fn append_in(
     subject: &Subject,
     body: &Body,
     storage_root: &str,
+    preconditions: &Preconditions,
 ) -> Result<String, LdpError> {
     let target = format!("{base}{path}");
     if !target.starts_with(storage_root) {
@@ -635,6 +770,10 @@ pub fn append_in(
     if !check(&*w, base, path, subject, AccessMode::Append)? {
         return Err(LdpError::Forbidden);
     }
+    // A POST's precondition is about the container (or the document appended
+    // to), which is what the client addressed and holds a tag for.
+    let current = w.meta(&target)?.map(|meta| meta.version);
+    preconditions.check_write(conditional::Method::Post, current.as_deref())?;
 
     if storage::is_container(&target) {
         let member = format!("{target}{}", uuid::Uuid::new_v4());
@@ -674,6 +813,23 @@ pub fn may_write(
 }
 
 /// `DELETE`.
+///
+/// `preconditions` is evaluated in [`delete_in`], after the WAC and not-found
+/// checks and before anything is removed.
+pub fn delete_if(
+    pod: &Pod,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    storage_root: &str,
+    preconditions: &Preconditions,
+) -> Result<(), LdpError> {
+    in_write(pod, |w| {
+        delete_in(w, base, path, subject, storage_root, preconditions)
+    })
+}
+
+/// [`delete_if`] with no preconditions.
 pub fn delete(
     pod: &Pod,
     base: &str,
@@ -681,7 +837,7 @@ pub fn delete(
     subject: &Subject,
     storage_root: &str,
 ) -> Result<(), LdpError> {
-    in_write(pod, |w| delete_in(w, base, path, subject, storage_root))
+    delete_if(pod, base, path, subject, storage_root, &Preconditions::NONE)
 }
 
 /// [`delete`] inside the caller's write.
@@ -690,12 +846,20 @@ pub fn delete(
 /// recreated resource can't quietly get its old grants back, and releases its
 /// blob. Content addressing means two resources can name one blob, which is
 /// why the blob is released rather than deleted here.
+///
+/// `preconditions` is evaluated after the WAC check and before anything is
+/// written, against this transaction's view of the resource, so no other write
+/// can land between the check and this one. It comes after the not-found
+/// check: a DELETE of a missing resource is 404 whatever its preconditions
+/// (RFC 9110 §13.2.1). Pass `Preconditions::NONE` when not answering an HTTP
+/// request.
 pub fn delete_in(
     w: &mut PodWrite<'_>,
     base: &str,
     path: &str,
     subject: &Subject,
     storage_root: &str,
+    preconditions: &Preconditions,
 ) -> Result<(), LdpError> {
     let resource = format!("{base}{path}");
     if !resource.starts_with(storage_root) {
@@ -707,6 +871,7 @@ pub fn delete_in(
     let Some(meta) = w.meta(&resource)? else {
         return Err(LdpError::NotFound);
     };
+    preconditions.check_write(conditional::Method::Delete, Some(meta.version.as_str()))?;
     // Without its root a pod has nowhere to put anything, and only
     // provisioning records one. 5b answers 405 here.
     if resource == storage_root {
@@ -729,7 +894,23 @@ pub enum PatchBody<'a> {
     SparqlUpdate(&'a str),
 }
 
-/// `PATCH`: WAC, the patch, and the write, in one transaction.
+/// `PATCH`: WAC, the preconditions, the patch, and the write, in one
+/// transaction.
+pub fn patch_if(
+    pod: &Pod,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    body: PatchBody<'_>,
+    storage_root: &str,
+    preconditions: &Preconditions,
+) -> Result<(), PatchError> {
+    in_write(pod, |w| {
+        patch_in(w, base, path, subject, body, storage_root, preconditions)
+    })
+}
+
+/// [`patch_if`] with no preconditions.
 pub fn patch(
     pod: &Pod,
     base: &str,
@@ -738,13 +919,24 @@ pub fn patch(
     body: PatchBody<'_>,
     storage_root: &str,
 ) -> Result<(), PatchError> {
-    in_write(pod, |w| {
-        patch_in(w, base, path, subject, body, storage_root)
-    })
+    patch_if(
+        pod,
+        base,
+        path,
+        subject,
+        body,
+        storage_root,
+        &Preconditions::NONE,
+    )
 }
 
 /// [`patch`] inside the caller's write. A patch mutates, so it needs Write
 /// (Control, on an ACL). A binary has no triples to patch.
+///
+/// `preconditions` is evaluated after the WAC check and before anything is
+/// written, against this transaction's view of the resource, so no other write
+/// can land between the check and this one. Pass `Preconditions::NONE` when not
+/// answering an HTTP request.
 pub fn patch_in(
     w: &mut PodWrite<'_>,
     base: &str,
@@ -752,6 +944,7 @@ pub fn patch_in(
     subject: &Subject,
     body: PatchBody<'_>,
     storage_root: &str,
+    preconditions: &Preconditions,
 ) -> Result<(), PatchError> {
     let resource = format!("{base}{path}");
     if !resource.starts_with(storage_root) {
@@ -760,6 +953,8 @@ pub fn patch_in(
     if !check(&*w, base, path, subject, AccessMode::Write).map_err(PatchError::Ldp)? {
         return Err(PatchError::Ldp(LdpError::Forbidden));
     }
+    let current = w.meta(&resource)?.map(|meta| meta.version);
+    preconditions.check_write(conditional::Method::Patch, current.as_deref())?;
     if w.meta(&resource)?
         .is_some_and(|meta| matches!(meta.kind, Kind::NonRdfSource))
     {

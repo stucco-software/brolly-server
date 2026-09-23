@@ -41,6 +41,9 @@ pub enum PatchError {
     Precondition(String),
     /// A SPARQL Update that would escape the resource's own graph.
     EscapesGraph,
+    /// The request's `If-Match` or `If-None-Match` didn't hold (412). Not
+    /// `Precondition`, which is a `solid:where` that didn't bind (409).
+    NotCurrent,
     Store(String),
     /// Refused by the LDP layer: WAC, the containment rule, a binary target,
     /// or the root.
@@ -58,6 +61,9 @@ impl std::fmt::Display for PatchError {
                 "SPARQL Update may not name a GRAPH or WITH — a PATCH acts on \
                  the resource it addresses"
             ),
+            PatchError::NotCurrent => {
+                write!(f, "the resource is not at the version the request named")
+            }
             PatchError::Store(e) => write!(f, "storage: {e}"),
             PatchError::Ldp(e) => write!(f, "{e}"),
         }
@@ -65,6 +71,12 @@ impl std::fmt::Display for PatchError {
 }
 
 impl std::error::Error for PatchError {}
+
+impl From<crate::conditional::PreconditionFailed> for PatchError {
+    fn from(_: crate::conditional::PreconditionFailed) -> Self {
+        PatchError::NotCurrent
+    }
+}
 
 impl From<StoreError> for PatchError {
     fn from(e: StoreError) -> Self {

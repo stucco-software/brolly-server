@@ -165,6 +165,74 @@ impl Harness {
     }
 }
 
+/// A request with extra headers, as whoever holds `session`, or anonymously.
+fn conditional_request(
+    method: &str,
+    path: &str,
+    body: Option<(&str, &str)>,
+    session: Option<&str>,
+    extra: &[(&str, &str)],
+) -> Request<Body> {
+    let mut builder = Request::builder()
+        .method(method)
+        .uri(path)
+        .header(header::HOST, HOST);
+    if let Some(session) = session {
+        builder = builder.header(header::COOKIE, format!("brolly_session={session}"));
+    }
+    if let Some((content_type, _)) = body {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    for (name, value) in extra {
+        builder = builder.header(*name, *value);
+    }
+    builder
+        .body(body.map_or(Body::empty(), |(_, b)| Body::from(b.to_string())))
+        .unwrap()
+}
+
+/// Send a request. Takes the router by value so a test can `tokio::spawn` it.
+async fn run(
+    router: axum::Router,
+    request: Request<Body>,
+) -> (StatusCode, String, axum::http::HeaderMap) {
+    let response = router.oneshot(request).await.unwrap();
+    let status = response.status();
+    let headers = response.headers().clone();
+    let text = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    (status, text, headers)
+}
+
+impl Harness {
+    /// [`Harness::send`] as the owner, with extra request headers.
+    async fn send_if(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<(&str, &str)>,
+        extra: &[(&str, &str)],
+    ) -> (StatusCode, String, axum::http::HeaderMap) {
+        run(
+            self.router.clone(),
+            conditional_request(method, path, body, Some(self.session.as_str()), extra),
+        )
+        .await
+    }
+
+    /// The `ETag` the owner sees on `path`.
+    async fn etag(&self, path: &str) -> String {
+        let (status, body, headers) = self.send("GET", path, None, true).await;
+        assert_eq!(status, StatusCode::OK, "{path}: {body}");
+        headers
+            .get(header::ETAG)
+            .unwrap_or_else(|| panic!("no ETag on {path}"))
+            .to_str()
+            .unwrap()
+            .to_string()
+    }
+}
+
 const NOTE: &str = r#"<> <https://example.org/title> "Written over HTTP" ."#;
 
 #[tokio::test]
@@ -979,4 +1047,541 @@ async fn wac_allow_on_an_acl_names_nothing_for_bob() {
     let (status, _, headers) = h.send("GET", "/~/shared/.acl", None, true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers["wac-allow"], "user=\"read write append control\"");
+}
+
+// --- conditional requests (stage 5a) -------------------------------------------
+
+const EDITED: &str = r#"<> <https://example.org/title> "Edited" ."#;
+
+#[tokio::test]
+async fn get_and_head_carry_an_etag_and_last_modified() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, _, get) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    let etag = get
+        .get(header::ETAG)
+        .expect("no ETag on GET")
+        .to_str()
+        .unwrap();
+    assert!(
+        etag.len() > 2 && etag.starts_with('"') && etag.ends_with('"'),
+        "a strong tag: {etag}"
+    );
+    let modified = get
+        .get(header::LAST_MODIFIED)
+        .expect("no Last-Modified on GET")
+        .to_str()
+        .unwrap();
+    assert!(modified.ends_with(" GMT"), "an HTTP-date: {modified}");
+
+    // HEAD is GET without the body, so it carries the same validators.
+    let (status, body, head) = h.send("HEAD", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty(), "HEAD sent a body: {body}");
+    assert_eq!(head.get(header::ETAG), get.get(header::ETAG));
+    assert_eq!(
+        head.get(header::LAST_MODIFIED),
+        get.get(header::LAST_MODIFIED)
+    );
+}
+
+/// Every kind has a version: a container (here the root) and a binary too.
+#[tokio::test]
+async fn a_container_and_a_binary_have_an_etag_too() {
+    let h = harness().await;
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+
+    for path in ["/~/", "/~/paper.pdf"] {
+        let (status, _, headers) = h.send("GET", path, None, true).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert!(headers.get(header::ETAG).is_some(), "{path}: no ETag");
+        assert!(
+            headers.get(header::LAST_MODIFIED).is_some(),
+            "{path}: no Last-Modified"
+        );
+    }
+}
+
+/// RFC 9110 §9.3.4: the server transforms what it stores, so a write response
+/// carries no ETag. The version still moves.
+#[tokio::test]
+async fn a_write_response_carries_no_etag_and_the_etag_moves() {
+    let h = harness().await;
+    let (status, _, headers) = h
+        .send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert!(status.is_success(), "{status}");
+    assert!(
+        headers.get(header::ETAG).is_none(),
+        "PUT (create) sent an ETag"
+    );
+    let before = h.etag("/~/note").await;
+
+    let (status, _, headers) = h
+        .send("PUT", "/~/note", Some(("text/turtle", EDITED)), true)
+        .await;
+    assert!(status.is_success(), "{status}");
+    assert!(
+        headers.get(header::ETAG).is_none(),
+        "PUT (replace) sent an ETag"
+    );
+    let after = h.etag("/~/note").await;
+    assert_ne!(after, before, "the ETag didn't change after a PUT");
+
+    let sparql =
+        r#"INSERT DATA { <https://alice.brolly.test/~/note> <https://example.org/tag> "x" }"#;
+    let (status, _, headers) = h
+        .send(
+            "PATCH",
+            "/~/note",
+            Some(("application/sparql-update", sparql)),
+            true,
+        )
+        .await;
+    assert!(status.is_success(), "{status}");
+    assert!(headers.get(header::ETAG).is_none(), "PATCH sent an ETag");
+    assert_ne!(
+        h.etag("/~/note").await,
+        after,
+        "the ETag didn't change after a PATCH"
+    );
+
+    let (status, _, headers) = h
+        .send("POST", "/~/", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert!(status.is_success(), "{status}");
+    assert!(headers.get(header::ETAG).is_none(), "POST sent an ETag");
+}
+
+/// What Solid clients use to create without overwriting.
+#[tokio::test]
+async fn if_none_match_star_creates_but_never_overwrites() {
+    let h = harness().await;
+
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", NOTE)),
+            &[("if-none-match", "*")],
+        )
+        .await;
+    assert!(status.is_success(), "a new resource is created: {status}");
+
+    let before = h.etag("/~/note").await;
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-none-match", "*")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+
+    let (_, body, _) = h.send("GET", "/~/note", None, true).await;
+    assert!(
+        body.contains("Written over HTTP") && !body.contains("Edited"),
+        "the refused PUT landed: {body}"
+    );
+    assert_eq!(
+        h.etag("/~/note").await,
+        before,
+        "a refused PUT moved the version"
+    );
+}
+
+/// What Solid clients use to detect a conflicting edit.
+#[tokio::test]
+async fn if_match_needs_the_current_strong_tag() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let stale = h.etag("/~/note").await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let current = h.etag("/~/note").await;
+    assert_ne!(stale, current);
+
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-match", stale.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "a stale tag");
+    assert_eq!(h.etag("/~/note").await, current, "the refused PUT landed");
+
+    // A weak tag never matches, even with the right opaque value.
+    let weak = format!("W/{current}");
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-match", weak.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "a weak tag");
+    assert_eq!(h.etag("/~/note").await, current, "the refused PUT landed");
+
+    // A list holds if any member matches.
+    let list = format!("{stale}, {current}");
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-match", list.as_str())],
+        )
+        .await;
+    assert!(status.is_success(), "the current tag: {status}");
+    let (_, body, _) = h.send("GET", "/~/note", None, true).await;
+    assert!(body.contains("Edited"), "got: {body}");
+}
+
+#[tokio::test]
+async fn if_match_star_needs_the_resource_to_exist() {
+    let h = harness().await;
+
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/absent",
+            Some(("text/turtle", NOTE)),
+            &[("if-match", "*")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    let (status, _, _) = h.send("GET", "/~/absent", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "the refused PUT created it");
+
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-match", "*")],
+        )
+        .await;
+    assert!(status.is_success(), "{status}");
+}
+
+#[tokio::test]
+async fn if_none_match_with_the_current_tag() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let current = h.etag("/~/note").await;
+
+    // GET and HEAD: 304, with the ETag and no body.
+    for method in ["GET", "HEAD"] {
+        let (status, body, headers) = h
+            .send_if(
+                method,
+                "/~/note",
+                None,
+                &[("if-none-match", current.as_str())],
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED, "{method}");
+        assert_eq!(
+            headers.get(header::ETAG).and_then(|v| v.to_str().ok()),
+            Some(current.as_str()),
+            "{method}: a 304 names the version it confirms"
+        );
+        assert!(body.is_empty(), "{method}: a 304 has no body: {body}");
+    }
+
+    // Another tag is a full response.
+    let (status, body, _) = h
+        .send_if("GET", "/~/note", None, &[("if-none-match", "\"other\"")])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("Written over HTTP"), "got: {body}");
+
+    // PUT and DELETE: 412, and nothing written.
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-none-match", current.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "PUT");
+    let (status, _, _) = h
+        .send_if(
+            "DELETE",
+            "/~/note",
+            None,
+            &[("if-none-match", current.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "DELETE");
+    assert_eq!(h.etag("/~/note").await, current, "a refused write landed");
+}
+
+#[tokio::test]
+async fn patch_and_delete_honour_if_match() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let stale = h.etag("/~/note").await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let current = h.etag("/~/note").await;
+
+    let sparql =
+        r#"INSERT DATA { <https://alice.brolly.test/~/note> <https://example.org/tag> "patched" }"#;
+    let (status, _, _) = h
+        .send_if(
+            "PATCH",
+            "/~/note",
+            Some(("application/sparql-update", sparql)),
+            &[("if-match", stale.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "PATCH, stale");
+    let (_, body, _) = h.send("GET", "/~/note", None, true).await;
+    assert!(
+        !body.contains("patched"),
+        "the refused PATCH landed: {body}"
+    );
+
+    let (status, _, _) = h
+        .send_if(
+            "PATCH",
+            "/~/note",
+            Some(("application/sparql-update", sparql)),
+            &[("if-match", current.as_str())],
+        )
+        .await;
+    assert!(status.is_success(), "PATCH, current: {status}");
+    let patched = h.etag("/~/note").await;
+
+    // `current` is stale now.
+    let (status, _, _) = h
+        .send_if("DELETE", "/~/note", None, &[("if-match", current.as_str())])
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "DELETE, stale");
+    let (status, _, _) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::OK, "the refused DELETE landed");
+
+    let (status, _, _) = h
+        .send_if("DELETE", "/~/note", None, &[("if-match", patched.as_str())])
+        .await;
+    assert!(status.is_success(), "DELETE, current: {status}");
+    let (status, _, _) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// A POST's `If-Match` names the container, the request's target, not the
+/// member it would mint.
+#[tokio::test]
+async fn if_match_on_a_post_is_about_the_container() {
+    let h = harness().await;
+    let (status, _, _) = h
+        .send("PUT", "/~/c/", Some(("text/turtle", "")), true)
+        .await;
+    assert!(status.is_success(), "an empty container: {status}");
+    let stale = h.etag("/~/c/").await;
+
+    // A member moves the container's version (R9).
+    let (status, _, _) = h
+        .send("POST", "/~/c/", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert!(status.is_success(), "{status}");
+    let current = h.etag("/~/c/").await;
+    assert_ne!(stale, current);
+
+    let (status, _, _) = h
+        .send_if(
+            "POST",
+            "/~/c/",
+            Some(("text/turtle", NOTE)),
+            &[("if-match", stale.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+    assert_eq!(
+        h.etag("/~/c/").await,
+        current,
+        "the refused POST added a member"
+    );
+
+    let (status, _, headers) = h
+        .send_if(
+            "POST",
+            "/~/c/",
+            Some(("text/turtle", NOTE)),
+            &[("if-match", current.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert!(headers.get(header::LOCATION).is_some());
+}
+
+/// The ETag is authoritative; dates are ignored.
+#[tokio::test]
+async fn date_preconditions_are_ignored() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    // Honoured, this would be a 304.
+    let (status, _, _) = h
+        .send_if(
+            "GET",
+            "/~/note",
+            None,
+            &[("if-modified-since", "Fri, 01 Jan 2100 00:00:00 GMT")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // Honoured, this would be a 412.
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-unmodified-since", "Mon, 01 Jan 1990 00:00:00 GMT")],
+        )
+        .await;
+    assert!(status.is_success(), "{status}");
+}
+
+/// One disclosure case: the method, a path that exists, a path that doesn't,
+/// the body to send, and the conditional header.
+type DisclosureCase = (
+    &'static str,
+    &'static str,
+    &'static str,
+    Option<(&'static str, &'static str)>,
+    (&'static str, &'static str),
+);
+
+/// A caller without the mode a method needs gets the same answer whether or
+/// not the resource exists. The precondition is evaluated after authorisation,
+/// so it can't become an existence oracle.
+#[tokio::test]
+async fn a_caller_without_the_mode_learns_nothing_from_a_precondition() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    h.send("PUT", "/~/c/", Some(("text/turtle", "")), true)
+        .await;
+    // Bob holds no grant anywhere in Alice's pod.
+    let bob = member_session(&h, "bob").await;
+
+    let turtle = Some(("text/turtle", NOTE));
+    let sparql = Some((
+        "application/sparql-update",
+        r#"INSERT DATA { <https://alice.brolly.test/~/note> <https://example.org/tag> "bob" }"#,
+    ));
+    let cases: [DisclosureCase; 8] = [
+        (
+            "PUT",
+            "/~/note",
+            "/~/absent",
+            turtle,
+            ("if-none-match", "*"),
+        ),
+        ("PUT", "/~/note", "/~/absent", turtle, ("if-match", "*")),
+        (
+            "PUT",
+            "/~/note",
+            "/~/absent",
+            turtle,
+            ("if-match", "\"stale\""),
+        ),
+        ("PATCH", "/~/note", "/~/absent", sparql, ("if-match", "*")),
+        (
+            "PATCH",
+            "/~/note",
+            "/~/absent",
+            sparql,
+            ("if-none-match", "*"),
+        ),
+        (
+            "DELETE",
+            "/~/note",
+            "/~/absent",
+            None,
+            ("if-match", "\"stale\""),
+        ),
+        ("POST", "/~/c/", "/~/absent/", turtle, ("if-match", "*")),
+        ("GET", "/~/note", "/~/absent", None, ("if-none-match", "*")),
+    ];
+
+    for (method, existing, missing, body, condition) in cases {
+        let (on_existing, _, _) = run(
+            h.router.clone(),
+            conditional_request(method, existing, body, Some(bob.as_str()), &[condition]),
+        )
+        .await;
+        let (on_missing, _, _) = run(
+            h.router.clone(),
+            conditional_request(method, missing, body, Some(bob.as_str()), &[condition]),
+        )
+        .await;
+        assert_eq!(
+            on_existing, on_missing,
+            "{method} {condition:?}: the answer depends on existence"
+        );
+        assert!(
+            !on_existing.is_success()
+                && on_existing != StatusCode::PRECONDITION_FAILED
+                && on_existing != StatusCode::NOT_MODIFIED,
+            "{method} {condition:?}: got {on_existing}, not a refusal"
+        );
+    }
+
+    let (_, body, _) = h.send("GET", "/~/note", None, true).await;
+    assert!(!body.contains("bob"), "a refused write landed: {body}");
+    let (status, _, _) = h.send("GET", "/~/absent", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a refused write created it");
+}
+
+/// The lost-update case `If-Match` exists for. The check and the write are one
+/// `Pod::write`, under the pod's lock, so two writers holding the same tag
+/// can't both pass. Spawned, so they run on different worker threads.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn of_two_concurrent_puts_with_one_if_match_exactly_one_lands() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    for round in 0..8 {
+        let tag = h.etag("/~/note").await;
+        let spawn = |writer: &str| {
+            let body = format!("<> <https://example.org/writer> \"{writer}-{round}\" .");
+            let request = conditional_request(
+                "PUT",
+                "/~/note",
+                Some(("text/turtle", body.as_str())),
+                Some(h.session.as_str()),
+                &[("if-match", tag.as_str())],
+            );
+            tokio::spawn(run(h.router.clone(), request))
+        };
+        let (a, b) = (spawn("a"), spawn("b"));
+        let (a, b) = (a.await.unwrap().0, b.await.unwrap().0);
+
+        let landed = [a, b].iter().filter(|s| s.is_success()).count();
+        assert_eq!(landed, 1, "round {round}: {a} and {b}");
+        assert!(
+            [a, b].contains(&StatusCode::PRECONDITION_FAILED),
+            "round {round}: {a} and {b}"
+        );
+    }
 }

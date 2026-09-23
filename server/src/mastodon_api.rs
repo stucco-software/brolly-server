@@ -547,12 +547,21 @@ pub async fn upload_media(
         let body = brolly_solid::ldp::prepare(blobs.as_ref(), &bytes, &media_type)
             .map_err(|e| StoreError::Backend(e.to_string()))?;
         pod.write(|w| {
-            brolly_solid::ldp::put_in(w, &base, &path, &subject, &body, &root).map_err(
-                |e| match e {
-                    brolly_solid::ldp::LdpError::BlobMissing => StoreError::BlobMissing,
-                    e => StoreError::Backend(e.to_string()),
-                },
-            )?;
+            // Not an HTTP precondition: this upload is a Mastodon call, not an
+            // LDP one.
+            brolly_solid::ldp::put_in(
+                w,
+                &base,
+                &path,
+                &subject,
+                &body,
+                &root,
+                &brolly_solid::conditional::Preconditions::NONE,
+            )
+            .map_err(|e| match e {
+                brolly_solid::ldp::LdpError::BlobMissing => StoreError::BlobMissing,
+                e => StoreError::Backend(e.to_string()),
+            })?;
             if let Some(text) = alt {
                 w.set_description(&iri, &[alt_text_quad(&iri, text)])?;
             }

@@ -9,6 +9,7 @@
 
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+pub mod conditional;
 pub mod ldp;
 pub mod oidc;
 pub mod patch;
