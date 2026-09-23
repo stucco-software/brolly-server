@@ -30,6 +30,6 @@ pub use manager::{StoreError, StoreManager};
 /// this crate.
 pub use oxigraph::store::Store;
 pub use resources::{
-    BlobMeta, Content, Kind, LegacyWriter, METADATA_GRAPH, Pod, PodRead, PodWrite, ReadStore,
-    ResourceMeta, ResourceRead,
+    BlobMeta, Content, Kind, METADATA_GRAPH, Pod, PodRead, PodWrite, ReadStore, ResourceMeta,
+    ResourceRead,
 };

@@ -4,12 +4,16 @@
 //! joins at all". These assert it actually works, not just that it renders.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::sync::{Arc, Mutex};
+
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use brolly_identity::db;
 use brolly_server::{AppState, app};
+use brolly_store::resources::{Kind, PodRead};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
+use tracing_subscriber::layer::SubscriberExt;
 
 async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
     let db = brolly_test_support::postgres().await;
@@ -131,6 +135,50 @@ async fn register_alice(db: &brolly_test_support::TestDb, router: &axum::Router)
         .next()
         .unwrap()
         .to_string()
+}
+
+/// Every `error` event emitted on this thread while it's installed, as text.
+///
+/// `#[tokio::test]` runs the test and the handlers it drives on one thread, so
+/// a thread-local subscriber sees everything registration logs.
+struct ErrorLog {
+    events: Arc<Mutex<Vec<String>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl ErrorLog {
+    fn install() -> Self {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = tracing_subscriber::registry().with(Collect(Arc::clone(&events)));
+        Self {
+            events,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    fn take(&self) -> Vec<String> {
+        std::mem::take(&mut *self.events.lock().unwrap())
+    }
+}
+
+struct Collect(Arc<Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Collect {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if *event.metadata().level() == tracing::Level::ERROR {
+            let mut text = event.metadata().target().to_string();
+            event.record(&mut Fields(&mut text));
+            self.0.lock().unwrap().push(text);
+        }
+    }
+}
+
+struct Fields<'a>(&'a mut String);
+
+impl tracing::field::Visit for Fields<'_> {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        self.0.push_str(&format!(" {}={value:?}", field.name()));
+    }
 }
 
 #[tokio::test]
@@ -448,6 +496,52 @@ async fn registering_provisions_a_pod_the_member_can_write_to() {
         response.status(),
         StatusCode::NO_CONTENT,
         "a newly registered member cannot write to their own pod"
+    );
+}
+
+/// Stage 5a: registration opens a brand-new pod, which the upgrade marks
+/// current on the spot, and provisioning records its root and root ACL in the
+/// pod's metadata. None of that is an error.
+///
+/// Reopening the pod is what shows it's at layout 2. An unmarked pod would be
+/// upgraded again, find no old-layout root (provisioning never writes one), and
+/// log at `error`.
+#[tokio::test]
+async fn a_new_registrations_pod_starts_on_the_current_layout() {
+    let errors = ErrorLog::install();
+    let (db, dir, router) = harness().await;
+    register_alice(&db, &router).await;
+    let alice = db::find_by_username(&db.pool, "alice")
+        .await
+        .unwrap()
+        .expect("registration created alice");
+
+    // Close every store the server holds, so the pod is opened afresh.
+    drop(router);
+    let stores = brolly_store::StoreManager::open(dir.path(), 4, 60).expect("reopen the stores");
+    let pod = stores.pod(alice.id).expect("reopen alice's pod");
+
+    let root = pod
+        .read(|r| r.meta("https://alice.brolly.test/~/"))
+        .unwrap()
+        .expect("provisioning recorded the storage root");
+    assert!(
+        matches!(root.kind, Kind::Container),
+        "the root is a container"
+    );
+    let acl = pod
+        .read(|r| r.meta("https://alice.brolly.test/~/.acl"))
+        .unwrap()
+        .expect("the root ACL is a resource");
+    assert!(
+        matches!(acl.kind, Kind::Auxiliary),
+        "the root ACL is auxiliary"
+    );
+
+    assert_eq!(
+        errors.take(),
+        Vec::<String>::new(),
+        "registering or reopening the pod logged an error"
     );
 }
 

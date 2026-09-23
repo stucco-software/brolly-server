@@ -6,12 +6,12 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use brolly_authz::AccessMode;
+use brolly_domain::vocab;
 use brolly_identity::{Scope, Subject, Via};
 use brolly_solid::ldp::{self, LdpError};
-use brolly_solid::storage;
 use brolly_store::StoreManager;
-use brolly_store::resources::Pod;
-use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use brolly_store::resources::{Content, Kind, Pod, PodRead, ResourceMeta};
+use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 use uuid::Uuid;
 
 const BASE: &str = "https://alice.brolly.id";
@@ -19,13 +19,37 @@ const ROOT: &str = "https://alice.brolly.id/~/";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
 const FOAF: &str = "http://xmlns.com/foaf/0.1/";
 
-/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
-/// so it doesn't depend on the code under test.
-fn seed(target: &Pod, quads: &[Quad]) {
-    let store = target.raw_store();
-    for quad in quads {
-        store.insert(quad).unwrap();
-    }
+/// Add `quads` to the ACL at `acl`, recording it as an auxiliary resource if
+/// it's new. Metadata is what makes an ACL exist, so a raw seed isn't enough.
+/// Goes through the pod, not through `ldp`, so the setup doesn't depend on the
+/// code under test.
+fn grant(pod: &Pod, acl: &str, quads: &[Quad]) {
+    pod.write(|w| {
+        let mut all = w
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(n(acl).as_ref())),
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        all.extend_from_slice(quads);
+        w.put(acl, Content::Auxiliary(&all))?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// What the metadata records about `resource`: `Some` is existence.
+fn meta(pod: &Pod, resource: &str) -> Option<ResourceMeta> {
+    pod.read(|r| r.meta(resource)).unwrap()
+}
+
+/// A container's members, sorted, from metadata.
+fn members(pod: &Pod, container: &str) -> Vec<String> {
+    let mut members = pod.write(|w| w.members(container)).unwrap();
+    members.sort();
+    members
 }
 
 fn n(s: &str) -> NamedNode {
@@ -76,27 +100,27 @@ fn pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let dir = tempfile::tempdir().unwrap();
     let mgr = StoreManager::open(dir.path(), 4, 60).unwrap();
     let store = mgr.pod(Uuid::new_v4()).unwrap();
-
-    store
-        .write(|w| storage::init_storage_root(w, ROOT))
-        .unwrap();
+    store.write(|w| w.create_root(ROOT)).unwrap();
 
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    let quads = vec![
-        t(&g, &a, &format!("{ACL}default"), ROOT),
-        t(&g, &a, &format!("{ACL}accessTo"), ROOT),
-        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
-        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
-        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Control")),
-        t(
-            &g,
-            &a,
-            &format!("{ACL}agent"),
-            "https://alice.brolly.id/profile#me",
-        ),
-    ];
-    seed(&store, &quads);
+    grant(
+        &store,
+        &g,
+        &[
+            t(&g, &a, &format!("{ACL}default"), ROOT),
+            t(&g, &a, &format!("{ACL}accessTo"), ROOT),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Control")),
+            t(
+                &g,
+                &a,
+                &format!("{ACL}agent"),
+                "https://alice.brolly.id/profile#me",
+            ),
+        ],
+    );
     (mgr, dir, store)
 }
 
@@ -142,7 +166,7 @@ fn rdf_xml_is_refused_on_write_and_not_stored_as_a_blob() {
 
     assert!(matches!(err, LdpError::Syntax(_)), "got {err:?}");
     assert!(
-        !storage::exists(&store.read_store(), &format!("{ROOT}note")),
+        meta(&store, &format!("{ROOT}note")).is_none(),
         "a refused write must not leave a resource behind"
     );
 }
@@ -256,10 +280,10 @@ fn a_body_cannot_write_into_another_resources_graph() {
     .unwrap();
 
     assert!(
-        !storage::exists(&store.read_store(), &format!("{ROOT}other")),
+        meta(&store, &format!("{ROOT}other")).is_none(),
         "a PUT must only write its own named graph"
     );
-    assert!(storage::exists(&store.read_store(), &format!("{ROOT}note")));
+    assert!(meta(&store, &format!("{ROOT}note")).is_some());
 }
 
 #[test]
@@ -277,15 +301,9 @@ fn containment_is_maintained_up_the_tree() {
     )
     .unwrap();
 
-    assert!(
-        storage::members(&store.read_store(), &format!("{ROOT}a/b/"))
-            .contains(&format!("{ROOT}a/b/c"))
-    );
-    assert!(
-        storage::members(&store.read_store(), &format!("{ROOT}a/"))
-            .contains(&format!("{ROOT}a/b/"))
-    );
-    assert!(storage::members(&store.read_store(), ROOT).contains(&format!("{ROOT}a/")));
+    assert!(members(&store, &format!("{ROOT}a/b/")).contains(&format!("{ROOT}a/b/c")));
+    assert!(members(&store, &format!("{ROOT}a/")).contains(&format!("{ROOT}a/b/")));
+    assert!(members(&store, ROOT).contains(&format!("{ROOT}a/")));
 }
 
 #[test]
@@ -304,7 +322,7 @@ fn posting_to_a_container_mints_a_member() {
     .unwrap();
 
     assert!(created.starts_with(ROOT));
-    assert!(storage::members(&store.read_store(), ROOT).contains(&created));
+    assert!(members(&store, ROOT).contains(&created));
 }
 
 #[test]
@@ -321,14 +339,11 @@ fn delete_removes_the_resource_and_its_containment() {
         ROOT,
     )
     .unwrap();
-    assert!(storage::exists(&store.read_store(), &format!("{ROOT}note")));
+    assert!(meta(&store, &format!("{ROOT}note")).is_some());
 
-    ldp::delete(&store, None, BASE, "/~/note", &alice(), ROOT).unwrap();
-    assert!(!storage::exists(
-        &store.read_store(),
-        &format!("{ROOT}note")
-    ));
-    assert!(!storage::members(&store.read_store(), ROOT).contains(&format!("{ROOT}note")));
+    ldp::delete(&store, BASE, "/~/note", &alice(), ROOT).unwrap();
+    assert!(meta(&store, &format!("{ROOT}note")).is_none());
+    assert!(!members(&store, ROOT).contains(&format!("{ROOT}note")));
 }
 
 #[test]
@@ -346,7 +361,7 @@ fn a_non_empty_container_cannot_be_deleted() {
     )
     .unwrap();
 
-    let err = ldp::delete(&store, None, BASE, "/~/a/", &alice(), ROOT).unwrap_err();
+    let err = ldp::delete(&store, BASE, "/~/a/", &alice(), ROOT).unwrap_err();
     assert!(
         matches!(err, LdpError::Forbidden),
         "deleting a populated container would orphan its subtree"
@@ -360,8 +375,9 @@ fn append_permission_does_not_confer_replace() {
     // Bob gets Append on the root, and nothing else.
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#bob");
-    seed(
+    grant(
         &store,
+        &g,
         &[
             t(&g, &a, &format!("{ACL}default"), ROOT),
             t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Append")),
@@ -431,8 +447,9 @@ fn public_read_works_for_anonymous_callers() {
 
     let g = format!("{ROOT}public.acl");
     let a = format!("{g}#public");
-    seed(
+    grant(
         &store,
+        &g,
         &[
             t(&g, &a, &format!("{ACL}accessTo"), &format!("{ROOT}public")),
             t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
@@ -454,4 +471,229 @@ fn the_storage_root_is_typed_as_a_pod_root() {
     assert!(out.is_container);
     assert!(body.contains("pim/space#Storage"), "got: {body}");
     assert!(body.contains("ldp#BasicContainer"), "got: {body}");
+}
+
+// --- stage 5a: server-managed metadata ---------------------------------------
+
+/// Every quad in one resource's own graph, through the pod.
+fn own_graph(pod: &Pod, resource: &str) -> Vec<Quad> {
+    pod.read_store()
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(n(resource).as_ref())),
+        )
+        .map(Result::unwrap)
+        .collect()
+}
+
+fn put_turtle(store: &Pod, path: &str, body: &[u8]) -> Result<(), LdpError> {
+    ldp::put(store, None, BASE, path, &alice(), body, "text/turtle", ROOT)
+}
+
+fn ntriples(store: &Pod, path: &str) -> String {
+    let out = ldp::read(
+        store,
+        None,
+        BASE,
+        path,
+        &alice(),
+        Some("application/n-triples"),
+    )
+    .unwrap();
+    String::from_utf8(out.body).unwrap()
+}
+
+#[test]
+fn an_empty_document_exists() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/empty", b"").unwrap();
+
+    assert!(
+        ntriples(&store, "/~/empty").trim().is_empty(),
+        "GET is 200, and empty"
+    );
+    assert!(matches!(
+        meta(&store, &format!("{ROOT}empty")).unwrap().kind,
+        Kind::RdfSource
+    ));
+    assert!(members(&store, ROOT).contains(&format!("{ROOT}empty")));
+
+    // It can be deleted, so its listing can be removed too.
+    ldp::delete(&store, BASE, "/~/empty", &alice(), ROOT).unwrap();
+    assert!(!members(&store, ROOT).contains(&format!("{ROOT}empty")));
+}
+
+#[test]
+fn an_empty_container_has_its_types_and_no_members() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/", b"").unwrap();
+
+    let body = ntriples(&store, "/~/c/");
+    assert!(body.contains("ldp#BasicContainer"), "{body}");
+    assert!(body.contains("ldp#Container>"), "{body}");
+    assert!(body.contains("ldp#Resource"), "{body}");
+    assert!(!body.contains("ldp#contains"), "{body}");
+    assert!(
+        !body.contains("space#Storage"),
+        "only the root is a pim:Storage: {body}"
+    );
+    assert!(matches!(
+        meta(&store, &format!("{ROOT}c/")).unwrap().kind,
+        Kind::Container
+    ));
+}
+
+#[test]
+fn a_container_put_with_an_extra_triple_keeps_its_members() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    put_turtle(&store, "/~/c/", br#"<> <https://example.org/title> "C" ."#).unwrap();
+
+    assert_eq!(
+        members(&store, &format!("{ROOT}c/")),
+        vec![format!("{ROOT}c/m")]
+    );
+    let body = ntriples(&store, "/~/c/");
+    assert!(body.contains("\"C\""), "{body}");
+    assert!(body.contains(&format!("<{ROOT}c/m>")), "{body}");
+}
+
+#[test]
+fn a_container_put_naming_a_non_member_is_a_containment_change() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    let body = format!(
+        "<> <{}> <{ROOT}c/m>, <{ROOT}c/ghost> .",
+        vocab::LDP_CONTAINS
+    );
+
+    let err = put_turtle(&store, "/~/c/", body.as_bytes()).unwrap_err();
+    assert!(matches!(err, LdpError::ContainmentChange), "got {err:?}");
+    assert_eq!(
+        members(&store, &format!("{ROOT}c/")),
+        vec![format!("{ROOT}c/m")]
+    );
+    assert!(
+        meta(&store, &format!("{ROOT}c/ghost")).is_none(),
+        "a member was invented"
+    );
+}
+
+#[test]
+fn a_container_put_echoing_its_listing_succeeds() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    let got = ldp::read(&store, None, BASE, "/~/c/", &alice(), Some("text/turtle")).unwrap();
+
+    put_turtle(&store, "/~/c/", &got.body).unwrap();
+
+    assert_eq!(
+        members(&store, &format!("{ROOT}c/")),
+        vec![format!("{ROOT}c/m")]
+    );
+    let own = own_graph(&store, &format!("{ROOT}c/"));
+    assert!(
+        own.is_empty(),
+        "the echoed types and containment are the server's, not stored: {own:?}"
+    );
+}
+
+#[test]
+fn a_container_put_with_a_non_rdf_body_is_not_rdf() {
+    let (_m, _d, store) = pod();
+    let err = ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/c/",
+        &alice(),
+        b"\x89PNG",
+        "image/png",
+        ROOT,
+    )
+    .unwrap_err();
+    assert!(matches!(err, LdpError::NotRdf), "got {err:?}");
+    assert!(meta(&store, &format!("{ROOT}c/")).is_none());
+}
+
+#[test]
+fn an_ordinary_document_serves_containment_and_digest_triples_as_data() {
+    let (_m, _d, store) = pod();
+    let digest = "ab".repeat(32);
+    let body = format!(
+        "<> <{}> <{ROOT}secret> ;\n   <{}> \"{digest}\" .",
+        vocab::LDP_CONTAINS,
+        vocab::BROLLY_BLOB_DIGEST
+    );
+    put_turtle(&store, "/~/doc", body.as_bytes()).unwrap();
+
+    let served = ntriples(&store, "/~/doc");
+    assert!(served.contains("ldp#contains"), "{served}");
+    assert!(served.contains(&digest), "{served}");
+    assert!(matches!(
+        meta(&store, &format!("{ROOT}doc")).unwrap().kind,
+        Kind::RdfSource
+    ));
+    assert!(ldp::blob_digest(&store, &format!("{ROOT}doc")).is_none());
+    assert!(
+        meta(&store, &format!("{ROOT}secret")).is_none(),
+        "inert data made a member"
+    );
+    assert_eq!(members(&store, ROOT), vec![format!("{ROOT}doc")]);
+}
+
+#[test]
+fn a_patch_that_creates_a_resource_lists_it() {
+    let (_m, _d, store) = pod();
+    let update = format!(r#"INSERT DATA {{ <{ROOT}made/new> <https://example.org/title> "x" }}"#);
+    ldp::patch(
+        &store,
+        BASE,
+        "/~/made/new",
+        &alice(),
+        ldp::PatchBody::SparqlUpdate(&update),
+        ROOT,
+    )
+    .unwrap();
+
+    assert_eq!(
+        members(&store, &format!("{ROOT}made/")),
+        vec![format!("{ROOT}made/new")]
+    );
+    assert!(members(&store, ROOT).contains(&format!("{ROOT}made/")));
+    assert!(matches!(
+        meta(&store, &format!("{ROOT}made/new")).unwrap().kind,
+        Kind::RdfSource
+    ));
+}
+
+#[test]
+fn a_container_with_members_cannot_be_emptied_by_put_and_then_deleted() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+
+    // Before 5a this PUT wiped the listing, and the DELETE then removed the
+    // container over a live member.
+    put_turtle(&store, "/~/c/", b"").unwrap();
+    assert_eq!(
+        members(&store, &format!("{ROOT}c/")),
+        vec![format!("{ROOT}c/m")]
+    );
+    assert!(matches!(
+        ldp::delete(&store, BASE, "/~/c/", &alice(), ROOT),
+        Err(LdpError::Forbidden)
+    ));
+    assert!(ldp::read(&store, None, BASE, "/~/c/m", &alice(), None).is_ok());
+}
+
+#[test]
+fn the_storage_root_cannot_be_deleted() {
+    let (_m, _d, store) = pod();
+    assert!(matches!(
+        ldp::delete(&store, BASE, "/~/", &alice(), ROOT),
+        Err(LdpError::Forbidden)
+    ));
+    assert!(meta(&store, ROOT).is_some());
 }

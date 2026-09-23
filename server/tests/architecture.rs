@@ -91,6 +91,34 @@ fn source_files() -> Vec<PathBuf> {
     out
 }
 
+/// Every `.rs` file in the workspace, wherever it sits: `src/`, `tests/`,
+/// `benches/`, `examples/`. `target/` is build output and the spike is
+/// throwaway.
+fn rust_files() -> Vec<PathBuf> {
+    fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                if path
+                    .file_name()
+                    .is_some_and(|n| n == "target" || n == "spikes" || n == ".git")
+                {
+                    continue;
+                }
+                walk(&path, out);
+            } else if path.extension().is_some_and(|e| e == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&workspace_root(), &mut out);
+    out
+}
+
 #[test]
 fn domain_has_no_internal_dependencies() {
     let deps = internal_deps();
@@ -233,9 +261,9 @@ fn app_is_defined_only_in_the_server_crate() {
 /// Postgres with a backfill job. When a projection is allowed to write, the
 /// thing it writes becomes a second source of truth that nothing can retire.
 ///
-/// A pure lint rather than a type-level guarantee. Writes need a `PodWrite`,
-/// which only `Pod::write` hands out, so a `.write(|` call is what to look
-/// for, alongside the index writers and raw oxigraph calls.
+/// A lint as well as the type system. Pod writes need a `PodWrite`, reached
+/// only through `Pod::write`, so the lint looks for those names alongside the
+/// store's own write functions and the raw oxigraph calls.
 #[test]
 fn the_mastodon_crate_never_writes_to_a_store() {
     /// Every mutation entry point in `brolly-store`, plus the raw oxigraph
@@ -250,9 +278,9 @@ fn the_mastodon_crate_never_writes_to_a_store() {
         "record_note",
         "forget_note",
         "index::clear",
-        // The pod handle's only way in, and its escape hatches.
+        // A pod write (stage 5a), and the raw escape hatch.
+        "PodWrite",
         ".write(|",
-        "legacy_under_root",
         "raw_store",
         // Raw oxigraph, which would sidestep canonicalization entirely.
         ".insert(",
@@ -298,5 +326,59 @@ fn the_mastodon_crate_never_writes_to_a_store() {
          It is a projection: read from pods and the index, return JSON, own \
          nothing. If a Mastodon read needs data that does not exist yet, the \
          write belongs in the adapter that owns it — see plan §3 Phase 6."
+    );
+}
+
+/// The metadata graph has one owner: `store/src/resources.rs`.
+///
+/// Stage 5a keeps existence, containment, versions and blob pointers in
+/// `urn:brolly:resources`, where no client write can reach them. Code that
+/// named the graph could read or write it around `PodWrite`, and the metadata
+/// would stop being true. Everything else asks `resources`.
+#[test]
+fn only_resources_names_the_metadata_graph() {
+    const GRAPH: &str = "urn:brolly:resources";
+    let owner = workspace_root().join("store/src/resources.rs");
+    assert!(
+        std::fs::read_to_string(&owner).is_ok_and(|text| text.contains(GRAPH)),
+        "{} no longer names {GRAPH}; this rule would pass vacuously",
+        owner.display()
+    );
+
+    let offenders: Vec<_> = source_files()
+        .into_iter()
+        .filter(|p| *p != owner && !p.to_string_lossy().contains("/spikes/"))
+        .filter(|p| std::fs::read_to_string(p).is_ok_and(|text| text.contains(GRAPH)))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "{GRAPH} is named outside store/src/resources.rs in {offenders:?}. \
+         Read and write resource metadata through Pod, PodWrite and \
+         ResourceRead instead."
+    );
+}
+
+/// `Pod::raw_store` hands out the bare `Store`: no lock, no metadata. It exists
+/// so tests can build old-layout pods. Anywhere else it's the bypass stage 5a
+/// closed, so it may appear only in test and bench code, and in `store`'s own
+/// source where it's defined.
+#[test]
+fn raw_store_is_reached_only_from_tests() {
+    let store_src = workspace_root().join("store/src");
+    let offenders: Vec<_> = rust_files()
+        .into_iter()
+        .filter(|p| !p.starts_with(&store_src))
+        .filter(|p| {
+            !p.components()
+                .any(|c| c.as_os_str() == "tests" || c.as_os_str() == "benches")
+        })
+        .filter(|p| std::fs::read_to_string(p).is_ok_and(|text| text.contains("raw_store")))
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "raw_store is used outside test code in {offenders:?}. Write through \
+         Pod::write, which keeps the metadata true."
     );
 }

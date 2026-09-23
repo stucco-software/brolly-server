@@ -90,30 +90,42 @@ fn the_outside_root_methods_refuse_the_metadata_graph() {
             "{method}: {result:?}"
         );
     }
-    assert!(graph(&pod.read_store(), METADATA_GRAPH).is_empty());
+    // A new pod's metadata holds its layout mark, and nothing forged.
+    assert!(!graph(&pod.read_store(), METADATA_GRAPH).contains(&forged));
 }
 
+/// `inbox` decides per IRI which family of methods to use, so it needs the
+/// same test `put` and the outside-root methods apply, and they must agree.
 #[test]
-fn the_legacy_writer_writes_without_metadata_and_never_into_it() {
-    // Rollout commit 1 only: today's behaviour for resources under the root.
+fn under_root_is_the_test_put_and_the_outside_root_methods_apply() {
     let (_dir, stores) = manager(60);
     let pod = stores.pod(Uuid::new_v4()).unwrap();
-    let old = "https://alice.brolly.test/~/old";
+    let root = "https://alice.brolly.test/~/";
+    let note = "https://alice.brolly.test/~/notes/1";
+    let foreign = "https://bob.brolly.test/~/notes/1";
 
-    pod.write(|w| w.legacy_under_root().insert(&[says(old, "raw")]))
-        .unwrap();
-    let read = pod.read_store();
-    assert_eq!(said(&read, old).as_deref(), Some("raw"));
-    assert!(read.meta(old).unwrap().is_none());
+    pod.write(|w| {
+        assert!(
+            !w.under_root(note)?,
+            "a pod with no root has nothing under it"
+        );
+        w.create_root(root)?;
+        assert!(w.under_root(note)?);
+        assert!(w.under_root(root)?);
+        assert!(!w.under_root("https://alice.brolly.test/inbox")?);
+        assert!(!w.under_root(foreign)?);
 
-    let result = pod.write(|w| {
-        w.legacy_under_root()
-            .insert(&[says(METADATA_GRAPH, "forged")])
-    });
-    assert!(
-        matches!(result, Err(StoreError::UnderRoot)),
-        "got {result:?}"
-    );
+        assert!(matches!(
+            w.replace_graph(note, &[]),
+            Err(StoreError::UnderRoot)
+        ));
+        assert!(matches!(
+            w.put(foreign, Content::Rdf(&[])),
+            Err(StoreError::NotUnderRoot)
+        ));
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
@@ -981,4 +993,57 @@ fn modified_moves_past_a_stored_time_oxigraph_shortened() {
 
     let next = pod.write(|w| w.put(&at("doc"), Content::Rdf(&[]))).unwrap();
     assert_eq!(next.modified, "2999-01-01T00:00:00.751Z");
+}
+
+// --- large containers --------------------------------------------------------------
+
+/// A container's record is read and rewritten by the predicates it holds, not
+/// by everything about the container. Its `ldp:contains` triples aren't part
+/// of the record, so reading its metadata and putting one more member leaves
+/// every other member listed, whatever the container's size.
+#[test]
+fn a_put_into_a_large_container_keeps_every_member() {
+    let (_dir, stores) = manager(60);
+    let pod = stores.pod(Uuid::new_v4()).unwrap();
+    let root = "https://alice.brolly.test/~/";
+    let folder = format!("{root}big/");
+    let member = |i: usize| format!("{folder}m{i:04}");
+    const MEMBERS: usize = 500;
+
+    pod.write(|w| {
+        w.create_root(root)?;
+        for i in 0..MEMBERS {
+            w.put(&member(i), Content::Rdf(&[says(&member(i), "hi")]))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+
+    let before = pod.read(|r| r.meta(&folder)).unwrap().unwrap();
+    assert_eq!(before.kind, Kind::Container);
+    assert!(before.blob.is_none());
+
+    let last = member(MEMBERS);
+    pod.write(|w| w.put(&last, Content::Rdf(&[])).map(|_| ()))
+        .unwrap();
+
+    let after = pod.read(|r| r.meta(&folder)).unwrap().unwrap();
+    assert_eq!(after.kind, Kind::Container);
+    assert_ne!(after.version, before.version, "the parent's version moves");
+    let members = pod.read(|r| r.members(&folder)).unwrap();
+    let expected: Vec<String> = (0..=MEMBERS).map(member).collect();
+    assert_eq!(members, expected);
+
+    // Re-putting and appending to the container rewrite its record, and keep
+    // its members too.
+    pod.write(|w| {
+        w.put(&folder, Content::Container(&[says(&folder, "a folder")]))?;
+        w.append(&folder, &[says(&folder, "still")])
+    })
+    .unwrap();
+    assert_eq!(pod.read(|r| r.members(&folder)).unwrap(), expected);
+    assert_eq!(
+        pod.read(|r| r.meta(&folder)).unwrap().unwrap().kind,
+        Kind::Container
+    );
 }

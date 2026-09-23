@@ -19,6 +19,7 @@ use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use uuid::Uuid;
 
 const BASE: &str = "https://alice.brolly.id";
+const ROOT: &str = "https://alice.brolly.id/~/";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
 const FOAF: &str = "http://xmlns.com/foaf/0.1/";
 const VCARD: &str = "http://www.w3.org/2006/vcard/ns#";
@@ -72,118 +73,106 @@ fn surface_allows(
     authorize(store, &acl, agent, mode).expect("authorize")
 }
 
-/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
-/// so it doesn't depend on the code under test.
-fn seed(target: &Pod, quads: &[Quad]) {
-    let store = target.raw_store();
-    for quad in quads {
-        store.insert(quad).unwrap();
-    }
-}
-
 fn fixture() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let dir = tempfile::tempdir().expect("tempdir");
     let mgr = StoreManager::open(dir.path(), 4, 60).expect("manager");
     let store = mgr.pod(Uuid::new_v4()).expect("pod");
 
-    let mut quads = Vec::new();
+    let authorization = |g: &str, fragment: &str, pairs: &[(&str, String)]| -> Vec<Quad> {
+        let a = format!("{g}#{fragment}");
+        pairs
+            .iter()
+            .map(|(p, o)| t(g, &a, &format!("{ACL}{p}"), o))
+            .collect()
+    };
+    let mut acls: Vec<(String, Vec<Quad>)> = Vec::new();
 
-    // /public.acl — public read.
-    let g = format!("{BASE}/public.acl");
-    let a = format!("{g}#public");
-    quads.push(t(
+    // /~/public.acl — public read.
+    let g = format!("{ROOT}public.acl");
+    let quads = authorization(
         &g,
-        &a,
-        &format!("{ACL}accessTo"),
-        &format!("{BASE}/public"),
-    ));
-    quads.push(t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")));
-    quads.push(t(
-        &g,
-        &a,
-        &format!("{ACL}agentClass"),
-        &format!("{FOAF}Agent"),
-    ));
+        "public",
+        &[
+            ("accessTo", format!("{ROOT}public")),
+            ("mode", format!("{ACL}Read")),
+            ("agentClass", format!("{FOAF}Agent")),
+        ],
+    );
+    acls.push((g, quads));
 
-    // /members.acl — any authenticated agent may read.
-    let g = format!("{BASE}/members.acl");
-    let a = format!("{g}#members");
-    quads.push(t(
+    // /~/members.acl — any authenticated agent may read.
+    let g = format!("{ROOT}members.acl");
+    let quads = authorization(
         &g,
-        &a,
-        &format!("{ACL}accessTo"),
-        &format!("{BASE}/members"),
-    ));
-    quads.push(t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")));
-    quads.push(t(
-        &g,
-        &a,
-        &format!("{ACL}agentClass"),
-        &format!("{ACL}AuthenticatedAgent"),
-    ));
+        "members",
+        &[
+            ("accessTo", format!("{ROOT}members")),
+            ("mode", format!("{ACL}Read")),
+            ("agentClass", format!("{ACL}AuthenticatedAgent")),
+        ],
+    );
+    acls.push((g, quads));
 
-    // /bob-only.acl — one specific WebID, read + write.
-    let g = format!("{BASE}/bob-only.acl");
-    let a = format!("{g}#bob");
-    quads.push(t(
+    // /~/bob-only.acl — one specific WebID, read + write.
+    let g = format!("{ROOT}bob-only.acl");
+    let quads = authorization(
         &g,
-        &a,
-        &format!("{ACL}accessTo"),
-        &format!("{BASE}/bob-only"),
-    ));
-    quads.push(t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")));
-    quads.push(t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")));
-    quads.push(t(
-        &g,
-        &a,
-        &format!("{ACL}agent"),
-        "https://bob.example/profile#me",
-    ));
+        "bob",
+        &[
+            ("accessTo", format!("{ROOT}bob-only")),
+            ("mode", format!("{ACL}Read")),
+            ("mode", format!("{ACL}Write")),
+            ("agent", "https://bob.example/profile#me".to_string()),
+        ],
+    );
+    acls.push((g, quads));
 
-    // /friends.acl — group access. The group document lives at a graph the ACL
-    // does not name, which is what the predecessor's fragment-stripping assumed.
-    let g = format!("{BASE}/friends.acl");
-    let a = format!("{g}#friends");
-    quads.push(t(
+    // /~/friends.acl — group access. The group document lives at a graph the
+    // ACL does not name, which is what the predecessor's fragment-stripping
+    // assumed.
+    let g = format!("{ROOT}friends.acl");
+    let quads = authorization(
         &g,
-        &a,
-        &format!("{ACL}accessTo"),
-        &format!("{BASE}/friends"),
-    ));
-    quads.push(t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")));
-    quads.push(t(
-        &g,
-        &a,
-        &format!("{ACL}agentGroup"),
-        &format!("{BASE}/groups/inner#g"),
-    ));
+        "friends",
+        &[
+            ("accessTo", format!("{ROOT}friends")),
+            ("mode", format!("{ACL}Read")),
+            ("agentGroup", format!("{ROOT}groups/inner#g")),
+        ],
+    );
+    acls.push((g, quads));
 
-    let g = format!("{BASE}/groups/somewhere-else");
-    quads.push(t(
-        &g,
-        &format!("{BASE}/groups/inner#g"),
+    let group_doc = format!("{ROOT}groups/somewhere-else");
+    let group = [t(
+        &group_doc,
+        &format!("{ROOT}groups/inner#g"),
         &format!("{VCARD}hasMember"),
         "https://carol.example/profile#me",
-    ));
+    )];
 
-    // /notes/.acl — inherited default: authenticated append on the container.
-    let g = format!("{BASE}/notes/.acl");
-    let a = format!("{g}#inherit");
-    quads.push(t(
+    // /~/notes/.acl — inherited default: authenticated append on the container.
+    let g = format!("{ROOT}notes/.acl");
+    let quads = authorization(
         &g,
-        &a,
-        &format!("{ACL}default"),
-        &format!("{BASE}/notes/"),
-    ));
-    quads.push(t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")));
-    quads.push(t(
-        &g,
-        &a,
-        &format!("{ACL}agentClass"),
-        &format!("{ACL}AuthenticatedAgent"),
-    ));
+        "inherit",
+        &[
+            ("default", format!("{ROOT}notes/")),
+            ("mode", format!("{ACL}Write")),
+            ("agentClass", format!("{ACL}AuthenticatedAgent")),
+        ],
+    );
+    acls.push((g, quads));
 
-    seed(&store, &quads);
+    store
+        .write(|w| {
+            w.create_root(ROOT)?;
+            for (acl, quads) in &acls {
+                w.put(acl, Content::Auxiliary(quads))?;
+            }
+            w.put(&group_doc, Content::Rdf(&group))?;
+            Ok(())
+        })
+        .expect("seed acls");
     (mgr, dir, store)
 }
 
@@ -202,84 +191,84 @@ fn matrix() -> Vec<Case> {
 
     vec![
         Case {
-            path: "/public",
+            path: "/~/public",
             agent: Agent::Anonymous,
             mode: AccessMode::Read,
             expect: true,
             why: "foaf:Agent grants anonymous read",
         },
         Case {
-            path: "/public",
+            path: "/~/public",
             agent: Agent::Anonymous,
             mode: AccessMode::Write,
             expect: false,
             why: "public read does not imply write",
         },
         Case {
-            path: "/members",
+            path: "/~/members",
             agent: Agent::Anonymous,
             mode: AccessMode::Read,
             expect: false,
             why: "AuthenticatedAgent must not match anonymous",
         },
         Case {
-            path: "/members",
+            path: "/~/members",
             agent: dave(),
             mode: AccessMode::Read,
             expect: true,
             why: "any authenticated agent matches AuthenticatedAgent",
         },
         Case {
-            path: "/bob-only",
+            path: "/~/bob-only",
             agent: bob(),
             mode: AccessMode::Read,
             expect: true,
             why: "acl:agent names bob",
         },
         Case {
-            path: "/bob-only",
+            path: "/~/bob-only",
             agent: dave(),
             mode: AccessMode::Read,
             expect: false,
             why: "a different WebID must not match",
         },
         Case {
-            path: "/bob-only",
+            path: "/~/bob-only",
             agent: bob(),
             mode: AccessMode::Append,
             expect: true,
             why: "acl:Write implies acl:Append",
         },
         Case {
-            path: "/friends",
+            path: "/~/friends",
             agent: carol(),
             mode: AccessMode::Read,
             expect: true,
             why: "vcard:hasMember in another graph still joins",
         },
         Case {
-            path: "/friends",
+            path: "/~/friends",
             agent: dave(),
             mode: AccessMode::Read,
             expect: false,
             why: "non-members must not match the group",
         },
         Case {
-            path: "/notes/first",
+            path: "/~/notes/first",
             agent: dave(),
             mode: AccessMode::Append,
             expect: true,
             why: "acl:default on the container is inherited, and Write implies Append",
         },
         Case {
-            path: "/notes/first",
+            path: "/~/notes/first",
             agent: Agent::Anonymous,
             mode: AccessMode::Append,
             expect: false,
             why: "inherited authenticated grant must not reach anonymous",
         },
         Case {
-            path: "/nothing-here",
+            path: "/~/nothing-here",
             agent: dave(),
             mode: AccessMode::Read,
             expect: false,
@@ -325,22 +314,22 @@ fn direct_acl_wins_over_inherited() {
     let (_mgr, _dir, store) = fixture();
 
     // /notes/first has no ACL of its own, so it inherits /notes/.acl.
-    let acl = effective_acl(&store.read_store(), BASE, "/notes/first")
+    let acl = effective_acl(&store.read_store(), BASE, "/~/notes/first")
         .unwrap()
         .unwrap();
-    assert_eq!(acl.graph.as_str(), format!("{BASE}/notes/.acl"));
+    assert_eq!(acl.graph.as_str(), format!("{ROOT}notes/.acl"));
     assert!(!acl.direct, "an inherited ACL matches acl:default");
     assert_eq!(
         acl.scope.as_str(),
-        format!("{BASE}/notes/"),
+        format!("{ROOT}notes/"),
         "an inherited ACL scopes to the container, not the requested resource"
     );
 
     // /public has its own.
-    let acl = effective_acl(&store.read_store(), BASE, "/public")
+    let acl = effective_acl(&store.read_store(), BASE, "/~/public")
         .unwrap()
         .unwrap();
-    assert_eq!(acl.graph.as_str(), format!("{BASE}/public.acl"));
+    assert_eq!(acl.graph.as_str(), format!("{ROOT}public.acl"));
     assert!(acl.direct, "a resource's own ACL matches acl:accessTo");
 }
 
@@ -352,9 +341,9 @@ fn an_accessto_grant_does_not_leak_through_inheritance() {
     // inheritance and the grant must not apply — accessTo and default are
     // distinct scopes, and conflating them is how ACLs silently over-grant.
     let as_inherited = EffectiveAcl {
-        graph: n(&format!("{BASE}/public.acl")),
+        graph: n(&format!("{ROOT}public.acl")),
         direct: false,
-        scope: n(&format!("{BASE}/public")),
+        scope: n(&format!("{ROOT}public")),
     };
     let allowed = authorize(
         &store.read_store(),
@@ -375,7 +364,6 @@ fn an_accessto_grant_does_not_leak_through_inheritance() {
 /// ACLs exist by metadata too.
 #[test]
 fn an_acl_written_earlier_in_the_same_write_governs() {
-    const ROOT: &str = "https://alice.brolly.id/~/";
     let dir = tempfile::tempdir().expect("tempdir");
     let mgr = StoreManager::open(dir.path(), 4, 60).expect("manager");
     let pod = mgr.pod(Uuid::new_v4()).expect("pod");
@@ -403,4 +391,33 @@ fn an_acl_written_earlier_in_the_same_write_governs() {
 
     assert_eq!(found, g, "the reader missed the write's own ACL");
     assert!(allowed, "the ACL written in this write didn't grant");
+}
+
+#[test]
+fn an_empty_recorded_acl_governs_and_grants_nothing() {
+    let (_mgr, _dir, store) = fixture();
+    let locked = format!("{ROOT}notes/locked.acl");
+    store
+        .write(|w| w.put(&locked, Content::Auxiliary(&[])).map(|_| ()))
+        .expect("record an empty ACL");
+
+    let reader = store.read_store();
+    let acl = effective_acl(&reader, BASE, "/~/notes/locked")
+        .unwrap()
+        .expect("the empty ACL governs");
+    assert_eq!(acl.graph.as_str(), locked);
+    assert!(acl.direct);
+    let dave = Agent::Authenticated("https://dave.example/profile#me".to_string());
+    assert!(
+        !authorize(&reader, &acl, &dave, AccessMode::Append).unwrap(),
+        "an empty ACL grants nothing, whatever the container's default says"
+    );
+    // Its sibling still inherits the container's.
+    assert!(surface_allows(
+        Surface::Solid,
+        &reader,
+        "/~/notes/first",
+        &dave,
+        AccessMode::Append
+    ));
 }

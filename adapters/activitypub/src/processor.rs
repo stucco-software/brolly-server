@@ -93,9 +93,16 @@ pub fn process_member(
         // in this pod's inbox (a recipient's copy) or outbox (the author's own).
         //
         // Origin alone isn't enough. The owner's pod receives the owner's own
-        // activities, so a Delete naming their `/~/.acl` would pass it and clear
-        // the ACL without WAC ever seeing the request. An LDP resource is never
-        // the embedded object of a delivered activity, so this can't reach one.
+        // activities, so a Delete naming their `/~/.acl` would pass it and
+        // remove the ACL without WAC ever seeing the request. Posts are LDP
+        // resources in their author's pod, so what keeps a Delete to posts is
+        // three facts together:
+        // - It removes only what a same-origin activity listed in this pod's
+        //   inbox or outbox carried in as its embedded object.
+        // - The server mints every such id, under `/~/notes/`
+        //   (`outbox::as_activity`, checked again by `outbox::authored`).
+        // - LDP writes can't create inbox or outbox entries. Those collections
+        //   live outside `/~/`, where `ldp::put` refuses to write.
         if let Some(target) = object_id(activity)
             && same_origin(target, actor)
         {

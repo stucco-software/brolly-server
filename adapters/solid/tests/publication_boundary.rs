@@ -8,8 +8,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use brolly_identity::{Scope, Subject, Via};
-use brolly_solid::{ldp, storage};
-use brolly_store::resources::{Pod, PodRead};
+use brolly_solid::ldp;
+use brolly_store::resources::{Content, Pod, PodRead};
 use brolly_store::{StoreManager, index};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 use std::sync::Arc;
@@ -18,15 +18,6 @@ use uuid::Uuid;
 const BASE: &str = "https://alice.brolly.id";
 const ROOT: &str = "https://alice.brolly.id/~/";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
-
-/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
-/// so it doesn't depend on the code under test.
-fn seed(target: &Pod, quads: &[Quad]) {
-    let store = target.raw_store();
-    for quad in quads {
-        store.insert(quad).unwrap();
-    }
-}
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -62,23 +53,25 @@ fn fixture() -> Fixture {
     let manager = StoreManager::open(dir.path(), 4, 60).unwrap();
     let pod = manager.pod(Uuid::new_v4()).unwrap();
 
-    pod.write(|w| storage::init_storage_root(w, ROOT)).unwrap();
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    seed(
-        &pod,
-        &[
-            t(&g, &a, &format!("{ACL}default"), ROOT),
-            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
-            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
-            t(
-                &g,
-                &a,
-                &format!("{ACL}agent"),
-                "https://alice.brolly.id/profile#me",
-            ),
-        ],
-    );
+    let grants = [
+        t(&g, &a, &format!("{ACL}default"), ROOT),
+        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        t(
+            &g,
+            &a,
+            &format!("{ACL}agent"),
+            "https://alice.brolly.id/profile#me",
+        ),
+    ];
+    pod.write(|w| {
+        w.create_root(ROOT)?;
+        w.put(&g, Content::Auxiliary(&grants))?;
+        Ok(())
+    })
+    .unwrap();
 
     Fixture {
         _dir: dir,
@@ -198,7 +191,7 @@ fn deleting_pod_content_also_publishes_nothing() {
         ROOT,
     )
     .unwrap();
-    ldp::delete(&f.pod, None, BASE, "/~/note", &alice(), ROOT).unwrap();
+    ldp::delete(&f.pod, BASE, "/~/note", &alice(), ROOT).unwrap();
 
     assert!(
         index_is_empty(&f.manager),

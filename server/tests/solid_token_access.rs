@@ -15,9 +15,8 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
 use brolly_server::{AppState, app};
-use brolly_solid::storage;
 use brolly_store::StoreManager;
-use brolly_store::resources::Pod;
+use brolly_store::resources::Content;
 use http_body_util::BodyExt;
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use p256::ecdsa::SigningKey;
@@ -32,15 +31,6 @@ const ROOT: &str = "https://alice.brolly.test/~/";
 const NOTE: &str = "https://alice.brolly.test/~/note";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
 const REDIRECT: &str = "https://app.example/cb";
-
-/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
-/// so it doesn't depend on the code under test.
-fn seed(target: &Pod, quads: &[Quad]) {
-    let store = target.raw_store();
-    for quad in quads {
-        store.insert(quad).unwrap();
-    }
-}
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -72,26 +62,29 @@ async fn harness() -> Harness {
         .unwrap();
 
     let pod = stores.pod(user.id).unwrap();
-    pod.write(|w| storage::init_storage_root(w, ROOT)).unwrap();
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    seed(
-        &pod,
-        &[
-            t(&g, &a, &format!("{ACL}default"), ROOT),
-            t(&g, &a, &format!("{ACL}accessTo"), ROOT),
-            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
-            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
-            t(&g, &a, &format!("{ACL}agent"), &format!("{POD}/profile#me")),
-            // Something to read.
-            t(
-                NOTE,
-                NOTE,
-                "https://example.org/title",
-                "https://example.org/a",
-            ),
-        ],
-    );
+    let grant = [
+        t(&g, &a, &format!("{ACL}default"), ROOT),
+        t(&g, &a, &format!("{ACL}accessTo"), ROOT),
+        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        t(&g, &a, &format!("{ACL}agent"), &format!("{POD}/profile#me")),
+    ];
+    // Something to read.
+    let note = [t(
+        NOTE,
+        NOTE,
+        "https://example.org/title",
+        "https://example.org/a",
+    )];
+    pod.write(|w| {
+        w.create_root(ROOT)?;
+        w.put(&g, Content::Auxiliary(&grant))?;
+        w.put(NOTE, Content::Rdf(&note))?;
+        Ok(())
+    })
+    .unwrap();
 
     let router = app(
         AppState {

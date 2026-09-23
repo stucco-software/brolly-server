@@ -21,7 +21,6 @@ USAGE:
     brolly-admin demote <username>
     brolly-admin plc-retry [--dry-run]
     brolly-admin whoami <username>
-    brolly-admin acl-uncontain
 
 COMMANDS:
     invite       Mint an invite code and print it. The code is shown once;
@@ -33,15 +32,10 @@ COMMANDS:
     plc-retry    Submit PLC operations the directory has not accepted yet.
                  Safe to re-run — already-submitted operations are skipped.
     whoami       Print what a member's identity resolves to.
-    acl-uncontain
-                 Stop listing .acl resources as members of their containers,
-                 in every pod. Run once after upgrading past stage 0. Stop
-                 the server first: it holds the stores open. Safe to re-run.
 
 ENVIRONMENT:
     DATABASE_URL          required
     BROLLY_BASE_DOMAIN    defaults to brolly.test
-    BROLLY_DATA_DIR       defaults to data (acl-uncontain); must already exist
 ";
 
 #[tokio::main]
@@ -90,7 +84,6 @@ async fn main() -> ExitCode {
         "demote" => set_role(&pool, &args, "member").await,
         "plc-retry" => plc_retry(&pool, &args).await,
         "whoami" => whoami(&pool, &base_domain, &args).await,
-        "acl-uncontain" => acl_uncontain(&pool).await,
         other => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             ExitCode::FAILURE
@@ -346,81 +339,5 @@ async fn whoami(pool: &sqlx::PgPool, base_domain: &str, args: &[String]) -> Exit
         Err(e) => eprintln!("plc        lookup failed: {e}"),
     }
 
-    ExitCode::SUCCESS
-}
-
-/// Sweep every pod for `ldp:contains` triples naming `.acl` resources.
-///
-/// One line per pod on stdout, `username<TAB>removed`, so the output can be
-/// piped, and a one-line summary on stderr. Failures go to stderr and make the
-/// exit status non-zero. A rerun skips nothing and removes only what's left.
-async fn acl_uncontain(pool: &sqlx::PgPool) -> ExitCode {
-    let data_dir = std::env::var("BROLLY_DATA_DIR").unwrap_or_else(|_| "data".to_string());
-
-    // `StoreManager::open` creates whatever is missing. Pointed at the wrong
-    // place, it would make an empty data directory, find no pods, and report
-    // success. The server creates `users/` on its first boot, so a directory
-    // without one isn't the server's.
-    let pods_dir = std::path::Path::new(&data_dir).join("users");
-    if !pods_dir.is_dir() {
-        eprintln!("no pod directory at {}", pods_dir.display());
-        eprintln!("set BROLLY_DATA_DIR to the directory the server uses");
-        eprintln!("(/var/lib/brolly in the image); this command never creates it");
-        return ExitCode::FAILURE;
-    }
-
-    // A small resident set: the sweep visits each pod once, so there is no
-    // working set to keep warm.
-    let stores = match brolly_store::StoreManager::open(&data_dir, 16, 60) {
-        Ok(stores) => stores,
-        Err(e) => {
-            eprintln!("could not open the stores under {data_dir}: {e}");
-            eprintln!("is the server still running? it holds the stores open; stop it first");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    let report = match brolly_server::maintenance::acl_uncontain(pool, &stores).await {
-        Ok(report) => report,
-        Err(e) => {
-            eprintln!("could not list members: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // Every member gets a pod at registration, so members with no pods at all
-    // means the wrong volume, not an instance with nothing to sweep.
-    if report.accounts > 0 && report.pods.is_empty() {
-        eprintln!(
-            "{} account(s) in the database but no pods under {data_dir}",
-            report.accounts
-        );
-        eprintln!("is BROLLY_DATA_DIR the directory the server uses?");
-        return ExitCode::FAILURE;
-    }
-
-    let mut removed = 0usize;
-    let mut failed = 0usize;
-    for sweep in &report.pods {
-        match &sweep.outcome {
-            Ok(count) => {
-                removed += count;
-                println!("{}\t{count}", sweep.username);
-            }
-            Err(e) => {
-                failed += 1;
-                eprintln!("{}: {e}", sweep.username);
-            }
-        }
-    }
-
-    eprintln!(
-        "acl-uncontain: {removed} containment triple(s) removed across {} pod(s)",
-        report.pods.len()
-    );
-    if failed > 0 {
-        eprintln!("{failed} pod(s) could not be swept; safe to re-run");
-        return ExitCode::FAILURE;
-    }
     ExitCode::SUCCESS
 }

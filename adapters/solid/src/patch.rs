@@ -16,12 +16,15 @@
 //! Those are checked first, so a client is never told a patch applied when it
 //! did not.
 
+use brolly_store::StoreError;
 use brolly_store::resources::{PodRead, PodWrite};
-use oxigraph::model::{GraphNameRef, NamedNode, Quad};
+use oxigraph::model::{GraphName, GraphNameRef, NamedNode, Quad};
 use oxigraph::sparql::SparqlEvaluator;
 use oxigraph::store::Store;
 use oxttl::N3Parser;
 use oxttl::n3::{N3Quad, N3Term};
+
+use crate::ldp::{self, LdpError};
 
 const SOLID: &str = "http://www.w3.org/ns/solid/terms#";
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
@@ -39,6 +42,9 @@ pub enum PatchError {
     /// A SPARQL Update that would escape the resource's own graph.
     EscapesGraph,
     Store(String),
+    /// Refused by the LDP layer: WAC, the containment rule, a binary target,
+    /// or the root.
+    Ldp(LdpError),
 }
 
 impl std::fmt::Display for PatchError {
@@ -53,11 +59,18 @@ impl std::fmt::Display for PatchError {
                  the resource it addresses"
             ),
             PatchError::Store(e) => write!(f, "storage: {e}"),
+            PatchError::Ldp(e) => write!(f, "{e}"),
         }
     }
 }
 
 impl std::error::Error for PatchError {}
+
+impl From<StoreError> for PatchError {
+    fn from(e: StoreError) -> Self {
+        PatchError::Ldp(LdpError::from(e))
+    }
+}
 
 /// The three formulae of an N3 Patch, as triple patterns.
 #[derive(Debug, Default)]
@@ -194,7 +207,8 @@ pub fn is_graph_safe(sparql: &str) -> bool {
 ///
 /// The resource's triples are copied into a scratch in-memory store as its
 /// **default graph**, the update runs there verbatim, and the result replaces
-/// the resource's named graph inside the caller's write.
+/// the resource's named graph inside the caller's write. The write goes
+/// through `PodWrite::put`, so a patch that creates a resource contains it.
 ///
 /// This avoids rewriting the client's SPARQL. Wrapping text in `WITH <g>` only
 /// works for the `DELETE/INSERT … WHERE` form — `INSERT DATA`, which is what
@@ -227,7 +241,7 @@ fn apply_scoped(
                 quad.subject,
                 quad.predicate,
                 quad.object,
-                oxigraph::model::GraphName::DefaultGraph,
+                GraphName::DefaultGraph,
             ))
             .map_err(|e| PatchError::Store(e.to_string()))?;
     }
@@ -241,11 +255,9 @@ fn apply_scoped(
         .map(|q| Quad::new(q.subject, q.predicate, q.object, graph.clone()))
         .collect();
 
-    // Every PATCH target is under the storage root (`pod.rs` refuses the rest).
-    w.legacy_under_root()
-        .replace_graph(resource, &patched)
-        .map_err(|e| PatchError::Store(e.to_string()))?;
-    Ok(())
+    // The target's kind decides the `Content`, and a container's body is held
+    // to the containment rule, exactly as a PUT would be.
+    ldp::store_patched(w, resource, patched).map_err(PatchError::Ldp)
 }
 
 /// Check the preconditions SPARQL cannot express.

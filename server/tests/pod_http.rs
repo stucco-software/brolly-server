@@ -5,9 +5,8 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use brolly_identity::db;
 use brolly_server::{AppState, app};
-use brolly_solid::storage;
 use brolly_store::StoreManager;
-use brolly_store::resources::{Pod, PodRead};
+use brolly_store::resources::{Content, Pod, PodRead};
 use http_body_util::BodyExt;
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use tower::ServiceExt;
@@ -16,15 +15,6 @@ const HOST: &str = "alice.brolly.test";
 const BASE: &str = "https://alice.brolly.test";
 const ROOT: &str = "https://alice.brolly.test/~/";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
-
-/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
-/// so it doesn't depend on the code under test.
-fn seed(target: &Pod, quads: &[Quad]) {
-    let store = target.raw_store();
-    for quad in quads {
-        store.insert(quad).unwrap();
-    }
-}
 
 /// Does the pod hold exactly this quad?
 fn holds(pod: &Pod, quad: &Quad) -> bool {
@@ -78,28 +68,30 @@ async fn harness() -> Harness {
 
     // Seed the pod: storage root plus an ACL granting Alice everything.
     let pod = stores.pod(user.id).unwrap();
-    pod.write(|w| storage::init_storage_root(w, ROOT)).unwrap();
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    seed(
-        &pod,
-        &[
-            // A real pod root ACL carries both: acl:default governs the
-            // container's children, acl:accessTo governs the container itself.
-            // They are distinct scopes and conflating them is how ACLs
-            // silently over-grant.
-            t(&g, &a, &format!("{ACL}default"), ROOT),
-            t(&g, &a, &format!("{ACL}accessTo"), ROOT),
-            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
-            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
-            t(
-                &g,
-                &a,
-                &format!("{ACL}agent"),
-                &format!("{BASE}/profile#me"),
-            ),
-        ],
-    );
+    let grant = [
+        // A real pod root ACL carries both: acl:default governs the
+        // container's children, acl:accessTo governs the container itself.
+        // They are distinct scopes and conflating them is how ACLs
+        // silently over-grant.
+        t(&g, &a, &format!("{ACL}default"), ROOT),
+        t(&g, &a, &format!("{ACL}accessTo"), ROOT),
+        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        t(
+            &g,
+            &a,
+            &format!("{ACL}agent"),
+            &format!("{BASE}/profile#me"),
+        ),
+    ];
+    pod.write(|w| {
+        w.create_root(ROOT)?;
+        w.put(&g, Content::Auxiliary(&grant))?;
+        Ok(())
+    })
+    .unwrap();
 
     let router = app(
         AppState {
@@ -307,6 +299,87 @@ async fn delete_removes_the_resource() {
 
     let (status, _, _) = h.send("GET", "/~/note", None, true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// Spec 5a, *After an upgrade*. A pod as stage 0 wrote it keeps containment in
+/// each container's own graph. After the upgrade, deleting a member de-lists
+/// it. A copy-only upgrade would leave the old `ldp:contains` in the content
+/// graph and list the member forever. The root's stale listing of its own
+/// `.acl`, which `acl-uncontain` used to sweep, doesn't survive either.
+#[tokio::test]
+async fn an_upgraded_container_stops_listing_a_deleted_member() {
+    const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+    const LDP: &str = "http://www.w3.org/ns/ldp#";
+    let h = harness().await;
+    let folder = format!("{ROOT}folder/");
+    let doc = format!("{folder}doc");
+    let acl = format!("{ROOT}.acl");
+    let owner = format!("{acl}#owner");
+
+    // Everything goes, the metadata graph included, and the old layout goes in
+    // its place: the root's types and listing in its own graph, the folder's
+    // listing in the folder's graph, and the owner's grant.
+    let pod = h.stores.pod(h.user).unwrap();
+    let raw = pod.raw_store();
+    raw.clear().unwrap();
+    for quad in [
+        t(ROOT, ROOT, RDF_TYPE, &format!("{LDP}BasicContainer")),
+        t(
+            ROOT,
+            ROOT,
+            RDF_TYPE,
+            "http://www.w3.org/ns/pim/space#Storage",
+        ),
+        t(ROOT, ROOT, &format!("{LDP}contains"), &folder),
+        t(ROOT, ROOT, &format!("{LDP}contains"), &acl),
+        t(&folder, &folder, RDF_TYPE, &format!("{LDP}BasicContainer")),
+        t(&folder, &folder, &format!("{LDP}contains"), &doc),
+        t(
+            &doc,
+            &doc,
+            "https://example.org/title",
+            "https://example.org/a",
+        ),
+        t(&acl, &owner, &format!("{ACL}accessTo"), ROOT),
+        t(&acl, &owner, &format!("{ACL}default"), ROOT),
+        t(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        t(
+            &acl,
+            &owner,
+            &format!("{ACL}agent"),
+            &format!("{BASE}/profile#me"),
+        ),
+    ] {
+        raw.insert(&quad).unwrap();
+    }
+    brolly_store::resources::upgrade(&pod).unwrap();
+    drop(pod);
+
+    let (status, root, _) = h.send("GET", "/~/", None, true).await;
+    assert_eq!(status, StatusCode::OK, "{root}");
+    assert!(
+        root.contains(&folder),
+        "the upgrade lost a listed container: {root}"
+    );
+    assert!(!root.contains(&acl), "the root still lists its ACL: {root}");
+
+    let (status, listing, _) = h.send("GET", "/~/folder/", None, true).await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert!(
+        listing.contains(&doc),
+        "setup: the member is listed: {listing}"
+    );
+
+    let (status, _, _) = h.send("DELETE", "/~/folder/doc", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, listing, _) = h.send("GET", "/~/folder/", None, true).await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert!(
+        !listing.contains(&doc),
+        "the deleted member is still listed: {listing}"
+    );
 }
 
 #[tokio::test]
@@ -774,26 +847,25 @@ fn share_with_bob(h: &Harness) {
     let g = format!("{shared}.acl");
     let owner = format!("{g}#owner");
     let bob = format!("{g}#bob");
-    seed(
-        &pod,
-        &[
-            t(&g, &owner, &format!("{ACL}accessTo"), &shared),
-            t(&g, &owner, &format!("{ACL}default"), &shared),
-            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
-            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
-            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Control")),
-            t(
-                &g,
-                &owner,
-                &format!("{ACL}agent"),
-                &format!("{BASE}/profile#me"),
-            ),
-            t(&g, &bob, &format!("{ACL}default"), &shared),
-            t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Read")),
-            t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Write")),
-            t(&g, &bob, &format!("{ACL}agent"), BOB_WEBID),
-        ],
-    );
+    let quads = [
+        t(&g, &owner, &format!("{ACL}accessTo"), &shared),
+        t(&g, &owner, &format!("{ACL}default"), &shared),
+        t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Control")),
+        t(
+            &g,
+            &owner,
+            &format!("{ACL}agent"),
+            &format!("{BASE}/profile#me"),
+        ),
+        t(&g, &bob, &format!("{ACL}default"), &shared),
+        t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        t(&g, &bob, &format!("{ACL}agent"), BOB_WEBID),
+    ];
+    pod.write(|w| w.put(&g, Content::Auxiliary(&quads)).map(|_| ()))
+        .unwrap();
 }
 
 /// The takeover over the wire: inherited Write used to be enough to PATCH the
@@ -879,7 +951,9 @@ async fn bob_cannot_delete_an_acl_he_does_not_control() {
 
     let pod = h.stores.pod(h.user).unwrap();
     assert!(
-        storage::exists(&pod.read_store(), &format!("{ROOT}shared/.acl")),
+        pod.read(|r| r.meta(&format!("{ROOT}shared/.acl")))
+            .unwrap()
+            .is_some(),
         "the refused DELETE landed"
     );
 }

@@ -18,7 +18,7 @@ use moka::sync::Cache;
 use uuid::Uuid;
 
 use crate::index::InstanceStore;
-use crate::resources::Pod;
+use crate::resources::{Pod, UpgradeOutcome};
 
 #[derive(Debug, Clone)]
 pub enum StoreError {
@@ -165,6 +165,27 @@ impl StoreManager {
             return Ok(pod);
         }
         let pod = Arc::new(Pod::open(&self.pod_dir(user))?);
+        // Upgrade before publishing. Until this returns no other thread can
+        // reach the pod, so its lock is uncontended; concurrent requests for
+        // it wait on the cache. A failed upgrade returns here, leaving nothing
+        // in the live map or the cache, and the next open retries. This never
+        // calls `pod()`, so it can't re-enter the cache's initialiser.
+        match crate::resources::upgrade(&pod)? {
+            UpgradeOutcome::NoRoot { candidates } => tracing::error!(
+                %user,
+                ?candidates,
+                "pod has no single storage root at /~/; it's served without metadata and its LDP reads answer 404"
+            ),
+            UpgradeOutcome::Upgraded(report) => tracing::info!(
+                %user,
+                root = %report.root,
+                resources = report.resources,
+                dropped_containment = report.dropped_containment,
+                not_binaries = report.not_binaries,
+                "pod upgraded to layout 2"
+            ),
+            UpgradeOutcome::Fresh | UpgradeOutcome::Current => {}
+        }
         let mut live = self.live_handles();
         // Drop entries whose pods have closed, so the map tracks what is open
         // rather than everyone who was ever served.

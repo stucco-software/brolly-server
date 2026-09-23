@@ -37,6 +37,10 @@ use crate::blobs::BlobStore;
 use crate::manager::StoreError;
 use crate::write::{insert_quads_in, remove_quads_in};
 
+mod upgrade;
+
+pub use upgrade::{UpgradeOutcome, UpgradeReport, upgrade};
+
 /// The graph holding every pod's resource metadata.
 ///
 /// Not an `https` IRI, so no LDP path can name it.
@@ -458,16 +462,21 @@ impl<'a> PodWrite<'a> {
         Ok(())
     }
 
-    /// TEMPORARY, rollout commit 1 only: raw writes under the storage root,
-    /// with no metadata, so that commit changes no behaviour. Removed in
-    /// commit 2, when every under-root writer moves to `put` and `remove`.
-    pub fn legacy_under_root(&mut self) -> LegacyWriter<'_, 'a> {
-        LegacyWriter {
-            transaction: &mut self.transaction,
-        }
-    }
-
     // --- internals ---
+
+    /// Insert quads straight into [`METADATA_GRAPH`]. Crate-private: only this
+    /// module's own bookkeeping (the upgrade's layout mark) writes there
+    /// directly; everything else goes through `put`, `append` and `remove`.
+    fn insert_metadata(&mut self, quads: &[Quad]) -> Result<(), StoreError> {
+        let stray = quads.iter().any(|quad| quad.graph_name != metadata_graph());
+        if stray {
+            return Err(StoreError::Invalid(
+                "a metadata quad names another graph".into(),
+            ));
+        }
+        insert_quads_in(&mut self.transaction, quads);
+        Ok(())
+    }
 
     /// Refuse the metadata graph always, and graphs under the storage root once
     /// a root is recorded. A pod with no root has nothing under it yet.
@@ -489,52 +498,6 @@ impl<'a> PodWrite<'a> {
         }
         Ok(())
     }
-}
-
-/// Raw writes under the storage root, with no metadata. TEMPORARY: rollout
-/// commit 1 only. Still refuses the metadata graph.
-pub struct LegacyWriter<'w, 'a> {
-    transaction: &'w mut Transaction<'a>,
-}
-
-impl LegacyWriter<'_, '_> {
-    pub fn insert(&mut self, quads: &[Quad]) -> Result<(), StoreError> {
-        refuse_metadata(quads)?;
-        insert_quads_in(self.transaction, quads);
-        Ok(())
-    }
-
-    pub fn remove(&mut self, quads: &[Quad]) -> Result<(), StoreError> {
-        refuse_metadata(quads)?;
-        remove_quads_in(self.transaction, quads);
-        Ok(())
-    }
-
-    pub fn replace_graph(&mut self, graph: &str, quads: &[Quad]) -> Result<(), StoreError> {
-        check_graph(graph, quads)?;
-        self.clear_graph(graph)?;
-        insert_quads_in(self.transaction, quads);
-        Ok(())
-    }
-
-    pub fn clear_graph(&mut self, graph: &str) -> Result<(), StoreError> {
-        if graph == METADATA_GRAPH {
-            return Err(StoreError::UnderRoot);
-        }
-        self.transaction
-            .clear_graph(GraphNameRef::NamedNode(iri(graph).as_ref()))?;
-        Ok(())
-    }
-}
-
-fn refuse_metadata(quads: &[Quad]) -> Result<(), StoreError> {
-    let names_metadata = quads.iter().any(
-        |quad| matches!(&quad.graph_name, GraphName::NamedNode(g) if g.as_str() == METADATA_GRAPH),
-    );
-    if names_metadata {
-        return Err(StoreError::UnderRoot);
-    }
-    Ok(())
 }
 
 // --- helpers ---------------------------------------------------------------------
@@ -561,6 +524,41 @@ fn check_graph(graph: &str, quads: &[Quad]) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// The predicates of a resource's own record in [`METADATA_GRAPH`]: what
+/// [`read_meta`] reads and `record` rewrites.
+///
+/// Read by predicate, never as "everything about the resource": a container's
+/// subject also carries one `ldp:contains` per member, and scanning those on
+/// every read and every rewrite made each member `put` cost the size of its
+/// container.
+const RECORD_PREDICATES: [&str; 6] = [
+    vocab::RDF_TYPE,
+    vocab::DCTERMS_MODIFIED,
+    vocab::BROLLY_VERSION,
+    vocab::BROLLY_BLOB_DIGEST,
+    vocab::BROLLY_MEDIA_TYPE,
+    vocab::BROLLY_BYTE_SIZE,
+];
+
+/// Every record quad about `resource`: one indexed lookup per record
+/// predicate, so the cost doesn't grow with a container's members.
+fn record_quads<R: PodRead + ?Sized>(read: &R, resource: &str) -> Result<Vec<Quad>, StoreError> {
+    let subject = iri(resource);
+    let graph = metadata_graph();
+    let mut quads = Vec::new();
+    for predicate in RECORD_PREDICATES {
+        for quad in read.quads_for_pattern(
+            Some(subject.as_ref().into()),
+            Some(iri(predicate).as_ref()),
+            None,
+            Some(graph.as_ref()),
+        ) {
+            quads.push(quad?);
+        }
+    }
+    Ok(quads)
+}
+
 /// Read one resource's record.
 fn read_meta<R: PodRead + ?Sized>(
     read: &R,
@@ -573,13 +571,7 @@ fn read_meta<R: PodRead + ?Sized>(
     let mut digest = None;
     let mut media_type = None;
     let mut byte_size = None;
-    for quad in read.quads_for_pattern(
-        Some(iri(resource).as_ref().into()),
-        None,
-        None,
-        Some(metadata_graph().as_ref()),
-    ) {
-        let quad = quad?;
+    for quad in record_quads(read, resource)? {
         let predicate = quad.predicate.as_str();
         match (predicate, &quad.object) {
             (vocab::RDF_TYPE, Term::NamedNode(class)) => match class.as_str() {
@@ -812,6 +804,19 @@ impl PodWrite<'_> {
         Ok(())
     }
 
+    /// Whether `iri` names a resource under this pod's storage root, by the
+    /// same test [`put`](Self::put) and the outside-root methods apply. False
+    /// while the pod has no root recorded.
+    ///
+    /// For a caller storing protocol records that must pick, per IRI, between
+    /// `put`/`remove` and the outside-root methods, as `activitypub::inbox`
+    /// does.
+    pub fn under_root(&self, iri: &str) -> Result<bool, StoreError> {
+        Ok(self
+            .storage_root()?
+            .is_some_and(|root| iri.starts_with(&root)))
+    }
+
     /// The storage root, if `resource` is under it.
     fn root_for(&self, resource: &str) -> Result<String, StoreError> {
         let root = self.storage_root()?.ok_or(StoreError::NoRoot)?;
@@ -822,8 +827,8 @@ impl PodWrite<'_> {
     }
 
     /// Rewrite `resource`'s record: types, a new stamp, blob metadata. Keeps
-    /// what isn't the record's own: `ldp:contains` and the root's
-    /// `pim:Storage`.
+    /// what isn't the record's own: `ldp:contains`, which it never reads, and
+    /// the root's `pim:Storage`.
     fn record(
         &mut self,
         resource: &str,
@@ -831,19 +836,10 @@ impl PodWrite<'_> {
         previous: Option<&ResourceMeta>,
         blob: Option<BlobMeta>,
     ) -> Result<ResourceMeta, StoreError> {
-        let stale: Vec<Quad> = self
-            .transaction
-            .quads_for_pattern(
-                Some(iri(resource).as_ref().into()),
-                None,
-                None,
-                Some(metadata_graph().as_ref()),
-            )
-            .filter(|quad| match quad {
-                Ok(quad) => is_record_quad(quad),
-                Err(_) => true,
-            })
-            .collect::<Result<_, _>>()?;
+        let stale: Vec<Quad> = record_quads(&*self, resource)?
+            .into_iter()
+            .filter(is_record_quad)
+            .collect();
         remove_quads_in(&mut self.transaction, &stale);
 
         let (modified_ms, modified) = next_modified(previous)?;
@@ -974,19 +970,12 @@ fn types_for(kind: Kind) -> &'static [&'static str] {
     }
 }
 
-/// Is this metadata quad part of a resource's own record, which `record`
-/// rewrites? Containment and the root's `pim:Storage` are not.
+/// Is this record-predicate quad part of a resource's own record, which
+/// `record` rewrites? The root's `pim:Storage` type is not. (`ldp:contains`
+/// isn't a record predicate, so it never gets this far.)
 fn is_record_quad(quad: &Quad) -> bool {
-    let predicate = quad.predicate.as_str();
-    if predicate == vocab::LDP_CONTAINS {
-        return false;
-    }
-    if predicate == vocab::RDF_TYPE
-        && matches!(&quad.object, Term::NamedNode(class) if class.as_str() == vocab::PIM_STORAGE)
-    {
-        return false;
-    }
-    true
+    !(quad.predicate.as_str() == vocab::RDF_TYPE
+        && matches!(&quad.object, Term::NamedNode(class) if class.as_str() == vocab::PIM_STORAGE))
 }
 
 fn kind_of(content: &Content<'_>) -> Kind {
@@ -1105,6 +1094,49 @@ fn ulid(ms: u64, randomness: [u8; 10]) -> String {
         .rev()
         .map(|i| char::from(ALPHABET[((value >> (5 * i)) & 0x1f) as usize]))
         .collect()
+}
+
+// --- serving containers ----------------------------------------------------------
+
+/// What a GET of `container` serves from metadata, in the container's own
+/// graph: its types (`ldp:Resource`, `ldp:Container`, `ldp:BasicContainer`,
+/// and `pim:Storage` at the root) and one `ldp:contains` per member.
+///
+/// `ldp::read_in` adds these to the container's content graph, and a container
+/// PUT is checked against them, so the echo of a GET round-trips.
+pub fn container_triples(r: &impl PodRead, container: &str) -> Result<Vec<Quad>, StoreError> {
+    const SERVED_TYPES: [&str; 4] = [
+        vocab::LDP_RESOURCE,
+        vocab::LDP_CONTAINER,
+        vocab::LDP_BASIC_CONTAINER,
+        vocab::PIM_STORAGE,
+    ];
+
+    let node = iri(container);
+    let graph = GraphName::NamedNode(node.clone());
+    let metadata = metadata_graph();
+    let mut out = Vec::new();
+    for predicate in [vocab::RDF_TYPE, vocab::LDP_CONTAINS] {
+        for quad in r.quads_for_pattern(
+            Some(node.as_ref().into()),
+            Some(iri(predicate).as_ref()),
+            None,
+            Some(metadata.as_ref()),
+        ) {
+            let quad = quad?;
+            let served = predicate == vocab::LDP_CONTAINS
+                || matches!(&quad.object, Term::NamedNode(t) if SERVED_TYPES.contains(&t.as_str()));
+            if served {
+                out.push(Quad::new(
+                    node.clone(),
+                    quad.predicate,
+                    quad.object,
+                    graph.clone(),
+                ));
+            }
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

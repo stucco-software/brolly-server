@@ -21,7 +21,6 @@ pub mod atproto_oauth;
 pub mod auth;
 pub mod client_metadata;
 pub mod consent;
-pub mod maintenance;
 pub mod mastodon_api;
 pub mod mastodon_oauth;
 pub mod outbox;

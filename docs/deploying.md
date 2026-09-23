@@ -141,6 +141,33 @@ CLI is available without a shell on the container.
 
 ## Upgrading
 
+### Stage 5a (resource metadata): snapshot first, forward-only
+
+From stage 5a on, each pod records what the server knows about its resources
+(whether each one exists, its container, its version and its binary) in a
+graph of its own, where no client write can reach it. A pod upgrades itself
+the first time the server opens it after the deploy. There's no command to run,
+and new pods start on the new layout.
+
+**This is the first change that redeploying the old image can't undo.** The
+upgrade moves containment out of each container's own graph, and the old code
+reads it only from there. So:
+
+1. **Snapshot the data volume before you deploy.** On Railway, back up the
+   service's volume. With docker compose, stop the server and copy the data
+   directory (`/var/lib/brolly` in the image, or wherever `BROLLY_DATA_DIR`
+   points).
+2. Deploy. Pods upgrade as members use them.
+3. **To go back, restore the snapshot**, then deploy the old image. Anything
+   written after the snapshot is lost.
+
+If the upgrade can't find a pod's storage root, it writes nothing, leaves the
+pod as it was and logs at `error`. That pod's LDP reads then answer 404. Only a
+pod that was never provisioned can get there.
+
+`brolly-admin acl-uncontain` is gone. The upgrade never lists an `.acl` as a
+member, so a pod that was never swept needs nothing more.
+
 ### Activities stored before `865cc98`
 
 From `865cc98` on, the server chooses the id of every object a member
@@ -154,54 +181,6 @@ Nobody else can reach it: removal still requires the target and the stored
 activity to be on the deleting member's own origin. So this only matters on an
 instance where someone already tried the hole on their own account, and no
 data migration is shipped for it.
-
-### Past stage 0 (ACL resources)
-
-`.acl` resources are no longer members of their containers. Pods written
-before the upgrade still list them. Until that's cleaned up, those containers
-show their ACL in listings, and a container with an ACL can't be deleted.
-Access control is unaffected either way.
-
-Run `brolly-admin acl-uncontain` once, after deploying the new image, with:
-
-- **the server stopped.** It holds the stores open, and the command fails to
-  open them while it runs.
-- **the server's `DATABASE_URL` and `BROLLY_DATA_DIR`.** The command needs the
-  volume itself, not a copy. It refuses a `BROLLY_DATA_DIR` with no `users/`
-  directory in it, and fails if the database has members but none of their
-  pods are there. Both mean it is looking in the wrong place.
-
-It prints one `username<TAB>removed` line per pod, then a summary line,
-`acl-uncontain: N containment triple(s) removed across M pod(s)`. It is safe to
-re-run, and a second run removes 0.
-
-**On Railway.** A one-off command can't do this. It can't reach the service's
-volume, and the running service holds the stores open. Run the command as the
-service's start command for one deploy instead:
-
-1. In the service's settings, set the custom start command to
-   `sh -c 'brolly-admin acl-uncontain && exec brolly-server'`.
-2. Deploy. A service with a volume never runs two deployments at once, so the
-   old server is gone before the sweep starts and nothing else holds the stores.
-3. In the deploy logs, confirm the `acl-uncontain: … removed across … pod(s)`
-   line, followed by the server's normal startup. If the sweep fails, `&&`
-   keeps the server from starting. The error is in the same logs.
-4. Clear the custom start command so the image's `brolly-server` is used again,
-   and deploy. Left in place, the sweep reruns on every boot. That's harmless,
-   but it opens every pod before the server starts.
-
-**With docker compose, or anywhere else.** Stop the server, run the command
-against the same database and data directory, start the server again:
-
-```fish
-docker compose stop brolly
-docker compose run --rm brolly brolly-admin acl-uncontain
-docker compose start brolly
-```
-
-From a checkout, stop `brolly-server` and run
-`BROLLY_DATA_DIR=<the server's data dir> cargo run --bin brolly-admin -- acl-uncontain`
-with the server's `DATABASE_URL`, then start the server.
 
 ### ATProto OAuth requests pushed before `f2f1982`
 

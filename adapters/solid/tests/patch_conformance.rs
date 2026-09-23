@@ -7,23 +7,15 @@
 
 use brolly_solid::patch::{self, PatchError};
 use brolly_store::StoreManager;
-use brolly_store::resources::{Pod, PodRead};
+use brolly_store::resources::{Content, Pod, PodRead};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 use uuid::Uuid;
 
 const RESOURCE: &str = "https://alice.brolly.id/~/note";
+const ROOT: &str = "https://alice.brolly.id/~/";
 
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
-}
-
-/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
-/// so it doesn't depend on the code under test.
-fn seed(target: &Pod, quads: &[Quad]) {
-    let store = target.raw_store();
-    for quad in quads {
-        store.insert(quad).unwrap();
-    }
 }
 
 fn pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
@@ -31,15 +23,19 @@ fn pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let mgr = StoreManager::open(dir.path(), 4, 60).unwrap();
     let store = mgr.pod(Uuid::new_v4()).unwrap();
 
-    seed(
-        &store,
-        &[Quad::new(
-            NamedOrBlankNode::NamedNode(n(RESOURCE)),
-            n("https://example.org/title"),
-            Term::Literal(oxigraph::model::Literal::new_simple_literal("Original")),
-            GraphName::NamedNode(n(RESOURCE)),
-        )],
-    );
+    let original = [Quad::new(
+        NamedOrBlankNode::NamedNode(n(RESOURCE)),
+        n("https://example.org/title"),
+        Term::Literal(oxigraph::model::Literal::new_simple_literal("Original")),
+        GraphName::NamedNode(n(RESOURCE)),
+    )];
+    store
+        .write(|w| {
+            w.create_root(ROOT)?;
+            w.put(RESOURCE, Content::Rdf(&original))?;
+            Ok(())
+        })
+        .unwrap();
     (mgr, dir, store)
 }
 

@@ -11,7 +11,6 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use brolly_identity::db;
 use brolly_server::{AppState, app};
-use brolly_solid::storage;
 use brolly_store::StoreManager;
 use http_body_util::BodyExt;
 use tower::ServiceExt;
@@ -41,8 +40,7 @@ async fn harness() -> Harness {
         .await
         .unwrap();
     let pod = stores.pod(alice.id).unwrap();
-    pod.write(|w| storage::init_storage_root(w, ALICE_ROOT))
-        .unwrap();
+    pod.write(|w| w.create_root(ALICE_ROOT)).unwrap();
 
     let router = app(
         AppState {

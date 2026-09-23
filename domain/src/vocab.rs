@@ -72,9 +72,9 @@ pub const SPACE_STORAGE: &str = "http://www.w3.org/ns/pim/space#storage";
 
 // --- LDP resources and server-managed metadata (stage 5a) -------------------
 //
-// `store::resources` writes these into each pod's `urn:brolly:resources`
-// graph. They describe resources the server manages, so no client write can
-// reach them there.
+// `store::resources` writes these into each pod's metadata graph, which it
+// names and owns. They describe resources the server manages, so no client
+// write can reach them there.
 
 /// `r` exists. In the metadata graph this triple *is* existence.
 pub const LDP_RESOURCE: &str = "http://www.w3.org/ns/ldp#Resource";

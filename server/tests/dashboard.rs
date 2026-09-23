@@ -14,7 +14,6 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
 use brolly_server::{AppState, app};
-use brolly_solid::storage;
 use brolly_store::StoreManager;
 use brolly_store::resources::PodRead;
 use http_body_util::BodyExt;
@@ -47,7 +46,7 @@ async fn harness() -> Harness {
         .await
         .unwrap();
     let pod = stores.pod(user.id).unwrap();
-    pod.write(|w| storage::init_storage_root(w, ROOT)).unwrap();
+    pod.write(|w| w.create_root(ROOT)).unwrap();
 
     let router = app(
         AppState {

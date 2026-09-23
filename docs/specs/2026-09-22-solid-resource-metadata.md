@@ -1,5 +1,9 @@
 # Stage 5a: server-managed resource metadata
 
+<!-- doc-paths: skip -->
+<!-- The spec cites a file this stage deletes, so not every path it names
+     resolves once it's implemented. -->
+
 **Status:** Approved for planning (2026-09-22), after three review passes
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 5, part a. Parts
 b (HTTP surface), c (write semantics) and d (auxiliary resources and the
@@ -513,7 +517,21 @@ provisioned can get there.
 next open retries.
 
 **Cost.** The upgrade blocks the opening thread once per pod, for a scan of its
-graphs. That's fine at today's sizes. `store/benches/` gains an upgrade case.
+graphs. `store/benches/upgrade.rs` measures it (release build, 10 containers,
+5 triples per document):
+
+| documents | first open | reopen |
+|---|---|---|
+| 100 | 48 ms | 15 ms |
+| 1,000 | 0.46 s | 0.11 s |
+| 10,000 | 14.8 s | 1.3 s |
+
+It's superlinear, and deliberately so: the whole upgrade is one transaction,
+and Oxigraph keeps a transaction's pending writes in an in-memory batch whose
+lookups slow as it grows. Splitting the upgrade across transactions would trade
+that for a pod that can be left half-upgraded, which R7 rules out. It's a
+one-time cost per pod, and today's pods hold tens of resources. A pod holding
+100,000 would need this reconsidered.
 
 **No rollback.** The upgrade strips, because a copy-only upgrade serves stale
 listings (the metadata says a member is gone while the old triple still lists

@@ -155,9 +155,11 @@ fn minted_under(iri: &str, prefix: &str) -> bool {
 
 /// Does this activity name only graphs the server minted for its author?
 ///
-/// `base` is the author's origin, `https://<username>.<base_domain>`. This is
-/// what keeps the author's own copy, which `deliver` writes without going
-/// through the processor, off their LDP resources.
+/// `base` is the author's origin, `https://<username>.<base_domain>`. The
+/// author's own copy, which `deliver` writes without going through the
+/// processor, lands only where this allows: an activity under `/~/activities/`
+/// and a note under `/~/notes/`. Both are resources in the author's pod, and
+/// none of the author's other resources can be reached this way.
 fn authored(activity: &Value, base: &str) -> Result<(), Refusal> {
     let id = activity["id"].as_str().unwrap_or_default();
     if !minted_under(id, &format!("{base}/~/activities/")) {
@@ -273,41 +275,39 @@ pub async fn deliver(
     let author_inbox = webid::inbox(&author.username, &state.base_domain);
     let author_outbox = webid::outbox(&author.username, &state.base_domain);
 
-    // The author's copy, and a Follow's bookkeeping, in one write. It closes
-    // before the recipient loop awaits anything: the write holds the pod's
-    // lock, and every other writer to this pod waits on it.
+    // The author holds their own post — content lives in exactly one place (D2)
+    // and this is it. The note and its activity are resources under the
+    // author's `/~/`, listed in `/~/notes/` and `/~/activities/`, and the outbox
+    // entry naming the activity lives outside it. One write covers all three,
+    // so a failure can't leave a post the outbox doesn't list. A Delete removes
+    // rather than stores, in the same single write.
+    //
+    // `Pod::write` is synchronous, so this write is closed before the recipient
+    // loop's first `.await`, and no member's delivery waits on the author's
+    // lock.
+    let deleting = activity["type"] == "Delete";
     let stored = author_pod.write(|w| {
-        // The author holds their own post — content lives in exactly one place
-        // (D2) and this is it. A Delete removes rather than stores.
-        if activity["type"] == "Delete" {
-            if let Err(e) =
-                processor::process_member(w, &author_inbox, &author_outbox, activity, &received)
-            {
-                tracing::error!(error = %e, "removing the author's copy failed");
-                return Ok(false);
-            }
-        } else if let Err(e) =
+        if deleting {
+            processor::process_member(w, &author_inbox, &author_outbox, activity, &received)
+                .map_err(rollback)
+        } else {
             brolly_activitypub::inbox::deliver(w, &author_outbox, activity, &received)
-        {
-            tracing::error!(error = %e, "storing the author's copy failed");
-            return Ok(false);
+                .map(|_| ())
+                .map_err(rollback)
         }
-
-        // A Follow is also a relationship, not only a notification.
-        if activity["type"] == "Follow"
-            && let Some(target) = activity["object"].as_str()
-        {
-            let _ = follows::record_following(w, actor, target);
-        }
-        Ok(true)
     });
-    match stored {
-        Ok(true) => {}
-        Ok(false) => return Err(DeliverError::Failed),
-        Err(e) => {
-            tracing::error!(error = %e, "storing the author's copy failed");
-            return Err(DeliverError::Failed);
-        }
+    if let Err(e) = stored {
+        let what = if deleting { "removing" } else { "storing" };
+        tracing::error!(error = %e, "{what} the author's copy failed");
+        return Err(DeliverError::Failed);
+    }
+
+    // A Follow is also a relationship, not only a notification. Its own write:
+    // best effort, and folding it in would let its failure roll back the post.
+    if activity["type"] == "Follow"
+        && let Some(target) = activity["object"].as_str()
+    {
+        let _ = author_pod.write(|w| follows::record_following(w, actor, target));
     }
 
     // Bound before the loop, so no read of the pod is held across its awaits.
@@ -333,6 +333,13 @@ pub async fn deliver(
     }
 
     Ok(())
+}
+
+/// The `StoreError` that makes `Pod::write` roll back, keeping the failure's
+/// message for the log. A delivery failure isn't a storage error, but the
+/// closure has to return one to abort.
+fn rollback(e: impl std::fmt::Display) -> brolly_store::StoreError {
+    brolly_store::StoreError::Backend(e.to_string())
 }
 
 /// Which inboxes this activity is for.

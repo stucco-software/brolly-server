@@ -7,14 +7,32 @@
 //!
 //! **Every read and every write checks WAC** (plan §5). The predecessor's WAC
 //! was reachable from one module while three other protocols bypassed it.
+//!
+//! **Two layers.** The outer functions ([`read`], [`put`], [`append`],
+//! [`delete`], [`patch`]) take a [`Pod`]. Each checks WAC, writes any blob
+//! bytes, and runs one `Pod::write` (or reads one `Pod::read` snapshot). The
+//! `_in` functions take the open [`PodWrite`] and check WAC against its
+//! snapshot, for callers composing several operations in one transaction
+//! (Mastodon's upload and its alt text).
+//!
+//! **Server-managed state comes from metadata** (`store::resources`):
+//! existence, kind, containment and a binary's blob. None of it is read from
+//! the graph a client writes, so an `ldp:contains` or `brolly:blobDigest`
+//! triple in an ordinary document is inert data.
+
+use std::collections::BTreeSet;
 
 use brolly_authz::{AccessMode, authorize, effective_acl};
 use brolly_domain::syntax::{self, ReadFormat, SyntaxError, WriteFormat};
+use brolly_domain::vocab;
 use brolly_identity::Subject;
-use brolly_store::resources::{Pod, PodRead, PodWrite};
+use brolly_store::resources::{
+    self, BlobMeta, Content, Kind, Pod, PodRead, PodWrite, ResourceRead,
+};
 use brolly_store::{BlobStore, StoreError};
-use oxigraph::model::{GraphNameRef, NamedNode, Quad};
+use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 
+use crate::patch::{self, PatchError};
 use crate::storage;
 
 #[derive(Debug)]
@@ -27,6 +45,17 @@ pub enum LdpError {
     Store(String),
     /// A write inside `/~/` that is not addressed to the storage root.
     OutsideStorage,
+    /// The target takes RDF only: a container, an ACL, a PATCH of a binary,
+    /// or a POST appending to a document.
+    NotRdf,
+    /// A container PUT whose `ldp:contains` triples don't name exactly the
+    /// container's current members. Membership changes only by creating or
+    /// deleting members (Solid Protocol §5.3).
+    ContainmentChange,
+    /// A binary's bytes vanished between `prepare` and the write: a
+    /// concurrent delete released identical bytes. Prepare again and retry
+    /// once (spec 5a, R12).
+    BlobMissing,
 }
 
 impl std::fmt::Display for LdpError {
@@ -37,6 +66,12 @@ impl std::fmt::Display for LdpError {
             LdpError::Syntax(e) => write!(f, "{e}"),
             LdpError::Store(e) => write!(f, "storage: {e}"),
             LdpError::OutsideStorage => write!(f, "path is outside the storage root"),
+            LdpError::NotRdf => write!(f, "this resource takes an RDF body"),
+            LdpError::ContainmentChange => write!(
+                f,
+                "a container's members change only by creating or deleting them"
+            ),
+            LdpError::BlobMissing => write!(f, "the blob was released before it was recorded"),
         }
     }
 }
@@ -51,7 +86,15 @@ impl From<SyntaxError> for LdpError {
 
 impl From<StoreError> for LdpError {
     fn from(e: StoreError) -> Self {
-        LdpError::Store(e.to_string())
+        match e {
+            // `put` refuses an IRI outside the pod's root. The outer functions
+            // check first, so this is the same refusal reached another way.
+            StoreError::NotUnderRoot => LdpError::OutsideStorage,
+            // Stage 0's answer to a populated container, until 5b's 409.
+            StoreError::ContainerNotEmpty => LdpError::Forbidden,
+            StoreError::BlobMissing => LdpError::BlobMissing,
+            other => LdpError::Store(other.to_string()),
+        }
     }
 }
 
@@ -61,53 +104,13 @@ impl From<oxigraph::store::StorageError> for LdpError {
     }
 }
 
-/// Predicates recording what a binary resource is and where its bytes are.
-///
-/// Ours, because no standard vocabulary names a content-addressed blob. The
-/// media type and size are conventional; the digest is the join to the blob
-/// store.
-pub const BLOB_DIGEST: &str = "https://brolly.id/ns#blobDigest";
-pub const BLOB_MEDIA_TYPE: &str = "https://brolly.id/ns#mediaType";
-pub const BLOB_SIZE: &str = "https://brolly.id/ns#byteSize";
-
-/// The digest recorded for `resource`, if it is a binary.
-///
-/// The presence of this triple is what makes a resource an LDP-NR: reads and
-/// deletes branch on it rather than on the request, so a binary behaves the
-/// same however it is reached.
-pub fn blob_digest(store: &impl PodRead, resource: &str) -> Option<String> {
-    literal_object(store, resource, BLOB_DIGEST)
-}
-
-fn literal_object(store: &impl PodRead, resource: &str, predicate: &str) -> Option<String> {
-    let node = iri(resource);
-    store
-        .quads_for_pattern(
-            Some((&oxigraph::model::NamedOrBlankNode::NamedNode(node.clone())).into()),
-            Some(iri(predicate).as_ref()),
-            None,
-            Some(GraphNameRef::NamedNode(node.as_ref())),
-        )
-        .filter_map(Result::ok)
-        .find_map(|q| match q.object {
-            oxigraph::model::Term::Literal(l) => Some(l.value().to_string()),
-            _ => None,
-        })
-}
-
-/// Is this digest still referenced by some other resource in the pod?
-///
-/// Content addressing means two resources can name one blob, so deleting either
-/// must not blank the other.
-fn digest_still_referenced(store: &impl PodRead, digest: &str, excluding: &str) -> bool {
-    store
-        .quads_for_pattern(None, Some(iri(BLOB_DIGEST).as_ref()), None, None)
-        .filter_map(Result::ok)
-        .any(|q| {
-            let matches_digest =
-                matches!(&q.object, oxigraph::model::Term::Literal(l) if l.value() == digest);
-            matches_digest && q.subject.to_string() != format!("<{excluding}>")
-        })
+/// The digest recorded for `resource`, if it is a binary. From metadata only.
+pub fn blob_digest(pod: &Pod, resource: &str) -> Option<String> {
+    pod.read(|r| r.meta(resource))
+        .ok()
+        .flatten()
+        .and_then(|meta| meta.blob)
+        .map(|blob| blob.digest)
 }
 
 /// A successful read.
@@ -204,7 +207,7 @@ pub fn granted_modes(
         .collect()
 }
 
-/// `GET` / `HEAD` an LDP resource.
+/// `GET` / `HEAD` an LDP resource, from one snapshot.
 ///
 /// A caller without Read gets `NotFound`, not `Forbidden`: telling an
 /// unauthorized caller that a resource exists is itself a disclosure, and the
@@ -217,56 +220,159 @@ pub fn read(
     subject: &Subject,
     accept: Option<&str>,
 ) -> Result<LdpOutcome, LdpError> {
-    let store = &pod.read_store();
-    let resource = format!("{base}{path}");
+    pod.read(|r| Ok(read_in(r, blobs, base, path, subject, accept)))?
+}
 
-    if !check(store, base, path, subject, AccessMode::Read)? {
+/// [`read`] against a snapshot the caller holds.
+pub fn read_in(
+    r: &ResourceRead<'_>,
+    blobs: Option<&BlobStore>,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    accept: Option<&str>,
+) -> Result<LdpOutcome, LdpError> {
+    let resource = format!("{base}{path}");
+    if !check(r, base, path, subject, AccessMode::Read)? {
         return Err(LdpError::NotFound);
     }
-    if !storage::exists(store, &resource) {
+    let Some(meta) = r.meta(&resource)? else {
         return Err(LdpError::NotFound);
-    }
+    };
+    let granted = granted_modes(r, base, path, subject);
 
     // A binary answers with its bytes. The ACL check above already ran, so
     // there is no path to the blob store that skips authorization.
-    if let Some(digest) = blob_digest(store, &resource) {
-        let Some(blobs) = blobs else {
-            return Err(LdpError::Store("no blob store for this pod".into()));
-        };
-        let bytes = blobs
-            .get(&digest)
-            .map_err(|e| LdpError::Store(e.to_string()))?
-            // The graph says there are bytes and there are not. That is a
+    if matches!(meta.kind, Kind::NonRdfSource) {
+        let blob = meta
+            .blob
+            .ok_or_else(|| LdpError::Store(format!("{resource} has no blob recorded")))?;
+        let bytes = blob_store(blobs)?
+            .get(&blob.digest)?
+            // The metadata says there are bytes and there are not. That is a
             // broken pod, not a missing resource.
-            .ok_or_else(|| LdpError::Store(format!("blob {digest} is missing")))?;
+            .ok_or_else(|| LdpError::Store(format!("blob {} is missing", blob.digest)))?;
         return Ok(LdpOutcome {
             body: bytes,
-            // Owned, because a stored media type is not a &'static str.
-            media_type: literal_object(store, &resource, BLOB_MEDIA_TYPE)
-                .unwrap_or_else(|| "application/octet-stream".to_string()),
-            granted: granted_modes(store, base, path, subject),
+            media_type: blob.media_type,
+            granted,
             is_container: false,
         });
     }
 
     let node = iri(&resource);
-    let quads: Vec<Quad> = store
+    let mut quads = r
         .quads_for_pattern(
             None,
             None,
             None,
             Some(GraphNameRef::NamedNode(node.as_ref())),
         )
-        .filter_map(Result::ok)
-        .collect();
+        .collect::<Result<Vec<Quad>, _>>()?;
+    let is_container = matches!(meta.kind, Kind::Container);
+    if is_container {
+        // Its types and its listing come from metadata, never from its graph.
+        quads.extend(resources::container_triples(r, &resource)?);
+    }
 
     let format = syntax::negotiate(accept);
     Ok(LdpOutcome {
         body: syntax::serialize(&quads, format)?,
         media_type: format.media_type().to_string(),
-        granted: granted_modes(store, base, path, subject),
-        is_container: storage::is_container(&resource),
+        granted,
+        is_container,
     })
+}
+
+/// A request body, ready to write: parsed later against its target's IRI, or
+/// already in the blob store.
+pub enum Body {
+    /// RDF. Parsed in `put_in`/`append_in`, because the base IRI is the target.
+    Rdf { bytes: Vec<u8>, format: ReadFormat },
+    /// A binary whose bytes [`prepare`] has already written to the blob store.
+    Binary(BlobMeta),
+}
+
+/// Get a body ready to write.
+///
+/// A non-RDF body's bytes go into the blob store here, **before** the pod's
+/// write lock is taken, so an upload doesn't queue other writers behind its
+/// disk I/O. Content addressing makes this idempotent. RDF/XML is refused
+/// rather than stored as a blob (ADR 0007): storing it defers the parse rather
+/// than avoiding it, and the two live `quick-xml` advisories are reachable
+/// either way.
+pub fn prepare(
+    blobs: Option<&BlobStore>,
+    body: &[u8],
+    content_type: &str,
+) -> Result<Body, LdpError> {
+    refuse_rdf_xml(content_type)?;
+    if syntax::is_parseable_rdf(content_type) {
+        return Ok(Body::Rdf {
+            bytes: body.to_vec(),
+            format: syntax::read_format(content_type)?,
+        });
+    }
+    Ok(Body::Binary(BlobMeta {
+        digest: blob_store(blobs)?.put(body)?,
+        media_type: syntax::media_type_of(content_type).to_string(),
+        byte_size: u64::try_from(body.len()).unwrap_or(u64::MAX),
+    }))
+}
+
+fn blob_store(blobs: Option<&BlobStore>) -> Result<&BlobStore, LdpError> {
+    blobs.ok_or_else(|| LdpError::Store("no blob store for this pod".into()))
+}
+
+/// What an outer write function checks before it takes the lock.
+struct Target<'a> {
+    pod: &'a Pod,
+    base: &'a str,
+    path: &'a str,
+    subject: &'a Subject,
+    storage_root: &'a str,
+}
+
+impl Target<'_> {
+    /// Refuse what can be refused without the lock, then [`prepare`] the body.
+    ///
+    /// - Outside the root is refused first, as before.
+    /// - `rdf_only` targets (a container or an ACL for PUT, a document for
+    ///   POST) refuse a binary body here, before its bytes reach the disk.
+    ///   `put_in`/`append_in` refuse it too, for callers that skip this.
+    /// - WAC is checked against the committed store *before* any bytes land,
+    ///   so a caller who may not write leaves nothing in the blob store.
+    ///   `put_in`/`append_in` check again inside the transaction.
+    fn prepare(
+        &self,
+        blobs: Option<&BlobStore>,
+        rdf_only: bool,
+        mode: AccessMode,
+        body: &[u8],
+        content_type: &str,
+    ) -> Result<Body, LdpError> {
+        let resource = format!("{}{}", self.base, self.path);
+        if !resource.starts_with(self.storage_root) {
+            return Err(LdpError::OutsideStorage);
+        }
+        refuse_rdf_xml(content_type)?;
+        let rdf = syntax::is_parseable_rdf(content_type);
+        if !rdf && rdf_only {
+            return Err(LdpError::NotRdf);
+        }
+        if !rdf
+            && !check(
+                &self.pod.read_store(),
+                self.base,
+                self.path,
+                self.subject,
+                mode,
+            )?
+        {
+            return Err(LdpError::Forbidden);
+        }
+        prepare(blobs, body, content_type)
+    }
 }
 
 /// `PUT` — create or replace a resource.
@@ -284,62 +390,185 @@ pub fn put(
     storage_root: &str,
 ) -> Result<(), LdpError> {
     let resource = format!("{base}{path}");
+    let rdf_only = storage::is_container(&resource) || governed(&resource).is_some();
+    let target = Target {
+        pod,
+        base,
+        path,
+        subject,
+        storage_root,
+    };
+    let attempt = || -> Result<(), LdpError> {
+        let body = target.prepare(blobs, rdf_only, AccessMode::Write, body, content_type)?;
+        in_write(pod, |w| put_in(w, base, path, subject, &body, storage_root))
+    };
+    // Identical bytes released by a concurrent delete between `prepare` and
+    // the write: write them again and retry, once (spec 5a, R12).
+    match attempt() {
+        Err(LdpError::BlobMissing) => attempt(),
+        other => other,
+    }
+}
+
+/// [`put`] inside the caller's write. Checks WAC against the transaction's
+/// snapshot, then writes with the `Content` the target calls for:
+///
+/// - an ACL: `Content::Auxiliary`, RDF only (stage 0's Control rule is in
+///   `check`);
+/// - a container (the path ends in `/`): RDF only, under [`container_body`]'s
+///   rule, as `Content::Container`; its members are untouched;
+/// - a document: `Content::Rdf`, stored exactly as sent;
+/// - a binary: `Content::Binary`, then the previous blob, if any, is released.
+///
+/// Every refusal comes before the first write.
+pub fn put_in(
+    w: &mut PodWrite<'_>,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    body: &Body,
+    storage_root: &str,
+) -> Result<(), LdpError> {
+    let resource = format!("{base}{path}");
     if !resource.starts_with(storage_root) {
         return Err(LdpError::OutsideStorage);
     }
-    if !check(&pod.read_store(), base, path, subject, AccessMode::Write)? {
+    if !check(&*w, base, path, subject, AccessMode::Write)? {
         return Err(LdpError::Forbidden);
     }
 
-    // ADR 0007: RDF/XML is refused rather than falling through to blob
-    // storage. Every *other* unparseable type is a legitimate binary, so this
-    // has to name RDF/XML specifically — `read_format` errors for all of them.
-    refuse_rdf_xml(content_type)?;
-
-    if syntax::is_parseable_rdf(content_type) {
-        let quads = parse_into_graph(body, syntax::read_format(content_type)?, &resource)?;
-        pod.write(|w| {
-            w.legacy_under_root().replace_graph(&resource, &quads)?;
-            contain(w, &resource, storage_root)
-        })?;
+    if governed(&resource).is_some() {
+        let quads = rdf_quads(body, &resource)?;
+        w.put(&resource, Content::Auxiliary(&quads))?;
+        return Ok(());
+    }
+    if storage::is_container(&resource) {
+        let quads = rdf_quads(body, &resource)?;
+        let kept = container_body(&*w, &resource, quads)?;
+        w.put(&resource, Content::Container(&kept))?;
         return Ok(());
     }
 
-    let blobs = blobs.ok_or_else(|| LdpError::Store("no blob store for this pod".into()))?;
-    // The new bytes land before the write, and the previous bytes are released
-    // only after it commits, so a failed write leaves the old resource intact.
-    let digest = blobs
-        .put(body)
-        .map_err(|e| LdpError::Store(e.to_string()))?;
-    let quads = blob_quads(&resource, &digest, content_type, body.len());
-    let released = pod.write(|w| {
-        let previous = blob_digest(&*w, &resource);
-        w.legacy_under_root().replace_graph(&resource, &quads)?;
-        contain(w, &resource, storage_root)?;
-        Ok(previous.filter(|previous| {
-            *previous != digest && !digest_still_referenced(&*w, previous, &resource)
-        }))
-    })?;
-    if let Some(previous) = released {
-        blobs
-            .remove(&previous)
-            .map_err(|e| LdpError::Store(e.to_string()))?;
+    let previous = w
+        .meta(&resource)?
+        .and_then(|meta| meta.blob)
+        .map(|blob| blob.digest);
+    let current = match body {
+        Body::Rdf { .. } => {
+            let quads = rdf_quads(body, &resource)?;
+            w.put(&resource, Content::Rdf(&quads))?;
+            None
+        }
+        Body::Binary(blob) => {
+            w.put(
+                &resource,
+                Content::Binary(BlobMeta {
+                    digest: blob.digest.clone(),
+                    media_type: blob.media_type.clone(),
+                    byte_size: blob.byte_size,
+                }),
+            )?;
+            Some(blob.digest.as_str())
+        }
+    };
+    // Released, not deleted: `Pod::write` deletes it after the commit, and
+    // only if nothing else in the pod still names it.
+    if let Some(previous) = previous
+        && current != Some(previous.as_str())
+    {
+        w.release_blob(&previous);
     }
     Ok(())
 }
 
-/// Record `resource` as a member of its container, unless it is an ACL.
-///
-/// ACL resources are auxiliary resources and aren't contained (Solid Protocol
-/// §4.3). Skipping the whole walk up the tree, not just the last step, is what
-/// stops a write to `/~/newdir/.acl` from creating `/~/newdir/` as a side
-/// effect. The ACL may exist before the resource it governs, and WAC applies it
-/// once that resource does.
-fn contain(w: &mut PodWrite<'_>, resource: &str, storage_root: &str) -> Result<(), StoreError> {
-    if governed(resource).is_some() {
-        return Ok(());
+/// Parse an RDF body into `resource`'s own graph, or refuse a binary.
+fn rdf_quads(body: &Body, resource: &str) -> Result<Vec<Quad>, LdpError> {
+    match body {
+        Body::Rdf { bytes, format } => parse_into_graph(bytes, *format, resource),
+        Body::Binary(_) => Err(LdpError::NotRdf),
     }
-    storage::add_containment(w, resource, storage_root)
+}
+
+/// The part of a container's body that is the client's to store.
+///
+/// - **Containment.** `<container> ldp:contains ?x` triples must name exactly
+///   the current members, so a GET-edit-PUT round trip works. A body with none
+///   leaves membership alone. Any other set is `ContainmentChange` (Solid
+///   Protocol §5.3). Either way none of them is stored: containment lives in
+///   metadata.
+/// - **Echoed server types** are dropped: `ldp:Resource`, `ldp:Container`,
+///   `ldp:BasicContainer`, and `pim:Storage` at the root.
+/// - **The rest** is kept.
+fn container_body(
+    r: &impl PodRead,
+    container: &str,
+    quads: Vec<Quad>,
+) -> Result<Vec<Quad>, LdpError> {
+    let node = NamedOrBlankNode::NamedNode(iri(container));
+    // What a GET serves from metadata: the types and the listing.
+    let served = resources::container_triples(r, container)?;
+    let members: BTreeSet<String> = served
+        .iter()
+        .filter(|q| q.predicate.as_str() == vocab::LDP_CONTAINS)
+        .map(|q| q.object.to_string())
+        .collect();
+    let is_root = served
+        .iter()
+        .any(|q| matches!(&q.object, Term::NamedNode(t) if t.as_str() == vocab::PIM_STORAGE));
+
+    let mut named = BTreeSet::new();
+    let mut kept = Vec::new();
+    for quad in quads {
+        let about_it = quad.subject == node;
+        if about_it && quad.predicate.as_str() == vocab::LDP_CONTAINS {
+            named.insert(quad.object.to_string());
+            continue;
+        }
+        // An echo of a type the server serves isn't the client's to store.
+        let echoed = about_it
+            && quad.predicate.as_str() == vocab::RDF_TYPE
+            && is_served_type(&quad.object, is_root);
+        if !echoed {
+            kept.push(quad);
+        }
+    }
+    if !named.is_empty() && named != members {
+        return Err(LdpError::ContainmentChange);
+    }
+    Ok(kept)
+}
+
+fn is_served_type(object: &Term, is_root: bool) -> bool {
+    let Term::NamedNode(t) = object else {
+        return false;
+    };
+    matches!(
+        t.as_str(),
+        vocab::LDP_RESOURCE | vocab::LDP_CONTAINER | vocab::LDP_BASIC_CONTAINER
+    ) || (is_root && t.as_str() == vocab::PIM_STORAGE)
+}
+
+/// Run `f` in one `Pod::write`, keeping its own error type.
+///
+/// `Pod::write` speaks `StoreError`. When `f` refuses, the closure returns an
+/// `Err`, so the transaction rolls back, and the refusal is handed back as it
+/// was.
+fn in_write<T, E: From<StoreError>>(
+    pod: &Pod,
+    f: impl FnOnce(&mut PodWrite<'_>) -> Result<T, E>,
+) -> Result<T, E> {
+    let mut refusal = None;
+    let written = pod.write(|w| {
+        f(w).map_err(|e| {
+            refusal = Some(e);
+            StoreError::Backend("refused, and rolled back".into())
+        })
+    });
+    match (written, refusal) {
+        (Ok(value), _) => Ok(value),
+        (Err(_), Some(refusal)) => Err(refusal),
+        (Err(e), None) => Err(E::from(e)),
+    }
 }
 
 /// ADR 0007: we serve RDF/XML but never parse it, and it must not become an
@@ -352,52 +581,7 @@ fn refuse_rdf_xml(content_type: &str) -> Result<(), LdpError> {
     }
 }
 
-/// The graph an LDP-NR is described by.
-fn blob_quads(resource: &str, digest: &str, media_type: &str, size: usize) -> Vec<Quad> {
-    use oxigraph::model::{Literal, NamedOrBlankNode, Term};
-    let node = iri(resource);
-    let graph = GraphNameRef::NamedNode(node.as_ref()).into_owned();
-    let subject = NamedOrBlankNode::NamedNode(node.clone());
-    let media_type = syntax::media_type_of(media_type).to_string();
-
-    vec![
-        Quad::new(
-            subject.clone(),
-            iri(brolly_domain::vocab::RDF_TYPE),
-            Term::NamedNode(iri(storage::LDP_NON_RDF_SOURCE)),
-            graph.clone(),
-        ),
-        Quad::new(
-            subject.clone(),
-            iri(brolly_domain::vocab::RDF_TYPE),
-            Term::NamedNode(iri(storage::LDP_RESOURCE)),
-            graph.clone(),
-        ),
-        Quad::new(
-            subject.clone(),
-            iri(BLOB_DIGEST),
-            Term::Literal(Literal::new_simple_literal(digest)),
-            graph.clone(),
-        ),
-        Quad::new(
-            subject.clone(),
-            iri(BLOB_MEDIA_TYPE),
-            Term::Literal(Literal::new_simple_literal(media_type)),
-            graph.clone(),
-        ),
-        Quad::new(
-            subject,
-            iri(BLOB_SIZE),
-            Term::Literal(Literal::new_typed_literal(
-                size.to_string(),
-                iri(brolly_domain::vocab::XSD_INTEGER),
-            )),
-            graph,
-        ),
-    ]
-}
-
-/// `POST` — append triples to a resource, or create a member of a container.
+/// `POST` — create a member of a container, or append triples to a document.
 ///
 /// Requires Append, which Write satisfies (`acl:Write` implies `acl:Append`).
 pub fn append(
@@ -410,45 +594,76 @@ pub fn append(
     content_type: &str,
     storage_root: &str,
 ) -> Result<String, LdpError> {
-    let container = format!("{base}{path}");
-    if !container.starts_with(storage_root) {
+    // Appending to a document takes RDF; a container's new member may be a
+    // binary.
+    let rdf_only = !storage::is_container(&format!("{base}{path}"));
+    let target = Target {
+        pod,
+        base,
+        path,
+        subject,
+        storage_root,
+    };
+    let attempt = || -> Result<String, LdpError> {
+        let body = target.prepare(blobs, rdf_only, AccessMode::Append, body, content_type)?;
+        in_write(pod, |w| {
+            append_in(w, base, path, subject, &body, storage_root)
+        })
+    };
+    match attempt() {
+        Err(LdpError::BlobMissing) => attempt(),
+        other => other,
+    }
+}
+
+/// [`append`] inside the caller's write.
+///
+/// POST to a container is a `put` of the minted member. POST to a document is
+/// stage 0's append, unchanged until 5c, and takes RDF only.
+pub fn append_in(
+    w: &mut PodWrite<'_>,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    body: &Body,
+    storage_root: &str,
+) -> Result<String, LdpError> {
+    let target = format!("{base}{path}");
+    if !target.starts_with(storage_root) {
         return Err(LdpError::OutsideStorage);
     }
-    if !check(&pod.read_store(), base, path, subject, AccessMode::Append)? {
+    if !check(&*w, base, path, subject, AccessMode::Append)? {
         return Err(LdpError::Forbidden);
     }
 
-    // POST to a container mints a new member; POST to a resource appends.
-    let target = if storage::is_container(&container) {
-        format!("{container}{}", uuid::Uuid::new_v4())
-    } else {
-        container.clone()
-    };
+    if storage::is_container(&target) {
+        let member = format!("{target}{}", uuid::Uuid::new_v4());
+        match body {
+            Body::Rdf { .. } => {
+                let quads = rdf_quads(body, &member)?;
+                w.put(&member, Content::Rdf(&quads))?;
+            }
+            Body::Binary(blob) => {
+                w.put(
+                    &member,
+                    Content::Binary(BlobMeta {
+                        digest: blob.digest.clone(),
+                        media_type: blob.media_type.clone(),
+                        byte_size: blob.byte_size,
+                    }),
+                )?;
+            }
+        }
+        return Ok(member);
+    }
 
-    // A binary member is created rather than appended to: there are no triples
-    // to merge into.
-    refuse_rdf_xml(content_type)?;
-    let quads = if syntax::is_parseable_rdf(content_type) {
-        parse_into_graph(body, syntax::read_format(content_type)?, &target)?
-    } else {
-        let blobs = blobs.ok_or_else(|| LdpError::Store("no blob store for this pod".into()))?;
-        let digest = blobs
-            .put(body)
-            .map_err(|e| LdpError::Store(e.to_string()))?;
-        blob_quads(&target, &digest, content_type, body.len())
-    };
-
-    pod.write(|w| {
-        w.legacy_under_root().insert(&quads)?;
-        contain(w, &target, storage_root)
-    })?;
+    let quads = rdf_quads(body, &target)?;
+    w.append(&target, &quads)?;
     Ok(target)
 }
 
-/// May this subject write to `path`?
-///
-/// Exposed for `PATCH`, which mutates through the SPARQL engine rather than
-/// through [`put`] and so cannot borrow its check.
+/// May this subject write to `path`? For callers outside a write; `patch_in`
+/// checks inside one.
 pub fn may_write(
     store: &impl PodRead,
     base: &str,
@@ -461,7 +676,22 @@ pub fn may_write(
 /// `DELETE`.
 pub fn delete(
     pod: &Pod,
-    blobs: Option<&BlobStore>,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    storage_root: &str,
+) -> Result<(), LdpError> {
+    in_write(pod, |w| delete_in(w, base, path, subject, storage_root))
+}
+
+/// [`delete`] inside the caller's write.
+///
+/// `remove` takes the resource's `.acl` with it (Solid Protocol §5.4), so a
+/// recreated resource can't quietly get its old grants back, and releases its
+/// blob. Content addressing means two resources can name one blob, which is
+/// why the blob is released rather than deleted here.
+pub fn delete_in(
+    w: &mut PodWrite<'_>,
     base: &str,
     path: &str,
     subject: &Subject,
@@ -471,47 +701,95 @@ pub fn delete(
     if !resource.starts_with(storage_root) {
         return Err(LdpError::OutsideStorage);
     }
-    if !check(&pod.read_store(), base, path, subject, AccessMode::Write)? {
+    if !check(&*w, base, path, subject, AccessMode::Write)? {
         return Err(LdpError::Forbidden);
     }
+    let Some(meta) = w.meta(&resource)? else {
+        return Err(LdpError::NotFound);
+    };
+    // Without its root a pod has nowhere to put anything, and only
+    // provisioning records one. 5b answers 405 here.
+    if resource == storage_root {
+        return Err(LdpError::Forbidden);
+    }
+    // Refusing to delete a non-empty container is LDP's rule, and it is the
+    // difference between removing a resource and silently orphaning a subtree.
+    if matches!(meta.kind, Kind::Container) && !w.members(&resource)?.is_empty() {
+        return Err(LdpError::Forbidden);
+    }
+    w.remove(&resource)?;
+    Ok(())
+}
 
-    let released = pod.write(|w| {
-        if !storage::exists(&*w, &resource) {
-            return Ok(Err(LdpError::NotFound));
-        }
+/// A PATCH body, by its content type.
+pub enum PatchBody<'a> {
+    /// `text/n3`: an N3 Patch.
+    N3(&'a [u8]),
+    /// `application/sparql-update`.
+    SparqlUpdate(&'a str),
+}
 
-        // Refusing to delete a non-empty container is LDP's rule, and it is the
-        // difference between removing a resource and silently orphaning a
-        // subtree.
-        if storage::is_container(&resource) && !storage::members(&*w, &resource).is_empty() {
-            return Ok(Err(LdpError::Forbidden));
-        }
+/// `PATCH`: WAC, the patch, and the write, in one transaction.
+pub fn patch(
+    pod: &Pod,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    body: PatchBody<'_>,
+    storage_root: &str,
+) -> Result<(), PatchError> {
+    in_write(pod, |w| {
+        patch_in(w, base, path, subject, body, storage_root)
+    })
+}
 
-        // Read the digest before the graph goes, then release the bytes only if
-        // no other resource still names them — content addressing means two
-        // resources can share one blob.
-        let digest = blob_digest(&*w, &resource);
-        w.legacy_under_root().clear_graph(&resource)?;
-        storage::remove_containment(w, &resource, storage_root)?;
-
-        // Deleting a resource deletes its ACL (Solid Protocol §5.4). Now that an
-        // ACL isn't a member, a container that has one can be deleted, and
-        // recreating it would otherwise quietly bring the old grants back. Both
-        // go in one transaction, so a failure leaves both.
-        w.legacy_under_root()
-            .clear_graph(&format!("{resource}.acl"))?;
-
-        Ok(Ok(digest.filter(|digest| {
-            !digest_still_referenced(&*w, digest, &resource)
-        })))
-    })??;
-
-    if let Some(digest) = released
-        && let Some(blobs) = blobs
+/// [`patch`] inside the caller's write. A patch mutates, so it needs Write
+/// (Control, on an ACL). A binary has no triples to patch.
+pub fn patch_in(
+    w: &mut PodWrite<'_>,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+    body: PatchBody<'_>,
+    storage_root: &str,
+) -> Result<(), PatchError> {
+    let resource = format!("{base}{path}");
+    if !resource.starts_with(storage_root) {
+        return Err(PatchError::Ldp(LdpError::OutsideStorage));
+    }
+    if !check(&*w, base, path, subject, AccessMode::Write).map_err(PatchError::Ldp)? {
+        return Err(PatchError::Ldp(LdpError::Forbidden));
+    }
+    if w.meta(&resource)?
+        .is_some_and(|meta| matches!(meta.kind, Kind::NonRdfSource))
     {
-        blobs
-            .remove(&digest)
-            .map_err(|e| LdpError::Store(e.to_string()))?;
+        return Err(PatchError::Ldp(LdpError::NotRdf));
+    }
+    match body {
+        PatchBody::N3(body) => patch::apply_n3_patch(w, &resource, body),
+        PatchBody::SparqlUpdate(sparql) => patch::apply_sparql_update(w, &resource, sparql),
+    }
+}
+
+/// Write a patched graph with the `Content` its target calls for: an ACL as
+/// `Auxiliary`, a container under [`container_body`]'s rule, anything else as
+/// an RDF document. A patch that creates a resource contains it, because `put`
+/// does.
+///
+/// A patch's `solid:where` can't match a container's `ldp:contains`, because
+/// containment isn't in the content graph (a known limitation; 5c revisits it).
+pub(crate) fn store_patched(
+    w: &mut PodWrite<'_>,
+    resource: &str,
+    patched: Vec<Quad>,
+) -> Result<(), LdpError> {
+    if governed(resource).is_some() {
+        w.put(resource, Content::Auxiliary(&patched))?;
+    } else if storage::is_container(resource) {
+        let kept = container_body(&*w, resource, patched)?;
+        w.put(resource, Content::Container(&kept))?;
+    } else {
+        w.put(resource, Content::Rdf(&patched))?;
     }
     Ok(())
 }

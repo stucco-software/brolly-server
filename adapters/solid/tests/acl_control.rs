@@ -10,10 +10,9 @@
 use brolly_authz::AccessMode;
 use brolly_identity::{Scope, Subject, Via};
 use brolly_solid::ldp::{self, LdpError};
-use brolly_solid::storage;
 use brolly_store::StoreManager;
-use brolly_store::resources::Pod;
-use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use brolly_store::resources::{Content, Kind, Pod, PodRead, ResourceMeta};
+use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 use uuid::Uuid;
 
 const BASE: &str = "https://alice.brolly.id";
@@ -32,15 +31,6 @@ const ALL: [AccessMode; 4] = [
     AccessMode::Control,
 ];
 
-/// Setup straight into the store, bypassing `Pod::write` (`test-fixtures`),
-/// so it doesn't depend on the code under test.
-fn seed(target: &Pod, quads: &[Quad]) {
-    let store = target.raw_store();
-    for quad in quads {
-        store.insert(quad).unwrap();
-    }
-}
-
 fn n(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
 }
@@ -52,6 +42,39 @@ fn t(graph: &str, s: &str, p: &str, o: &str) -> Quad {
         Term::NamedNode(n(o)),
         GraphName::NamedNode(n(graph)),
     )
+}
+
+/// Add `quads` to the ACL at `acl`, recording it as an auxiliary resource if
+/// it's new. Metadata is what makes an ACL exist, so a raw seed isn't enough.
+/// Goes through the pod, not through `ldp`, so the setup doesn't depend on the
+/// code under test.
+fn grant(pod: &Pod, acl: &str, quads: &[Quad]) {
+    pod.write(|w| {
+        let mut all = w
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(n(acl).as_ref())),
+            )
+            .collect::<Result<Vec<_>, _>>()?;
+        all.extend_from_slice(quads);
+        w.put(acl, Content::Auxiliary(&all))?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// What the metadata records about `resource`: `Some` is existence.
+fn meta(pod: &Pod, resource: &str) -> Option<ResourceMeta> {
+    pod.read(|r| r.meta(resource)).unwrap()
+}
+
+/// A container's members, sorted, from metadata.
+fn members(pod: &Pod, container: &str) -> Vec<String> {
+    let mut members = pod.write(|w| w.members(container)).unwrap();
+    members.sort();
+    members
 }
 
 fn member(name: &str, webid: &str) -> Subject {
@@ -81,14 +104,13 @@ fn pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let dir = tempfile::tempdir().unwrap();
     let mgr = StoreManager::open(dir.path(), 4, 60).unwrap();
     let store = mgr.pod(Uuid::new_v4()).unwrap();
-    store
-        .write(|w| storage::init_storage_root(w, ROOT))
-        .unwrap();
+    store.write(|w| w.create_root(ROOT)).unwrap();
 
     let g = format!("{ROOT}.acl");
     let a = format!("{g}#owner");
-    seed(
+    grant(
         &store,
+        &g,
         &[
             t(&g, &a, &format!("{ACL}default"), ROOT),
             t(&g, &a, &format!("{ACL}accessTo"), ROOT),
@@ -112,8 +134,9 @@ fn shared_pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     let g = format!("{shared}.acl");
     let owner = format!("{g}#owner");
     let bob = format!("{g}#bob");
-    seed(
+    grant(
         &store,
+        &g,
         &[
             t(&g, &owner, &format!("{ACL}accessTo"), &shared),
             t(&g, &owner, &format!("{ACL}default"), &shared),
@@ -186,7 +209,7 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
         "PATCH goes through may_write"
     );
     assert!(matches!(
-        ldp::delete(&store, None, BASE, "/~/shared/.acl", &bob(), ROOT),
+        ldp::delete(&store, BASE, "/~/shared/.acl", &bob(), ROOT),
         Err(LdpError::Forbidden)
     ));
 
@@ -233,10 +256,7 @@ fn bob_cannot_create_the_acl_of_a_document_he_can_write() {
         ),
         "Write on a document must not let Bob create its ACL"
     );
-    assert!(!storage::exists(
-        &store.read_store(),
-        &format!("{ROOT}shared/doc.acl")
-    ));
+    assert!(meta(&store, &format!("{ROOT}shared/doc.acl")).is_none());
 }
 
 #[test]
@@ -334,9 +354,9 @@ fn the_owner_can_do_all_of_it() {
     // `doc.acl.acl` goes before `doc.acl`. It holds a note, not grants, and
     // while it exists the old rule takes it as `doc.acl`'s own ACL, which would
     // refuse the delete for a reason that has nothing to do with this fix.
-    ldp::delete(&store, None, BASE, "/~/shared/doc.acl.acl", &alice(), ROOT).unwrap();
-    ldp::delete(&store, None, BASE, "/~/shared/doc.acl", &alice(), ROOT).unwrap();
-    assert!(!storage::exists(&store.read_store(), &format!("{doc}.acl")));
+    ldp::delete(&store, BASE, "/~/shared/doc.acl.acl", &alice(), ROOT).unwrap();
+    ldp::delete(&store, BASE, "/~/shared/doc.acl", &alice(), ROOT).unwrap();
+    assert!(meta(&store, &format!("{doc}.acl")).is_none());
 
     ldp::put(
         &store,
@@ -349,7 +369,7 @@ fn the_owner_can_do_all_of_it() {
         ROOT,
     )
     .unwrap();
-    ldp::delete(&store, None, BASE, "/~/shared/.acl", &alice(), ROOT).unwrap();
+    ldp::delete(&store, BASE, "/~/shared/.acl", &alice(), ROOT).unwrap();
 }
 
 /// `WAC-Allow` on an ACL is all or nothing: Control on the governed resource
@@ -362,8 +382,9 @@ fn wac_allow_on_an_acl_is_all_or_nothing() {
     // enough to manage its ACL.
     let g = format!("{ROOT}shared/.acl");
     let c = format!("{g}#carol");
-    seed(
+    grant(
         &store,
+        &g,
         &[
             t(&g, &c, &format!("{ACL}accessTo"), &format!("{ROOT}shared/")),
             t(&g, &c, &format!("{ACL}mode"), &format!("{ACL}Control")),
@@ -422,7 +443,7 @@ fn an_acl_is_not_a_member_of_its_container() {
     .unwrap();
     assert_eq!(appended, format!("{ROOT}shared/.acl"));
 
-    let members = storage::members(&store.read_store(), &format!("{ROOT}shared/"));
+    let members = members(&store, &format!("{ROOT}shared/"));
     assert!(
         members.contains(&doc),
         "an ordinary resource is still contained"
@@ -456,15 +477,12 @@ fn an_acl_does_not_create_the_container_it_governs() {
     )
     .unwrap();
 
-    assert!(storage::exists(
-        &store.read_store(),
-        &format!("{newdir}.acl")
+    assert!(matches!(
+        meta(&store, &format!("{newdir}.acl")).unwrap().kind,
+        Kind::Auxiliary
     ));
-    assert!(
-        !storage::exists(&store.read_store(), &newdir),
-        "/~/newdir/ was created"
-    );
-    assert!(!storage::members(&store.read_store(), ROOT).contains(&newdir));
+    assert!(meta(&store, &newdir).is_none(), "/~/newdir/ was created");
+    assert!(!members(&store, ROOT).contains(&newdir));
 }
 
 /// Solid Protocol §5.4: deleting a resource deletes its auxiliary resources.
@@ -496,10 +514,10 @@ fn deleting_a_resource_deletes_its_acl() {
     )
     .unwrap();
 
-    ldp::delete(&store, None, BASE, "/~/shared/doc", &alice(), ROOT).unwrap();
+    ldp::delete(&store, BASE, "/~/shared/doc", &alice(), ROOT).unwrap();
 
-    assert!(!storage::exists(&store.read_store(), &doc));
-    assert!(!storage::exists(&store.read_store(), &format!("{doc}.acl")));
+    assert!(meta(&store, &doc).is_none());
+    assert!(meta(&store, &format!("{doc}.acl")).is_none());
 }
 
 /// A container with an ACL can now be deleted, because the ACL isn't a
@@ -544,11 +562,8 @@ fn a_recreated_container_does_not_get_its_old_grants_back() {
         "precondition: Bob was granted Write"
     );
 
-    ldp::delete(&store, None, BASE, "/~/shared/", &alice(), ROOT).unwrap();
-    assert!(!storage::exists(
-        &store.read_store(),
-        &format!("{shared}.acl")
-    ));
+    ldp::delete(&store, BASE, "/~/shared/", &alice(), ROOT).unwrap();
+    assert!(meta(&store, &format!("{shared}.acl")).is_none());
 
     ldp::put(
         &store,
@@ -567,9 +582,64 @@ fn a_recreated_container_does_not_get_its_old_grants_back() {
     );
 }
 
-/// What `put` wrote before this fix, and the sweep that removes it.
+/// An ACL is a resource: it exists, has a version, and goes with what it
+/// governs.
 #[test]
-fn stale_acl_containment_is_swept_and_a_rerun_removes_nothing() {
+fn an_acl_exists_has_a_version_and_goes_with_its_resource() {
+    let (_m, _d, store) = shared_pod();
+    let doc = format!("{ROOT}shared/doc");
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc.acl",
+        &alice(),
+        acl_granting(ALICE, &doc).as_bytes(),
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+
+    let acl = meta(&store, &format!("{doc}.acl")).expect("the ACL exists");
+    assert!(matches!(acl.kind, Kind::Auxiliary));
+    assert!(!acl.version.is_empty());
+
+    ldp::delete(&store, BASE, "/~/shared/doc", &alice(), ROOT).unwrap();
+    assert!(meta(&store, &format!("{doc}.acl")).is_none());
+}
+
+#[test]
+fn an_acl_takes_an_rdf_body_only() {
+    let (_m, _d, store) = shared_pod();
+    let err = ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/.acl",
+        &alice(),
+        b"\x89PNG",
+        "image/png",
+        ROOT,
+    )
+    .unwrap_err();
+    assert!(matches!(err, LdpError::NotRdf), "got {err:?}");
+}
+
+/// Solid's rule: an existing ACL governs, and an empty one grants nothing. It
+/// must not fall through to the container's broader `acl:default`.
+#[test]
+fn an_empty_acl_governs_and_grants_nothing() {
     let (_m, _d, store) = shared_pod();
     ldp::put(
         &store,
@@ -582,34 +652,31 @@ fn stale_acl_containment_is_swept_and_a_rerun_removes_nothing() {
         ROOT,
     )
     .unwrap();
-
-    // The triples an old `put` of each ACL would have left behind.
-    store
-        .write(|w| {
-            storage::add_containment(w, &format!("{ROOT}.acl"), ROOT)?;
-            storage::add_containment(w, &format!("{ROOT}shared/.acl"), ROOT)
-        })
-        .unwrap();
-
-    assert_eq!(store.write(storage::uncontain_acls).unwrap(), 2);
-    assert_eq!(
-        storage::members(&store.read_store(), &format!("{ROOT}shared/")),
-        vec![format!("{ROOT}shared/doc")]
+    assert!(
+        ldp::granted_modes(&store.read_store(), BASE, "/~/shared/doc", &bob())
+            .contains(&AccessMode::Write),
+        "precondition: the container's default reaches Bob"
     );
-    let root = storage::members(&store.read_store(), ROOT);
-    assert!(!root.contains(&format!("{ROOT}.acl")), "got {root:?}");
-    assert!(root.contains(&format!("{ROOT}shared/")), "got {root:?}");
 
-    // The ACLs themselves are untouched; only their membership goes.
-    assert!(storage::exists(&store.read_store(), &format!("{ROOT}.acl")));
-    assert!(storage::exists(
-        &store.read_store(),
-        &format!("{ROOT}shared/.acl")
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/shared/doc.acl",
+        &alice(),
+        b"",
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+
+    assert!(meta(&store, &format!("{ROOT}shared/doc.acl")).is_some());
+    assert!(
+        ldp::granted_modes(&store.read_store(), BASE, "/~/shared/doc", &bob()).is_empty(),
+        "an empty ACL fell through to the container's default"
+    );
+    assert!(matches!(
+        ldp::read(&store, None, BASE, "/~/shared/doc", &bob(), None),
+        Err(LdpError::NotFound)
     ));
-
-    assert_eq!(
-        store.write(storage::uncontain_acls).unwrap(),
-        0,
-        "idempotent"
-    );
 }

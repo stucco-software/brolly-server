@@ -3,7 +3,7 @@
 
 use brolly_domain::iri::{iris_in, is_canonical};
 use brolly_store::index::{self, NotePointer};
-use brolly_store::{InstanceStore, PodRead, StoreManager};
+use brolly_store::{InstanceStore, METADATA_GRAPH, PodRead, StoreManager};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde_json::json;
 use uuid::Uuid;
@@ -112,6 +112,9 @@ fn pods_are_isolated_and_delete_is_rm_rf() {
         bob_pod
             .read_store()
             .quads_for_pattern(None, None, None, None)
+            .map(Result::unwrap)
+            // A new pod holds only its layout mark, in the metadata graph.
+            .filter(|q| !matches!(&q.graph_name, GraphName::NamedNode(g) if g.as_str() == METADATA_GRAPH))
             .count(),
         0,
         "one user's write must not appear in another's pod"

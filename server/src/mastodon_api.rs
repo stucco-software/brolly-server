@@ -21,6 +21,7 @@ use brolly_identity::db::{self, User};
 use brolly_identity::{extract, webid};
 use brolly_mastodon::oauth::Grant;
 use brolly_mastodon::{compose, instance, oauth, status_id, timeline, translate};
+use brolly_store::StoreError;
 use brolly_store::resources::{Pod, PodRead};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -527,29 +528,46 @@ pub async fn upload_media(
     let id = status_id::mint_note_id();
     let path = format!("/~/media/{id}");
     let base = format!("https://{}.{}", user.username, state.base_domain);
+    let iri = media_iri(&user.username, &state.base_domain, &id);
+    let root = brolly_identity::routing::storage_root(&user.username, &state.base_domain);
+    let subject = subject_for(&state, &user, &grant);
+    let alt = description.as_deref().filter(|d| !d.trim().is_empty());
 
     let Ok(pod) = state.stores.pod(user.id) else {
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
     };
     let blobs = state.stores.blobs(user.id).ok();
 
-    if let Err(e) = brolly_solid::ldp::put(
-        &pod,
-        blobs.as_ref(),
-        &base,
-        &path,
-        &subject_for(&state, &user, &grant),
-        &bytes,
-        &media_type,
-        &brolly_identity::routing::storage_root(&user.username, &state.base_domain),
-    ) {
+    // The bytes go into the blob store first, outside the pod's lock, so an
+    // upload doesn't queue behind it on disk I/O. Then the resource and its alt
+    // text commit in one write, so a client never reads back an upload without
+    // the description it was sent with. The multipart awaits are all behind
+    // us, so nothing here holds the lock across one.
+    let store_upload = || -> Result<(), StoreError> {
+        let body = brolly_solid::ldp::prepare(blobs.as_ref(), &bytes, &media_type)
+            .map_err(|e| StoreError::Backend(e.to_string()))?;
+        pod.write(|w| {
+            brolly_solid::ldp::put_in(w, &base, &path, &subject, &body, &root).map_err(
+                |e| match e {
+                    brolly_solid::ldp::LdpError::BlobMissing => StoreError::BlobMissing,
+                    e => StoreError::Backend(e.to_string()),
+                },
+            )?;
+            if let Some(text) = alt {
+                w.set_description(&iri, &[alt_text_quad(&iri, text)])?;
+            }
+            Ok(())
+        })
+    };
+    // Identical bytes, released by a delete between the two steps above: write
+    // them again and retry, once (spec 5a, R12).
+    let stored = match store_upload() {
+        Err(StoreError::BlobMissing) => store_upload(),
+        other => other,
+    };
+    if let Err(e) = stored {
         tracing::error!(error = %e, "media upload failed");
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Upload failed");
-    }
-
-    let iri = media_iri(&user.username, &state.base_domain, &id);
-    if let Some(text) = description.as_deref().filter(|d| !d.trim().is_empty()) {
-        set_alt_text(&pod, &iri, text);
     }
 
     let media_id = status_id::encode(&id, user.id).unwrap_or(id);
@@ -565,24 +583,43 @@ pub async fn upload_media(
         .into_response()
 }
 
-fn set_alt_text(pod: &Pod, iri: &str, text: &str) {
-    use oxigraph_model::{Literal, NamedNode, NamedOrBlankNode, Quad, Term};
+/// The triple recording an upload's alt text, in the upload's own graph.
+fn alt_text_quad(iri: &str, text: &str) -> oxigraph_model::Quad {
+    use oxigraph_model::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
     let node = NamedNode::new_unchecked(iri);
-    let quad = Quad::new(
+    Quad::new(
         NamedOrBlankNode::NamedNode(node.clone()),
         NamedNode::new_unchecked(ALT_TEXT),
         Term::Literal(Literal::new_simple_literal(text)),
-        oxigraph_model::GraphName::NamedNode(node),
-    );
-    // The media resource is under the storage root, so this is written the
-    // way it always was until the pod keeps resource metadata.
-    if let Err(e) = pod.write(|w| w.legacy_under_root().insert(&[quad])) {
-        tracing::warn!(error = %e, "storing alt text failed");
-    }
+        GraphName::NamedNode(node),
+    )
 }
 
 fn alt_text(pod: &impl PodRead, iri: &str) -> Option<String> {
     brolly_store::collection::literal(pod, iri, ALT_TEXT)
+}
+
+/// What the Mastodon API shows of an upload.
+struct Media {
+    media_type: String,
+    description: Option<String>,
+}
+
+/// The upload at `iri`, or `None` if there's no binary there.
+///
+/// One snapshot. The media type comes from the pod's resource metadata, which
+/// the server records and no client write reaches. Only the alt text is read
+/// from the upload's own graph, because a member writes it.
+fn media(pod: &Pod, iri: &str) -> Result<Option<Media>, StoreError> {
+    pod.read(|r| {
+        let Some(blob) = r.meta(iri)?.and_then(|meta| meta.blob) else {
+            return Ok(None);
+        };
+        Ok(Some(Media {
+            media_type: blob.media_type,
+            description: alt_text(r, iri),
+        }))
+    })
 }
 
 /// `PUT /api/v1/media/{id}` — set or change alt text.
@@ -626,27 +663,41 @@ pub async fn update_media(
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
     };
     let iri = media_iri(&user.username, &state.base_domain, &local_id);
-    if brolly_solid::ldp::blob_digest(&pod.read_store(), &iri).is_none() {
-        return not_found();
-    }
 
+    // Checking it's an upload and adding the alt text are one write, so the
+    // upload can't be deleted in between. The description replaces whatever
+    // was there and changes the version, like any other edit.
     if let Some(text) = update.description.as_deref() {
-        set_alt_text(&pod, &iri, text);
+        let appended = pod.write(|w| {
+            if w.meta(&iri)?.and_then(|meta| meta.blob).is_none() {
+                return Ok(false);
+            }
+            w.set_description(&iri, &[alt_text_quad(&iri, text)])?;
+            Ok(true)
+        });
+        match appended {
+            Ok(true) => {}
+            Ok(false) => return not_found(),
+            Err(e) => {
+                tracing::error!(error = %e, "storing alt text failed");
+                return error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Could not save the description",
+                );
+            }
+        }
     }
 
-    let media_type = brolly_store::collection::literal(
-        &pod.read_store(),
-        &iri,
-        brolly_solid::ldp::BLOB_MEDIA_TYPE,
-    )
-    .unwrap_or_else(|| "application/octet-stream".into());
-    Json(media_json(
-        &id,
-        &iri,
-        &media_type,
-        alt_text(&pod.read_store(), &iri).as_deref(),
-    ))
-    .into_response()
+    match media(&pod, &iri) {
+        Ok(Some(upload)) => Json(media_json(
+            &id,
+            &iri,
+            &upload.media_type,
+            upload.description.as_deref(),
+        ))
+        .into_response(),
+        _ => not_found(),
+    }
 }
 
 /// `GET /api/v1/media/{id}` — clients poll this for processing state.
@@ -671,22 +722,16 @@ pub async fn get_media(
         return not_found();
     };
     let iri = media_iri(&user.username, &state.base_domain, &local_id);
-    if brolly_solid::ldp::blob_digest(&pod.read_store(), &iri).is_none() {
-        return not_found();
+    match media(&pod, &iri) {
+        Ok(Some(upload)) => Json(media_json(
+            &id,
+            &iri,
+            &upload.media_type,
+            upload.description.as_deref(),
+        ))
+        .into_response(),
+        _ => not_found(),
     }
-    let media_type = brolly_store::collection::literal(
-        &pod.read_store(),
-        &iri,
-        brolly_solid::ldp::BLOB_MEDIA_TYPE,
-    )
-    .unwrap_or_else(|| "application/octet-stream".into());
-    Json(media_json(
-        &id,
-        &iri,
-        &media_type,
-        alt_text(&pod.read_store(), &iri).as_deref(),
-    ))
-    .into_response()
 }
 
 // --- composition -----------------------------------------------------------------
@@ -753,20 +798,15 @@ pub async fn create_status(
             );
         }
         let iri = media_iri(&user.username, &state.base_domain, &local_id);
-        let Some(_) = brolly_solid::ldp::blob_digest(&pod.read_store(), &iri) else {
+        let Ok(Some(upload)) = media(&pod, &iri) else {
             return error(
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Validation failed: Media attachment not found",
             );
         };
         attachments.push(compose::Attachment {
-            media_type: brolly_store::collection::literal(
-                &pod.read_store(),
-                &iri,
-                brolly_solid::ldp::BLOB_MEDIA_TYPE,
-            )
-            .unwrap_or_else(|| "application/octet-stream".into()),
-            description: alt_text(&pod.read_store(), &iri),
+            media_type: upload.media_type,
+            description: upload.description,
             url: iri,
         });
     }

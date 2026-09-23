@@ -13,7 +13,7 @@ use brolly_activitypub::{follows, inbox};
 use brolly_identity::db;
 use brolly_server::outbox::{DeliverError, Refusal, deliver};
 use brolly_server::{AppState, app};
-use brolly_store::resources::PodRead;
+use brolly_store::resources::{Kind, PodRead};
 use brolly_store::{StoreManager, index};
 use http_body_util::BodyExt;
 use oxigraph::model::NamedNode;
@@ -195,6 +195,30 @@ impl Harness {
             .await
             .unwrap()
             .status()
+    }
+
+    /// GET a path in a member's pod as Turtle, for its status and body.
+    async fn get(&self, username: &str, cookie: &str, path: &str) -> (StatusCode, String) {
+        let response = self
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(path)
+                    .header(header::HOST, format!("{username}.{BASE}"))
+                    .header(header::ACCEPT, "text/turtle")
+                    .header(header::COOKIE, cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = response.status();
+        let body =
+            String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+                .to_string();
+        (status, body)
     }
 }
 
@@ -627,6 +651,120 @@ async fn publishing_stores_the_post_in_the_authors_own_pod() {
     .await
     .unwrap();
     assert_eq!(rows, 0, "post content must never acquire a Postgres column");
+}
+
+// --- posts are pod resources (stage 5a) --------------------------------------
+
+/// A post is an LDP resource in its author's pod: the note is listed in
+/// `/~/notes/` and its `Create` in `/~/activities/`. The author's `Delete`
+/// de-lists both, because it goes through the same `remove` an LDP DELETE
+/// does.
+#[tokio::test]
+async fn a_published_note_is_listed_in_the_authors_notes_until_she_deletes_it() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+
+    let (status, created) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({"type": "Note", "content": "listed", "to": [PUBLIC]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "publish: {created}");
+    let note = created["object"]["id"].as_str().unwrap().to_string();
+    let activity = created["id"].as_str().unwrap().to_string();
+    let note_path = note
+        .strip_prefix(&format!("https://alice.{BASE}"))
+        .unwrap()
+        .to_string();
+
+    let (status, notes) = h.get("alice", &alice, "/~/notes/").await;
+    assert_eq!(status, StatusCode::OK, "{notes}");
+    assert!(notes.contains(&note), "the note isn't listed: {notes}");
+    let (status, activities) = h.get("alice", &alice, "/~/activities/").await;
+    assert_eq!(status, StatusCode::OK, "{activities}");
+    assert!(
+        activities.contains(&activity),
+        "the Create isn't listed: {activities}"
+    );
+    assert_eq!(
+        h.get_status("alice", &alice, &note_path).await,
+        StatusCode::OK
+    );
+
+    let (status, _) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({"type": "Delete", "object": note, "to": [PUBLIC]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let (status, notes) = h.get("alice", &alice, "/~/notes/").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the container outlives its last member"
+    );
+    assert!(
+        !notes.contains(&note),
+        "the deleted note is still listed: {notes}"
+    );
+    let (_, activities) = h.get("alice", &alice, "/~/activities/").await;
+    assert!(
+        !activities.contains(&activity),
+        "the deleted post's Create is still listed: {activities}"
+    );
+    assert_eq!(
+        h.get_status("alice", &alice, &note_path).await,
+        StatusCode::NOT_FOUND
+    );
+}
+
+/// A follower's copy lives under the author's origin, so it can never be under
+/// the follower's storage root. It's protocol state in their pod, not a
+/// resource, and their own storage doesn't list it.
+#[tokio::test]
+async fn a_followers_copy_of_a_post_is_not_a_resource_in_their_pod() {
+    let h = harness().await;
+    let alice = h.login("alice").await;
+    let bob = h.login("bob").await;
+    h.publish(
+        "bob",
+        &bob,
+        &json!({"type": "Follow", "object": actor("alice")}),
+    )
+    .await;
+    let (_, created) = h
+        .publish(
+            "alice",
+            &alice,
+            &json!({"type": "Note", "content": "for my followers", "to": [PUBLIC]}),
+        )
+        .await;
+    let note = created["object"]["id"].as_str().unwrap().to_string();
+
+    // Setup: bob has the copy, or the rest proves nothing.
+    assert!(inbox::read_activity(&h.pod("bob").read_store(), &note).is_some());
+
+    assert!(
+        !matches!(h.pod("bob").read(|r| r.meta(&note)), Ok(Some(_))),
+        "bob's copy of alice's note was recorded as a resource in his pod"
+    );
+    let (status, listing) = h.get("bob", &bob, "/~/").await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert!(
+        !listing.contains(&format!("alice.{BASE}")),
+        "bob's storage lists something of alice's: {listing}"
+    );
+
+    // The same note is a resource in its author's pod.
+    assert!(matches!(
+        h.pod("alice").read(|r| r.meta(&note)),
+        Ok(Some(meta)) if matches!(meta.kind, Kind::RdfSource)
+    ));
 }
 
 // --- an activity only touches graphs its actor owns (stage 0, A1) -----------

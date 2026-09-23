@@ -13,7 +13,7 @@
 
 use brolly_domain::faithful;
 use brolly_store::StoreError;
-use brolly_store::resources::{PodRead, PodWrite};
+use brolly_store::resources::{Content, PodRead, PodWrite};
 use oxigraph::model::{GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde_json::Value;
 
@@ -74,12 +74,18 @@ fn iri(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
 }
 
-/// Store an activity in the recipient's inbox, inside the caller's write.
+/// Store an activity in an inbox or outbox collection, inside the caller's
+/// write.
 ///
 /// Idempotent: a remote instance may deliver to both the shared inbox and the
 /// personal one, and arriving twice must not show the post twice. The graph is
 /// named by the activity IRI and containment is a single triple, so a repeat
 /// delivery rewrites the same quads rather than adding more.
+///
+/// The activity and any embedded object each get their own graph, and
+/// [`write_record`] decides from each IRI whether that graph is a resource in
+/// this pod or a copy of someone else's. The collection entry is protocol
+/// state outside the storage root either way.
 pub fn deliver(
     w: &mut PodWrite<'_>,
     inbox: &str,
@@ -129,16 +135,25 @@ pub fn deliver(
     Ok(id)
 }
 
+/// Store one record as its own graph, replacing whatever was there.
+///
+/// Where it goes is decided from its IRI, never by the caller. Under this
+/// pod's storage root it's the author's own note or activity, and `put`
+/// records it as a resource: it exists, it's listed in its container, and it
+/// has a version, like anything written over LDP. Anywhere else it's a copy of
+/// someone else's post: protocol state, with no metadata. So an author's post
+/// is always a pod resource, and a recipient's copy, under another origin,
+/// never is.
 fn write_record(w: &mut PodWrite<'_>, id: &str, record: &Value) -> Result<(), InboxError> {
     let node = iri(id);
     let quads = faithful::encode(record, &node, &node, AS2).map_err(InboxError::Encode)?;
     // Replace rather than merge: a redelivered activity that lost a field
     // should not keep the old value alongside the new one.
-    //
-    // The record may be the author's own post, under their storage root, or a
-    // recipient's copy of someone else's. Until the pod keeps resource
-    // metadata, both are written the way they always were.
-    w.legacy_under_root().replace_graph(id, &quads)?;
+    if w.under_root(id)? {
+        w.put(id, Content::Rdf(&quads))?;
+    } else {
+        w.replace_graph(id, &quads)?;
+    }
     Ok(())
 }
 
@@ -160,6 +175,12 @@ fn clear_received_at(w: &mut PodWrite<'_>, inbox: &str, activity: &str) -> Resul
 ///
 /// Both halves matter: a membership row left pointing at a cleared graph is a
 /// hole in every timeline that tries to render it.
+///
+/// The graph goes the way [`write_record`] stored it. A resource under this
+/// pod's root goes through `remove`, which also takes it out of its container
+/// and drops its metadata. `remove` of one already gone is a no-op, so a
+/// Delete that reaches the same graph twice doesn't fail. A copy under another
+/// origin is cleared.
 pub fn remove(w: &mut PodWrite<'_>, inbox: &str, activity: &str) -> Result<(), InboxError> {
     let inbox_node = iri(inbox);
     w.remove_quads(&[Quad::new(
@@ -169,6 +190,10 @@ pub fn remove(w: &mut PodWrite<'_>, inbox: &str, activity: &str) -> Result<(), I
         GraphName::NamedNode(inbox_node),
     )])?;
     clear_received_at(w, inbox, activity)?;
-    w.legacy_under_root().clear_graph(activity)?;
+    if w.under_root(activity)? {
+        w.remove(activity)?;
+    } else {
+        w.clear_graph(activity)?;
+    }
     Ok(())
 }

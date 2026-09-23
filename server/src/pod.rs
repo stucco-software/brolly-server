@@ -15,7 +15,7 @@ use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
 use brolly_solid::ldp::{self, LdpError};
 use brolly_solid::oidc::tokens;
 use brolly_solid::patch;
-use brolly_store::resources::{Pod, PodWrite};
+use brolly_store::resources::Pod;
 use std::sync::Arc;
 
 use crate::AppState;
@@ -226,6 +226,20 @@ fn ldp_error(error: LdpError) -> Response {
         )
             .into_response(),
         LdpError::Syntax(e) => (StatusCode::UNSUPPORTED_MEDIA_TYPE, e.to_string()).into_response(),
+        LdpError::NotRdf => (
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "this resource takes an RDF body",
+        )
+            .into_response(),
+        LdpError::ContainmentChange => (
+            StatusCode::CONFLICT,
+            "a container's members change only by creating or deleting them",
+        )
+            .into_response(),
+        LdpError::BlobMissing => {
+            tracing::error!("a blob was released under a write that still needed it");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
         LdpError::Store(e) => {
             tracing::error!(error = %e, "ldp storage failure");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -364,34 +378,15 @@ pub async fn patch(
         Ok(r) => r,
         Err(response) => return response,
     };
-    let resource = format!("{}{path}", request.base);
-    if !resource.starts_with(&request.storage_root) {
-        return ldp_error(LdpError::OutsideStorage);
-    }
-
-    // A patch mutates, so it needs Write.
-    match ldp::may_write(
-        &request.pod.read_store(),
-        &request.base,
-        &path,
-        &request.subject,
-    ) {
-        Ok(true) => {}
-        Ok(false) => return ldp_error(LdpError::Forbidden),
-        Err(e) => return ldp_error(e),
-    }
-
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
         .unwrap_or_default();
 
-    let result = match content_type.split(';').next().unwrap_or_default().trim() {
-        "text/n3" => patch_in(&request.pod, |w| patch::apply_n3_patch(w, &resource, &body)),
+    let patch_body = match content_type.split(';').next().unwrap_or_default().trim() {
+        "text/n3" => ldp::PatchBody::N3(&body),
         "application/sparql-update" => match std::str::from_utf8(&body) {
-            Ok(sparql) => patch_in(&request.pod, |w| {
-                patch::apply_sparql_update(w, &resource, sparql)
-            }),
+            Ok(sparql) => ldp::PatchBody::SparqlUpdate(sparql),
             Err(_) => {
                 return (StatusCode::BAD_REQUEST, "body is not UTF-8").into_response();
             }
@@ -405,8 +400,17 @@ pub async fn patch(
         }
     };
 
-    match result {
+    // WAC, the patch and the write, in one transaction.
+    match ldp::patch(
+        &request.pod,
+        &request.base,
+        &path,
+        &request.subject,
+        patch_body,
+        &request.storage_root,
+    ) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(patch::PatchError::Ldp(e)) => ldp_error(e),
         Err(patch::PatchError::Precondition(m)) => (StatusCode::CONFLICT, m).into_response(),
         Err(patch::PatchError::EscapesGraph) => (
             StatusCode::FORBIDDEN,
@@ -423,19 +427,6 @@ pub async fn patch(
     }
 }
 
-/// Apply a patch in one `Pod::write`.
-///
-/// A refused patch comes back inside `Ok`, so the transaction commits, but
-/// every refusal happens before the patch writes anything.
-fn patch_in(
-    pod: &Pod,
-    apply: impl FnOnce(&mut PodWrite<'_>) -> Result<(), patch::PatchError>,
-) -> Result<(), patch::PatchError> {
-    pod.write(|w| Ok(apply(w)))
-        .map_err(|e| patch::PatchError::Store(e.to_string()))
-        .flatten()
-}
-
 /// `DELETE /~/*path`
 pub async fn delete(
     State(state): State<AppState>,
@@ -449,7 +440,6 @@ pub async fn delete(
     };
     match ldp::delete(
         &request.pod,
-        Some(&request.blobs),
         &request.base,
         &path,
         &request.subject,
@@ -524,5 +514,28 @@ pub async fn subdomain_fallback(State(state): State<AppState>, uri: axum::http::
             "not found; user storage lives under /~/",
         )
             .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 5a uses the codes `pod.rs` already has; 5b revisits them.
+    #[test]
+    fn the_new_ldp_refusals_have_status_codes() {
+        assert_eq!(
+            ldp_error(LdpError::NotRdf).status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE
+        );
+        assert_eq!(
+            ldp_error(LdpError::ContainmentChange).status(),
+            StatusCode::CONFLICT,
+            "Solid Protocol §5.3"
+        );
+        assert_eq!(
+            ldp_error(LdpError::BlobMissing).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

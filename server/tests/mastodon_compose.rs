@@ -16,7 +16,9 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use brolly_identity::db;
 use brolly_server::{AppState, app};
+use brolly_store::resources::{Kind, PodRead};
 use http_body_util::BodyExt;
+use oxigraph::model::{GraphNameRef, NamedNodeRef};
 use tower::ServiceExt;
 
 const BASE: &str = "brolly.test";
@@ -292,6 +294,90 @@ async fn alt_text_can_be_set_after_upload_and_before_posting() {
         posted.json()["media_attachments"][0]["description"],
         "added later"
     );
+}
+
+async fn get_media(h: &Harness, token: &str, media_id: &str) -> Reply {
+    send(
+        h,
+        Request::builder()
+            .method("GET")
+            .uri(format!("/api/v1/media/{media_id}"))
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+/// Stage 5a: an upload's media type and blob live in the pod's resource
+/// metadata, not in triples a client could write. `GET` and `PUT` on the media
+/// read them from there, and the alt text sent with an upload arrives in the
+/// same write as the upload itself.
+#[tokio::test]
+async fn an_upload_reads_back_from_metadata_with_its_alt_text() {
+    let h = harness().await;
+    let (user, token) = a_member(&h, "alice").await;
+
+    let media_id = upload(&h, &token, Some("a small dog")).await;
+    let got = get_media(&h, &token, &media_id).await;
+    assert_eq!(got.status, StatusCode::OK, "body: {}", got.body);
+    assert_eq!(
+        got.json()["type"],
+        "image",
+        "the media type wasn't read from metadata"
+    );
+    assert_eq!(
+        got.json()["description"],
+        "a small dog",
+        "the alt text sent with the upload was lost"
+    );
+    let iri = got.json()["url"].as_str().unwrap().to_string();
+
+    // The server recorded the blob as the upload's metadata, and nothing in the
+    // upload's own graph names it.
+    let pod = h.stores.pod(user).unwrap();
+    let meta = pod
+        .read(|r| r.meta(&iri))
+        .unwrap()
+        .expect("the upload is a pod resource");
+    assert!(matches!(meta.kind, Kind::NonRdfSource));
+    assert_eq!(
+        meta.blob.expect("with blob metadata").media_type,
+        "image/png"
+    );
+    let pointers = pod
+        .read_store()
+        .quads_for_pattern(
+            None,
+            Some(NamedNodeRef::new_unchecked(
+                "https://brolly.id/ns#blobDigest",
+            )),
+            None,
+            Some(GraphNameRef::NamedNode(NamedNodeRef::new_unchecked(&iri))),
+        )
+        .count();
+    assert_eq!(pointers, 0, "a blob pointer is still in the content graph");
+
+    // Alt text added later reads back through the same path.
+    let later = upload(&h, &token, None).await;
+    let updated = send(
+        &h,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/api/v1/media/{later}"))
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from("description=added%20later"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(updated.status, StatusCode::OK, "body: {}", updated.body);
+    assert_eq!(updated.json()["type"], "image");
+    let got = get_media(&h, &token, &later).await;
+    assert_eq!(got.json()["type"], "image");
+    assert_eq!(got.json()["description"], "added later");
 }
 
 #[tokio::test]

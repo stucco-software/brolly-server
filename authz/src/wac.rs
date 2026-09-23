@@ -2,6 +2,7 @@
 
 use brolly_domain::vocab;
 use brolly_store::PodRead;
+use brolly_store::resources::METADATA_GRAPH;
 use oxigraph::model::{NamedNode, Term};
 use oxigraph::sparql::QueryResults;
 
@@ -105,9 +106,14 @@ fn acl_candidates(base: &str, path: &str) -> Vec<String> {
 /// Find the ACL that governs `path`.
 ///
 /// **One query, not one probe per level.** Candidates are generated in Rust,
-/// then a single `SELECT` asks which of them actually exist; the caller takes
-/// the most specific. The predecessor issued a `resource_exists` round trip per
+/// then a single `SELECT` asks which of them exist; the caller takes the most
+/// specific. The predecessor issued a `resource_exists` round trip per
 /// hierarchy level.
+///
+/// **An ACL exists when the pod's metadata records it** (spec 5a, R16), not
+/// when its graph has triples. So an emptied ACL governs, and grants nothing,
+/// instead of falling through to an ancestor's broader `acl:default`. Which
+/// authorizations it holds is still read from its graph, by [`authorize`].
 pub fn effective_acl(
     store: &impl PodRead,
     base: &str,
@@ -125,9 +131,10 @@ pub fn effective_acl(
         r#"
         SELECT DISTINCT ?acl WHERE {{
           VALUES ?acl {{ {values} }}
-          GRAPH ?acl {{ ?s ?p ?o }}
+          GRAPH <{METADATA_GRAPH}> {{ ?acl a <{auxiliary}> }}
         }}
-        "#
+        "#,
+        auxiliary = vocab::BROLLY_AUXILIARY,
     );
 
     let existing = select_iris(store, &query, "acl", &[])?;

@@ -11,9 +11,8 @@
 
 use brolly_identity::db::{self, DbError};
 use brolly_identity::{routing, webid};
-use brolly_solid::storage;
 use brolly_store::StoreError;
-use brolly_store::resources::Pod;
+use brolly_store::resources::{Content, Pod};
 use oxigraph_model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -34,6 +33,12 @@ fn triple(graph: &str, subject: &str, predicate: &str, object: &str) -> Quad {
 }
 
 /// Create a member's storage root and the ACL that makes it theirs.
+///
+/// One write. `create_root` records the root in the pod's metadata, and only
+/// provisioning calls it. The ACL is stored as an auxiliary resource, so it
+/// exists and has a version but is never a member of the root. A root without
+/// its ACL is a pod its owner can't write to, so the two commit together or
+/// not at all.
 ///
 /// The grant carries **both** `acl:accessTo` and `acl:default`: the first
 /// governs the container itself, the second governs everything inside it. They
@@ -58,12 +63,10 @@ pub fn pod(pod: &Pod, username: &str, base_domain: &str) -> Result<(), StoreErro
         triple(&acl, &owner, &format!("{ACL}agent"), &member),
     ];
 
-    // The root and its ACL in one write, so a pod never has a root its owner
-    // can't write to. Both are under the storage root and are written the way
-    // they always were until the pod keeps resource metadata.
     pod.write(|w| {
-        storage::init_storage_root(w, &root)?;
-        w.legacy_under_root().insert(&grant)
+        w.create_root(&root)?;
+        w.put(&acl, Content::Auxiliary(&grant))?;
+        Ok(())
     })
 }
 
