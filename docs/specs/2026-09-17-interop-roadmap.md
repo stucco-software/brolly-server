@@ -79,7 +79,7 @@ a constant (trunk-based), the way `FEDERATION_ENABLED` does.
 | 2 | **ATProto auth** | Legacy sessions: `createSession`, `getSession`, `refreshSession`, `deleteSession`, app passwords. OAuth completion: protected-resource metadata, the missing authorization-server fields, DPoP nonces, `htu`/`htm` checked against the actual request, scope checks on XRPC, token lifetimes. `getServiceAuth`. | Without this, nobody can log in from outside the web UI. |
 | 3 | **PDS surface** | `atproto-proxy` forwarding with service auth, defaulting to the Bluesky AppView and refusing protected methods. `app.bsky.actor.getPreferences`/`putPreferences`. `identity.resolveHandle`, `/.well-known/atproto-did`, `/.well-known/did.json`. `repo.listRecords` and a real `describeRepo`. `sync.listRepos`, `getRepoStatus`, `getLatestCommit`, `getBlocks`, `getRecord`. `requestCrawl` sent on startup. | The Bluesky app works and relays can crawl. This is finish-line items 1–3, apart from media. |
 | 4 | **One media model** (plus an ADR) | Every upload is one pod resource over ADR 0013's store, whatever protocol wrote it. Each protocol reads it its own way: Solid `foaf:depiction` and LDP-NR, ActivityPub `icon`/`attachment`, Mastodon `avatar` and attachments, ATProto blob CIDs through `uploadBlob`/`getBlob`/`listBlobs`. Read access follows the publication it belongs to (public post, avatar) rather than the owner-only default. Also: atomic blob writes, content-type allow-list and `nosniff`, alt text that replaces the previous value, JSON `media_ids`, and multipart `update_credentials`. | Finish-line item 1 needs avatars and images. It also has to land before stage 6 settles profile writes. |
-| 5 | **Solid LDP conformance** | Empty resources exist. POST honours `Slug` and `Link rel=type`. Containment triples are protected (409). PATCH creates the resource and takes Append for inserts. ETag and `If-Match`/`If-None-Match`. `Accept-Patch`/`Accept-Put`/`Allow` computed per resource. 401 vs 403 with `WWW-Authenticate`. Storage-root `Link` headers and `solid:storageDescription`. `WAC-Allow` with `public=`. `Link rel=describedby`. Deleting a resource deletes its auxiliary resources. Container listings carry `dcterms:modified`/`stat:size`. CORS echoes the origin and exposes the full header set. Conformance harness in CI. | Solid apps and finish-line item 5. |
+| 5 | **Solid LDP conformance** (part a done, 2026-09-23) | Empty resources exist. POST honours `Slug` and `Link rel=type`. Containment triples are protected (409). PATCH creates the resource and takes Append for inserts. ETag and `If-Match`/`If-None-Match`. `Accept-Patch`/`Accept-Put`/`Allow` computed per resource. 401 vs 403 with `WWW-Authenticate`. Storage-root `Link` headers and `solid:storageDescription`. `WAC-Allow` with `public=`. `Link rel=describedby`. Deleting a resource deletes its auxiliary resources. Container listings carry `dcterms:modified`/`stat:size`. CORS echoes the origin and exposes the full header set. Conformance harness in CI. | Solid apps and finish-line item 5. |
 | 6 | **Solid identity** | A writable WebID profile, with type indexes and a preferences file provisioned. Client ID Documents. `prompt=none`. Accept DPoP tokens from other Solid-OIDC issuers, so resources can be shared across servers. | Finish-line item 4. |
 | 7 | **Notifications** | Solid Notifications Protocol, WebSocketChannel2023, and whether to also support legacy `solid-0.1` `Updates-Via` for SolidOS. | The Solid Protocol requires it (§7.1), and SolidOS uses it for live updates. It comes last because apps still work without it, just without live refresh. |
 
@@ -91,6 +91,16 @@ run 5, 6, 7, then 1, 2, 3, then 4. Stage 4's media model still covers Solid
 uploads, but it waits for the ATProto blob work it shares a design with. Until
 then, Solid binaries keep today's behaviour: stored and served, owner-only by
 default like everything else under `/~/`.
+
+**Stage 5 is four parts,** because the first one had to move state before
+anything could report it:
+
+| Part | Spec | State |
+|---|---|---|
+| a | Server-managed resource metadata: existence, kind, containment, modified time, version, blob pointers, and conditional requests (`docs/specs/2026-09-22-solid-resource-metadata.md`) | Done, 2026-09-23 |
+| b | The HTTP surface: 401/403 with `WWW-Authenticate`, per-resource `Allow`/`Accept-*`, `Link` headers and the storage description, `WAC-Allow public=`, `Vary`, CORS, 201 on create, 409 on a non-empty container (`docs/specs/2026-09-23-solid-http-surface.md`) | Spec in review |
+| c | Write semantics: `Slug`, creating containers by `POST`, `/foo` vs `/foo/`, PATCH access modes | Not started |
+| d | Auxiliary resources: `.meta`, `Link rel=describedby`, deleting a resource's auxiliaries with it, and the Solid Conformance Test Harness in CI | Not started |
 
 ## Not in scope
 

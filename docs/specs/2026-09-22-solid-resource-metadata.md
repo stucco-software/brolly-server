@@ -4,7 +4,7 @@
 <!-- The spec cites a file this stage deletes, so not every path it names
      resolves once it's implemented. -->
 
-**Status:** Approved for planning (2026-09-22), after three review passes
+**Status:** Implemented, 2026-09-23 (commits `40eb57c`, `9d58082`, `ef7916b`, `f0aa242`, `23928f6`). Approved for planning 2026-09-22 after three review passes.
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 5, part a. Parts
 b (HTTP surface), c (write semantics) and d (auxiliary resources and the
 conformance suite) build on this one.
