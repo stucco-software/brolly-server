@@ -4,9 +4,9 @@
 <!-- The spec names files this stage creates, so not every path it cites
      resolves until it's implemented. -->
 
-**Status:** Draft (2026-09-23), revised after one adversarial review against the
-Solid Protocol, WAC, Solid-OIDC, LDP, RFC 9110 and the Solid
-specification-tests (CTS) feature files
+**Status:** Draft (2026-09-23), revised after two adversarial reviews against
+the Solid Protocol, WAC, Solid-OIDC, LDP, RFC 9110/9449/6750, the CTS feature
+files, and axum's own routing source
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 5, part b. Part a
 (`docs/specs/2026-09-22-solid-resource-metadata.md`) landed the state this part
 reports. Parts c (write semantics) and d (auxiliary resources and the
@@ -35,7 +35,7 @@ state over HTTP is still mostly wrong, and a Solid app can't work from it.
    `Allow` — SolidOS decides which edit affordances to draw from it — is told
    it may write resources it cannot.
 3. **`Accept-Put` is never sent, and `served_types()` is dead code**
-   (`adapters/solid/src/ldp.rs:1014`).
+   (`adapters/solid/src/ldp.rs:1014`, zero call sites).
 4. **A resource doesn't say what it is.** No `Link rel="type"` is emitted
    anywhere, so a client can't tell a container from a document from a binary
    without parsing the body — which it can't do for a binary. The storage root
@@ -51,27 +51,36 @@ state over HTTP is still mostly wrong, and a Solid app can't work from it.
 7. **`WAC-Allow` has no `public=` component** (`pod.rs:254`). A client can't
    tell whether the resource it is looking at is world-readable — the one thing
    a share UI has to show.
-8. **`Vary` is never sent** although `GET` content-negotiates on `Accept`, so
-   any cache between the pod and the client may serve Turtle to a client that
-   asked for JSON-LD. CTS requires `Vary: Origin` as well
-   (`protocol/cors/acao-vary.feature`).
-9. **A `PUT` that creates answers 204.** LDP and every Solid client expect 201.
-10. **Deleting a non-empty container is 403,** which says "you may not", when
-    the truth is "not while it has members" — §5.4 requires 409 with a body
-    describing the error. Stage 5a left this mapping in place
+8. **`Vary` is never sent** although `GET` content-negotiates on `Accept`. CTS
+   requires `Vary: Origin` too (`protocol/cors/acao-vary.feature`).
+9. **One ETag serves every syntax.** 5a's R4 gives a resource one version, and
+   `pod.rs:323` decides 304 from the version alone. A client that cached Turtle
+   and revalidates asking for JSON-LD is told its Turtle is fresh.
+10. **A `PUT` that creates answers 204.** LDP and every Solid client expect 201.
+11. **Deleting a non-empty container is 403,** which says "you may not", when
+    the truth is "not while it has members" — §5.4 requires 409 *with a body
+    describing the error*. Stage 5a left this mapping in place
     (`adapters/solid/src/ldp.rs:106-116`) pending this part.
-11. **An authenticated `HEAD` is anonymous.** `subject_for` is handed the
+12. **The storage root's protections are unreachable, and the root ACL has
+    none.** `/~/` is registered with `get`/`post`/`options` only
+    (`server/src/lib.rs:319-324`), so `DELETE /~/` is answered by axum's
+    method-router before any handler runs, and `ldp.rs:877`'s root guard is
+    dead over HTTP. `/~/.acl` *does* route, and `delete_in` has no guard for it
+    at all: today a caller with `Control` can delete the storage root's ACL,
+    which §5.4 forbids with a 405.
+13. **Our own 405s carry no `Allow`,** an RFC 9110 §15.5.6 MUST.
+    (Axum's generated 405 does carry one; `pod::subdomain_fallback:557`'s does
+    not, and it is reachable for the bare path `/~`.)
+14. **An authenticated `HEAD` is anonymous.** `subject_for` is handed the
     literal string `"GET"` (`pod.rs:301`), so a DPoP proof whose `htm` claim is
-    `HEAD` — which is what every correct client sends, and what CTS signs —
-    fails verification and is downgraded. HEAD then 404s on the member's own
-    resource.
-12. **A container listing says nothing about its members.** 5a records each
-    resource's modified time and size; a listing still carries only
-    `ldp:contains`, so a file manager has to `HEAD` every member to draw a list.
-13. **405s carry no `Allow`,** which RFC 9110 §15.5.6 makes a MUST. This is
-    what a client gets for `PUT /~/` or `DELETE /~/`
-    (`server/src/pod.rs:557-560`, and axum's own method-router 405).
-14. **A body with no `Content-Type` is guessed at.** `pod::put` and `pod::post`
+    `HEAD` — what every correct client sends, and what CTS signs — fails
+    verification and is downgraded. HEAD then 404s on the member's own
+    resource. The `htu` is built from the percent-**decoded** `Path`, so any
+    escaped character mismatches too.
+15. **A container listing says nothing about its members.** 5a records each
+    resource's modified time and size; a listing carries only `ldp:contains`,
+    so a file manager has to `HEAD` every member to draw a list.
+16. **A body with no `Content-Type` is guessed at.** `pod::put` and `pod::post`
     default to `text/turtle` (`pod.rs:366`, `:399`); Solid §2.1 makes that a
     MUST-400.
 
@@ -84,18 +93,17 @@ state over HTTP is still mostly wrong, and a Solid app can't work from it.
 - **A resource announces its kind, its ACL, and its storage,** in headers, so a
   client knows what it is holding before it parses anything.
 - **What is public is visible as public.**
-- **Responses are cache-correct:** conditional and negotiated responses carry
-  the validators and the `Vary` that RFC 9110 requires.
-- **Nothing in 5a's write path changes.** This part reads state and formats
-  responses. Below the HTTP layer it changes only which `LdpError` a refusal
-  carries, whether a `PUT` reports creating, and what a container's body says
-  about its members.
+- **Caches, shared and private, cannot serve the wrong syntax or a stale
+  affordance.**
+- **5a's write path keeps its shape.** Below the HTTP layer this part adds one
+  body-free read (`ldp::describe`), splits one error variant, reports whether a
+  `PUT` created, and puts member metadata in listings. Nothing else moves.
 
 ## Non-goals
 
 Part 5c covers `Slug`, creating containers by `POST`, the `/foo` vs `/foo/`
 distinction, PATCH access modes (so `Allow` does **not** promise `PATCH` to an
-Append-only caller here — see H4), and 422. Part 5d covers `.meta`,
+Append-only caller here — H4), and 422. Part 5d covers `.meta`,
 `Link rel="describedby"` (which points at `.meta` and would be a dead link
 before it exists), deleting a resource's auxiliaries with it, and CTS in CI.
 
@@ -107,10 +115,9 @@ Also not in scope:
 - **Accepting tokens from other issuers.** Stage 6.
 - **Media.** Stage 4. A binary is still owner-only by default.
 - **Refusing to change a resource's type by `PUT`.** Today a `PUT` of
-  `application/pdf` over an RDF document is accepted (`ldp.rs:431` restricts
-  the RDF-only rule to containers and ACLs). H5 tells the truth about that
-  rather than changing it; whether it *should* change belongs with 5c's write
-  semantics.
+  `application/pdf` over an RDF document is accepted — `ldp.rs:431` restricts
+  the RDF-only rule to containers and ACLs. H5 tells the truth about that
+  rather than changing it; whether it *should* change belongs with 5c.
 
 ## Design
 
@@ -131,11 +138,25 @@ for *R* are *G*:
 | either | yes | no | **404** |
 | either | yes | yes | proceed |
 
-"Authenticated" means **a credential was presented and verified**, not
-`Subject::agent()`. A service-auth subject has no WebID and reports
-`Agent::Anonymous` (`identity/src/subject.rs:100-108`); challenging it with a
-401 it has already satisfied would be a retry loop. The branch is on whether
-`subject_for` verified something.
+**Where the decision lives.** `ldp` knows the modes; only `pod.rs` knows
+whether a credential was presented and verified. Splitting the decision across
+them would mean threading an `authenticated` flag through every `ldp` entry
+point and through `authz/tests/conformance_matrix.rs`, which drives them
+directly. Instead:
+
+- `ldp` gains **`LdpError::Denied`** — *the caller does not hold the mode* —
+  distinct from `NotFound`, which keeps its current meaning: *the caller holds
+  the mode and there is nothing there.* `read_in` returns `Denied` at
+  `ldp.rs:258-260` where it returns `NotFound` today; the genuine-absence
+  return at `:261-263` is unchanged. The write paths split the same way.
+- `pod.rs` maps `Denied` to **401 or 403** from its own knowledge of the
+  credential, and `NotFound` to 404.
+
+Nothing about `ldp`'s signatures changes, and `Subject::agent()` is never the
+basis for the split: a service-auth subject has `webid: None` and reports
+`Agent::Anonymous` (`identity/src/subject.rs:100-108`), but it authenticated,
+so it gets 403 and not a challenge it has already satisfied. `subject_for`
+returns that bit alongside the subject.
 
 This replaces stage 0's A2 refusal rule — *"a caller without the required mode
 gets `NotFound`, so existence isn't disclosed"*
@@ -143,7 +164,7 @@ gets `NotFound`, so existence isn't disclosed"*
 avoided is preserved: an unauthenticated caller gets 401 for `/~/secret` and
 401 for `/~/does-not-exist` and cannot tell them apart; an authenticated caller
 gets 403 for both. Only a caller who may read learns the difference, and
-learning it is the point. CTS agrees on every row
+learning it is the point. CTS agrees row for row
 (`web-access-control/protected-operation/read-access-public.feature`: public →
 401, Bob → 403, and a *permitted* caller reading a fictive resource → 404).
 
@@ -151,7 +172,7 @@ learning it is the point. CTS agrees on every row
 `.acl`. So for a resource shared with Bob by a *direct* ACL: while it exists
 Bob has Read and sees 200 or 404; once Alice deletes it, the direct ACL is gone
 and Bob's modes revert to the ancestor's, so he sees 403. Bob learns the
-resource once existed. Under stage 0 both were 404. We accept this: the
+resource once existed. Under stage 0 both were 404. We accept it: the
 alternative is keeping a deleted resource's ACL, which leaves a rule granting
 access to an IRI the member believes they erased.
 
@@ -162,20 +183,25 @@ not an access decision.
 ### H2. Credentials that don't verify are a 401, not anonymity
 
 **Scoped to the `Authorization` header.** A `brolly_session` cookie is not a
-presented credential: it is `SameSite=Lax`, so a browser sends it on any
-top-level navigation, and a logged-out member opening a public image in their
-own pod would be met with a challenge for a credential they never offered. A
-cookie that doesn't resolve still falls through to anonymous, and H1 decides.
+presented credential: it is `SameSite=Lax` (`server/tests/auth_flow.rs:249`),
+so a browser sends it on any top-level navigation, and a logged-out member
+opening a public image in their own pod would be met with a challenge for a
+credential they never offered. A cookie that doesn't resolve still falls
+through to anonymous, and H1 decides. `extract::credential` already prefers the
+header when both are present (`identity/src/extract.rs:85`).
 
 For an `Authorization` header, each of these becomes an immediate refusal,
 before any WAC evaluation, and the request is *not* retried as anonymous:
 
-- a malformed header, an unknown, expired or revoked token
-- a failed DPoP proof, a replayed `jti`, an `htu`/`htm` mismatch
+| Failure | `error` |
+|---|---|
+| malformed header, unknown, expired or revoked token | `invalid_token` |
+| failed DPoP proof, replayed `jti`, `htu`/`htm` mismatch | `invalid_dpop_proof` |
 
-Why not keep downgrading: a client whose token expired is currently told its
-resources are gone, with no signal to refresh. RFC 6750 §3 and Solid-OIDC both
-make `invalid_token` the answer.
+The two codes matter. RFC 9449 §7.1 defines `invalid_dpop_proof` precisely
+because `invalid_token` tells a client to refresh a token that is fine — it
+would refresh, re-sign the same broken proof, and loop. Neither code leaks
+anything a correct client doesn't already know.
 
 `error_description` is omitted. It would be the only place in the surface where
 a refusal explains itself to an unauthenticated caller, and the values are
@@ -190,16 +216,17 @@ On a 401 from an absent credential, or from a DPoP-bearing one:
 WWW-Authenticate: DPoP algs="ES256", as_uri="https://{apex}"
 ```
 
-with `, error="invalid_token"` appended for H2. Solid-OIDC §9.1 makes `as_uri`
-a MUST unless the scheme has its own discovery mechanism, and RFC 9449 §7.1's
+with `, error="…"` appended per H2's table. Solid-OIDC §10.1 makes `as_uri` a
+MUST unless the scheme has its own discovery mechanism, and RFC 9449 §7.1's
 `DPoP` parameters (`realm`, `scope`, `error`, `error_description`, `algs`)
-include none. `{apex}` is the instance's apex domain, which is where this
-server's Solid-OIDC metadata lives (`solid_oidc::apex_only`,
-`server/src/lib.rs:206-221`).
+include none. The value is the instance's apex origin, byte-identical to what
+the profile publishes as `solid:oidcIssuer` (`server/src/profile.rs:96`) and to
+the `iss` claim (`solid_oidc.rs:94`).
 
 `ES256` is what we verify — `identity/src/dpop.rs:336` and
 `adapters/solid/src/oidc/tokens.rs:191` are ES256-only — and advertising more
-would be a lie. `realm` is omitted; Solid-OIDC doesn't use it.
+would be a lie. `realm` is omitted; RFC 6750 §3 and RFC 9449 §7.1 both make it
+optional and Solid-OIDC doesn't use it.
 
 **A bearer credential gets a `Bearer` challenge instead.** Mastodon's API
 tokens reach pod URLs through `Credential::Bearer` (`pod.rs:175-193`), and a
@@ -212,10 +239,9 @@ client to send a bare token that will be refused.
 ### H4. `Allow`, per resource and per caller
 
 `OPTIONS` becomes a real handler: it resolves the pod, authenticates, and
-evaluates WAC for the target, exactly as `GET` does. So do `GET` and `HEAD`,
-which carry the same `Allow` (CTS reads it from a `GET`; SolidOS reads it from
-whichever it last made). `OPTIONS` keeps today's **204**, which CTS accepts
-alongside 200.
+evaluates WAC for the target. So do `GET` and `HEAD`, which carry the same
+`Allow` (CTS reads it from a `GET`; SolidOS reads it from whichever it last
+made). `OPTIONS` keeps today's **204**, which CTS accepts alongside 200.
 
 Given effective modes *G* and the target's kind:
 
@@ -234,42 +260,53 @@ triples to a document (`ldp.rs:799-801`) and `pod::post` routes it.
 would allow it, because `patch_in` requires `Write` (`ldp.rs:953`) and 5c owns
 the change. Advertising it would be exactly the lie H4 exists to stop.
 
-Only the **root** container and the **root's** ACL are undeletable (Solid
-Protocol §5.4 names precisely those two). Any other `.acl` may be deleted by a
-caller with `Control`: WAC §3.2 makes *removing* the ACL representation the
-specified way to revert a resource to inheriting its container's rules, so
-refusing the delete would leave no way to un-share short of writing an empty
-ACL.
+**`OPTIONS` is gated on holding *any* mode, not on `Read`.** An Append-only
+caller — the drop-box and inbox pattern, the client that most needs `Allow` to
+learn it may `POST` — must be able to ask. A caller with no modes at all still
+gets H1's 401 or 403, so `OPTIONS` is not an existence oracle. For the same
+reason `OPTIONS` on a **target that doesn't exist** answers 204 with the
+`Allow` a creation would have, where `GET` would answer 404: "may I create
+here" is the question, and H5's `Accept-Put` is the answer.
 
-A caller with no modes at all never sees this header: H1 has already answered
-401 or 403, with *M* = `Read`. An `OPTIONS` that enumerated a resource's
-capabilities to a caller with no access would be the existence oracle H1
-closes. A CORS preflight is not an `OPTIONS` request in this sense — the
-middleware answers it before routing (`server/src/lib.rs:161`) and it carries
-no credentials by definition.
+A CORS preflight is not an `OPTIONS` request in this sense — the middleware
+answers it before routing (`server/src/lib.rs:161`) and it carries no
+credentials by definition.
 
-**Authorization comes before method availability.** `DELETE` of the root ACL by
-a caller without `Control` is H1's 403, not H12's 405. A 405 would tell a
-caller with no access that the target exists and is special.
+**Authorization comes before method availability.** `DELETE` of the storage
+root by a caller without `Write` is H1's 401/403, not H12's 405. A 405 would
+tell a caller with no access that the target exists and is special. For that
+ordering to be reachable at all, `/~/` has to route the write methods — see
+H12.
+
+Only the **root** container and the **root's** ACL are undeletable: Solid
+Protocol §5.4 names precisely those two, and adds that servers must exclude
+`DELETE` from their `Allow`. Any other `.acl` may be deleted by a caller with
+`Control`: WAC §3.2 makes removing the ACL representation the specified way to
+revert a resource to inheriting its container's rules, so refusing the delete
+would leave no way to un-share short of writing an empty ACL.
 
 ### H5. `Accept-Patch`, `Accept-Post`, `Accept-Put`
 
 Each is sent only when the corresponding method is in `Allow`, on `OPTIONS`,
-`GET` and `HEAD`:
+`GET` and `HEAD`. Solid §5.2 states the MUST unconditionally; we narrow it
+deliberately, as CSS does, because a header that advertises a method the caller
+may not use is the same lie as a wrong `Allow`.
 
 - `Accept-Patch: text/n3, application/sparql-update` — what `patch` parses.
-- `Accept-Post:` and `Accept-Put:` come from **`accepted_write_types()`**
+- `Accept-Post` and `Accept-Put` come from **`accepted_write_types()`**
   (`ldp.rs:1009`), the list the parser accepts. Not `served_types()`, which
   includes RDF/XML — a format `refuse_rdf_xml` (`ldp.rs:671`) rejects on every
   write, per ADR 0007. LDP §7.1.2 and Solid §5.2 define these headers as what
   is *allowed*, so advertising RDF/XML would be advertising a guaranteed 415.
-- For a target that is a **binary, or doesn't exist yet**, `Accept-Put` is
-  `*/*`: both accept any media type today (`ldp.rs:431`, `Target::prepare` at
-  `ldp.rs:390`). For a **container or an `.acl`**, it is the RDF list, which is
-  5a's `NotRdf` refusal made discoverable.
+- `Accept-Put` is `*/*` for anything that accepts any media type today — a
+  binary, an **existing RDF document** (`ldp.rs:431` applies the RDF-only rule
+  to containers and ACLs alone), and a target that doesn't exist. It is the RDF
+  list for a **container or an `.acl`**, which is 5a's `NotRdf` refusal made
+  discoverable.
 
 `served_types()` is deleted rather than promoted: it is the *serialization*
 list, it duplicates `syntax::negotiate`'s knowledge, and nothing reads it.
+Deleting it leaves `WriteFormat` unused in `ldp.rs:32`'s import.
 
 ### H6. `Link` headers
 
@@ -293,29 +330,33 @@ match on `ldp:Container`.
 The storage root's `pim:Storage` and `solid:owner` links are Solid Protocol
 §4.1 MUSTs ("servers MUST advertise the storage resource… when responding to
 storage's request URI"; and the owner link "targeting the root container").
-They are what turns problem 4 from a body a client must already be reading
-into something discoverable from any response.
+They turn problem 4 from a body a client must already be reading into something
+discoverable from any response.
 
 LDP §4.2.1.4 asks for `rel="type"` on *all* responses to an LDPR's URI,
-including errors. We narrow it to the successful reads and creates
-deliberately: a 401 or 403 must not imply what kind of resource is behind it,
-and a 404 must not imply one is.
+including errors. We narrow it to successful reads and creates deliberately: a
+401 or 403 must not imply what kind of resource is behind it, and a 404 must
+not imply one is.
 
 ### H7. The ACL of an ACL is itself
 
-`acl_iri(target)` lives in `brolly-solid` beside its inverse, `governed()`
-(`adapters/solid/src/ldp.rs:162`), and `storage::is_container` — not in
-`identity`, which can't depend on the adapter and would drift from them.
+`acl_iri(target)` lives in `brolly-solid`, beside `governed()`
+(`adapters/solid/src/ldp.rs:162`) and `storage::is_container`, because it needs
+both notions. It is **not** the inverse of `governed()`, which strips every
+trailing `.acl` (`governed("/~/x.acl.acl") == Some("/~/x")`,
+tested at `ldp.rs:1036`):
 
 - `target` ends in `.acl` → `target`
 - a container `/~/notes/` → `/~/notes/.acl`
 - anything else `/~/note` → `/~/note.acl`
 
-which is what `authz::acl_candidates` (`authz/src/wac.rs:84-103`) already
-computes. An ACL resource is governed by its own `Control` mode (stage 0's A2),
-so pointing it at itself is the truth. Today's concatenation produces
+An ACL resource is governed by its own `Control` mode (stage 0's A2), so
+pointing it at itself is the truth. Today's concatenation produces
 `x.acl.acl`, an IRI with no ACL semantics that a client following the link
-would create as an ordinary resource.
+would create as an ordinary resource. Note that `authz::acl_candidates`
+(`authz/src/wac.rs:84-103`) is pure string work and *does* generate
+`/~/x.acl.acl` as its first candidate for `/~/x.acl`; it is a lookup order, not
+a statement about which ACL governs what, and H7 does not change it.
 
 ### H8. The storage description resource
 
@@ -344,12 +385,13 @@ It is generated, not stored: it holds nothing a member could edit, and storing
 it would put a resource inside the storage that describes the storage, which
 `ldp:contains` would then list.
 
-Two routing facts it has to respect. Adding the path to
-`USER_PROTOCOL_RESOURCES` (`identity/src/routing.rs:20`) alone turns today's
-404 into a **501** — that list only feeds `pod::subdomain_fallback`. The
-serving route goes in `app()`, and **axum routes are not host-scoped**, so the
-handler must resolve the subdomain itself the way `profile` and `actor` do; on
-the apex it is a 404.
+The route goes in `app()`, next to `webfinger` and `nodeinfo`. It is **not**
+added to `USER_PROTOCOL_RESOURCES` (`identity/src/routing.rs:20`): that list
+feeds only `pod::subdomain_fallback`, which axum never reaches once a route
+matches, so an entry there would be dead weight the architecture tests would
+later have to explain. Because axum routes are not host-scoped, the handler
+resolves the subdomain itself the way `profile` and `actor` do, and answers 404
+on the apex.
 
 ### H9. `WAC-Allow` gains `public=`
 
@@ -358,24 +400,29 @@ WAC-Allow: user="read write append control", public="read"
 ```
 
 `user=` is the caller's effective modes, as today. `public=` is a second
-`granted_modes` probe with the anonymous subject against the **same snapshot**,
-so the two components can never disagree about the ACL they describe. WAC
-§6.1's ABNF allows an empty group, so a caller with nothing gets `user=""`.
+`granted_modes` probe with an anonymous subject. It has to run **inside the
+snapshot**: `Pod::read` drops the snapshot when its closure returns
+(`store/src/resources.rs:307-315`), so a header builder in `pod.rs` is working
+after the store is closed. The probe therefore happens in `read_in` and rides
+out on the outcome, which is what guarantees the two components describe the
+same ACL. `identity` gains a `Subject::anonymous()` constructor — `pod.rs`
+builds one inline and privately today (`pod.rs:101-107`).
 
+WAC §6.1's ABNF allows an empty group, so a caller with nothing gets `user=""`.
 On an `.acl`, `granted_modes` is all-or-nothing on `Control`
 (`ldp.rs:217-222`), so `public=` there is `""` unless the ACL grants Control to
 everyone.
 
-Sent on `GET`, `HEAD` (WAC §6's MUST) and on `OPTIONS`, which now does the same
-evaluation. Not on writes, where the modes a client would read are the ones it
-just exercised.
+Sent on `GET`, `HEAD` (WAC §6's MUST) and on `OPTIONS`, under H4's any-mode
+gate. Not on writes, where the modes a client would read are the ones it just
+exercised.
 
 The cost is a second WAC evaluation per read, against the snapshot already open
 and the ACL already resolved: four `authorize` calls over an in-memory graph.
 
-### H10. `Vary`, and what a 304 carries
+### H10. `Vary`, the ETag, and what a 304 carries
 
-`Vary` is **appended to, never replaced** — H14's CORS layer is outermost and
+**`Vary` is appended to, never replaced** — H14's CORS layer is outermost and
 currently `insert`s (`lib.rs:192`), which would drop whatever the handler set.
 
 - `Accept` on a `GET`/`HEAD` of an RDF source, whose body is negotiated. Not on
@@ -383,11 +430,22 @@ currently `insert`s (`lib.rs:192`), which would drop whatever the handler set.
 - `Origin` on every response, binaries included — CTS checks exactly that
   (`protocol/cors/acao-vary.feature` uses a `.txt`).
 
-A 304 carries `ETag` and `Vary`, which RFC 9110 §15.4.5 requires, and also
-`Last-Modified`, `Link`, `Allow`, `Accept-*` and `WAC-Allow`, which §15.4.5
-says a sender SHOULD NOT generate. We exceed it knowingly: a client that
-revalidates a cached resource would otherwise lose every affordance it had, and
-re-fetch to get them back. `Content-Location`, `Cache-Control` and `Expires`
+**The ETag gains a syntax token:** `"{version}.{syntax}"`, e.g. `"7.ttl"`,
+`"7.jsonld"`, `"7.bin"` for a binary. `Vary: Accept` fixes shared caches;
+it does nothing for the client that cached Turtle and revalidates asking for
+JSON-LD, which today gets a 304 and reuses its Turtle as JSON-LD (problem 9).
+Making the validator name the representation is what RFC 9110 §8.8.1 means by
+one — and it preserves 5a's R4, because the *version* is still one number per
+resource: preconditions compare the version part only, so an `If-Match` taken
+from a JSON-LD `GET` still guards a Turtle `PUT`.
+
+A 304 carries `ETag` and `Vary`, which RFC 9110 §15.4.5 requires, plus
+`Last-Modified`, `Link`, `Allow`, `Accept-*` and `WAC-Allow`. §15.4.5's
+SHOULD NOT covers *representation* metadata — `Content-Encoding`,
+`Content-Language`, `Content-Length`, `Content-Type` — and explicitly permits
+`Last-Modified`; `Allow`, `Accept-*` and `WAC-Allow` are control and resource
+metadata, so none of this is a deviation. A client that revalidates must not
+lose the affordances it had. `Content-Location`, `Cache-Control` and `Expires`
 are absent because a 200 from this server doesn't send them either. Today a 304
 carries `ETag` alone.
 
@@ -396,62 +454,86 @@ carries `ETag` alone.
 `PUT` returns **201** with `Location` and H6's `Link` set when the target did
 not exist, and **204** when it replaced something. 5a's write path knows which
 happened (`ldp.rs:531` reads the target's metadata before writing) but returns
-`()`; this threads a created/replaced answer out through `put_if`/`put_in` and
-their callers — `server/src/mastodon_api.rs:552`,
-`server/tests/federation_flows.rs:508`, and the `adapters/solid/tests/acl_control.rs`
-call sites.
+`()`; this threads a created/replaced answer out through `put_if`/`put_in`.
+
+`ldp::put` has roughly 55 call sites — `adapters/solid/tests/acl_control.rs`
+(23), `ldp_conformance.rs` (16), `ldp_nonrdf.rs` (13), `publication_boundary.rs`
+(3), `server/src/mastodon_api.rs:552`, `server/tests/federation_flows.rs:508`.
+Most keep compiling because the new payload is ignorable, but every
+`matches!` and `let err = …` site needs a look. The plan should size for it.
 
 `POST` keeps 201 + `Location`. `PATCH` and `DELETE` keep 204. No write response
 carries an `ETag` — 5a's rule, unchanged: RFC 9110 §9.3.4 forbids the validator
 when the stored representation isn't what was sent.
 
-### H12. Deleting a non-empty container is 409
+### H12. The storage root, its ACL, and the non-empty container
 
-`StoreError::ContainerNotEmpty` maps to a new `LdpError::NotEmpty` → **409**,
-replacing the 403 stage 5a left in place, **with a body naming the problem** —
-§5.4 requires the body, not just the status. Deleting the storage root or the
-root's `.acl` is **405** with H4's `Allow`, and only for a caller who would
-otherwise have been allowed (H4's ordering rule).
+- `/~/` gains `put`, `patch` and `delete` routes (`server/src/lib.rs:319-324`).
+  Without them axum's method-router answers 405 before any handler runs, so
+  `ldp.rs:877`'s root guard is unreachable over HTTP and H4's
+  authorization-first ordering cannot hold. The handlers run WAC, then refuse.
+- **`DELETE` of the storage root or of `/~/.acl` → 405** with H4's `Allow`, for
+  a caller who would otherwise have been allowed. The root ACL needs a new
+  guard in `delete_in`; today a caller with `Control` can delete it.
+- **`DELETE` of a non-empty container → 409 with a body naming the problem.**
+  `StoreError::ContainerNotEmpty` maps to a new `LdpError::NotEmpty`, replacing
+  the 403 stage 5a left in place. §5.4 requires the body, not just the status.
 
-### H13. Container listings carry member metadata, and clients can't write it
+### H13. Container listings carry member metadata, and clients can't change it
 
 A container's body gains, for each member, the metadata 5a already records
-(Solid Protocol §4.2.1, contained resource metadata):
+(Solid Protocol §4.2.1, Contained Resource Metadata):
 
 ```turtle
 </~/notes/> ldp:contains </~/notes/first> .
-</~/notes/first> dcterms:modified "2026-09-23T10:00:00Z"^^xsd:dateTime ;
-    stat:mtime 1790000000 ;
-    stat:size 214 .
+</~/notes/first> dcterms:modified "2026-09-23T10:00:00.007Z"^^xsd:dateTime ;
+    <http://www.w3.org/ns/posix/stat#mtime> 1790000000 ;
+    <http://www.w3.org/ns/posix/stat#size> 214 .
 ```
 
-`dcterms:modified` and `stat:mtime` are the same instant in the two forms §4.2.1
-names. `stat:size` is emitted for binaries only: §4.2.1 excuses metadata that is
+`dcterms:modified` and `stat:mtime` are the same instant in the two forms
+§4.2.1 names, at the millisecond precision 5a stores. The `stat:` prefix
+expands to `http://www.w3.org/ns/posix/stat#` — the Solid Protocol's prefix
+table omits the `#`, but the vocabulary's terms carry it, and `statsize` is not
+a term. Neither has a declared range, so both are `xsd:integer` by our choice.
+`stat:size` is emitted for binaries only: §4.2.1 excuses metadata that is
 "inapplicable", and an RDF source's serialized length depends on the syntax the
 client asked for, so a number that changes with `Accept` is worse than no
 number. The `rdf:type` of an IANA media type is omitted for the same reason.
 
-**These triples are server-owned, exactly like `ldp:contains`.** `container_body`
-(`adapters/solid/src/ldp.rs:596-633`) keeps only quads whose subject *is* the
-container, so without a change a client could `GET` a listing, `PUT` it back,
-and have the member metadata stored as its content — stale forever, and served
-next to the generated version. That defeats 5a's R8. Solid §5.3 settles it:
-"servers MUST NOT allow HTTP POST, PUT and PATCH to update a container's
-resource metadata statements; if the server receives such a request, it MUST
-respond with a 409 status code." A write whose body carries a statement about a
-contained resource is a **409**, the same `ContainmentChange` shape 5a already
-has for `ldp:contains`.
+**These triples are server-owned, exactly like `ldp:contains`.**
+`container_body` (`ldp.rs:596-633`) keeps every quad whose subject isn't the
+container, so without a rule a client could `GET` a listing, `PUT` it back, and
+have the member metadata stored as content — stale forever, and served beside
+the generated version. §4.2.1: "servers MUST NOT allow HTTP POST, PUT and PATCH
+to update a container's resource metadata statements; if the server receives
+such a request, it MUST respond with a 409 status code."
 
-This is what makes 5a's R9 observable: a container's version moves when a member
-changes, and a client can now see what changed without a request per member.
+The rule follows containment's shape exactly (`ldp.rs:629`), and **an exact
+echo is not an update**:
+
+- A statement whose subject is a contained resource and whose predicate is one
+  of the four §4.2.1 metadata predicates is **dropped** when it matches what
+  the server would serve, and **409** when it differs.
+- Any other statement about a contained resource — `<…/first> rdfs:label
+  "First"` in the container's description — is ordinary content and is kept.
+
+Without the echo tolerance a plain read-modify-write of a container would 409,
+which is what Inrupt's `solid-client`, LDO and SolidOS all do, and what 5a's
+"echoing its listing exactly, succeeds" test asserts.
+
+This is also what makes 5a's R9 observable: `set_description` → `contain` →
+`touch(parent)` (`resources.rs:734`, `:878-888`) already moves a container's
+version when a member changes, and a client can now see what changed without a
+request per member.
 
 ### H14. CORS
 
 - Echo the request's `Origin` when one is present, with `Vary: Origin` appended
   (H10). Keep `*` when there is none. Credentials stay disallowed, as
-  `server/src/lib.rs:148` explains — with credentials off, echoing and `*` grant
-  a browser identical permission, but a named origin is cacheable per-origin and
-  CTS checks for it.
+  `server/src/lib.rs:148` explains — with credentials off, echoing and `*`
+  grant a browser identical permission, but a named origin is cacheable
+  per-origin and CTS checks for it.
 - **Preflights echo `Access-Control-Request-Headers`.** Today
   `Access-Control-Allow-Headers` is a fixed list (`lib.rs:174`) that can never
   admit a header it doesn't already name. CTS asserts the response does *not*
@@ -464,26 +546,25 @@ changes, and a client can now see what changed without a request per member.
 
 ### H15. An authenticated `HEAD` is authenticated
 
-`subject_for` receives the request's actual method and actual URL, so a DPoP
-proof binding `htm: HEAD` verifies. A bug fix with a security shape: today a
-correct client's HEAD silently loses its identity and gets the anonymous
-answer. CTS signs `HEAD` proofs (`read-method-allow.feature`), so nothing in
-part d passes without this.
+`subject_for` receives the request's actual method and its **undecoded** URI,
+so a DPoP proof binding `htm: HEAD` verifies and an `htu` containing a
+percent-escape matches. Today `pod.rs:301` passes the literal `"GET"` and
+builds the URL from the decoded `Path`, so a correct client's HEAD silently
+loses its identity and gets the anonymous answer. CTS signs `HEAD` proofs
+(`read-method-allow.feature`), so nothing in part d passes without this.
 
 `server/src/activitypub.rs:289` is `subject_for`'s other caller. It keeps its
 own rule — the inbox answers 404 to a non-owner, because 403 would confirm the
 inbox exists (`activitypub.rs:276`, guarded by `server/tests/pod_http.rs:719`)
 — but it picks up H2: a credential that doesn't verify is a 401 there too.
 
-### H16. Every 405 carries `Allow`
+### H16. Our 405s carry `Allow`
 
-RFC 9110 §15.5.6 makes it a MUST, and nothing in the server does it today.
-Three 405s exist: `pod::subdomain_fallback`'s `UserStorage` arm
-(`pod.rs:557`), H8's storage description, and H12's undeletable root. Axum's
-own method-router 405 is unreachable here because `Router::fallback` takes
-precedence (`lib.rs:327`), so the fallback is the one place that has to compute
-it: `GET, HEAD, POST, OPTIONS` for the storage root, `GET, HEAD, OPTIONS` for a
-read-only protocol resource.
+RFC 9110 §15.5.6 makes it a MUST. Axum's generated 405 already carries one
+(it tracks the methods registered on the route), so the gap is our own:
+`pod::subdomain_fallback`'s `UserStorage` arm (`pod.rs:557`, reachable for the
+bare path `/~`), H8's read-only storage description, and H12's undeletable
+root and root ACL.
 
 ### H17. A body without `Content-Type` is a 400
 
@@ -497,40 +578,74 @@ fine — that is how a client creates an empty resource, which 5a made possible.
 
 | File | Change |
 |---|---|
-| `server/src/pod.rs` | `ldp_error` gains 401/403/409; `subject_for` returns `Result<Subject, Response>` (H2, H3), takes the real method and URL (H15); `options` becomes a stateful handler (H4); one `headers_for` builder shared by GET, HEAD, OPTIONS, 304 and the create responses (H4–H10); `Content-Type` required (H17); `Allow` on the fallback's 405 (H16) |
-| `adapters/solid/src/ldp.rs` | `LdpError::{Unauthenticated, NotEmpty}`, returned by `read`/`write` in place of `NotFound`/`Forbidden` per H1; `granted_modes` gains the anonymous probe (H9); `put_if`/`put_in` report created vs replaced (H11); `container_body` refuses member metadata (H13); `acl_iri` (H7); `served_types` deleted (H5) |
-| `server/src/lib.rs` | CORS echo, preflight header echo, expose list (H14); route for `/.well-known/solid` (H8) |
-| `identity/src/routing.rs` | `/.well-known/solid` in `USER_PROTOCOL_RESOURCES` (H8) |
+| `adapters/solid/src/ldp.rs` | `LdpError::{Denied, NotEmpty}` (H1, H12); **`describe()`**, a body-free per-resource read returning kind, existence, version, modified, `granted` and `public` (H4, H6, H9, H10); anonymous probe inside `read_in` (H9); `acl_iri` (H7); root-ACL delete guard (H12); `put_if`/`put_in` report created vs replaced (H11); `container_body` drops or refuses member metadata (H13); `served_types` deleted (H5) |
+| `server/src/pod.rs` | `subject_for` returns the subject *and* whether a credential verified, takes the real method and undecoded URI (H2, H15); `ldp_error` maps `Denied` → 401/403 and `NotEmpty` → 409 (H1, H12); one `headers_for` over `describe`'s output, shared by GET, HEAD, OPTIONS, 304 and the create responses (H4–H10); stateful `options` (H4); `Content-Type` required (H17); `Allow` on the fallback's 405 (H16) |
+| `server/src/lib.rs` | `/~/` gains `put`/`patch`/`delete` (H12); route for `/.well-known/solid` (H8); CORS echo, preflight header echo, expose list (H14) |
 | `adapters/solid/src/storage_description.rs` | new: generates H8's document |
 | `store/src/resources.rs` | container listings carry member metadata (H13) |
+| `domain/src/vocab.rs` | `STAT_SIZE`, `STAT_MTIME`, the LDP type IRIs, `SOLID_OWNER`, `SOLID_STORAGE_DESCRIPTION` (H6, H13) |
+| `identity/src/subject.rs` | `Subject::anonymous()` (H9) |
 | `server/src/activitypub.rs` | follows `subject_for`'s new signature, keeps its 404 rule (H15) |
 
-**Tests whose expectations flip** (the plan has to rewrite them, not delete
-them): `server/tests/pod_http.rs:273` and `:530` (404 → 401), `:1012` (403 →
-405 for the root ACL only), `:1030` (404 → 403), `:1049` (exact `WAC-Allow`
-string, now two components), `:454` (`OPTIONS` is authenticated and per
-resource), `:847` (`updates-via` dropped, three names added);
-`server/src/pod.rs:584`'s unit test; and `adapters/solid/tests/acl_control.rs`
-for the `put` arity and `granted_modes`.
+**Tests whose expectations change** (rewrite, don't delete):
+`server/tests/pod_http.rs` — `an_anonymous_reader_gets_nothing` (:273, 404 →
+401), `a_binary_is_invisible_to_a_caller_without_read` (:530, 404 → 401),
+`options_advertises_the_patch_formats` (:454, `OPTIONS` is now authenticated
+and per-resource), `wac_allow_on_an_acl_names_nothing_for_bob` (:1030, Bob's
+404 → 403, and the exact `WAC-Allow` string gains `public=`),
+`the_headers_ldp_depends_on_are_exposed` (:847, expose list changes),
+`get_and_head_carry_an_etag_and_last_modified` (:1057, the ETag gains a syntax
+token). `bob_cannot_delete_an_acl_he_does_not_control` (:1012) does **not**
+change: that ACL is `/~/shared/.acl`, not the root's, and Bob is authenticated
+without `Control`, so 403 stands. Also `server/src/pod.rs:584`'s unit test,
+`authz/tests/conformance_matrix.rs`, and the `ldp::put` call sites in H11.
+
+## Chunks
+
+Five, landing as four commits — chunks 2 and 3 stage separately but only make
+sense together, as 5a's did.
+
+1. **Credentials and refusals.** `subject_for`'s signature, the real method and
+   URI, `LdpError::Denied`, the 401/403/404 table, `WWW-Authenticate` with both
+   error codes, `activitypub.rs` keeping its 404. *It changes the meaning of
+   every existing refusal and rewrites the most tests; everything else is
+   additive on top of it.*
+2. **`describe` and the shared header builder.** The body-free description, the
+   anonymous probe inside the snapshot, `Subject::anonymous`, stateful
+   `OPTIONS`, `Allow`, `Accept-*`, `served_types` deleted. *The missing
+   abstraction; nothing after this can be built without it, and it is what
+   makes "one `headers_for`" true rather than five.*
+3. **Discovery.** `acl_iri`, the `Link` set, `storage_description.rs` and its
+   route, `Allow` on our 405s, `/~/` gaining the write methods so H12's rules
+   are reachable. *All new surface, no behaviour change to existing paths.*
+4. **Caching and CORS.** `public=`, `Vary` appended, the syntax-tagged ETag and
+   the fuller 304, origin echo, preflight header echo, expose list. *The only
+   chunk whose correctness is judged by a cache rather than a client; isolate
+   it so a mistake here doesn't hide inside the header work.*
+5. **Write responses and bodies.** 201 on create through `put_if`/`put_in` and
+   its call sites, `NotEmpty` → 409 with a body, the root-ACL guard, member
+   metadata in listings with the echo-tolerant §4.2.1 refusal, `Content-Type`
+   required. *The only chunk that changes what is stored and what writes say;
+   it carries the round-trip risk and deserves its own revert boundary.*
 
 ## Decisions
 
 | # | Decision | Why |
 |---|---|---|
-| H1 | Status depends on effective modes and on whether a credential verified, never on existence: unauthenticated+denied → 401, authenticated+denied → 403, permitted+missing → 404 | Tells a client what to do without becoming an existence oracle; matches CTS row for row |
-| H2 | An `Authorization` header that doesn't verify is a 401, not anonymity; a stale cookie still falls through to anonymous | An expired token must look like an expired token, not like deletion — but a `SameSite=Lax` cookie the browser sent unasked is not a presented credential |
-| H3 | `WWW-Authenticate: DPoP algs="ES256", as_uri="https://{apex}"`, `error="invalid_token"` when something was presented; a bearer credential gets a `Bearer` challenge | Solid-OIDC §9.1 makes `as_uri` a MUST; a Mastodon client can't act on a DPoP challenge |
-| H4 | `Allow` computed from the caller's modes and the target's kind; `POST` on documents too; no `PATCH` for Append-only until 5c; only the root and the root's `.acl` are undeletable; authorization decided before method availability | A static `Allow` promises writes that will be refused; WAC §3.2 makes deleting an ACL the way to revert to inheritance |
-| H5 | `Accept-Patch`/`Accept-Post`/`Accept-Put` sent only when the method is allowed, sourced from `accepted_write_types()`; `*/*` for a binary or a new resource; `served_types()` deleted | These headers mean "allowed"; `served_types()` includes RDF/XML, which ADR 0007 always refuses |
+| H1 | Status depends on effective modes and on whether a credential verified, never on existence: unauthenticated+denied → 401, authenticated+denied → 403, permitted+missing → 404. `ldp` reports `Denied` vs `NotFound`; `pod.rs` picks 401 or 403 | Tells a client what to do without becoming an existence oracle; matches CTS row for row; keeps the credential question out of `ldp`'s signatures |
+| H2 | An `Authorization` header that doesn't verify is a 401, not anonymity; `invalid_token` for the token, `invalid_dpop_proof` for the proof; a stale cookie still falls through to anonymous | An expired token must look like an expired token; `invalid_token` on a proof failure sends a client into a refresh loop; a `SameSite=Lax` cookie the browser sent unasked is not a presented credential |
+| H3 | `WWW-Authenticate: DPoP algs="ES256", as_uri="https://{apex}"`, plus `error=`; a bearer credential gets a `Bearer` challenge | Solid-OIDC §10.1 makes `as_uri` a MUST; a Mastodon client can't act on a DPoP challenge |
+| H4 | `Allow` computed from the caller's modes and the target's kind; `POST` on documents too; no `PATCH` for Append-only until 5c; `OPTIONS` gated on *any* mode and answering 204 for an absent target; only the root and the root's ACL are undeletable; authorization decided before method availability | A static `Allow` promises writes that will be refused; an Append-only client must be able to discover `POST`; WAC §3.2 makes deleting an ACL the way to revert to inheritance |
+| H5 | `Accept-Patch`/`Accept-Post`/`Accept-Put` sent only when the method is allowed — a deliberate narrowing of §5.2's MUST — sourced from `accepted_write_types()`; `*/*` wherever any type is accepted today; `served_types()` deleted | These headers mean "allowed"; `served_types()` includes RDF/XML, which ADR 0007 always refuses |
 | H6 | `Link rel="type"` with the LDP kinds, plus `pim:Storage` and `solid:owner` on the root, `acl`, and `storageDescription`; successful reads and creates only | §4.1 MUSTs the storage links; a 4xx must not imply a resource kind |
-| H7 | An ACL's ACL is itself; `acl_iri` lives beside `governed()` in `brolly-solid` | Stage 0's A2 governs `.acl` by its own `Control`; `x.acl.acl` is a fiction; splitting the pair from its inverse invites drift |
-| H8 | Generated, world-readable storage description at `/.well-known/solid`, subdomain-scoped by the handler | Solid Protocol §4.1; discovery precedes credentials; axum routes aren't host-scoped |
-| H9 | `WAC-Allow` gains `public=` from an anonymous probe on the same snapshot; sent on GET, HEAD and OPTIONS | A share UI has to show whether a resource is public |
-| H10 | `Vary` appended not replaced: `Accept` on negotiated reads, `Origin` always; a 304 carries every header a 200 would | CTS checks `Vary: Origin` on a binary; a revalidation shouldn't cost a client its affordances (knowingly exceeding §15.4.5's SHOULD NOT) |
+| H7 | An ACL's ACL is itself; `acl_iri` lives beside `governed()` in `brolly-solid`, and is not its inverse | Stage 0's A2 governs `.acl` by its own `Control`; `x.acl.acl` is a fiction |
+| H8 | Generated, world-readable storage description at `/.well-known/solid`, routed in `app()` and subdomain-scoped by the handler, not listed in `USER_PROTOCOL_RESOURCES` | Solid Protocol §4.1; discovery precedes credentials; a routed path never reaches the fallback that list feeds |
+| H9 | `WAC-Allow` gains `public=` from an anonymous probe **inside** the snapshot, carried out on the outcome; sent on GET, HEAD and OPTIONS | A share UI has to show whether a resource is public; `Pod::read` closes the snapshot before any header builder runs |
+| H10 | ETag becomes `"{version}.{syntax}"` with preconditions comparing the version only; `Vary` appended, `Accept` on negotiated reads and `Origin` always; a 304 carries every header a 200 would | One validator for every syntax lets a private cache reuse Turtle as JSON-LD; §15.4.5's SHOULD NOT covers representation metadata, which `Allow`/`Accept-*`/`WAC-Allow` are not |
 | H11 | `PUT` that creates → 201 + `Location` + `Link`; replace → 204 | LDP, and what clients branch on |
-| H12 | Non-empty container `DELETE` → 409 **with a body**; root or root ACL → 405 | §5.4 requires both the status and the explanation |
-| H13 | Listings carry members' `dcterms:modified`, `stat:mtime` and (binaries only) `stat:size`; a write naming a contained resource is a 409 | §4.2.1 for the metadata, §5.3 for the refusal; without the refusal a round-trip `PUT` would store it as content and defeat 5a's R8 |
+| H12 | `/~/` routes the write methods; root and root ACL `DELETE` → 405 after authorization; non-empty container `DELETE` → 409 **with a body** | §5.4 names both protections and requires the 409's explanation; without the routes neither is reachable and the root ACL is deletable today |
+| H13 | Listings carry members' `dcterms:modified`, `stat:mtime` and (binaries only) `stat:size`; a write that *changes* one of those four predicates on a contained resource is a 409, an exact echo is dropped, anything else is kept | §4.2.1 for both the metadata and the refusal; a blanket refusal would break the read-modify-write every Solid client does |
 | H14 | CORS echoes `Origin` and the preflight's requested headers; expose list gains `accept-put`, `www-authenticate`, `vary` | Solid §6 wants any header combination to be sendable; CTS asserts the echo both ways |
-| H15 | `HEAD` authenticates as `HEAD`; the ActivityPub inbox keeps its 404 rule | A correct DPoP proof must not silently downgrade the caller |
-| H16 | Every 405 carries `Allow` | RFC 9110 §15.5.6, and no 405 in the server does today |
+| H15 | `HEAD` authenticates as `HEAD`, with the undecoded URI; the ActivityPub inbox keeps its 404 rule | A correct DPoP proof must not silently downgrade the caller |
+| H16 | Our own 405s carry `Allow` | RFC 9110 §15.5.6; axum's generated 405 already does, ours don't |
 | H17 | A body with no `Content-Type` is a 400, not Turtle | Solid §2.1; guessing turns a client bug into stored garbage |
