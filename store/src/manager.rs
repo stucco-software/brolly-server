@@ -216,8 +216,13 @@ impl StoreManager {
     /// dangling pointers, which is the correct steady state — they sweep lazily
     /// on dereference (D5).
     pub fn delete_pod(&self, user: Uuid) -> Result<(), StoreError> {
-        self.pods.invalidate(&user);
         self.live_handles().remove(&user);
+        self.pods.invalidate(&user);
+        // `invalidate` only schedules the eviction, so without this the pod's
+        // `Pod` can still be dropping — and RocksDB still closing its files —
+        // while the directory is being removed, which fails with "directory
+        // not empty". `run_pending_tasks` finishes the eviction first.
+        self.pods.run_pending_tasks();
         let dir = self.pod_dir(user);
         if dir.exists() {
             std::fs::remove_dir_all(&dir)?;
