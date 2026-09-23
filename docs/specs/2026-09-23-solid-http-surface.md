@@ -4,7 +4,7 @@
 <!-- The spec names files this stage creates, so not every path it cites
      resolves until it's implemented. -->
 
-**Status:** Draft (2026-09-23), revised after two adversarial reviews against
+**Status:** Draft (2026-09-23), revised after three adversarial reviews against
 the Solid Protocol, WAC, Solid-OIDC, LDP, RFC 9110/9449/6750, the CTS feature
 files, and axum's own routing source
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 5, part b. Part a
@@ -139,22 +139,44 @@ for *R* are *G*:
 | either | yes | yes | proceed |
 
 **Where the decision lives.** `ldp` knows the modes; only `pod.rs` knows
-whether a credential was presented and verified. Splitting the decision across
-them would mean threading an `authenticated` flag through every `ldp` entry
-point and through `authz/tests/conformance_matrix.rs`, which drives them
-directly. Instead:
+whether a credential was presented and verified. Threading an `authenticated`
+flag into `ldp` would put the credential question inside `brolly-solid`, which
+has no other reason to know about tokens, and into every one of its entry
+points. Instead:
 
 - `ldp` gains **`LdpError::Denied`** — *the caller does not hold the mode* —
   distinct from `NotFound`, which keeps its current meaning: *the caller holds
-  the mode and there is nothing there.* `read_in` returns `Denied` at
-  `ldp.rs:258-260` where it returns `NotFound` today; the genuine-absence
-  return at `:261-263` is unchanged. The write paths split the same way.
+  the mode and there is nothing there.*
 - `pod.rs` maps `Denied` to **401 or 403** from its own knowledge of the
   credential, and `NotFound` to 404.
 
+Every site that refuses for lack of a mode becomes `Denied`:
+
+| `ldp.rs` | Today | Becomes |
+|---|---|---|
+| `:259` `read_in`, WAC fails | `NotFound` | `Denied` |
+| `:262` `read_in`, no metadata | `NotFound` | unchanged |
+| `:402` `Target::prepare`, WAC fails | `Forbidden` | `Denied` |
+| `:529` `put_in` | `Forbidden` | `Denied` |
+| `:771` `append_in` | `Forbidden` | `Denied` |
+| `:869` `delete_in` | `Forbidden` | `Denied` |
+| `:872` `delete_in`, no metadata | `NotFound` | unchanged |
+| `:878` `delete_in`, storage root | `Forbidden` | `Undeletable` (H12's 405) |
+| `:883` and `:111` non-empty container | `Forbidden` | `NotEmpty` (H12's 409) |
+| `:954` `patch_in` | `Forbidden` | `Denied` |
+
+`:402` is easy to miss and it matters: it is the pre-lock WAC check that only
+runs for **non-RDF bodies**, so leaving it as `Forbidden` would make an
+anonymous `PUT` answer 403 for a PNG and 401 for Turtle — the status would
+depend on the `Content-Type`. It is live and tested
+(`adapters/solid/tests/ldp_nonrdf.rs:255`).
+
+After this split `Forbidden` has no producers left, so it is renamed
+`Undeletable` for `:878`'s guard, which `pod.rs` maps to 405 rather than 403.
+
 Nothing about `ldp`'s signatures changes, and `Subject::agent()` is never the
 basis for the split: a service-auth subject has `webid: None` and reports
-`Agent::Anonymous` (`identity/src/subject.rs:100-108`), but it authenticated,
+`Agent::Anonymous` (`identity/src/subject.rs:103-110`), but it authenticated,
 so it gets 403 and not a challenge it has already satisfied. `subject_for`
 returns that bit alongside the subject.
 
@@ -216,7 +238,7 @@ On a 401 from an absent credential, or from a DPoP-bearing one:
 WWW-Authenticate: DPoP algs="ES256", as_uri="https://{apex}"
 ```
 
-with `, error="…"` appended per H2's table. Solid-OIDC §10.1 makes `as_uri` a
+with `, error="…"` appended per H2's table. Solid-OIDC §9.1 makes `as_uri` a
 MUST unless the scheme has its own discovery mechanism, and RFC 9449 §7.1's
 `DPoP` parameters (`realm`, `scope`, `error`, `error_description`, `algs`)
 include none. The value is the instance's apex origin, byte-identical to what
@@ -327,11 +349,15 @@ A container gets both `#Container` and `#BasicContainer`: the Solid Protocol
 names `ldp:BasicContainer` and CTS checks for it, while generic LDP clients
 match on `ldp:Container`.
 
-The storage root's `pim:Storage` and `solid:owner` links are Solid Protocol
-§4.1 MUSTs ("servers MUST advertise the storage resource… when responding to
-storage's request URI"; and the owner link "targeting the root container").
-They turn problem 4 from a body a client must already be reading into something
-discoverable from any response.
+`pim:Storage` on the root is a §4.1 MUST — "servers MUST advertise the storage
+resource… when responding to storage's request URI". `solid:owner` is a
+conditional one: §4.1 constrains the form ("when a server wants to advertise
+the owner… the server MUST include the `Link` header field… targeting the root
+container"), and advertising it at all is our choice. We do, because H8's
+description names an owner anyway and a client that has the root should not
+need a second request to learn whose it is. Together they turn problem 4 from a
+body a client must already be reading into something discoverable from any
+response.
 
 LDP §4.2.1.4 asks for `rel="type"` on *all* responses to an LDPR's URI,
 including errors. We narrow it to successful reads and creates deliberately: a
@@ -430,24 +456,61 @@ currently `insert`s (`lib.rs:192`), which would drop whatever the handler set.
 - `Origin` on every response, binaries included — CTS checks exactly that
   (`protocol/cors/acao-vary.feature` uses a `.txt`).
 
-**The ETag gains a syntax token:** `"{version}.{syntax}"`, e.g. `"7.ttl"`,
-`"7.jsonld"`, `"7.bin"` for a binary. `Vary: Accept` fixes shared caches;
-it does nothing for the client that cached Turtle and revalidates asking for
-JSON-LD, which today gets a 304 and reuses its Turtle as JSON-LD (problem 9).
-Making the validator name the representation is what RFC 9110 §8.8.1 means by
-one — and it preserves 5a's R4, because the *version* is still one number per
-resource: preconditions compare the version part only, so an `If-Match` taken
-from a JSON-LD `GET` still guards a Turtle `PUT`.
+**The ETag gains a syntax token:** `"{version}.{syntax}"`, e.g.
+`"01J8….ttl"`, `"01J8….jsonld"`, `"01J8….bin"` for a binary.
+
+A conforming private cache already handles problem 9 once `Vary: Accept` is
+sent: RFC 9111 §4.1 requires it to key stored responses on the varied header,
+so it won't select its Turtle entry for a JSON-LD request and won't send that
+tag back. The syntax token is defence in depth against clients that don't, and
+against a tag a client stored before this stage. It is worth its cost —
+`etag()` gains an argument, tags become parseable, and every cached validator
+in the wild is invalidated once — because "reuse Turtle as JSON-LD" fails
+silently and produces a parse error a long way from its cause.
+
+**Reads compare the whole tag; writes compare the version.**
+
+- `If-None-Match` on a `GET`/`HEAD` compares the full tag, so a client holding
+  `"01J8….ttl"` that revalidates asking for JSON-LD gets a 200. Comparing only
+  the version here would re-introduce exactly problem 9.
+- `If-Match` and `If-None-Match` on a write compare the version part only. A
+  `PUT` replaces the resource, not a representation, and a client that took its
+  tag from a `HEAD` negotiated as Turtle must be able to guard a JSON-LD `PUT`
+  with it. This is a deliberate deviation from RFC 9110 §13.1.1, which requires
+  the strong comparison of §8.8.3.2 — octet-for-octet on the opaque tag. We
+  take it because the alternative makes a correct client's conditional write
+  fail for a reason it cannot see, and because the version *is* the resource
+  state that `If-Match` exists to guard. 5a's R4 is preserved: one version per
+  resource, one syntax token per representation.
+- `If-Match: *` and `If-None-Match: *` are unaffected — `Condition::Any` carries
+  no tag and asks only whether a current representation exists.
+
+**A tag we didn't issue matches nothing.** The version is a ULID, so it never
+contains a `.`, and `split_once('.')` is unambiguous. A tag with no `.`, or
+with a suffix outside the set we issue, matches no representation and no
+version: an `If-Match` carrying one fails closed with 412 and the client
+re-`GET`s. That is what a 5a-era cached tag does after deploy, and it is the
+right answer for a forged one.
+
+This moves 5a's `conditional.rs` tests that spell tags by hand —
+`an_etag_is_the_version_in_quotes` (:487) certainly, and
+`if_match_compares_strongly` (:416),
+`if_none_match_tags_refuse_the_current_version` (:448) and
+`a_read_is_not_modified_when_if_none_match_matches` (:476) under the strict
+rule. It moves **no** `pod_http` test: `get_and_head_carry_an_etag_and_last_modified`
+(:1057) asserts only that the tag is quoted and non-empty, and nothing there
+re-uses a tag across syntaxes.
 
 A 304 carries `ETag` and `Vary`, which RFC 9110 §15.4.5 requires, plus
 `Last-Modified`, `Link`, `Allow`, `Accept-*` and `WAC-Allow`. §15.4.5's
 SHOULD NOT covers *representation* metadata — `Content-Encoding`,
-`Content-Language`, `Content-Length`, `Content-Type` — and explicitly permits
-`Last-Modified`; `Allow`, `Accept-*` and `WAC-Allow` are control and resource
-metadata, so none of this is a deviation. A client that revalidates must not
-lose the affordances it had. `Content-Location`, `Cache-Control` and `Expires`
-are absent because a 200 from this server doesn't send them either. Today a 304
-carries `ETag` alone.
+`Content-Language`, `Content-Length`, `Content-Type`; `Allow`, `Accept-*` and
+`WAC-Allow` are control and resource metadata, so those are not a deviation.
+`Last-Modified` is: §15.4.5 excuses cache-guiding metadata only "if the
+response does not have an ETag field", and ours does. We send it anyway,
+because a client that revalidates must not lose the affordances it had.
+`Content-Location`, `Cache-Control` and `Expires` are absent because a 200 from
+this server doesn't send them either. Today a 304 carries `ETag` alone.
 
 ### H11. A `PUT` that creates answers 201
 
@@ -472,6 +535,11 @@ when the stored representation isn't what was sent.
   Without them axum's method-router answers 405 before any handler runs, so
   `ldp.rs:877`'s root guard is unreachable over HTTP and H4's
   authorization-first ordering cannot hold. The handlers run WAC, then refuse.
+  These are **new handlers**, not new entries: `pod::get`/`put`/`patch`/`delete`
+  all take `Path(String)`, and the `/~/{*path}` wildcard doesn't match an empty
+  remainder — which is why `get_root` and `post_root` exist. So `put_root`,
+  `patch_root`, `delete_root` and (for H4's stateful `OPTIONS`) `options_root`
+  join them, each delegating to the same inner function with an empty path.
 - **`DELETE` of the storage root or of `/~/.acl` → 405** with H4's `Allow`, for
   a caller who would otherwise have been allowed. The root ACL needs a new
   guard in `delete_in`; today a caller with `Control` can delete it.
@@ -491,15 +559,28 @@ A container's body gains, for each member, the metadata 5a already records
     <http://www.w3.org/ns/posix/stat#size> 214 .
 ```
 
+§4.2.1 makes the metadata a SHOULD and the protection below a MUST.
+
 `dcterms:modified` and `stat:mtime` are the same instant in the two forms
-§4.2.1 names, at the millisecond precision 5a stores. The `stat:` prefix
-expands to `http://www.w3.org/ns/posix/stat#` — the Solid Protocol's prefix
-table omits the `#`, but the vocabulary's terms carry it, and `statsize` is not
-a term. Neither has a declared range, so both are `xsd:integer` by our choice.
+§4.2.1 names. Both come from the **same normalising path `meta()` uses**
+(`store/src/resources.rs:591`, `normalise_modified`), not from the raw quads
+`container_triples` reads: commit `9d58082` exists because Oxigraph shortens
+`.750Z` to `.75Z` and `.000Z` to `Z` on the way in, so a listing built from raw
+quads would disagree with the member's own `Last-Modified` about one write in
+ten. `stat:mtime` is derived through `parse_modified` — nothing stores an
+integer mtime — and `stat:size` comes from the stored `brolly:byteSize`.
+
+The `stat:` prefix expands to `http://www.w3.org/ns/posix/stat#` — the Solid
+Protocol's prefix table omits the `#`, but the vocabulary's terms carry it, and
+`statsize` is not a term. Neither term declares a range, so both are
+`xsd:integer` by our choice.
+
 `stat:size` is emitted for binaries only: §4.2.1 excuses metadata that is
 "inapplicable", and an RDF source's serialized length depends on the syntax the
 client asked for, so a number that changes with `Accept` is worse than no
-number. The `rdf:type` of an IANA media type is omitted for the same reason.
+number. §4.2.1's fourth statement, the `rdf:type` naming an IANA media-type
+class, is omitted for the same reason — a negotiated resource has no single
+one.
 
 **These triples are server-owned, exactly like `ldp:contains`.**
 `container_body` (`ldp.rs:596-633`) keeps every quad whose subject isn't the
@@ -509,18 +590,32 @@ the generated version. §4.2.1: "servers MUST NOT allow HTTP POST, PUT and PATCH
 to update a container's resource metadata statements; if the server receives
 such a request, it MUST respond with a 409 status code."
 
-The rule follows containment's shape exactly (`ldp.rs:629`), and **an exact
-echo is not an update**:
+**An exact echo is not an update.** The rule is per statement, and it compares
+*values*, not lexical forms — `1790000000` and `"1790000000"^^xsd:integer` are
+the same number, and a client that round-trips a timestamp through JSON-LD may
+spell it a third way:
 
-- A statement whose subject is a contained resource and whose predicate is one
-  of the four §4.2.1 metadata predicates is **dropped** when it matches what
-  the server would serve, and **409** when it differs.
-- Any other statement about a contained resource — `<…/first> rdfs:label
-  "First"` in the container's description — is ordinary content and is kept.
+- A statement whose subject is a contained resource and whose predicate is
+  `dcterms:modified`, `stat:mtime` or `stat:size` — the three we serve — is
+  parsed as a value: milliseconds since the epoch for the first two, an integer
+  for the third. It is **dropped** when that value equals the one the server
+  would serve, and **409** when it differs or won't parse.
+- **`rdf:type` is not on the list,** because we don't serve it. `<…/first> a
+  schema:Note` in a container's description is ordinary content, and so is any
+  other predicate on a member — `<…/first> rdfs:label "First"` is kept.
 
 Without the echo tolerance a plain read-modify-write of a container would 409,
 which is what Inrupt's `solid-client`, LDO and SolidOS all do, and what 5a's
 "echoing its listing exactly, succeeds" test asserts.
+
+This is *not* containment's set-wise rule (`ldp.rs:629`: send none and
+membership is left alone, send a non-empty set and it must match exactly). It
+is per statement, and it has no equivalent of containment's empty-set escape
+hatch. It also has a race containment doesn't: a member's `dcterms:modified`
+moves on every write to that member, not only on create and delete, so a client
+that reads a listing, edits a member, and then writes the container's
+description back is refused for metadata it never touched. The 409's body — the
+one §5.4 requires anyway — says to re-read and retry.
 
 This is also what makes 5a's R9 observable: `set_description` → `contain` →
 `touch(parent)` (`resources.rs:734`, `:878-888`) already moves a container's
@@ -538,7 +633,7 @@ request per member.
   `Access-Control-Allow-Headers` is a fixed list (`lib.rs:174`) that can never
   admit a header it doesn't already name. CTS asserts the response does *not*
   carry `Accept` when the preflight didn't ask for it
-  (`protocol/cors/accept-acah.feature`), and Solid §6 wants apps able to send
+  (`protocol/cors/accept-acah.feature`), and Solid §8.1 wants apps able to send
   any combination of headers.
 - `Access-Control-Expose-Headers` gains `accept-put`, `www-authenticate` and
   `vary` (not CORS-safelisted, and H10 now sends it), and drops `updates-via`,
@@ -552,6 +647,11 @@ percent-escape matches. Today `pod.rs:301` passes the literal `"GET"` and
 builds the URL from the decoded `Path`, so a correct client's HEAD silently
 loses its identity and gets the anonymous answer. CTS signs `HEAD` proofs
 (`read-method-allow.feature`), so nothing in part d passes without this.
+
+The handlers need two more extractors — `axum::http::Method` and
+`OriginalUri` — declared **before** `Path`, which must stay last. The
+undecoded path is load-bearing: `htu_matches` (`identity/src/dpop.rs:397`) is
+exact string equality after stripping query and fragment.
 
 `server/src/activitypub.rs:289` is `subject_for`'s other caller. It keeps its
 own rule — the inbox answers 404 to a non-owner, because 403 would confirm the
@@ -571,14 +671,21 @@ root and root ACL.
 Solid §2.1: "Server MUST reject `PUT`, `POST`, and `PATCH` requests that
 contain content but lack the `Content-Type` header field, with a status code of
 `400`." `pod::put` and `pod::post` default to `text/turtle` (`pod.rs:366`,
-`:399`); that default is removed. An empty body with no `Content-Type` is still
-fine — that is how a client creates an empty resource, which 5a made possible.
+`:399`); that default is removed. `pod::patch` needs the same treatment from
+the other side: it defaults to `""`, falls into the `other =>` arm
+(`pod.rs:445`) and answers **415** where §2.1 wants 400.
+
+**An empty body with no `Content-Type` is treated as an empty RDF document,**
+not refused: §2.1's MUST is about requests that "contain content", and creating
+an empty resource this way is what 5a made possible. `ldp::prepare` needs a
+content type to reach `Content::Rdf(&[])`, so the default survives for exactly
+this case and no other.
 
 ## What this changes in the code
 
 | File | Change |
 |---|---|
-| `adapters/solid/src/ldp.rs` | `LdpError::{Denied, NotEmpty}` (H1, H12); **`describe()`**, a body-free per-resource read returning kind, existence, version, modified, `granted` and `public` (H4, H6, H9, H10); anonymous probe inside `read_in` (H9); `acl_iri` (H7); root-ACL delete guard (H12); `put_if`/`put_in` report created vs replaced (H11); `container_body` drops or refuses member metadata (H13); `served_types` deleted (H5) |
+| `adapters/solid/src/ldp.rs` | `LdpError::{Denied, NotEmpty}`, `Forbidden` renamed `Undeletable` (H1, H12); **`describe()`**, a body-free per-resource read returning kind, existence, version, modified, `granted` and `public` (H4, H6, H9, H10); anonymous probe inside `read_in` (H9); `acl_iri` (H7); root-ACL delete guard (H12); `put_if`/`put_in` report created vs replaced (H11); `container_body` drops or refuses member metadata (H13); `served_types` deleted (H5) |
 | `server/src/pod.rs` | `subject_for` returns the subject *and* whether a credential verified, takes the real method and undecoded URI (H2, H15); `ldp_error` maps `Denied` → 401/403 and `NotEmpty` → 409 (H1, H12); one `headers_for` over `describe`'s output, shared by GET, HEAD, OPTIONS, 304 and the create responses (H4–H10); stateful `options` (H4); `Content-Type` required (H17); `Allow` on the fallback's 405 (H16) |
 | `server/src/lib.rs` | `/~/` gains `put`/`patch`/`delete` (H12); route for `/.well-known/solid` (H8); CORS echo, preflight header echo, expose list (H14) |
 | `adapters/solid/src/storage_description.rs` | new: generates H8's document |
@@ -597,8 +704,17 @@ and per-resource), `wac_allow_on_an_acl_names_nothing_for_bob` (:1030, Bob's
 `get_and_head_carry_an_etag_and_last_modified` (:1057, the ETag gains a syntax
 token). `bob_cannot_delete_an_acl_he_does_not_control` (:1012) does **not**
 change: that ACL is `/~/shared/.acl`, not the root's, and Bob is authenticated
-without `Control`, so 403 stands. Also `server/src/pod.rs:584`'s unit test,
-`authz/tests/conformance_matrix.rs`, and the `ldp::put` call sites in H11.
+without `Control`, so 403 stands.
+
+In `adapters/solid/tests`, H1 inverts an invariant several tests assert
+directly: `ldp_conformance.rs:220-221` (both absent *and* refused are
+`NotFound` today), `:238`, `:364` (non-empty container → `NotEmpty`),
+`ldp_nonrdf.rs:241` and `:255` (`Target::prepare`'s refusal). All fail loudly
+through `matches!`; none change silently. Also `server/src/pod.rs:584`'s unit
+test, `conditional.rs`'s hand-spelled tags (H10), and the `ldp::put` call sites
+in H11. `authz/tests/conformance_matrix.rs` is **not** affected — `brolly-authz`
+has no `brolly-solid` dependency and drives `effective_acl`/`authorize` through
+its own stubs.
 
 ## Chunks
 
@@ -634,7 +750,7 @@ sense together, as 5a's did.
 |---|---|---|
 | H1 | Status depends on effective modes and on whether a credential verified, never on existence: unauthenticated+denied → 401, authenticated+denied → 403, permitted+missing → 404. `ldp` reports `Denied` vs `NotFound`; `pod.rs` picks 401 or 403 | Tells a client what to do without becoming an existence oracle; matches CTS row for row; keeps the credential question out of `ldp`'s signatures |
 | H2 | An `Authorization` header that doesn't verify is a 401, not anonymity; `invalid_token` for the token, `invalid_dpop_proof` for the proof; a stale cookie still falls through to anonymous | An expired token must look like an expired token; `invalid_token` on a proof failure sends a client into a refresh loop; a `SameSite=Lax` cookie the browser sent unasked is not a presented credential |
-| H3 | `WWW-Authenticate: DPoP algs="ES256", as_uri="https://{apex}"`, plus `error=`; a bearer credential gets a `Bearer` challenge | Solid-OIDC §10.1 makes `as_uri` a MUST; a Mastodon client can't act on a DPoP challenge |
+| H3 | `WWW-Authenticate: DPoP algs="ES256", as_uri="https://{apex}"`, plus `error=`; a bearer credential gets a `Bearer` challenge | Solid-OIDC §9.1 makes `as_uri` a MUST; a Mastodon client can't act on a DPoP challenge |
 | H4 | `Allow` computed from the caller's modes and the target's kind; `POST` on documents too; no `PATCH` for Append-only until 5c; `OPTIONS` gated on *any* mode and answering 204 for an absent target; only the root and the root's ACL are undeletable; authorization decided before method availability | A static `Allow` promises writes that will be refused; an Append-only client must be able to discover `POST`; WAC §3.2 makes deleting an ACL the way to revert to inheritance |
 | H5 | `Accept-Patch`/`Accept-Post`/`Accept-Put` sent only when the method is allowed — a deliberate narrowing of §5.2's MUST — sourced from `accepted_write_types()`; `*/*` wherever any type is accepted today; `served_types()` deleted | These headers mean "allowed"; `served_types()` includes RDF/XML, which ADR 0007 always refuses |
 | H6 | `Link rel="type"` with the LDP kinds, plus `pim:Storage` and `solid:owner` on the root, `acl`, and `storageDescription`; successful reads and creates only | §4.1 MUSTs the storage links; a 4xx must not imply a resource kind |
@@ -645,7 +761,7 @@ sense together, as 5a's did.
 | H11 | `PUT` that creates → 201 + `Location` + `Link`; replace → 204 | LDP, and what clients branch on |
 | H12 | `/~/` routes the write methods; root and root ACL `DELETE` → 405 after authorization; non-empty container `DELETE` → 409 **with a body** | §5.4 names both protections and requires the 409's explanation; without the routes neither is reachable and the root ACL is deletable today |
 | H13 | Listings carry members' `dcterms:modified`, `stat:mtime` and (binaries only) `stat:size`; a write that *changes* one of those four predicates on a contained resource is a 409, an exact echo is dropped, anything else is kept | §4.2.1 for both the metadata and the refusal; a blanket refusal would break the read-modify-write every Solid client does |
-| H14 | CORS echoes `Origin` and the preflight's requested headers; expose list gains `accept-put`, `www-authenticate`, `vary` | Solid §6 wants any header combination to be sendable; CTS asserts the echo both ways |
+| H14 | CORS echoes `Origin` and the preflight's requested headers; expose list gains `accept-put`, `www-authenticate`, `vary` | Solid §8.1 wants any header combination to be sendable; CTS asserts the echo both ways |
 | H15 | `HEAD` authenticates as `HEAD`, with the undecoded URI; the ActivityPub inbox keeps its 404 rule | A correct DPoP proof must not silently downgrade the caller |
 | H16 | Our own 405s carry `Allow` | RFC 9110 §15.5.6; axum's generated 405 already does, ours don't |
 | H17 | A body with no `Content-Type` is a 400, not Turtle | Solid §2.1; guessing turns a client bug into stored garbage |
