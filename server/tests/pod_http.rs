@@ -1195,6 +1195,48 @@ async fn if_none_match_star_creates_but_never_overwrites() {
     );
 }
 
+/// A binary's bytes reach disk before the transaction that decides whether to
+/// keep them (R12: uploads don't queue behind the write lock). So a refused
+/// upload has already written a file, and nothing else will ever reference it —
+/// an attacker who can be refused repeatedly could fill the volume one 412 at a
+/// time. The refusal path has to hand the bytes back.
+#[tokio::test]
+async fn a_binary_refused_by_a_precondition_leaves_no_bytes_behind() {
+    use sha2::{Digest, Sha256};
+
+    let h = harness().await;
+    const OTHER: &str = "%PDF-1.4\n1 0 obj\n<< /Type /Nothing >>\nendobj\n";
+    let refused: String = Sha256::digest(OTHER.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    let (status, _, _) = h
+        .send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/paper.pdf",
+            Some(("application/pdf", OTHER)),
+            &[("if-none-match", "*")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED);
+
+    let (status, body, _) = h.send("GET", "/~/paper.pdf", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, PDF, "the refused upload landed");
+
+    let blobs = h.stores.blobs(h.user).unwrap();
+    assert!(
+        !blobs.contains(&refused),
+        "the refused upload's bytes are still on disk"
+    );
+}
+
 /// What Solid clients use to detect a conflicting edit.
 #[tokio::test]
 async fn if_match_needs_the_current_strong_tag() {
