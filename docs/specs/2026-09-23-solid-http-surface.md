@@ -220,6 +220,16 @@ before any WAC evaluation, and the request is *not* retried as anonymous:
 | malformed header, unknown, expired or revoked token | `invalid_token` |
 | failed DPoP proof, replayed `jti`, `htu`/`htm` mismatch | `invalid_dpop_proof` |
 
+Three edge cases, settled while planning:
+
+- A header that can't be parsed at all is `invalid_token`, with the `DPoP`
+  challenge — the pod's default scheme.
+- A token that verifies but names a WebID this instance doesn't host is
+  `invalid_token`. Accepting other issuers' tokens is stage 6.
+- A database failure while verifying is a **500**, not a 401: the credential
+  may be fine, and a challenge would send a correct client to re-authenticate
+  for nothing.
+
 The two codes matter. RFC 9449 §7.1 defines `invalid_dpop_proof` precisely
 because `invalid_token` tells a client to refresh a token that is fine — it
 would refresh, re-sign the same broken proof, and loop. Neither code leaks
@@ -288,7 +298,9 @@ learn it may `POST` — must be able to ask. A caller with no modes at all still
 gets H1's 401 or 403, so `OPTIONS` is not an existence oracle. For the same
 reason `OPTIONS` on a **target that doesn't exist** answers 204 with the
 `Allow` a creation would have, where `GET` would answer 404: "may I create
-here" is the question, and H5's `Accept-Put` is the answer.
+here" is the question, and H5's `Accept-Put` is the answer. For a caller with
+`Write` that `Allow` is `PUT, PATCH, OPTIONS` — not `GET` or `DELETE`, which
+would 404, and not `POST`, which needs something that exists to post into.
 
 A CORS preflight is not an `OPTIONS` request in this sense — the middleware
 answers it before routing (`server/src/lib.rs:161`) and it carries no
@@ -322,9 +334,11 @@ may not use is the same lie as a wrong `Allow`.
   is *allowed*, so advertising RDF/XML would be advertising a guaranteed 415.
 - `Accept-Put` is `*/*` for anything that accepts any media type today — a
   binary, an **existing RDF document** (`ldp.rs:431` applies the RDF-only rule
-  to containers and ACLs alone), and a target that doesn't exist. It is the RDF
-  list for a **container or an `.acl`**, which is 5a's `NotRdf` refusal made
-  discoverable.
+  to containers and ACLs alone), and an absent target at a document path. It
+  is the RDF list for a **container or an `.acl`, existing or not** — decided
+  by the path, the same way `PUT` decides it — which is 5a's `NotRdf` refusal
+  made discoverable. A missing `/~/new/` advertising `*/*` would invite a PUT
+  that is guaranteed a 415.
 
 `served_types()` is deleted rather than promoted: it is the *serialization*
 list, it duplicates `syntax::negotiate`'s knowledge, and nothing reads it.
@@ -718,8 +732,9 @@ its own stubs.
 
 ## Chunks
 
-Five, landing as four commits — chunks 2 and 3 stage separately but only make
-sense together, as 5a's did.
+Five, one commit each. (An earlier draft paired chunks 2 and 3; planning showed
+chunk 2 stands alone, and separate commits are easier to bisect and revert.)
+The plan is `docs/plans/2026-09-23-solid-http-surface.md`.
 
 1. **Credentials and refusals.** `subject_for`'s signature, the real method and
    URI, `LdpError::Denied`, the 401/403/404 table, `WWW-Authenticate` with both
