@@ -810,11 +810,14 @@ async fn a_webid_is_readable_cross_origin() {
         headers_of(&h, "GET", "/profile", &[("origin", "https://app.example")]).await;
 
     assert_eq!(status, StatusCode::OK);
+    // Echoed, not `*`. With credentials disallowed the two grant a browser
+    // identical permission, but a named origin is cacheable per-origin, and
+    // CTS checks for the echo (`protocol/cors/acao-vary.feature`).
     assert_eq!(
         headers
             .get("access-control-allow-origin")
             .and_then(|v| v.to_str().ok()),
-        Some("*")
+        Some("https://app.example")
     );
 }
 
@@ -888,9 +891,22 @@ async fn the_headers_ldp_depends_on_are_exposed() {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_ascii_lowercase();
-    for wanted in ["location", "link", "etag", "wac-allow"] {
+    for wanted in [
+        "location",
+        "link",
+        "etag",
+        "wac-allow",
+        "accept-put",
+        "www-authenticate",
+        "vary",
+    ] {
         assert!(exposed.contains(wanted), "{wanted} not exposed: {exposed}");
     }
+    // Nothing sends it until stage 7, and an expose list is a promise.
+    assert!(
+        !exposed.contains("updates-via"),
+        "still exposing updates-via: {exposed}"
+    );
 }
 
 // --- ACL resources -------------------------------------------------------------
@@ -1083,13 +1099,18 @@ async fn wac_allow_on_an_acl_names_nothing_for_bob() {
         .get("wac-allow")
         .map(|v| v.to_str().unwrap().to_string());
     assert!(
-        matches!(allowed.as_deref(), None | Some("user=\"\"")),
+        matches!(allowed.as_deref(), None | Some("user=\"\", public=\"\"")),
         "got {allowed:?}"
     );
 
     let (status, _, headers) = h.send("GET", "/~/shared/.acl", None, true).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(headers["wac-allow"], "user=\"read write append control\"");
+    // An ACL is all-or-nothing on Control: Alice holds it and gets all four,
+    // the anonymous probe doesn't and gets none.
+    assert_eq!(
+        headers["wac-allow"],
+        "user=\"read write append control\", public=\"\""
+    );
 }
 
 // --- refusals (stage 5b, H1–H3) -------------------------------------------------
@@ -2487,5 +2508,451 @@ async fn the_storage_roots_acl_cannot_be_deleted() {
         status,
         StatusCode::OK,
         "the member can still read their pod"
+    );
+}
+
+// --- caching (stage 5b, H10) ---------------------------------------------------
+
+/// Spec problem 9: one ETag served every syntax, and the 304 was decided from
+/// the version alone, so a client that cached Turtle and revalidated asking
+/// for JSON-LD was told its Turtle was fresh — and then parsed Turtle as
+/// JSON-LD, a parse error a long way from its cause.
+#[tokio::test]
+async fn a_turtle_tag_does_not_revalidate_a_json_ld_read() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, _, headers) = h
+        .send_if("GET", "/~/note", None, &[("accept", "text/turtle")])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let turtle_tag = headers[header::ETAG].to_str().unwrap().to_string();
+    assert!(turtle_tag.ends_with(".ttl\""), "got {turtle_tag}");
+
+    // The Turtle tag confirms the Turtle representation.
+    let (status, _, _) = h
+        .send_if(
+            "GET",
+            "/~/note",
+            None,
+            &[
+                ("accept", "text/turtle"),
+                ("if-none-match", turtle_tag.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED, "its own syntax");
+
+    // It confirms nothing else.
+    let (status, _, headers) = h
+        .send_if(
+            "GET",
+            "/~/note",
+            None,
+            &[
+                ("accept", "application/ld+json"),
+                ("if-none-match", turtle_tag.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "a Turtle tag confirmed JSON-LD");
+    assert_eq!(headers[header::CONTENT_TYPE], "application/ld+json");
+    let json_tag = headers[header::ETAG].to_str().unwrap().to_string();
+    assert!(json_tag.ends_with(".jsonld\""), "got {json_tag}");
+    assert_ne!(json_tag, turtle_tag);
+
+    // The version half is the same resource state either way, which is what
+    // makes a write guarded by either tag work (H10).
+    assert_eq!(
+        turtle_tag.trim_end_matches(".ttl\""),
+        json_tag.trim_end_matches(".jsonld\"")
+    );
+}
+
+/// A binary's bytes are the same for every `Accept`, so its tag says so and
+/// one token serves. Nothing negotiates, so nothing can be confirmed wrongly.
+#[tokio::test]
+async fn a_binary_is_tagged_as_a_binary() {
+    let h = harness().await;
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+
+    let (status, _, headers) = h
+        .send_if("GET", "/~/paper.pdf", None, &[("accept", "*/*")])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let tag = headers[header::ETAG].to_str().unwrap().to_string();
+    assert!(tag.ends_with(".bin\""), "got {tag}");
+
+    // Asking for JSON-LD doesn't change the bytes, so the tag still holds.
+    let (status, _, _) = h
+        .send_if(
+            "GET",
+            "/~/paper.pdf",
+            None,
+            &[
+                ("accept", "application/ld+json"),
+                ("if-none-match", tag.as_str()),
+            ],
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+}
+
+/// H10's deviation from RFC 9110 §13.1.1, over the wire. A client that read a
+/// resource as Turtle and writes it back as JSON-LD guards the write with the
+/// tag it has, and must not be refused for a syntax it never claimed.
+#[tokio::test]
+async fn a_tag_from_one_syntax_guards_a_write_in_another() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (_, _, headers) = h
+        .send_if("GET", "/~/note", None, &[("accept", "text/turtle")])
+        .await;
+    let turtle_tag = headers[header::ETAG].to_str().unwrap().to_string();
+
+    let json = r#"[{"@id":"https://alice.brolly.test/~/note",
+        "https://example.org/title":[{"@value":"Edited"}]}]"#;
+    let (status, body, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("application/ld+json", json)),
+            &[("if-match", turtle_tag.as_str())],
+        )
+        .await;
+    assert!(status.is_success(), "{status}: {body}");
+
+    // And a tag for a version that has moved on is still refused.
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-match", turtle_tag.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "a stale version");
+}
+
+/// A tag cached before this stage has no syntax token, so it names no version
+/// and no representation. `If-Match` fails closed and the client re-`GET`s;
+/// `If-None-Match` is a full response rather than a wrong 304.
+#[tokio::test]
+async fn a_tag_from_before_this_stage_matches_nothing() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let current = h.etag("/~/note").await;
+    let bare = format!("\"{}\"", current.trim_matches('"').trim_end_matches(".ttl"));
+    assert_ne!(bare, current, "the tag has no token to strip");
+
+    let (status, _, _) = h
+        .send_if("GET", "/~/note", None, &[("if-none-match", bare.as_str())])
+        .await;
+    assert_eq!(status, StatusCode::OK, "a 5a-era tag confirmed a read");
+
+    let (status, _, _) = h
+        .send_if(
+            "PUT",
+            "/~/note",
+            Some(("text/turtle", EDITED)),
+            &[("if-match", bare.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::PRECONDITION_FAILED, "fail closed");
+    assert_eq!(h.etag("/~/note").await, current, "the refused PUT landed");
+}
+
+// --- WAC-Allow (stage 5b, H9) --------------------------------------------------
+
+/// Grant the world Read on a resource, the way a member's share UI would.
+///
+/// A direct ACL replaces the inherited one rather than adding to it, so
+/// Alice's own grants have to be restated here or she loses them — which is
+/// WAC working, not a bug in the helper.
+fn make_public(h: &Harness, path: &str) {
+    let resource = format!("{ROOT}{path}");
+    let g = format!("{resource}.acl");
+    let owner = format!("{g}#owner");
+    let public = format!("{g}#public");
+    set_acl(
+        h,
+        &g,
+        &[
+            t(&g, &owner, &format!("{ACL}accessTo"), &resource),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            t(
+                &g,
+                &owner,
+                &format!("{ACL}agent"),
+                &format!("{BASE}/profile#me"),
+            ),
+            t(&g, &public, &format!("{ACL}accessTo"), &resource),
+            t(&g, &public, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &public, &format!("{ACL}agentClass"), EVERYONE),
+        ],
+    );
+}
+
+/// Spec problem 7: a share UI has to show whether what it is looking at is
+/// world-readable, and it cannot learn that by asking as itself. `public=` is
+/// a second `granted_modes` probe with an anonymous subject, run inside the
+/// same snapshot so both components describe the same ACL.
+#[tokio::test]
+async fn wac_allow_names_what_the_public_holds() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    h.send("PUT", "/~/open", Some(("text/turtle", NOTE)), true)
+        .await;
+    make_public(&h, "open");
+
+    // The harness's root ACL grants Alice Read and Write, and Write satisfies
+    // Append (`AccessMode::satisfying`), so she holds three modes on both.
+    let (status, _, headers) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["wac-allow"], "user=\"read write append\", public=\"\"",
+        "a private resource still reports an empty public group"
+    );
+
+    let (status, _, headers) = h.send("GET", "/~/open", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers["wac-allow"],
+        "user=\"read write append\", public=\"read\""
+    );
+
+    // And HEAD carries it too (WAC §6's MUST), and OPTIONS, which now makes
+    // the same evaluation (H9).
+    for method in ["HEAD", "OPTIONS"] {
+        let (status, _, headers) = h.send(method, "/~/open", None, true).await;
+        assert!(status.is_success(), "{method}: {status}");
+        assert_eq!(
+            headers["wac-allow"], "user=\"read write append\", public=\"read\"",
+            "{method}"
+        );
+    }
+}
+
+/// An anonymous reader of a public resource sees the same `public=` group it
+/// is a member of, and a `user=` group that is the same thing said twice.
+#[tokio::test]
+async fn an_anonymous_reader_of_a_public_resource_sees_both_groups() {
+    let h = harness().await;
+    h.send("PUT", "/~/open", Some(("text/turtle", NOTE)), true)
+        .await;
+    make_public(&h, "open");
+
+    let (status, _, headers) = h.send("GET", "/~/open", None, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(headers["wac-allow"], "user=\"read\", public=\"read\"");
+}
+
+// --- Vary and the 304 (stage 5b, H10) -------------------------------------------
+
+/// All the `Vary` field lines as one value. A repeated field line means the
+/// same as one line joined with commas (RFC 9110 §5.3), and this stage sets
+/// the header from two places: the handler and the CORS layer.
+fn vary_of(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get_all(header::VARY)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect::<Vec<_>>()
+        .join(", ")
+        .to_ascii_lowercase()
+}
+
+/// Spec problem 8: `GET` negotiates on `Accept` and never said so, so a shared
+/// cache could hand a client asking for JSON-LD the Turtle it stored for
+/// someone else. A binary gets no `Vary: Accept`: its bytes are the same for
+/// every `Accept`, and claiming otherwise fragments a cache for nothing.
+#[tokio::test]
+async fn a_negotiated_read_varies_on_accept_and_a_binary_does_not() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+
+    for path in ["/~/note", "/~/"] {
+        for method in ["GET", "HEAD"] {
+            let (status, _, headers) = h.send(method, path, None, true).await;
+            assert_eq!(status, StatusCode::OK, "{method} {path}");
+            assert!(
+                vary_of(&headers).contains("accept"),
+                "{method} {path}: {}",
+                vary_of(&headers)
+            );
+        }
+    }
+
+    let (status, _, headers) = h.send("GET", "/~/paper.pdf", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !vary_of(&headers).contains("accept"),
+        "a binary varied on Accept: {}",
+        vary_of(&headers)
+    );
+}
+
+/// RFC 9110 §15.4.5 requires `ETag` and `Vary` on a 304. We send more: a
+/// client that revalidates must not lose the affordances it had, so `Allow`,
+/// `Accept-*` and `WAC-Allow` — control and resource metadata, not the
+/// representation metadata §15.4.5's SHOULD NOT covers — ride along, and so
+/// does `Link`. `Last-Modified` is the one deviation, and it is deliberate.
+#[tokio::test]
+async fn a_304_carries_what_the_200_carried() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, _, ok) = h
+        .send_if("GET", "/~/note", None, &[("accept", "text/turtle")])
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let tag = ok[header::ETAG].to_str().unwrap().to_string();
+
+    let (status, body, not_modified) = h
+        .send_if(
+            "GET",
+            "/~/note",
+            None,
+            &[("accept", "text/turtle"), ("if-none-match", tag.as_str())],
+        )
+        .await;
+    assert_eq!(status, StatusCode::NOT_MODIFIED);
+    assert!(body.is_empty(), "a 304 has no body: {body}");
+
+    for name in [
+        "etag",
+        "last-modified",
+        "link",
+        "allow",
+        "accept-patch",
+        "accept-post",
+        "accept-put",
+        "wac-allow",
+    ] {
+        let on_200 = ok.get_all(name).iter().collect::<Vec<_>>();
+        let on_304 = not_modified.get_all(name).iter().collect::<Vec<_>>();
+        assert!(!on_200.is_empty(), "{name} missing from the 200");
+        assert_eq!(on_304, on_200, "{name} differs on the 304");
+    }
+    assert_eq!(vary_of(&not_modified), vary_of(&ok), "Vary differs");
+
+    // §15.4.5's SHOULD NOT: representation metadata stays off.
+    for name in [header::CONTENT_TYPE, header::CONTENT_LENGTH] {
+        assert!(
+            not_modified.get(&name).is_none(),
+            "{name} on a 304: representation metadata"
+        );
+    }
+}
+
+// --- CORS (stage 5b, H14) -------------------------------------------------------
+
+/// CTS `protocol/cors/acao-vary.feature`: a response whose `Allow-Origin`
+/// depends on the request's `Origin` must say so, or a shared cache serves one
+/// origin's response to another. It uses a `.txt`, so this has to hold for a
+/// binary too — the one response with nothing else to vary on.
+#[tokio::test]
+async fn every_response_varies_on_origin_binaries_included() {
+    let h = harness().await;
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+
+    for path in ["/profile", "/~/paper.pdf", "/~/nothing-here"] {
+        let (_, headers) = headers_of(&h, "GET", path, &[("origin", "https://app.example")]).await;
+        assert!(
+            vary_of(&headers).contains("origin"),
+            "{path}: {}",
+            vary_of(&headers)
+        );
+    }
+}
+
+/// The handler sets `Vary: Accept` and the CORS layer is outermost. If it
+/// `insert`s rather than appends, the negotiated read silently stops
+/// advertising that it negotiates, and a shared cache serves Turtle to a
+/// JSON-LD request — problem 8 restored by the layer meant to fix it.
+#[tokio::test]
+async fn the_cors_layer_adds_to_vary_rather_than_replacing_it() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let request = conditional_request(
+        "GET",
+        "/~/note",
+        None,
+        Some(h.session.as_str()),
+        &[("origin", "https://app.example"), ("accept", "text/turtle")],
+    );
+    let (status, _, headers) = run(h.router.clone(), request).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let vary = vary_of(&headers);
+    assert!(
+        vary.contains("accept"),
+        "the handler's Accept was lost: {vary}"
+    );
+    assert!(vary.contains("origin"), "no Origin: {vary}");
+}
+
+/// With no `Origin` there is no origin to echo, and `*` is the only answer
+/// that lets a `file://` page or a curl-style client read the response.
+#[tokio::test]
+async fn a_request_with_no_origin_still_gets_a_wildcard() {
+    let h = harness().await;
+    let (status, headers) = headers_of(&h, "GET", "/profile", &[]).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        headers
+            .get("access-control-allow-origin")
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
+    assert!(headers.get("access-control-allow-credentials").is_none());
+}
+
+/// Solid §8.1 wants an app able to send any combination of headers. A fixed
+/// `Allow-Headers` list can never admit one it doesn't already name, so a
+/// client sending a header we haven't thought of is blocked by the browser
+/// before the request is made. CTS also asserts the response does *not* carry
+/// `Accept` when the preflight didn't ask for it
+/// (`protocol/cors/accept-acah.feature`).
+#[tokio::test]
+async fn a_preflight_is_answered_with_the_headers_it_asked_for() {
+    let h = harness().await;
+    let (status, headers) = headers_of(
+        &h,
+        "OPTIONS",
+        "/~/notes/first",
+        &[
+            ("origin", "https://app.example"),
+            ("access-control-request-method", "PUT"),
+            ("access-control-request-headers", "x-invented-by-the-app"),
+        ],
+    )
+    .await;
+
+    assert!(status.is_success(), "preflight rejected: {status}");
+    let allowed = headers
+        .get("access-control-allow-headers")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(allowed.contains("x-invented-by-the-app"), "got: {allowed}");
+    assert!(
+        !allowed.contains("accept"),
+        "named a header the preflight didn't ask for: {allowed}"
     );
 }

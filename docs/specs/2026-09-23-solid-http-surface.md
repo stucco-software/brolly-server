@@ -526,6 +526,16 @@ because a client that revalidates must not lose the affordances it had.
 `Content-Location`, `Cache-Control` and `Expires` are absent because a 200 from
 this server doesn't send them either. Today a 304 carries `ETag` alone.
 
+**A 304 carries no `Content-Length`.** Found while implementing: axum stamps
+`Content-Length` on every top-level response whose body reports an exact size,
+so an ordinary empty 304 went out as `content-length: 0` — since 5a. RFC 9110
+§8.6 says a server MUST NOT send `Content-Length` on a 304 unless it equals
+what the 200's body would have been, and a cache that honours it overwrites
+the length it stored with zero. The 304's body reports no exact size and
+reports itself finished, so axum adds nothing and hyper writes neither a
+length nor a chunked encoding. That costs one direct dependency, `http-body`,
+which axum and hyper already link.
+
 ### H11. A `PUT` that creates answers 201
 
 `PUT` returns **201** with `Location` and H6's `Link` set when the target did

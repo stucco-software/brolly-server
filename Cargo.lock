@@ -917,6 +917,7 @@ dependencies = [
  "brolly-test-support",
  "form_urlencoded",
  "futures-util",
+ "http-body",
  "http-body-util",
  "moka",
  "oxigraph",

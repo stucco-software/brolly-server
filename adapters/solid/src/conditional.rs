@@ -3,9 +3,14 @@
 //! Transport-free like the rest of this crate. It takes header *values* and a
 //! resource's current version, and says whether a request may go ahead. The
 //! version is the `brolly:version` the pod's metadata keeps, a fresh ULID on
-//! every change, and the `ETag` is that version in quotes (spec R4). There is
-//! one version per resource whatever the representation, so every tag the
-//! server issues is strong.
+//! every change, and the `ETag` is that version and the representation's
+//! syntax token in quotes — `"01J8….ttl"` (5a's R4, 5b's H10). There is one
+//! version per resource whatever the representation, so every tag the server
+//! issues is strong.
+//!
+//! **Reads compare the whole tag; writes compare the version.** See
+//! [`Preconditions::not_modified`] and [`Preconditions::check_write`], which
+//! carry the reasoning and the RFC 9110 §13.1.1 deviation.
 //!
 //! **Where it runs.** A write's preconditions are evaluated in
 //! `ldp::put_in`, `append_in`, `delete_in` and `patch_in`, after WAC and before
@@ -18,6 +23,8 @@
 //! authoritative, and one-second dates can't tell apart two writes in the same
 //! second.
 
+use brolly_domain::syntax::WriteFormat;
+
 /// One `entity-tag` (RFC 9110 §8.8.3).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EntityTag {
@@ -28,15 +35,33 @@ pub struct EntityTag {
 }
 
 impl EntityTag {
-    /// Strong comparison: both strong, same opaque value. Ours are always
-    /// strong, so a `W/` tag never matches.
-    fn strong_eq(&self, version: &str) -> bool {
-        !self.weak && self.opaque == version
+    /// The two halves of a tag *this server* issued: the version and the
+    /// syntax token.
+    ///
+    /// `None` for anything else — a tag with no `.`, or with a suffix outside
+    /// [`TOKENS`]. The version is a ULID, so it never contains a `.` and
+    /// `split_once` is unambiguous.
+    fn split(&self) -> Option<(&str, &str)> {
+        let (version, token) = self.opaque.split_once('.')?;
+        TOKENS.contains(&token).then_some((version, token))
     }
 
-    /// Weak comparison: same opaque value, prefix ignored.
-    fn weak_eq(&self, version: &str) -> bool {
-        self.opaque == version
+    /// Strong comparison against a *version*, for a write.
+    ///
+    /// Ours are always strong, so a `W/` tag never matches.
+    fn strong_eq_version(&self, version: &str) -> bool {
+        !self.weak && self.split().map(|(v, _)| v) == Some(version)
+    }
+
+    /// Weak comparison against a version, for a write. The prefix is ignored.
+    fn weak_eq_version(&self, version: &str) -> bool {
+        self.split().map(|(v, _)| v) == Some(version)
+    }
+
+    /// Weak comparison against a whole tag, for a read: both halves must
+    /// match, so a tag cached as Turtle cannot confirm a JSON-LD read.
+    fn weak_eq_representation(&self, version: &str, syntax: &str) -> bool {
+        self.split() == Some((version, syntax))
     }
 }
 
@@ -203,6 +228,23 @@ impl Preconditions {
     /// | `If-Match: "a", …` | all four | no tag strongly matches |
     /// | `If-None-Match: *` | PUT, PATCH | the resource exists |
     /// | `If-None-Match: "a", …` | PUT, PATCH, DELETE | a tag weakly matches |
+    ///
+    /// A write's tags are compared on their **version half only**. A `PUT`
+    /// replaces the resource, not a representation, so a client that took its
+    /// tag from a `HEAD` negotiated as Turtle must be able to guard a JSON-LD
+    /// `PUT` with it.
+    ///
+    /// This is a deliberate deviation from RFC 9110 §13.1.1, which requires
+    /// the strong comparison of §8.8.3.2 — octet-for-octet on the opaque tag.
+    /// We take it because the alternative makes a correct client's conditional
+    /// write fail for a reason it cannot see, and because the version *is* the
+    /// resource state `If-Match` exists to guard. One version per resource,
+    /// one syntax token per representation (5a's R4, preserved).
+    ///
+    /// A tag we didn't issue matches no version, so an `If-Match` carrying one
+    /// fails closed with a 412 the client answers by re-`GET`ting.
+    /// `If-Match: *` and `If-None-Match: *` are unaffected: `Condition::Any`
+    /// carries no tag and asks only whether a current representation exists.
     pub fn check_write(
         &self,
         method: Method,
@@ -213,7 +255,7 @@ impl Preconditions {
                 (_, None) => false,
                 (Condition::Any, Some(_)) => true,
                 (Condition::Tags(tags), Some(version)) => {
-                    tags.iter().any(|tag| tag.strong_eq(version))
+                    tags.iter().any(|tag| tag.strong_eq_version(version))
                 }
             };
             if !holds {
@@ -225,7 +267,7 @@ impl Preconditions {
                 (_, None) => false,
                 (Condition::Any, Some(_)) => matches!(method, Method::Put | Method::Patch),
                 (Condition::Tags(tags), Some(version)) => {
-                    method != Method::Post && tags.iter().any(|tag| tag.weak_eq(version))
+                    method != Method::Post && tags.iter().any(|tag| tag.weak_eq_version(version))
                 }
             };
             if fails {
@@ -235,22 +277,72 @@ impl Preconditions {
         Ok(())
     }
 
-    /// Should a GET or HEAD of a resource at `current` answer 304?
+    /// Should a GET or HEAD answer 304?
+    ///
+    /// `version` and `syntax` describe the representation that *would* be
+    /// sent, and both must match: a read compares the **whole tag**. A client
+    /// holding `"01J8….ttl"` that revalidates asking for JSON-LD gets a 200.
+    /// Comparing only the version here would re-introduce the bug the syntax
+    /// token exists for — a cache reusing Turtle as JSON-LD, which fails
+    /// silently and produces a parse error a long way from its cause.
     ///
     /// Only `If-None-Match` counts on a read. `If-Match` on a GET is ignored,
     /// as in the spec's table.
-    pub fn not_modified(&self, current: &str) -> bool {
+    pub fn not_modified(&self, version: &str, syntax: &str) -> bool {
         match &self.if_none_match {
             None => false,
             Some(Condition::Any) => true,
-            Some(Condition::Tags(tags)) => tags.iter().any(|tag| tag.weak_eq(current)),
+            Some(Condition::Tags(tags)) => tags
+                .iter()
+                .any(|tag| tag.weak_eq_representation(version, syntax)),
         }
     }
 }
 
-/// The `ETag` for a version: the version in quotes, strong.
-pub fn etag(version: &str) -> String {
-    format!("\"{version}\"")
+/// The syntax token in a binary's `ETag`.
+///
+/// A binary's bytes are the same whatever the client asked for, so there is
+/// nothing to negotiate and one token serves every `Accept`.
+pub const BINARY: &str = "bin";
+
+/// The token for a serialization: the second half of its `ETag`.
+///
+/// Short, stable, and free of the `.` the split depends on. Deliberately not
+/// media types: an `ETag` is opaque to everyone but us, and spelling
+/// `text/turtle` inside one would invite a client to parse it and then to
+/// depend on it.
+pub fn token(format: WriteFormat) -> &'static str {
+    match format {
+        WriteFormat::Turtle => "ttl",
+        WriteFormat::NTriples => "nt",
+        WriteFormat::NQuads => "nq",
+        WriteFormat::TriG => "trig",
+        WriteFormat::JsonLd => "jsonld",
+        WriteFormat::RdfXml => "rdfxml",
+    }
+}
+
+/// Every token this server issues.
+///
+/// A suffix outside this set names no representation we could have served, so
+/// a tag carrying one matches nothing: not the whole tag on a read, and not
+/// the version on a write. That is what a tag cached before this stage does —
+/// it has no `.` at all — and it is the right answer for a forged one.
+///
+/// Kept beside [`token`] so adding a syntax that misses this list fails
+/// `every_syntax_has_a_distinct_token_we_recognise` rather than failing a
+/// client's revalidation.
+const TOKENS: [&str; 7] = ["ttl", "nt", "nq", "trig", "jsonld", "rdfxml", BINARY];
+
+/// The `ETag` for a representation: `"{version}.{syntax}"`, strong.
+///
+/// `syntax` is [`token`] of the serialization, or [`BINARY`]. The token is
+/// defence in depth behind `Vary: Accept` (H10): a conforming private cache
+/// already keys its stored responses on the varied header (RFC 9111 §4.1) and
+/// won't offer its Turtle entry for a JSON-LD request, but plenty don't, and
+/// a tag stored before this stage doesn't know it should.
+pub fn etag(version: &str, syntax: &str) -> String {
+    format!("\"{version}.{syntax}\"")
 }
 
 /// `dcterms:modified` as an HTTP-date (IMF-fixdate, RFC 9110 §5.6.7), for
@@ -317,6 +409,7 @@ pub fn http_date(modified: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use brolly_domain::syntax::WriteFormat;
 
     const ALL: [Method; 4] = [Method::Put, Method::Patch, Method::Delete, Method::Post];
 
@@ -400,7 +493,7 @@ mod tests {
             assert_eq!(Preconditions::NONE.check_write(method, None), Ok(()));
             assert_eq!(Preconditions::NONE.check_write(method, Some("v")), Ok(()));
         }
-        assert!(!Preconditions::NONE.not_modified("v"));
+        assert!(!Preconditions::NONE.not_modified("v", "ttl"));
     }
 
     #[test]
@@ -413,21 +506,21 @@ mod tests {
     }
 
     #[test]
-    fn if_match_compares_strongly() {
-        let p = with(Some(r#""old", "v""#), None);
+    fn if_match_compares_strongly_and_only_the_version() {
+        let p = with(Some(r#""old.ttl", "v.ttl""#), None);
         for method in ALL {
             assert_eq!(p.check_write(method, Some("v")), Ok(()));
             assert_eq!(p.check_write(method, Some("new")), Err(PreconditionFailed));
             assert_eq!(p.check_write(method, None), Err(PreconditionFailed));
         }
-        // A weak tag never matches, even with the right opaque value.
+        // A weak tag never matches, even with the right version.
         assert_eq!(
-            with(Some(r#"W/"v""#), None).check_write(Method::Put, Some("v")),
+            with(Some(r#"W/"v.ttl""#), None).check_write(Method::Put, Some("v")),
             Err(PreconditionFailed)
         );
         // A field with nothing usable in it holds for nothing: fail closed.
         assert_eq!(
-            with(Some("v"), None).check_write(Method::Put, Some("v")),
+            with(Some("v.ttl"), None).check_write(Method::Put, Some("v")),
             Err(PreconditionFailed)
         );
     }
@@ -446,7 +539,7 @@ mod tests {
 
     #[test]
     fn if_none_match_tags_refuse_the_current_version() {
-        let p = with(None, Some(r#""old", "v""#));
+        let p = with(None, Some(r#""old.ttl", "v.ttl""#));
         for method in [Method::Put, Method::Patch, Method::Delete] {
             assert_eq!(p.check_write(method, Some("v")), Err(PreconditionFailed));
             assert_eq!(p.check_write(method, Some("new")), Ok(()));
@@ -456,14 +549,14 @@ mod tests {
         assert_eq!(p.check_write(Method::Post, Some("v")), Ok(()));
         // RFC 9110 §13.1.2: If-None-Match uses the weak comparison.
         assert_eq!(
-            with(None, Some(r#"W/"v""#)).check_write(Method::Put, Some("v")),
+            with(None, Some(r#"W/"v.ttl""#)).check_write(Method::Put, Some("v")),
             Err(PreconditionFailed)
         );
     }
 
     #[test]
     fn both_fields_must_hold() {
-        let p = with(Some(r#""v""#), Some("*"));
+        let p = with(Some(r#""v.ttl""#), Some("*"));
         assert_eq!(
             p.check_write(Method::Put, Some("v")),
             Err(PreconditionFailed)
@@ -472,24 +565,115 @@ mod tests {
 
     // --- reads -----------------------------------------------------------------
 
+    /// The read rule, and spec problem 9 in one line: a cached Turtle tag must
+    /// not confirm a JSON-LD read. `*` still matches any representation.
     #[test]
-    fn a_read_is_not_modified_when_if_none_match_matches() {
-        assert!(with(None, Some(r#""v""#)).not_modified("v"));
-        assert!(with(None, Some(r#""old", W/"v""#)).not_modified("v"));
-        assert!(with(None, Some("*")).not_modified("v"));
-        assert!(!with(None, Some(r#""old""#)).not_modified("v"));
+    fn a_read_is_not_modified_only_for_the_representation_it_cached() {
+        assert!(with(None, Some(r#""v.ttl""#)).not_modified("v", "ttl"));
+        assert!(with(None, Some(r#""old.ttl", W/"v.ttl""#)).not_modified("v", "ttl"));
+        assert!(with(None, Some("*")).not_modified("v", "ttl"));
+        assert!(!with(None, Some(r#""old.ttl""#)).not_modified("v", "ttl"));
+        // Problem 9. Comparing the version alone here would re-introduce it.
+        assert!(!with(None, Some(r#""v.ttl""#)).not_modified("v", "jsonld"));
+        assert!(!with(None, Some(r#""v.jsonld""#)).not_modified("v", "ttl"));
+        // A binary's bytes are the same for every Accept, so one token serves.
+        assert!(with(None, Some(r#""v.bin""#)).not_modified("v", BINARY));
         // If-Match isn't evaluated on a read.
-        assert!(!with(Some(r#""old""#), None).not_modified("v"));
+        assert!(!with(Some(r#""old.ttl""#), None).not_modified("v", "ttl"));
     }
 
     // --- headers out -------------------------------------------------------------
 
     #[test]
-    fn an_etag_is_the_version_in_quotes() {
+    fn an_etag_is_the_version_and_the_syntax_in_quotes() {
+        let v = "01J8Z3T5V7W9X1Y3Z5A7B9C1D3";
         assert_eq!(
-            etag("01J8Z3T5V7W9X1Y3Z5A7B9C1D3"),
-            r#""01J8Z3T5V7W9X1Y3Z5A7B9C1D3""#
+            etag(v, token(WriteFormat::Turtle)),
+            r#""01J8Z3T5V7W9X1Y3Z5A7B9C1D3.ttl""#
         );
+        assert_eq!(
+            etag(v, token(WriteFormat::JsonLd)),
+            r#""01J8Z3T5V7W9X1Y3Z5A7B9C1D3.jsonld""#
+        );
+        assert_eq!(etag(v, BINARY), r#""01J8Z3T5V7W9X1Y3Z5A7B9C1D3.bin""#);
+    }
+
+    /// H10's deviation from RFC 9110 §13.1.1, which wants the strong
+    /// comparison of §8.8.3.2 — octet-for-octet on the opaque tag. A client
+    /// that took its tag from a Turtle `HEAD` must be able to guard a JSON-LD
+    /// `PUT` with it: a `PUT` replaces the resource, not a representation, and
+    /// the version *is* the state `If-Match` exists to guard. Comparing the
+    /// whole tag here would fail a correct client's conditional write for a
+    /// reason it cannot see.
+    #[test]
+    fn a_write_condition_ignores_the_syntax_half() {
+        for syntax in ["ttl", "nt", "nq", "trig", "jsonld", "rdfxml", "bin"] {
+            let field = format!("\"v.{syntax}\"");
+            assert_eq!(
+                with(Some(field.as_str()), None).check_write(Method::Put, Some("v")),
+                Ok(()),
+                "If-Match {syntax}"
+            );
+            assert_eq!(
+                with(None, Some(field.as_str())).check_write(Method::Put, Some("v")),
+                Err(PreconditionFailed),
+                "If-None-Match {syntax}"
+            );
+        }
+    }
+
+    /// A 5a-era cached tag has no `.` at all; a forged one may carry a suffix
+    /// we never issue. Neither names a version, so `If-Match` fails closed
+    /// with a 412 the client answers by re-`GET`ting, and `If-None-Match` lets
+    /// the write through. The version is a ULID, so it never contains a `.`
+    /// and the split is unambiguous.
+    #[test]
+    fn a_tag_we_did_not_issue_names_no_version() {
+        for opaque in ["v", "v.png", "v.TTL", "v.ttl.ttl", ".ttl", "v."] {
+            let field = format!("\"{opaque}\"");
+            assert_eq!(
+                with(Some(field.as_str()), None).check_write(Method::Put, Some("v")),
+                Err(PreconditionFailed),
+                "If-Match {opaque}"
+            );
+            assert_eq!(
+                with(None, Some(field.as_str())).check_write(Method::Put, Some("v")),
+                Ok(()),
+                "If-None-Match {opaque}"
+            );
+            assert!(
+                !with(None, Some(field.as_str())).not_modified("v", "ttl"),
+                "not_modified {opaque}"
+            );
+        }
+    }
+
+    /// Every syntax we can serve needs a token, no token may contain the `.`
+    /// the split depends on, and no two may collide — a collision would let a
+    /// tag confirm the wrong representation, which is the bug this is for.
+    #[test]
+    fn every_syntax_has_a_distinct_token_we_recognise() {
+        const EVERY: [WriteFormat; 6] = [
+            WriteFormat::Turtle,
+            WriteFormat::NTriples,
+            WriteFormat::NQuads,
+            WriteFormat::TriG,
+            WriteFormat::JsonLd,
+            WriteFormat::RdfXml,
+        ];
+        for format in EVERY {
+            let issued = token(format);
+            assert!(
+                TOKENS.contains(&issued),
+                "{format:?}: {issued} is not issued"
+            );
+            assert!(!issued.contains('.'), "{format:?}: {issued} has a dot");
+        }
+        let mut seen = TOKENS.to_vec();
+        seen.sort_unstable();
+        let unique = seen.len();
+        seen.dedup();
+        assert_eq!(seen.len(), unique, "two representations share a token");
     }
 
     #[test]

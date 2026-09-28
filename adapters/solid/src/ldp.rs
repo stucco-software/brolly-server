@@ -156,6 +156,13 @@ pub struct LdpOutcome {
     pub body: Vec<u8>,
     /// Owned: a binary's type comes from the pod, not from a fixed list.
     pub media_type: String,
+    /// The syntax token of the representation in `body`: the second half of
+    /// the `ETag` (H10). `conditional::BINARY` for a binary, whose bytes are
+    /// the same for every `Accept`; otherwise the negotiated format's token.
+    ///
+    /// It comes from the same negotiation that produced `body`, so an `ETag`
+    /// always names the bytes it goes out with.
+    pub syntax: &'static str,
     /// The target as [`describe`] reports it, from the same snapshot as
     /// `body`: existence, kind, and both sets of modes. `Allow`, `Accept-*`
     /// and `WAC-Allow` are all built from this one value, on `GET`, `HEAD` and
@@ -422,6 +429,7 @@ pub fn read_in(
         return Ok(LdpOutcome {
             body: bytes,
             media_type: blob.media_type,
+            syntax: conditional::BINARY,
             description,
             version,
             modified,
@@ -447,6 +455,7 @@ pub fn read_in(
     Ok(LdpOutcome {
         body: syntax::serialize(&quads, format)?,
         media_type: format.media_type().to_string(),
+        syntax: conditional::token(format),
         description,
         version,
         modified,

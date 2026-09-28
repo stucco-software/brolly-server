@@ -17,7 +17,7 @@ use brolly_identity::dpop::DpopError;
 use brolly_identity::routing::{SubdomainRoute, subdomain_route};
 use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
 use brolly_solid::conditional::{self, Preconditions};
-use brolly_solid::ldp::{self, Description, LdpError};
+use brolly_solid::ldp::{self, Description, LdpError, LdpOutcome};
 use brolly_solid::oidc::tokens;
 use brolly_solid::patch;
 use brolly_solid::storage;
@@ -491,18 +491,37 @@ fn refuse_deletion(request: &PodRequest, path: &str) -> Response {
         .into_response()
 }
 
-fn wac_allow(granted: &[brolly_authz::AccessMode]) -> String {
-    use brolly_authz::AccessMode::*;
-    let names: Vec<&str> = granted
+/// One `WAC-Allow` field value (WAC §6.1).
+///
+/// `granted` is the caller's effective modes; `public` is a second
+/// `granted_modes` probe with an anonymous subject, run by `ldp` **inside the
+/// read's snapshot** so both components describe the same ACL — a builder out
+/// here would be working after `Pod::read` closed it.
+///
+/// Both groups are always spelled, empty or not: §6.1's ABNF allows an empty
+/// group, and a client has to be able to tell "not public" from "the server
+/// didn't say". On an `.acl`, `granted_modes` is all-or-nothing on Control
+/// (`ldp.rs`), so `public=` there is empty unless the ACL grants Control to
+/// everyone.
+fn wac_allow(granted: &[AccessMode], public: &[AccessMode]) -> String {
+    format!(
+        "user=\"{}\", public=\"{}\"",
+        mode_names(granted),
+        mode_names(public)
+    )
+}
+
+fn mode_names(modes: &[AccessMode]) -> String {
+    modes
         .iter()
         .map(|m| match m {
-            Read => "read",
-            Write => "write",
-            Append => "append",
-            Control => "control",
+            AccessMode::Read => "read",
+            AccessMode::Write => "write",
+            AccessMode::Append => "append",
+            AccessMode::Control => "control",
         })
-        .collect();
-    format!("user=\"{}\"", names.join(" "))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// What [`patch`] matches on, and so what `Accept-Patch` advertises. A third
@@ -674,7 +693,8 @@ fn links(
 }
 
 /// Every header a pod resource's `GET`, `HEAD` and `OPTIONS` carry about the
-/// resource and the caller: H4's `Allow`, H5's `Accept-*` and H6's `Link`.
+/// resource and the caller: H4's `Allow`, H5's `Accept-*`, H6's `Link` and
+/// H9's `WAC-Allow`.
 ///
 /// The one entry point for all three methods, so SolidOS — which draws its
 /// affordances from whichever it made last — can't get two answers for one
@@ -695,6 +715,10 @@ fn headers_for(
             &request.webid,
             description.kind(),
         ),
+    ));
+    out.push((
+        header::HeaderName::from_static("wac-allow"),
+        wac_allow(&description.granted, &description.public),
     ));
     out
 }
@@ -722,9 +746,11 @@ fn preconditions(headers: &HeaderMap) -> Preconditions {
 
 /// `GET /~/*path`, and `HEAD`, which axum routes here without the body.
 ///
-/// Sends `ETag` (the resource's version) and `Last-Modified`, and answers 304
-/// to an `If-None-Match` naming the current version. Only here: a write's
-/// response carries no `ETag`, because the server transforms what it stores
+/// Sends `ETag` — the resource's version and the representation's syntax,
+/// `"{version}.{syntax}"` — and `Last-Modified`, and answers 304 to an
+/// `If-None-Match` naming the representation it would have sent. A tag for
+/// another syntax is a full response (H10). Only here: a write's response
+/// carries no `ETag`, because the server transforms what it stores
 /// (RFC 9110 §9.3.4).
 pub async fn get(
     State(state): State<AppState>,
@@ -740,7 +766,7 @@ pub async fn get(
     };
     let accept = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
 
-    let outcome = match ldp::read(
+    let mut outcome = match ldp::read(
         &request.pod,
         Some(&request.blobs),
         &request.base,
@@ -751,43 +777,113 @@ pub async fn get(
         Ok(outcome) => outcome,
         Err(e) => return ldp_error(e, request.authenticated, &request.apex),
     };
+    let resource = format!("{}{path}", request.base);
 
     // After `read` succeeded, so after the Read check, and against the version
-    // from the same snapshot as the body. A caller without Read was refused
-    // above, 401 or 403, whatever they sent.
-    let etag = conditional::etag(&outcome.version);
-    if preconditions(&headers).not_modified(&outcome.version) {
-        // RFC 9110 §15.4.5: a 304 carries the ETag and no body.
-        return (StatusCode::NOT_MODIFIED, [(header::ETAG, etag)]).into_response();
+    // and syntax from the same snapshot and negotiation as the body. A caller
+    // without Read was refused above, 401 or 403, whatever they sent.
+    if preconditions(&headers).not_modified(&outcome.version, outcome.syntax) {
+        let mut response = (
+            StatusCode::NOT_MODIFIED,
+            axum::body::Body::new(NotModifiedBody),
+        )
+            .into_response();
+        read_headers(&mut response, &request, &resource, &outcome);
+        return response;
     }
 
+    // Taken rather than cloned: `read_headers` borrows the outcome, and a pod
+    // read can be megabytes.
+    let body = std::mem::take(&mut outcome.body);
     let mut response = (
         StatusCode::OK,
-        [
-            (header::CONTENT_TYPE, outcome.media_type.clone()),
-            (
-                header::HeaderName::from_static("wac-allow"),
-                wac_allow(&outcome.description.granted),
-            ),
-            (header::ETAG, etag),
-        ],
-        outcome.body,
+        [(header::CONTENT_TYPE, outcome.media_type.clone())],
+        body,
     )
         .into_response();
-    // H4–H6: the same builder `OPTIONS` uses, over the description `read`
-    // took from the body's own snapshot.
-    let resource = format!("{}{path}", request.base);
+    read_headers(&mut response, &request, &resource, &outcome);
+    response
+}
+
+/// The body of a 304: nothing, with its size deliberately left unstated.
+///
+/// RFC 9110 §8.6: a server MUST NOT send `Content-Length` on a 304 unless it
+/// equals the length the 200 would have had. Axum stamps `Content-Length` on
+/// every top-level response whose body reports an *exact* size before it
+/// leaves the router, so an ordinary empty body goes out as
+/// `content-length: 0` — telling a cache that revalidates to overwrite the
+/// length it stored with zero. This body reports no exact size, so axum adds
+/// nothing, and it reports itself finished, so hyper treats it as empty and
+/// writes no length and no chunked encoding either (a 304 can't have a body).
+struct NotModifiedBody;
+
+impl http_body::Body for NotModifiedBody {
+    type Data = axum::body::Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        std::task::Poll::Ready(None)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        true
+    }
+
+    // The default, spelled out because it is the point: a lower bound of zero
+    // and no upper bound is not `exact()`, so axum leaves `Content-Length`
+    // alone.
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::default()
+    }
+}
+
+/// Everything a `GET` or `HEAD` answers with **except** the representation:
+/// no `Content-Type`, no body.
+///
+/// The 200 and the 304 share it, so the two differ in exactly the status and
+/// the representation metadata. RFC 9110 §15.4.5 requires `ETag` and `Vary`
+/// on a 304; the rest is control and resource metadata — `Allow`, `Accept-*`,
+/// `WAC-Allow`, `Link` — which its SHOULD NOT does not cover, and a client
+/// that revalidates must not lose the affordances it had.
+///
+/// `Last-Modified` *is* a deviation: §15.4.5 excuses cache-guiding metadata
+/// only "if the response does not have an ETag field", and ours does. We send
+/// it anyway, for the same reason. `Content-Location`, `Cache-Control` and
+/// `Expires` are absent because a 200 from this server doesn't send them
+/// either.
+fn read_headers(
+    response: &mut Response,
+    request: &PodRequest,
+    resource: &str,
+    outcome: &LdpOutcome,
+) {
+    // H4–H6 and H9: the same builder `OPTIONS` uses, over the description
+    // `read` took from the body's own snapshot.
     apply(
-        &mut response,
-        headers_for(&request, &resource, &outcome.description),
+        response,
+        headers_for(request, resource, &outcome.description),
     );
+
+    let headers = response.headers_mut();
+    if let Ok(value) = HeaderValue::from_str(&conditional::etag(&outcome.version, outcome.syntax)) {
+        headers.insert(header::ETAG, value);
+    }
     // Omitted rather than wrong if the stored time isn't one we can render.
     if let Some(date) = conditional::http_date(&outcome.modified)
         && let Ok(value) = HeaderValue::from_str(&date)
     {
-        response.headers_mut().insert(header::LAST_MODIFIED, value);
+        headers.insert(header::LAST_MODIFIED, value);
     }
-    response
+    // Appended, never inserted: the CORS layer is outermost and adds `Origin`
+    // to this same field (H10, H14). A binary is not negotiated — its bytes
+    // are the same for every `Accept` — so claiming it varies would fragment
+    // a cache for nothing.
+    if outcome.syntax != conditional::BINARY {
+        headers.append(header::VARY, HeaderValue::from_static("Accept"));
+    }
 }
 
 /// `PUT /~/*path`

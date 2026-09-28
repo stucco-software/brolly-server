@@ -145,13 +145,21 @@ impl AppState {
 /// `Access-Control-Request-Method`; a bare `OPTIONS` is a real request and has
 /// to reach the handler.
 ///
-/// **`Allow-Origin: *` with no `Allow-Credentials`, and the omission is the
-/// security-critical half.** Echoing the origin *with* credentials would let
-/// any site on the web make cookie-authenticated requests to the dashboard and
-/// read the answers. Solid authenticates with a `DPoP` or `Authorization`
+/// **The origin is echoed, with no `Allow-Credentials`, and the omission is
+/// the security-critical half.** Echoing the origin *with* credentials would
+/// let any site on the web make cookie-authenticated requests to the dashboard
+/// and read the answers. Solid authenticates with a `DPoP` or `Authorization`
 /// header the calling script must already hold, never with our cookie, so the
-/// wildcard costs nothing and grants nothing: a cross-origin script with no
-/// token is anonymous, and WAC treats it accordingly.
+/// echo costs nothing and grants nothing: a cross-origin script with no token
+/// is anonymous, and WAC treats it accordingly. With credentials disallowed,
+/// echoing and `*` grant a browser identical permission; the echo is for
+/// caches, which can key on it, and for CTS, which checks for it. A request
+/// with no `Origin` keeps the wildcard.
+///
+/// **A preflight is answered with the headers it asked for**, rather than from
+/// a fixed list that can never admit one it doesn't already name (Solid §8.1).
+/// The echoed value is a `HeaderValue` the `http` crate already parsed out of
+/// the request, so it cannot carry a newline into the response.
 ///
 /// The session cookie is `SameSite=Lax` besides, so it is not sent on a
 /// cross-site subresource request in the first place. These headers change only
@@ -163,34 +171,61 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
             .headers()
             .contains_key(header::ACCESS_CONTROL_REQUEST_METHOD);
 
+    // Read what the answer depends on before the request is consumed.
+    let origin = request.headers().get(header::ORIGIN).cloned();
+    let requested = request
+        .headers()
+        .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
+        .cloned();
+
     let mut response = if preflight {
         axum::http::StatusCode::NO_CONTENT.into_response()
     } else {
         next.run(request).await
     };
 
-    // `dpop` and `slug` are not on the CORS safelist, so any request carrying
-    // one is preflighted and fails unless named here.
+    // The fallback for a response that isn't answering a preflight, where the
+    // field means nothing to a browser but has always been sent. `dpop` and
+    // `slug` are not on the CORS safelist, so any request carrying one is
+    // preflighted and fails unless named.
     const ALLOW_HEADERS: &str =
         "authorization, dpop, content-type, accept, slug, link, if-match, if-none-match";
     // A script sees only safelisted response headers unless they are exposed.
-    // `location` after a POST and `link` for the ACL are load-bearing in LDP.
-    const EXPOSE_HEADERS: &str =
-        "location, link, etag, allow, accept-patch, accept-post, wac-allow, updates-via";
+    // `location` after a POST and `link` for the ACL are load-bearing in LDP;
+    // `www-authenticate` is how a client learns to re-authenticate (H3) and
+    // `vary` is how it learns what the answer depended on (H10). `updates-via`
+    // is gone: nothing sends it until stage 7, and an expose list is a promise.
+    const EXPOSE_HEADERS: &str = "location, link, etag, allow, accept-patch, \
+         accept-post, accept-put, wac-allow, www-authenticate, vary";
 
     let headers = response.headers_mut();
     for (name, value) in [
-        (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
         (
             header::ACCESS_CONTROL_ALLOW_METHODS,
             "GET, HEAD, POST, PUT, PATCH, DELETE, OPTIONS",
         ),
-        (header::ACCESS_CONTROL_ALLOW_HEADERS, ALLOW_HEADERS),
         (header::ACCESS_CONTROL_EXPOSE_HEADERS, EXPOSE_HEADERS),
         (header::ACCESS_CONTROL_MAX_AGE, "86400"),
     ] {
         headers.insert(name, axum::http::HeaderValue::from_static(value));
     }
+    // Echoed when there is one to echo; a request with no `Origin` — curl, a
+    // `file://` page — still needs the wildcard to read anything.
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        origin.unwrap_or(axum::http::HeaderValue::from_static("*")),
+    );
+    // A preflight is answered with what it asked for: CTS also checks we don't
+    // name headers the preflight didn't ask for.
+    headers.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        requested.unwrap_or(axum::http::HeaderValue::from_static(ALLOW_HEADERS)),
+    );
+    // Appended, never inserted: the handler sets `Vary: Accept` on a
+    // negotiated read (H10) and this layer is outermost, so an `insert` here
+    // would drop it. On every response, binaries and refusals included —
+    // `Allow-Origin` depends on `Origin` whatever the status.
+    headers.append(header::VARY, axum::http::HeaderValue::from_static("Origin"));
     response
 }
 

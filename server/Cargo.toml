@@ -32,6 +32,10 @@ brolly-mastodon.workspace = true
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 axum = { version = "0.8.9", features = ["multipart", "ws"] }
+# Named only to implement `http_body::Body` for a 304's empty body, whose size
+# must stay unannounced (`server/src/pod.rs`, `NotModifiedBody`). The same 1.x
+# copy axum and hyper already link.
+http-body = "1.1"
 tokio = { version = "1.53.1", features = ["full"] }
 askama = "0.14"
 tower-http = { version = "0.7.0", features = ["fs"] }
