@@ -466,13 +466,28 @@ async fn an_upgraded_container_stops_listing_a_deleted_member() {
     );
 }
 
+/// Rewritten for 5b. `OPTIONS` used to answer one static line for every
+/// resource and every caller; now it is authenticated and per-resource, so the
+/// PATCH formats go to a caller who may PATCH and to nobody else. What this
+/// guards: an `Accept-Patch` offered to someone whose every PATCH is refused.
 #[tokio::test]
 async fn options_advertises_the_patch_formats() {
     let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
     let (status, _, headers) = h.send("OPTIONS", "/~/note", None, true).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let patch = headers["accept-patch"].to_str().unwrap();
+    let patch = header_of(&headers, "accept-patch");
     assert!(patch.contains("text/n3") && patch.contains("sparql-update"));
+
+    // An anonymous caller holds nothing here, so it is told nothing.
+    let (status, _, headers) = h.send("OPTIONS", "/~/note", None, false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        headers.get("accept-patch").is_none(),
+        "advertised to nobody"
+    );
 }
 
 #[tokio::test]
@@ -1805,5 +1820,244 @@ async fn of_two_concurrent_puts_with_one_if_match_exactly_one_lands() {
             [a, b].contains(&StatusCode::PRECONDITION_FAILED),
             "round {round}: {a} and {b}"
         );
+    }
+}
+
+// --- what a caller may do (stage 5b, H4 and H5) --------------------------------
+
+/// `foaf:Agent`, WAC's "everyone, signed in or not".
+const EVERYONE: &str = "http://xmlns.com/foaf/0.1/Agent";
+
+/// A header's value, or a panic naming the header that was missing.
+fn header_of(headers: &axum::http::HeaderMap, name: &str) -> String {
+    headers
+        .get(name)
+        .unwrap_or_else(|| panic!("no {name} header"))
+        .to_str()
+        .unwrap()
+        .to_string()
+}
+
+/// Write `quads` as the ACL at `graph`, replacing whatever was there.
+///
+/// A direct ACL replaces the root's `acl:default` for its own resource, so a
+/// test that needs the owner to keep a mode has to name her here too.
+fn set_acl(h: &Harness, graph: &str, quads: &[Quad]) {
+    let pod = h.stores.pod(h.user).unwrap();
+    pod.write(|w| w.put(graph, Content::Auxiliary(quads)).map(|_| ()))
+        .unwrap();
+}
+
+/// What a static `Allow` breaks: SolidOS picks its edit affordances from it,
+/// so one line promising every method to every caller draws a save button
+/// whose every press is refused.
+#[tokio::test]
+async fn options_tells_this_caller_what_it_may_do_with_this_resource() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, _, headers) = h.send("OPTIONS", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "CTS accepts 204 or 200");
+    assert_eq!(
+        header_of(&headers, "allow"),
+        "GET, HEAD, PUT, POST, PATCH, DELETE, OPTIONS"
+    );
+    // Each Accept-* is sent because its method is in Allow.
+    assert_eq!(
+        header_of(&headers, "accept-patch"),
+        "text/n3, application/sparql-update"
+    );
+    let post = header_of(&headers, "accept-post");
+    assert!(post.contains("text/turtle"), "got: {post}");
+    // ADR 0007: RDF/XML is served and never parsed, so advertising it as a
+    // write body would be advertising a guaranteed 415.
+    assert!(!post.contains("rdf+xml"), "got: {post}");
+    assert_eq!(
+        header_of(&headers, "accept-put"),
+        "*/*",
+        "a document's PUT takes any media type today"
+    );
+}
+
+/// "May I create here?" is what `OPTIONS` on a missing target asks, and
+/// `Accept-Put` is the answer. A `GET` of the same path is a 404, so an
+/// `Allow` offering `GET` would be the very lie H4 exists to stop.
+#[tokio::test]
+async fn options_offers_creation_where_nothing_exists_yet() {
+    let h = harness().await;
+
+    let (status, _, headers) = h.send("OPTIONS", "/~/not-yet", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "a writer may ask");
+    assert_eq!(header_of(&headers, "allow"), "PUT, PATCH, OPTIONS");
+    assert_eq!(header_of(&headers, "accept-put"), "*/*");
+    assert!(
+        headers.get("accept-post").is_none(),
+        "there is nothing to post into"
+    );
+
+    let (status, _, _) = h.send("GET", "/~/not-yet", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "asking created nothing");
+}
+
+/// Solid Protocol §5.4 names exactly two resources a server must refuse to
+/// delete, and requires `DELETE` to be missing from their `Allow`. What this
+/// guards: a client invited to remove the pod's root, leaving the member
+/// nowhere to put anything.
+#[tokio::test]
+async fn the_storage_root_and_its_own_acl_are_never_offered_for_deletion() {
+    let h = harness().await;
+    // The harness grants Alice Read and Write. An ACL answers only to Control.
+    let g = format!("{ROOT}.acl");
+    let a = format!("{g}#owner");
+    set_acl(
+        &h,
+        &g,
+        &[
+            t(&g, &a, &format!("{ACL}default"), ROOT),
+            t(&g, &a, &format!("{ACL}accessTo"), ROOT),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Control")),
+            t(
+                &g,
+                &a,
+                &format!("{ACL}agent"),
+                &format!("{BASE}/profile#me"),
+            ),
+        ],
+    );
+
+    for path in ["/~/", "/~/.acl"] {
+        let (status, _, headers) = h.send("OPTIONS", path, None, true).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{path}");
+        let allow = header_of(&headers, "allow");
+        assert!(!allow.contains("DELETE"), "{path} offered DELETE: {allow}");
+        assert!(allow.contains("PUT"), "{path}: {allow}");
+        // 5a's NotRdf refusal, made discoverable: both take RDF and only RDF.
+        let put = header_of(&headers, "accept-put");
+        assert!(!put.contains("*/*"), "{path} accepts anything: {put}");
+        assert_eq!(put, header_of(&headers, "accept-post"), "{path}");
+    }
+
+    // Any other ACL may be deleted by a caller with Control. WAC §3.2 makes
+    // removing it the way to put a resource back on its container's rules.
+    share_with_bob(&h);
+    let (_, _, headers) = h.send("OPTIONS", "/~/shared/.acl", None, true).await;
+    assert!(header_of(&headers, "allow").contains("DELETE"));
+}
+
+/// A reader is offered reading. What this guards: a viewer shown an editor,
+/// and a client trying a `PUT` it was promised and getting a 403 it had no way
+/// to predict.
+#[tokio::test]
+async fn a_public_reader_is_offered_reading_and_nothing_else() {
+    let h = harness().await;
+    h.send("PUT", "/~/public", Some(("text/turtle", NOTE)), true)
+        .await;
+    let g = format!("{ROOT}public.acl");
+    let a = format!("{g}#everyone");
+    set_acl(
+        &h,
+        &g,
+        &[
+            t(&g, &a, &format!("{ACL}accessTo"), &format!("{ROOT}public")),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &a, &format!("{ACL}agentClass"), EVERYONE),
+        ],
+    );
+
+    let (status, _, headers) = h.send("OPTIONS", "/~/public", None, false).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(header_of(&headers, "allow"), "GET, HEAD, OPTIONS");
+    for absent in ["accept-patch", "accept-post", "accept-put"] {
+        assert!(
+            headers.get(absent).is_none(),
+            "{absent} offered to a reader"
+        );
+    }
+}
+
+/// The drop-box and inbox pattern, and why H4 gates `OPTIONS` on holding
+/// *any* mode rather than Read. An append-only client most needs `Allow` to
+/// tell it that it may `POST`, and has no other way to learn it: it can't
+/// read the container.
+#[tokio::test]
+async fn an_append_only_caller_can_discover_that_it_may_post() {
+    let h = harness().await;
+    h.send("PUT", "/~/drop/", Some(("text/turtle", "")), true)
+        .await;
+    let g = format!("{ROOT}drop/.acl");
+    let a = format!("{g}#everyone");
+    set_acl(
+        &h,
+        &g,
+        &[
+            t(&g, &a, &format!("{ACL}accessTo"), &format!("{ROOT}drop/")),
+            t(&g, &a, &format!("{ACL}default"), &format!("{ROOT}drop/")),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Append")),
+            t(&g, &a, &format!("{ACL}agentClass"), EVERYONE),
+        ],
+    );
+
+    let (status, _, headers) = h.send("OPTIONS", "/~/drop/", None, false).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "Append is a mode");
+    assert_eq!(header_of(&headers, "allow"), "POST, OPTIONS");
+    assert!(header_of(&headers, "accept-post").contains("text/turtle"));
+    // PATCH needs Write (`ldp::patch_in`) until 5c.
+    assert!(headers.get("accept-patch").is_none());
+    assert!(headers.get("accept-put").is_none());
+
+    // And the promise holds.
+    let (status, _, _) = h
+        .send("POST", "/~/drop/", Some(("text/turtle", NOTE)), false)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+/// `OPTIONS` must not become the existence oracle the rest of the surface
+/// refuses to be. A caller holding nothing gets H1's refusal, the same one
+/// whether or not the target is there, and no `Allow` with it.
+#[tokio::test]
+async fn options_refuses_a_caller_who_holds_no_mode_at_all() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let bob = member_session(&h, "bob").await;
+
+    for path in ["/~/note", "/~/not-yet"] {
+        let (status, _, headers) = send_as(&h, &bob, "OPTIONS", path, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: signed in, denied");
+        assert!(
+            headers.get("allow").is_none(),
+            "{path}: Allow leaked to Bob"
+        );
+
+        let (status, _, headers) = h.send("OPTIONS", path, None, false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: no credential");
+        assert!(headers.get("allow").is_none(), "{path}: Allow leaked");
+    }
+}
+
+/// CTS reads `Allow` from a `GET`, and SolidOS from whichever method it made
+/// last. Two builders would drift apart, so there is one.
+#[tokio::test]
+async fn get_and_head_carry_the_same_affordances_as_options() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (_, _, options) = h.send("OPTIONS", "/~/note", None, true).await;
+    for method in ["GET", "HEAD"] {
+        let (status, _, headers) = h.send(method, "/~/note", None, true).await;
+        assert_eq!(status, StatusCode::OK, "{method}");
+        for name in ["allow", "accept-patch", "accept-post", "accept-put"] {
+            assert!(options.get(name).is_some(), "OPTIONS sent no {name}");
+            assert_eq!(
+                headers.get(name),
+                options.get(name),
+                "{method} and OPTIONS disagree about {name}"
+            );
+        }
     }
 }

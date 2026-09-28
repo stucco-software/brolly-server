@@ -320,7 +320,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             "/~/",
             get(pod::get_root)
                 .post(pod::post_root)
-                .options(pod::options),
+                .options(pod::options_root),
         )
         .nest_service("/static", ServeDir::new(static_dir))
         // Default-deny on subdomains. No LDP fallback (ADR 0010).

@@ -29,11 +29,11 @@
 use std::collections::BTreeSet;
 
 use brolly_authz::{AccessMode, authorize, effective_acl};
-use brolly_domain::syntax::{self, ReadFormat, SyntaxError, WriteFormat};
+use brolly_domain::syntax::{self, ReadFormat, SyntaxError};
 use brolly_domain::vocab;
 use brolly_identity::Subject;
 use brolly_store::resources::{
-    self, BlobMeta, Content, Kind, Pod, PodRead, PodWrite, ResourceRead,
+    self, BlobMeta, Content, Kind, Pod, PodRead, PodWrite, ResourceMeta, ResourceRead,
 };
 use brolly_store::{BlobStore, StoreError};
 use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -157,15 +157,18 @@ pub struct LdpOutcome {
     pub body: Vec<u8>,
     /// Owned: a binary's type comes from the pod, not from a fixed list.
     pub media_type: String,
-    /// Modes the caller actually holds, for the `WAC-Allow` header. Clients use
-    /// it to decide whether to show an edit affordance instead of discovering
-    /// the answer by failing.
-    pub granted: Vec<AccessMode>,
-    pub is_container: bool,
-    /// `brolly:version` from the same snapshot as `body`: the `ETag`.
+    /// The target as [`describe`] reports it, from the same snapshot as
+    /// `body`: existence, kind, and both sets of modes. `Allow`, `Accept-*`
+    /// and `WAC-Allow` are all built from this one value, on `GET`, `HEAD` and
+    /// `OPTIONS` alike, so those three cannot disagree.
+    pub description: Description,
+    /// `brolly:version` from that snapshot: the `ETag`. Not an `Option` like
+    /// the one inside `description`, because [`read`] returns only for a
+    /// resource that is there — which makes the missing case unrepresentable
+    /// rather than something `pod.rs` has to unwrap.
     pub version: String,
-    /// `dcterms:modified` from the same snapshot, as stored (`xsd:dateTime`):
-    /// the `Last-Modified`.
+    /// `dcterms:modified` from that snapshot, as stored (`xsd:dateTime`): the
+    /// `Last-Modified`.
     pub modified: String,
 }
 
@@ -251,6 +254,97 @@ pub fn granted_modes(
         .collect()
 }
 
+/// What a resource is, and what a caller may do with it — without its body.
+///
+/// The body-free half of [`read`], and the only thing the HTTP surface needs
+/// to build `Allow`, `Accept-*`, `Link` and `WAC-Allow` (spec 5b, H4–H10).
+/// `OPTIONS` needs it because it answers for resources the caller may not
+/// read and for targets that do not exist yet; `GET` and `HEAD` take the same
+/// value so the affordances a client reads cannot depend on which method it
+/// read them from.
+///
+/// **Every field comes from one snapshot.** `Pod::read` drops its transaction
+/// when the closure returns, so anything that asks these questions afterwards
+/// is asking a different pod. That is why the anonymous probe for `public`
+/// runs in here and rides out on the value, and it is what guarantees
+/// `WAC-Allow`'s two components describe one ACL.
+pub struct Description {
+    /// The resource's metadata, or `None` when nothing is recorded at the IRI.
+    /// Existence, kind, version and modified time all come from here, so they
+    /// cannot disagree with each other.
+    pub meta: Option<ResourceMeta>,
+    /// Modes the caller holds. Empty means no access of any kind, which is
+    /// what `pod.rs` turns into H1's 401 or 403.
+    pub granted: Vec<AccessMode>,
+    /// Modes an anonymous caller holds: `WAC-Allow`'s `public=`. A share UI
+    /// has to be able to show whether a resource is world-readable, and
+    /// failing at it is the only other way to find out.
+    pub public: Vec<AccessMode>,
+}
+
+impl Description {
+    /// Is there a resource at this IRI? Existence is one metadata triple
+    /// (5a, R2), never a graph that happens to have triples in it.
+    pub fn exists(&self) -> bool {
+        self.meta.is_some()
+    }
+
+    /// What it is, or `None` when it isn't there.
+    pub fn kind(&self) -> Option<Kind> {
+        self.meta.as_ref().map(|meta| meta.kind)
+    }
+
+    /// A container by its *recorded* kind. Not the same question as
+    /// [`storage::is_container`], which reads a trailing slash off an IRI and
+    /// so answers for targets that don't exist.
+    pub fn is_container(&self) -> bool {
+        matches!(self.kind(), Some(Kind::Container))
+    }
+
+    /// Does the caller hold `mode`?
+    pub fn holds(&self, mode: AccessMode) -> bool {
+        self.granted.contains(&mode)
+    }
+}
+
+/// Describe `path` without reading it: [`read`]'s metadata and modes, no body.
+///
+/// Takes no [`BlobStore`] on purpose. A binary is described from the
+/// `BlobMeta` already in its metadata — kind, media type, size — and its bytes
+/// are never fetched, so `OPTIONS` on a 40 MB video costs what `OPTIONS` on a
+/// note costs.
+///
+/// Unlike [`read`] it does **not** check Read, and it does not refuse: it
+/// reports, and the caller decides. `pod::options` refuses a caller holding no
+/// mode at all (5b, H4), which is what keeps this from becoming an existence
+/// oracle. Collapsing the two here would make "you may create here" and "this
+/// already exists" the same answer, and `OPTIONS` needs to tell them apart.
+pub fn describe(
+    pod: &Pod,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+) -> Result<Description, LdpError> {
+    pod.read(|r| Ok(describe_in(r, base, path, subject)))?
+}
+
+/// [`describe`] against a snapshot the caller already holds.
+pub fn describe_in(
+    r: &impl PodRead,
+    base: &str,
+    path: &str,
+    subject: &Subject,
+) -> Result<Description, LdpError> {
+    let resource = format!("{base}{path}");
+    Ok(Description {
+        meta: r.meta(&resource)?,
+        granted: granted_modes(r, base, path, subject),
+        // Inside the snapshot, against the ACL `granted` just resolved, so the
+        // two can never describe different states of the pod.
+        public: granted_modes(r, base, path, &Subject::anonymous()),
+    })
+}
+
 /// `GET` / `HEAD` an LDP resource, from one snapshot.
 ///
 /// A caller without Read gets [`LdpError::Denied`], not `NotFound`: telling
@@ -281,10 +375,14 @@ pub fn read_in(
     if !check(r, base, path, subject, AccessMode::Read)? {
         return Err(LdpError::Denied);
     }
-    let Some(meta) = r.meta(&resource)? else {
+    // One description, from this snapshot, carried out on the outcome. The
+    // Read check stays separate: it propagates a broken ACL as a store error,
+    // where `granted_modes` reports an empty set, and a pod that can't be
+    // evaluated must not look like a pod that denies.
+    let description = describe_in(r, base, path, subject)?;
+    let Some(meta) = description.meta.clone() else {
         return Err(LdpError::NotFound);
     };
-    let granted = granted_modes(r, base, path, subject);
     // The validators come from this snapshot's metadata, the one the body is
     // read from, so an `ETag` always describes the bytes it goes out with.
     let version = meta.version.clone();
@@ -304,8 +402,7 @@ pub fn read_in(
         return Ok(LdpOutcome {
             body: bytes,
             media_type: blob.media_type,
-            granted,
-            is_container: false,
+            description,
             version,
             modified,
         });
@@ -330,8 +427,7 @@ pub fn read_in(
     Ok(LdpOutcome {
         body: syntax::serialize(&quads, format)?,
         media_type: format.media_type().to_string(),
-        granted,
-        is_container,
+        description,
         version,
         modified,
     })
@@ -1030,21 +1126,12 @@ fn parse_into_graph(
         .collect())
 }
 
-/// Response syntaxes we advertise in `Accept-Post` / `Accept-Patch`.
+/// The media types a write body may carry: `Accept-Post`, `Accept-Put` and,
+/// for a container or an ACL, the only types a `PUT` to it will be accepted
+/// in. What the parser takes, which is deliberately narrower than what
+/// `syntax::negotiate` serves — RDF/XML is served and never parsed (ADR 0007).
 pub fn accepted_write_types() -> &'static str {
     "text/turtle, application/n-triples, application/n-quads, application/trig, application/ld+json"
-}
-
-/// Formats we can serve, for `OPTIONS`.
-pub fn served_types() -> &'static [WriteFormat] {
-    &[
-        WriteFormat::Turtle,
-        WriteFormat::NTriples,
-        WriteFormat::NQuads,
-        WriteFormat::TriG,
-        WriteFormat::JsonLd,
-        WriteFormat::RdfXml,
-    ]
 }
 
 #[cfg(test)]

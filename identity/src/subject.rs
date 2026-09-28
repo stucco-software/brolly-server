@@ -95,6 +95,28 @@ impl Subject {
         }
     }
 
+    /// Nobody: no credential was presented, or the one that was did not
+    /// resolve to a person.
+    ///
+    /// `via` is `Via::Session` because it has to be something; it is kept for
+    /// audit and for the few decisions that differ by scheme, and an anonymous
+    /// subject makes none of them. What matters is `webid: None`, which makes
+    /// [`Subject::agent`] `Agent::Anonymous`, so only
+    /// `acl:agentClass foaf:Agent` can grant it anything.
+    ///
+    /// Used twice for different reasons: `pod.rs` falls back to it when a
+    /// request carries no credential, and `ldp::describe` probes with it to
+    /// find out what the *public* may do with a resource (spec 5b, H9).
+    pub fn anonymous() -> Self {
+        Self {
+            user_id: None,
+            did: None,
+            webid: None,
+            scope: Scope::default(),
+            via: Via::Session,
+        }
+    }
+
     /// The authz agent for this subject.
     ///
     /// A subject with no WebID is anonymous *for authorization purposes* even if
@@ -134,6 +156,20 @@ mod tests {
         assert!(scope.includes_any(&["read:statuses", "read"]));
         assert!(scope.includes("write:statuses"));
         assert!(!scope.includes("admin"));
+    }
+
+    /// The pod, the ActivityPub inbox and `ldp::describe`'s `public=` probe
+    /// each need "nobody". Three private copies of this struct literal is how
+    /// one of them ends up with a `webid` of `Some("")`, which `authorize`
+    /// would then match against `acl:agent`.
+    #[test]
+    fn an_anonymous_subject_authorizes_as_nobody() {
+        let nobody = Subject::anonymous();
+        assert_eq!(nobody.agent(), brolly_authz::Agent::Anonymous);
+        assert_eq!(nobody.webid, None, "a WebID is what grants match on");
+        assert_eq!(nobody.user_id, None);
+        assert_eq!(nobody.did, None);
+        assert!(nobody.scope.as_slice().is_empty(), "no scope is granted");
     }
 
     #[test]

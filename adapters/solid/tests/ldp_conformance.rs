@@ -145,7 +145,7 @@ fn put_then_get_round_trips() {
     let body = String::from_utf8(out.body).unwrap();
     assert!(body.contains("First note"), "got: {body}");
     assert_eq!(out.media_type, "text/turtle");
-    assert!(out.granted.contains(&AccessMode::Write));
+    assert!(out.description.holds(AccessMode::Write));
 }
 
 #[test]
@@ -476,7 +476,11 @@ fn public_read_works_for_anonymous_callers() {
 
     let out = ldp::read(&store, None, BASE, "/~/public", &anonymous(), None).unwrap();
     assert!(!out.body.is_empty());
-    assert_eq!(out.granted, vec![AccessMode::Read], "public read only");
+    assert_eq!(
+        out.description.granted,
+        vec![AccessMode::Read],
+        "public read only"
+    );
 }
 
 #[test]
@@ -485,7 +489,7 @@ fn the_storage_root_is_typed_as_a_pod_root() {
     let out = ldp::read(&store, None, BASE, "/~/", &alice(), Some("text/turtle")).unwrap();
     let body = String::from_utf8(out.body).unwrap();
 
-    assert!(out.is_container);
+    assert!(out.description.is_container());
     assert!(body.contains("pim/space#Storage"), "got: {body}");
     assert!(body.contains("ldp#BasicContainer"), "got: {body}");
 }
@@ -713,4 +717,190 @@ fn the_storage_root_cannot_be_deleted() {
         Err(LdpError::Undeletable)
     ));
     assert!(meta(&store, ROOT).is_some());
+}
+
+// --- stage 5b: describe --------------------------------------------------------
+
+/// `OPTIONS` has to answer "may I create here?", which means describing an
+/// IRI with nothing behind it. A `describe` that refused like `read` does
+/// would make that question unanswerable, and H5's `Accept-Put` is the answer.
+#[test]
+fn describing_an_absent_target_reports_what_a_creation_could_do() {
+    let (_m, _d, store) = pod();
+
+    let d = ldp::describe(&store, BASE, "/~/not-yet", &alice()).unwrap();
+    assert!(!d.exists(), "nothing has been written there");
+    assert_eq!(d.kind(), None);
+    assert!(d.holds(AccessMode::Write), "Alice may create it");
+}
+
+/// The kind, the version and the modified time all come from one snapshot, so
+/// a header set built from them can't describe a state the body never had.
+#[test]
+fn a_description_reports_the_kind_and_the_validators_of_what_is_there() {
+    let (_m, _d, store) = pod();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+
+    let note = ldp::describe(&store, BASE, "/~/note", &alice()).unwrap();
+    assert!(note.exists());
+    assert_eq!(note.kind(), Some(Kind::RdfSource));
+    assert!(!note.is_container());
+    let recorded = meta(&store, &format!("{ROOT}note")).unwrap();
+    let described = note.meta.expect("the resource exists");
+    assert_eq!(described.version, recorded.version);
+    assert_eq!(described.modified, recorded.modified);
+
+    let root = ldp::describe(&store, BASE, "/~/", &alice()).unwrap();
+    assert_eq!(root.kind(), Some(Kind::Container));
+    assert!(root.is_container(), "the storage root is a container");
+
+    let acl = ldp::describe(&store, BASE, "/~/.acl", &alice()).unwrap();
+    assert_eq!(
+        acl.kind(),
+        Some(Kind::Auxiliary),
+        "an ACL is not an RDF source"
+    );
+}
+
+/// H9: `WAC-Allow`'s `public=`. A share UI has to show whether the thing it is
+/// looking at is world-readable, and the probe has to run against the same ACL
+/// as `granted` — a second pass in `pod.rs` would run after the snapshot
+/// closed and could report a different pod.
+#[test]
+fn a_description_says_what_the_public_may_do_as_well_as_the_caller() {
+    let (_m, _d, store) = pod();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/public",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/private",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+
+    let g = format!("{ROOT}public.acl");
+    let everyone = format!("{g}#everyone");
+    let owner = format!("{g}#owner");
+    grant(
+        &store,
+        &g,
+        &[
+            t(
+                &g,
+                &everyone,
+                &format!("{ACL}accessTo"),
+                &format!("{ROOT}public"),
+            ),
+            t(&g, &everyone, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(
+                &g,
+                &everyone,
+                &format!("{ACL}agentClass"),
+                &format!("{FOAF}Agent"),
+            ),
+            t(
+                &g,
+                &owner,
+                &format!("{ACL}accessTo"),
+                &format!("{ROOT}public"),
+            ),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            t(
+                &g,
+                &owner,
+                &format!("{ACL}agent"),
+                "https://alice.brolly.id/profile#me",
+            ),
+        ],
+    );
+
+    let public = ldp::describe(&store, BASE, "/~/public", &alice()).unwrap();
+    assert_eq!(public.public, vec![AccessMode::Read], "world-readable");
+    assert!(
+        public.holds(AccessMode::Write),
+        "and Alice can still edit it"
+    );
+
+    let private = ldp::describe(&store, BASE, "/~/private", &alice()).unwrap();
+    assert!(private.public.is_empty(), "nothing is granted to everyone");
+    assert!(private.holds(AccessMode::Write));
+}
+
+/// `describe` reports; it does not refuse. The gate is H4's, in
+/// `pod::options`, which answers 401 or 403 to a caller holding no mode at all
+/// — `options_refuses_a_caller_who_holds_no_mode_at_all` in
+/// `server/tests/pod_http.rs` is what keeps this off the wire. Refusing here
+/// instead would collapse "you may create here" and "this already exists" into
+/// one answer, and H4 needs both.
+#[test]
+fn a_description_is_a_report_and_not_a_decision() {
+    let (_m, _d, store) = pod();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/secret",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+
+    let d = ldp::describe(&store, BASE, "/~/secret", &stranger()).unwrap();
+    assert!(d.granted.is_empty(), "the stranger holds nothing");
+    assert!(d.public.is_empty());
+    // Whereas `read` refuses outright.
+    assert!(ldp::read(&store, None, BASE, "/~/secret", &stranger(), None).is_err());
+}
+
+/// `read` is built on `describe`, so `GET` and `OPTIONS` cannot disagree about
+/// what a caller may do. The failure this guards: two code paths computing
+/// modes, and a client drawing an edit affordance from the one that is wrong.
+#[test]
+fn a_read_carries_the_description_describe_would_have_given() {
+    let (_m, _d, store) = pod();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+
+    let out = ldp::read(&store, None, BASE, "/~/note", &alice(), None).unwrap();
+    let described = ldp::describe(&store, BASE, "/~/note", &alice()).unwrap();
+    assert_eq!(out.description.granted, described.granted);
+    assert_eq!(out.description.public, described.public);
+    assert_eq!(out.description.kind(), described.kind());
+    assert_eq!(out.version, described.meta.expect("it exists").version);
 }

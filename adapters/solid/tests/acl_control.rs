@@ -299,7 +299,7 @@ fn bob_keeps_his_access_to_ordinary_resources() {
     let out = ldp::read(&store, None, BASE, "/~/shared/doc", &bob(), None).unwrap();
     assert!(String::from_utf8(out.body).unwrap().contains("A note"));
     assert_eq!(
-        out.granted,
+        out.description.granted,
         vec![AccessMode::Read, AccessMode::Write, AccessMode::Append]
     );
 }
@@ -393,10 +393,10 @@ fn wac_allow_on_an_acl_is_all_or_nothing() {
     );
 
     let owner = ldp::read(&store, None, BASE, "/~/shared/.acl", &alice(), None).unwrap();
-    assert_eq!(owner.granted, ALL.to_vec());
+    assert_eq!(owner.description.granted, ALL.to_vec());
 
     let carol = ldp::read(&store, None, BASE, "/~/shared/.acl", &carol(), None).unwrap();
-    assert_eq!(carol.granted, ALL.to_vec());
+    assert_eq!(carol.description.granted, ALL.to_vec());
 
     assert!(ldp::granted_modes(&store.read_store(), BASE, "/~/shared/.acl", &bob()).is_empty());
 }

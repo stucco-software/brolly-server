@@ -8,14 +8,16 @@
 use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
+use brolly_authz::AccessMode;
 use brolly_identity::db::{self, User};
 use brolly_identity::dpop::DpopError;
 use brolly_identity::routing::{SubdomainRoute, subdomain_route};
 use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
 use brolly_solid::conditional::{self, Preconditions};
-use brolly_solid::ldp::{self, LdpError};
+use brolly_solid::ldp::{self, Description, LdpError};
 use brolly_solid::oidc::tokens;
 use brolly_solid::patch;
+use brolly_solid::storage;
 use brolly_store::resources::Pod;
 use std::sync::Arc;
 
@@ -125,13 +127,7 @@ impl Caller {
     /// resource is readable without a credential.
     fn anonymous() -> Caller {
         Caller {
-            subject: Subject {
-                user_id: None,
-                did: None,
-                webid: None,
-                scope: Scope::default(),
-                via: Via::Session,
-            },
+            subject: Subject::anonymous(),
             authenticated: false,
         }
     }
@@ -180,8 +176,9 @@ pub(crate) enum Refused {
 /// (`server/src/solid_oidc.rs:43`).
 ///
 /// `algs` names ES256 alone, because that is all we verify
-/// (`identity/src/dpop.rs:336`), and advertising more would be a lie. `realm` is omitted: RFC 6750 §3 and
-/// RFC 9449 §7.1 both make it optional and Solid-OIDC doesn't use it.
+/// (`identity/src/dpop.rs:336`), and advertising more would be a lie. `realm`
+/// is omitted: RFC 6750 §3 and RFC 9449 §7.1 both make it optional and
+/// Solid-OIDC doesn't use it.
 /// `error_description` is omitted because it would be the only place in this
 /// surface where a refusal explains itself to an unauthenticated caller, and
 /// its values are either obvious ("expired") or something an attacker would
@@ -473,6 +470,113 @@ fn wac_allow(granted: &[brolly_authz::AccessMode]) -> String {
     format!("user=\"{}\"", names.join(" "))
 }
 
+/// What [`patch`] matches on, and so what `Accept-Patch` advertises. A third
+/// syntax here would advertise a 415.
+const ACCEPT_PATCH: &str = "text/n3, application/sparql-update";
+
+/// H4: the methods this caller may use on this target, in a fixed order.
+///
+/// Computed from the caller's modes and whether the target exists. Nothing is
+/// decided by kind: `POST` is offered on documents too, because `append_in`
+/// appends to one and [`post`] routes it.
+fn allowed(description: &Description, resource: &str, storage_root: &str) -> Vec<&'static str> {
+    let exists = description.exists();
+    let write = description.holds(AccessMode::Write);
+    let mut methods = Vec::new();
+    if exists && description.holds(AccessMode::Read) {
+        methods.extend(["GET", "HEAD"]);
+    }
+    if write {
+        methods.push("PUT");
+    }
+    // Needs an existing target: there is no container to mint a member in,
+    // and no document to append to.
+    if exists && (write || description.holds(AccessMode::Append)) {
+        methods.push("POST");
+    }
+    // Not offered to an Append-only caller, though the protocol would allow
+    // it: `ldp::patch_in` requires Write, and 5c owns that change.
+    if write {
+        methods.push("PATCH");
+    }
+    // Authorization is decided before this: a caller without Write gets H1's
+    // refusal, not a 405 telling them the target is special.
+    if write && exists && !undeletable(resource, storage_root) {
+        methods.push("DELETE");
+    }
+    methods.push("OPTIONS");
+    methods
+}
+
+/// The storage root and the storage root's own ACL: the two resources Solid
+/// Protocol §5.4 forbids deleting, and whose `Allow` must not list `DELETE`.
+fn undeletable(resource: &str, storage_root: &str) -> bool {
+    resource == storage_root || resource == format!("{storage_root}.acl")
+}
+
+/// H5: what a `PUT` to this target may carry.
+///
+/// The condition is `ldp::put_if`'s own `rdf_only`, spelled the same way on
+/// purpose, and it reads the IRI, not the metadata: `put_if` refuses a binary
+/// for `/~/new/` whether or not `/~/new/` exists yet.
+fn accept_put(resource: &str) -> &'static str {
+    if storage::is_container(resource) || ldp::governed(resource).is_some() {
+        ldp::accepted_write_types()
+    } else {
+        "*/*"
+    }
+}
+
+/// H4 and H5: `Allow`, and an `Accept-*` for each write method it names.
+///
+/// One builder for `OPTIONS`, `GET` and `HEAD`. CTS reads `Allow` from a
+/// `GET`, SolidOS from whichever it made last, and two builders would drift.
+///
+/// Each `Accept-*` goes out only when its method is allowed. Solid §5.2
+/// states the MUST unconditionally; we narrow it, as CSS does, because
+/// advertising a method the caller can't use is the same lie as a wrong
+/// `Allow`.
+fn affordances(
+    description: &Description,
+    resource: &str,
+    storage_root: &str,
+) -> Vec<(header::HeaderName, String)> {
+    let methods = allowed(description, resource, storage_root);
+    let mut out = vec![(header::ALLOW, methods.join(", "))];
+    if methods.contains(&"PATCH") {
+        out.push((
+            header::HeaderName::from_static("accept-patch"),
+            ACCEPT_PATCH.to_string(),
+        ));
+    }
+    if methods.contains(&"POST") {
+        out.push((
+            header::HeaderName::from_static("accept-post"),
+            ldp::accepted_write_types().to_string(),
+        ));
+    }
+    if methods.contains(&"PUT") {
+        out.push((
+            header::HeaderName::from_static("accept-put"),
+            accept_put(resource).to_string(),
+        ));
+    }
+    out
+}
+
+/// Put built headers onto a response.
+///
+/// A value that isn't a legal header value is dropped, not panicked on. None
+/// of ours can be illegal: they are ASCII lists built here and `ldp`'s own
+/// constants.
+fn apply(response: &mut Response, headers: Vec<(header::HeaderName, String)>) {
+    for (name, value) in headers {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            response.headers_mut().insert(name, value);
+        }
+    }
+}
+
 /// A request's `If-Match` and `If-None-Match`.
 ///
 /// Each header may arrive on several lines, which mean the same as one line
@@ -541,7 +645,7 @@ pub async fn get(
             (header::CONTENT_TYPE, outcome.media_type.clone()),
             (
                 header::HeaderName::from_static("wac-allow"),
-                wac_allow(&outcome.granted),
+                wac_allow(&outcome.description.granted),
             ),
             (
                 header::LINK,
@@ -552,6 +656,13 @@ pub async fn get(
         outcome.body,
     )
         .into_response();
+    // H4/H5: the same builder `OPTIONS` uses, over the description `read`
+    // took from the body's own snapshot.
+    let resource = format!("{}{path}", request.base);
+    apply(
+        &mut response,
+        affordances(&outcome.description, &resource, &request.storage_root),
+    );
     // Omitted rather than wrong if the stored time isn't one we can render.
     if let Some(date) = conditional::http_date(&outcome.modified)
         && let Ok(value) = HeaderValue::from_str(&date)
@@ -750,26 +861,64 @@ pub async fn post_root(
     post(state, method, uri, headers, Path(String::new()), body).await
 }
 
-/// `OPTIONS /~/*path`
-pub async fn options() -> Response {
-    (
-        StatusCode::NO_CONTENT,
-        [
-            (
-                header::ALLOW,
-                "GET, HEAD, PUT, POST, PATCH, DELETE, OPTIONS".to_string(),
-            ),
-            (
-                header::HeaderName::from_static("accept-patch"),
-                "text/n3, application/sparql-update".to_string(),
-            ),
-            (
-                header::HeaderName::from_static("accept-post"),
-                ldp::accepted_write_types().to_string(),
-            ),
-        ],
-    )
-        .into_response()
+/// `OPTIONS /~/*path`: what *this* caller may do with *this* resource.
+///
+/// Resolves the pod, authenticates and evaluates WAC like any other method.
+/// The handler this replaces took no state, no path and no credential, and
+/// gave every resource in every pod the same `Allow`. Answers 204, which CTS
+/// accepts as well as 200, with H4's `Allow` and H5's `Accept-*`.
+///
+/// A CORS preflight never gets here. `lib.rs`'s middleware answers an
+/// `OPTIONS` carrying `Access-Control-Request-Method` before routing, and a
+/// preflight carries no credentials by definition.
+pub async fn options(
+    State(state): State<AppState>,
+    method: Method,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    Path(path): Path<String>,
+) -> Response {
+    let path = format!("/~/{path}");
+    let request = match resolve(&state, &headers, &method, &uri).await {
+        Ok(r) => r,
+        Err(response) => return response,
+    };
+    let description = match ldp::describe(&request.pod, &request.base, &path, &request.subject) {
+        Ok(description) => description,
+        Err(e) => return ldp_error(e, request.authenticated, &request.apex),
+    };
+    // H4: gated on holding *any* mode, not on Read. An Append-only caller,
+    // the drop box and the inbox, is the one that most needs to learn it may
+    // POST. A caller with nothing gets H1's 401 or 403, the same whether or
+    // not the target exists, so this is not an existence oracle. A caller
+    // with a mode on a target that doesn't exist gets 204 and the `Allow` a
+    // creation would have.
+    if description.granted.is_empty() {
+        return ldp_error(LdpError::Denied, request.authenticated, &request.apex);
+    }
+    let resource = format!("{}{path}", request.base);
+    let mut response = StatusCode::NO_CONTENT.into_response();
+    apply(
+        &mut response,
+        affordances(&description, &resource, &request.storage_root),
+    );
+    response
+}
+
+/// `OPTIONS /~/`: the storage root itself. A wildcard route doesn't match
+/// an empty remainder (see [`get_root`]), and without this the root would get
+/// no per-caller `Allow`, which is the one place `DELETE` must be left out.
+///
+/// Takes the same extractors as its wildcard twin and forwards them, so a
+/// DPoP proof on `OPTIONS /~/` is checked against the method and URL it
+/// signed (H15), like everywhere else.
+pub async fn options_root(
+    state: State<AppState>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    options(state, method, uri, headers, Path(String::new())).await
 }
 
 /// Anything on a subdomain that is not `/~/` and not a protocol resource.
@@ -946,5 +1095,130 @@ mod tests {
             unauthorized(Refused::Unavailable, "https://brolly.test").status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    // --- H4 and H5: what a caller may do ---------------------------------------
+
+    use brolly_authz::AccessMode::{Append, Control, Read, Write};
+    use brolly_store::resources::{Kind, ResourceMeta};
+
+    const ROOT: &str = "https://alice.brolly.test/~/";
+    const DOC: &str = "https://alice.brolly.test/~/note";
+    const ALL: [AccessMode; 4] = [Read, Write, Append, Control];
+
+    /// A description, as `ldp::describe` would give it, for `kind` (`None`:
+    /// nothing there) and a caller holding `granted`.
+    fn described(kind: Option<Kind>, granted: &[AccessMode]) -> Description {
+        Description {
+            meta: kind.map(|kind| ResourceMeta {
+                kind,
+                modified: "2026-09-23T10:00:00.000Z".into(),
+                version: "01J8Z3T5V7W9X1Y3Z5A7B9C1D3".into(),
+                blob: None,
+            }),
+            granted: granted.to_vec(),
+            public: Vec::new(),
+        }
+    }
+
+    fn allow_line(kind: Option<Kind>, granted: &[AccessMode], resource: &str) -> String {
+        allowed(&described(kind, granted), resource, ROOT).join(", ")
+    }
+
+    fn value_of<'a>(headers: &'a [(header::HeaderName, String)], name: &str) -> Option<&'a str> {
+        headers
+            .iter()
+            .find(|(n, _)| n.as_str() == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    /// H4's table, row by row, on a document that exists. What this guards is
+    /// a method promised to a caller whose mode `ldp` will refuse it for.
+    #[test]
+    fn allow_names_only_what_the_modes_permit() {
+        let doc = Some(Kind::RdfSource);
+        assert_eq!(
+            allow_line(doc, &ALL, DOC),
+            "GET, HEAD, PUT, POST, PATCH, DELETE, OPTIONS"
+        );
+        assert_eq!(allow_line(doc, &[Read], DOC), "GET, HEAD, OPTIONS");
+        // POST appends to a document as well as minting a container's member.
+        // PATCH needs Write in `ldp::patch_in`, so an appender isn't offered it.
+        assert_eq!(allow_line(doc, &[Append], DOC), "POST, OPTIONS");
+        assert_eq!(
+            allow_line(doc, &[Read, Append], DOC),
+            "GET, HEAD, POST, OPTIONS"
+        );
+        // Control governs the resource's ACL, not the resource.
+        assert_eq!(allow_line(doc, &[Control], DOC), "OPTIONS");
+    }
+
+    /// Nothing there: what a creation could do. `GET` would 404 and `DELETE`
+    /// would 404, and there is no container to `POST` into.
+    #[test]
+    fn an_absent_target_is_offered_creation_and_not_reading() {
+        assert_eq!(allow_line(None, &ALL, DOC), "PUT, PATCH, OPTIONS");
+        assert_eq!(allow_line(None, &[Read, Append], DOC), "OPTIONS");
+    }
+
+    /// Solid Protocol §5.4 names exactly two undeletable resources. Any other
+    /// ACL, and any other container, stays deletable: WAC §3.2 makes deleting
+    /// an ACL the way to revert to inheritance.
+    #[test]
+    fn only_the_root_and_its_own_acl_are_never_offered_delete() {
+        let container = Some(Kind::Container);
+        let acl = Some(Kind::Auxiliary);
+        let root_acl = format!("{ROOT}.acl");
+        assert!(!allow_line(container, &ALL, ROOT).contains("DELETE"));
+        assert!(!allow_line(acl, &ALL, &root_acl).contains("DELETE"));
+        assert!(allow_line(container, &ALL, &format!("{ROOT}notes/")).contains("DELETE"));
+        assert!(allow_line(acl, &ALL, &format!("{ROOT}notes/.acl")).contains("DELETE"));
+        assert!(allow_line(acl, &ALL, &format!("{DOC}.acl")).contains("DELETE"));
+    }
+
+    /// H5: each `Accept-*` goes out only when its method is in `Allow`. A
+    /// header advertising a method the caller can't use is as wrong as an
+    /// `Allow` that lists it.
+    #[test]
+    fn each_accept_header_follows_its_method() {
+        let doc = Some(Kind::RdfSource);
+
+        let full = affordances(&described(doc, &ALL), DOC, ROOT);
+        assert_eq!(value_of(&full, "accept-patch"), Some(ACCEPT_PATCH));
+        assert_eq!(
+            value_of(&full, "accept-post"),
+            Some(ldp::accepted_write_types())
+        );
+        assert_eq!(value_of(&full, "accept-put"), Some("*/*"));
+
+        let reader = affordances(&described(doc, &[Read]), DOC, ROOT);
+        assert_eq!(value_of(&reader, "allow"), Some("GET, HEAD, OPTIONS"));
+        for name in ["accept-patch", "accept-post", "accept-put"] {
+            assert_eq!(value_of(&reader, name), None, "{name} offered to a reader");
+        }
+
+        let appender = affordances(&described(doc, &[Append]), DOC, ROOT);
+        assert!(value_of(&appender, "accept-post").is_some());
+        assert_eq!(value_of(&appender, "accept-patch"), None);
+        assert_eq!(value_of(&appender, "accept-put"), None);
+    }
+
+    /// The rule is `ldp::put_if`'s own `rdf_only`: a container or an ACL takes
+    /// RDF, anything else takes whatever it's sent. A drift between the two
+    /// would promise a 415.
+    #[test]
+    fn a_container_and_an_acl_take_rdf_only_on_put() {
+        let rdf = ldp::accepted_write_types();
+        assert_eq!(accept_put(ROOT), rdf);
+        assert_eq!(
+            accept_put(&format!("{ROOT}notes/")),
+            rdf,
+            "even before it exists"
+        );
+        assert_eq!(accept_put(&format!("{ROOT}.acl")), rdf);
+        assert_eq!(accept_put(&format!("{DOC}.acl.acl")), rdf);
+        assert_eq!(accept_put(DOC), "*/*");
+        assert_eq!(accept_put(&format!("{ROOT}photo.png")), "*/*");
+        assert!(!rdf.contains("rdf+xml"), "ADR 0007");
     }
 }

@@ -482,3 +482,29 @@ fn a_non_rdf_post_to_a_document_is_not_rdf() {
     .unwrap_err();
     assert!(matches!(err, LdpError::NotRdf), "got {err:?}");
 }
+
+/// `describe` takes no `BlobStore` — that is the point. `OPTIONS` on a 40 MB
+/// video must cost what `OPTIONS` on a note costs, and the signature is what
+/// makes reading the bytes impossible rather than merely unlikely. Everything
+/// a header needs about a binary is in its recorded `BlobMeta`.
+#[test]
+fn describing_a_binary_never_asks_for_its_bytes() {
+    let pod = pod();
+    ldp::put(
+        &pod.store,
+        Some(&pod.blobs),
+        BASE,
+        "/~/avatar.png",
+        &alice(),
+        PNG,
+        "image/png",
+        ROOT,
+    )
+    .unwrap();
+
+    let d = ldp::describe(&pod.store, BASE, "/~/avatar.png", &alice()).unwrap();
+    assert_eq!(d.kind(), Some(Kind::NonRdfSource));
+    let blob = d.meta.expect("it exists").blob.expect("a binary has bytes");
+    assert_eq!(blob.media_type, "image/png");
+    assert_eq!(blob.byte_size, PNG.len() as u64);
+}
