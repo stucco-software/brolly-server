@@ -2061,3 +2061,431 @@ async fn get_and_head_carry_the_same_affordances_as_options() {
         }
     }
 }
+
+// --- discovery (stage 5b, H6–H8) ------------------------------------------------
+
+/// The `Link` field, as one string.
+///
+/// Several link values may arrive on one line or on several; RFC 9110 §5.3
+/// says they mean the same thing, and a test that asks whether a link is there
+/// shouldn't care which way the handler spelled it.
+fn links(headers: &axum::http::HeaderMap) -> String {
+    headers
+        .get_all(header::LINK)
+        .iter()
+        .map(|v| v.to_str().unwrap())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// The target of the first link with this relation.
+fn link_target(headers: &axum::http::HeaderMap, rel: &str) -> String {
+    let all = links(headers);
+    let marker = format!("; rel=\"{rel}\"");
+    let end = all
+        .find(&marker)
+        .unwrap_or_else(|| panic!("no rel={rel} in {all}"));
+    let start = all[..end].rfind('<').expect("a link target");
+    all[start + 1..end - 1].to_string()
+}
+
+/// The failure mode: nothing emitted `Link rel="type"`, so a client had to
+/// parse the body to tell a container from a document, and had no way at all
+/// to classify a binary.
+#[tokio::test]
+async fn a_read_says_what_kind_of_resource_it_returned() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+
+    let (status, _, headers) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    let document = links(&headers);
+    assert!(
+        document.contains("<http://www.w3.org/ns/ldp#Resource>; rel=\"type\""),
+        "{document}"
+    );
+    assert!(
+        document.contains("ldp#RDFSource>; rel=\"type\""),
+        "{document}"
+    );
+    assert!(!document.contains("ldp#Container"), "{document}");
+
+    // HEAD is the request a file manager makes, and it must learn the same.
+    let (_, _, headers) = h.send("HEAD", "/~/paper.pdf", None, true).await;
+    assert!(
+        links(&headers).contains("ldp#NonRDFSource>; rel=\"type\""),
+        "{:?}",
+        links(&headers)
+    );
+
+    let (_, _, headers) = h.send("GET", "/~/", None, true).await;
+    let container = links(&headers);
+    assert!(
+        container.contains("ldp#Container>; rel=\"type\""),
+        "{container}"
+    );
+    assert!(
+        container.contains("ldp#BasicContainer>; rel=\"type\""),
+        "{container}"
+    );
+}
+
+/// §4.1's MUST, and the fix for problem 4: before this, `pim:Storage` was
+/// stated only inside the root's own body, which a client had to already be
+/// reading to find.
+#[tokio::test]
+async fn the_storage_root_advertises_itself_and_its_owner() {
+    let h = harness().await;
+    let (status, _, headers) = h.send("GET", "/~/", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    let root = links(&headers);
+    assert!(
+        root.contains("<http://www.w3.org/ns/pim/space#Storage>; rel=\"type\""),
+        "{root}"
+    );
+    assert!(
+        root.contains(&format!(
+            "<{BASE}/profile#me>; rel=\"http://www.w3.org/ns/solid/terms#owner\""
+        )),
+        "{root}"
+    );
+
+    // Only the root. A resource inside a storage is not itself one.
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let (_, _, headers) = h.send("GET", "/~/note", None, true).await;
+    let note = links(&headers);
+    assert!(!note.contains("space#Storage"), "{note}");
+    assert!(!note.contains("terms#owner"), "{note}");
+}
+
+/// `pod.rs` built this link by concatenation, so a GET of an `.acl`
+/// advertised `<…/.acl.acl>` — an IRI with no ACL semantics that a client
+/// following the link would create as an ordinary resource.
+#[tokio::test]
+async fn an_acl_links_itself_rather_than_a_fiction() {
+    let h = harness().await;
+    share_with_bob(&h);
+
+    let (status, _, headers) = h.send("GET", "/~/shared/.acl", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    let link = links(&headers);
+    assert!(
+        link.contains(&format!("<{ROOT}shared/.acl>; rel=\"acl\"")),
+        "{link}"
+    );
+    assert!(!link.contains(".acl.acl"), "{link}");
+}
+
+/// SolidOS reads its affordances from whichever of the two it made last. Two
+/// answers for one resource is two different UIs for one resource.
+#[tokio::test]
+async fn options_carries_the_same_links_as_a_get() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (_, _, read) = h.send("GET", "/~/note", None, true).await;
+    let (status, _, options) = h.send("OPTIONS", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(links(&options), links(&read));
+}
+
+/// "May I create here?" is a fair question (H4), and the answer must not say
+/// what kind of thing is — or isn't — already there.
+#[tokio::test]
+async fn options_on_a_target_that_does_not_exist_claims_no_kind() {
+    let h = harness().await;
+    let (status, _, headers) = h.send("OPTIONS", "/~/nothing-here", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let link = links(&headers);
+    assert!(!link.contains("rel=\"type\""), "{link}");
+    assert!(
+        link.contains(&format!("<{ROOT}nothing-here.acl>; rel=\"acl\"")),
+        "{link}"
+    );
+}
+
+/// The link and the route drifting apart is the failure: §4.1 requires the
+/// relation, and a client that follows it to a 404 has no other way to
+/// discover the storage. So follow it, rather than asserting the path.
+#[tokio::test]
+async fn the_advertised_storage_description_resolves() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let (_, _, headers) = h.send("GET", "/~/note", None, true).await;
+    let target = link_target(
+        &headers,
+        "http://www.w3.org/ns/solid/terms#storageDescription",
+    );
+    let path = target
+        .strip_prefix(BASE)
+        .unwrap_or_else(|| panic!("the description is on the pod's own origin: {target}"));
+
+    // Anonymously: discovery precedes credentials.
+    let (status, body, headers) = h.send("GET", path, None, false).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("text/turtle"),
+        "{headers:?}"
+    );
+    assert!(
+        body.contains("http://www.w3.org/ns/pim/space#Storage"),
+        "{body}"
+    );
+    assert!(body.contains(&format!("{BASE}/profile#me")), "{body}");
+}
+
+/// A JSON-LD client (Inrupt's, LDO) asks for JSON-LD everywhere. Answering
+/// Turtle regardless is a parse error a long way from its cause.
+#[tokio::test]
+async fn the_storage_description_negotiates_like_a_pod_read() {
+    let h = harness().await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/.well-known/solid")
+        .header(header::HOST, HOST)
+        .header(header::ACCEPT, "application/ld+json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body, headers) = run(h.router.clone(), request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        headers[header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/ld+json"),
+        "{headers:?}"
+    );
+}
+
+/// It is generated from the routing table, so there is nothing a write could
+/// change. The failure is a write that *looks* accepted — or a 405 with no
+/// `Allow`, which RFC 9110 §15.5.6 makes a MUST (H16).
+#[tokio::test]
+async fn the_storage_description_is_read_only() {
+    let h = harness().await;
+    for method in ["PUT", "POST", "PATCH", "DELETE"] {
+        let (status, _, headers) = h
+            .send(
+                method,
+                "/.well-known/solid",
+                Some(("text/turtle", NOTE)),
+                true,
+            )
+            .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert_eq!(headers[header::ALLOW], "GET, HEAD, OPTIONS", "{method}");
+    }
+
+    let (status, _, headers) = h.send("OPTIONS", "/.well-known/solid", None, false).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(headers[header::ALLOW], "GET, HEAD, OPTIONS");
+
+    // HEAD is GET without the body, and anonymous like GET.
+    let (status, body, _) = h.send("HEAD", "/.well-known/solid", None, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.is_empty(), "HEAD sent a body: {body}");
+}
+
+/// Routes aren't host-scoped, so the handler decides. The apex is not a
+/// storage, and a description there would describe nobody's pod. Every method
+/// gets the 404 — a 405 would say the resource exists.
+#[tokio::test]
+async fn the_apex_has_no_storage_description() {
+    let h = harness().await;
+    for method in ["GET", "OPTIONS", "PUT"] {
+        let request = Request::builder()
+            .method(method)
+            .uri("/.well-known/solid")
+            .header(header::HOST, "brolly.test")
+            .body(Body::empty())
+            .unwrap();
+        let (status, _, _) = run(h.router.clone(), request).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{method}");
+    }
+}
+
+/// A description naming a member who doesn't exist would be a storage that
+/// isn't there.
+#[tokio::test]
+async fn an_unknown_pod_has_no_storage_description() {
+    let h = harness().await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/.well-known/solid")
+        .header(header::HOST, "nobody.brolly.test")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _, _) = run(h.router.clone(), request).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+// --- the storage root (stage 5b, H12 and H16) --------------------------------
+
+/// The methods an `Allow` field names. Axum's own 405 joins them with `,` and
+/// ours with `, `; a test asking whether a method is offered shouldn't care.
+fn allowed(headers: &axum::http::HeaderMap) -> Vec<String> {
+    headers
+        .get(header::ALLOW)
+        .expect("a 405 without Allow breaks RFC 9110 §15.5.6")
+        .to_str()
+        .unwrap()
+        .split(',')
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .collect()
+}
+
+/// Rewrite the root ACL so Alice holds `Control` there as well. The harness's
+/// ACL grants only Read and Write, so that no other test can touch an `.acl` by
+/// accident. This one has to be able to.
+fn control_at_the_root(h: &Harness) {
+    let g = format!("{ROOT}.acl");
+    let a = format!("{g}#owner");
+    set_acl(
+        h,
+        &g,
+        &[
+            t(&g, &a, &format!("{ACL}default"), ROOT),
+            t(&g, &a, &format!("{ACL}accessTo"), ROOT),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Control")),
+            t(
+                &g,
+                &a,
+                &format!("{ACL}agent"),
+                &format!("{BASE}/profile#me"),
+            ),
+        ],
+    );
+}
+
+/// Authorization comes before method availability (H4). Axum's generated 405
+/// answered this before any handler ran, which told a caller with no access at
+/// all that the target exists and is special.
+#[tokio::test]
+async fn an_anonymous_delete_of_the_storage_root_is_a_challenge_not_a_405() {
+    let h = harness().await;
+    let (status, _, headers) = h.send("DELETE", "/~/", None, false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        headers.contains_key(header::WWW_AUTHENTICATE),
+        "a 401 tells the client how to authenticate: {headers:?}"
+    );
+}
+
+/// §5.4's first undeletable resource. Without its root a pod has nowhere to
+/// put anything, and only provisioning records one. The 405 must list what the
+/// owner *can* do, which is everything but this.
+#[tokio::test]
+async fn the_owner_cannot_delete_the_storage_root() {
+    let h = harness().await;
+    let (status, _, headers) = h.send("DELETE", "/~/", None, true).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let allow = allowed(&headers);
+    assert!(!allow.iter().any(|m| m == "DELETE"), "{allow:?}");
+    for method in ["GET", "PUT", "PATCH", "POST"] {
+        assert!(
+            allow.iter().any(|m| m == method),
+            "the owner holds Write, so {method} is on offer: {allow:?}"
+        );
+    }
+
+    let (status, _, _) = h.send("GET", "/~/", None, true).await;
+    assert_eq!(status, StatusCode::OK, "the refused DELETE landed");
+}
+
+/// A member may describe their own storage root like any other container.
+/// With no route, both were axum's 405, whatever the caller's modes.
+#[tokio::test]
+async fn the_storage_root_takes_a_put_and_a_patch() {
+    let h = harness().await;
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/",
+            Some(("text/turtle", r#"<> <https://example.org/title> "Home" ."#)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, body, _) = h
+        .send(
+            "PATCH",
+            "/~/",
+            Some((
+                "application/sparql-update",
+                r#"INSERT DATA { <https://alice.brolly.test/~/> <https://example.org/note> "Mine" }"#,
+            )),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let (status, root, _) = h.send("GET", "/~/", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(root.contains("Home") && root.contains("Mine"), "{root}");
+}
+
+/// RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and `subdomain_fallback`'s
+/// storage arm sent none. `/~` without its slash is the one path that still
+/// reaches it (H16).
+#[tokio::test]
+async fn the_bare_storage_path_answers_its_405_with_an_allow() {
+    let h = harness().await;
+    for method in ["GET", "DELETE"] {
+        let (status, _, headers) = h.send(method, "/~", None, true).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        assert!(headers.contains_key(header::ALLOW), "{method}: {headers:?}");
+    }
+}
+
+/// Solid Protocol §5.4 names two undeletable resources, the storage root and
+/// its ACL, and until 5b the second one could be deleted by anyone holding
+/// `Control`. That shuts the pod to its own member. Deleting an ACL is how a
+/// resource falls back to its container's rules (WAC §3.2), the root has no
+/// container, so no rule is left anywhere, and only provisioning ever writes a
+/// root ACL.
+#[tokio::test]
+async fn the_storage_roots_acl_cannot_be_deleted() {
+    let h = harness().await;
+    control_at_the_root(&h);
+
+    // Authorization first (H4). A caller without Control is refused for that
+    // reason, and learns nothing about the resource being special.
+    let (status, _, _) = h.send("DELETE", "/~/.acl", None, false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    let (status, _, headers) = h.send("DELETE", "/~/.acl", None, true).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    let allow = allowed(&headers);
+    assert!(!allow.iter().any(|m| m == "DELETE"), "{allow:?}");
+    assert!(
+        allow.iter().any(|m| m == "PUT"),
+        "Control still lets the member rewrite their root's rules: {allow:?}"
+    );
+
+    let pod = h.stores.pod(h.user).unwrap();
+    assert!(
+        pod.read(|r| r.meta(&format!("{ROOT}.acl")))
+            .unwrap()
+            .is_some(),
+        "the refused DELETE landed"
+    );
+    let (status, _, _) = h.send("GET", "/~/", None, true).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the member can still read their pod"
+    );
+}

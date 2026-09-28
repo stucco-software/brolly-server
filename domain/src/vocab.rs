@@ -103,9 +103,38 @@ pub const BROLLY_BLOB_DIGEST: &str = "https://brolly.id/ns#blobDigest";
 pub const BROLLY_MEDIA_TYPE: &str = "https://brolly.id/ns#mediaType";
 pub const BROLLY_BYTE_SIZE: &str = "https://brolly.id/ns#byteSize";
 
+// --- discovery (stage 5b, H6 and H8) ---------------------------------------
+//
+// The link relations a pod read advertises. The LDP classes above are the
+// `rel="type"` *values*; these two are relation IRIs, which is what `rel=`
+// carries when no short name is registered.
+
+/// `Link rel="…#owner"` on the storage root, and the predicate the storage
+/// description uses for the same statement. Solid Protocol §4.1.
+pub const SOLID_OWNER: &str = "http://www.w3.org/ns/solid/terms#owner";
+/// `Link rel="…#storageDescription"` on every resource in a storage
+/// (Solid Protocol §4.1). Points at the generated document
+/// `brolly_solid::storage_description` serves.
+pub const SOLID_STORAGE_DESCRIPTION: &str = "http://www.w3.org/ns/solid/terms#storageDescription";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// These two IRIs are what a `Link` header's `rel=` carries **verbatim**
+    /// — Solid has no registered short name for either — so a typo is a link
+    /// relation no client recognises, not a compile error.
+    #[test]
+    fn the_discovery_relations_are_solid_terms() {
+        for term in [SOLID_OWNER, SOLID_STORAGE_DESCRIPTION] {
+            assert!(term.starts_with(SOLID), "{term}");
+        }
+        assert_eq!(SOLID_OWNER, "http://www.w3.org/ns/solid/terms#owner");
+        assert_eq!(
+            SOLID_STORAGE_DESCRIPTION,
+            "http://www.w3.org/ns/solid/terms#storageDescription"
+        );
+    }
 
     #[test]
     fn resource_terms_live_in_their_namespaces() {

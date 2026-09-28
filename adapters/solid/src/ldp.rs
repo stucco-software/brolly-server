@@ -69,10 +69,9 @@ pub enum LdpError {
     /// container's current members. Membership changes only by creating or
     /// deleting members (Solid Protocol §5.3).
     ContainmentChange,
-    /// The storage root, which a pod cannot be without. Solid Protocol §5.4
-    /// names it and the root's own ACL as the two resources a server must
-    /// refuse to delete. 5b's chunk 3 answers it 405 with an `Allow`; until
-    /// then it keeps stage 0's 403.
+    /// The storage root or the root's own ACL: the two resources Solid
+    /// Protocol §5.4 says a server must refuse to delete. `pod.rs` answers it
+    /// 405 with the caller's `Allow`.
     Undeletable,
     /// A container that still has members. Not "you may not" — "not while it
     /// has members". 5b's chunk 5 answers it 409 *with a body describing the
@@ -190,6 +189,27 @@ pub fn governed(path: &str) -> Option<&str> {
         resource = shorter;
     }
     Some(resource)
+}
+
+/// The IRI of the ACL that holds `target`'s access rules.
+///
+/// **Not the inverse of [`governed`].** `governed` strips *every* trailing
+/// `.acl`, because `Control` at the bottom of the chain is what guards the
+/// whole of it (stage 0's A2). This answers a different question — which IRI a
+/// client fetches or writes to change `target`'s rules — and for an ACL
+/// resource that is the ACL itself, because an `.acl` is governed by its own
+/// `Control`.
+///
+/// Everything else gets `.acl` appended. That is one expression and two cases:
+/// a container's ACL lives *inside* it (`/~/notes/` → `/~/notes/.acl`, since
+/// the IRI already ends in `/`) and a document's beside it (`/~/note` →
+/// `/~/note.acl`). Both agree with `authz::acl_candidates`' most specific
+/// candidate, which is the graph WAC actually reads.
+pub fn acl_iri(target: &str) -> String {
+    match governed(target) {
+        Some(_) => target.to_string(),
+        None => format!("{target}.acl"),
+    }
 }
 
 /// Resolve and evaluate the ACL governing `resource`.
@@ -993,8 +1013,16 @@ pub fn delete_in(
     };
     preconditions.check_write(conditional::Method::Delete, Some(meta.version.as_str()))?;
     // Without its root a pod has nowhere to put anything, and only
-    // provisioning records one. Solid Protocol §5.4; chunk 3 answers 405.
+    // provisioning records one. `pod.rs` answers 405 (§5.4).
     if resource == storage_root {
+        return Err(LdpError::Undeletable);
+    }
+    // The root's ACL is undeletable too (§5.4). Deleting an ACL is how a
+    // resource falls back to its container's rules (WAC §3.2), and the root
+    // has no container: the pod would be left with no rule anywhere, and only
+    // provisioning writes one. Only this ACL. Every other `.acl` may be
+    // deleted by a caller with Control, because that is how a member un-shares.
+    if resource == acl_iri(storage_root) {
         return Err(LdpError::Undeletable);
     }
     // Refusing to delete a non-empty container is LDP's rule, and it is the
@@ -1136,7 +1164,7 @@ pub fn accepted_write_types() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::governed;
+    use super::{acl_iri, governed};
 
     /// The table in spec A2, row for row.
     #[test]
@@ -1160,5 +1188,41 @@ mod tests {
             governed("https://alice.brolly.id/~/notes/.acl"),
             Some("https://alice.brolly.id/~/notes/")
         );
+    }
+
+    /// H7's first case. The failure this guards is `pod.rs`'s concatenation:
+    /// a GET of `/~/x.acl` advertised `</~/x.acl.acl>; rel="acl"`, an IRI no
+    /// ACL governs and that a client following the link would create as an
+    /// ordinary document.
+    #[test]
+    fn an_acl_is_its_own_acl() {
+        assert_eq!(acl_iri("/~/x.acl"), "/~/x.acl");
+        assert_eq!(acl_iri("/~/notes/.acl"), "/~/notes/.acl");
+        // Including the fiction itself, if one ever gets written.
+        assert_eq!(acl_iri("/~/x.acl.acl"), "/~/x.acl.acl");
+    }
+
+    /// A container's ACL lives *inside* it and a document's beside it. Both
+    /// are `{target}.acl`, and they agree with `authz::acl_candidates`' first
+    /// candidate — which is the resource WAC will actually read.
+    #[test]
+    fn a_containers_acl_is_inside_it_and_a_documents_is_beside_it() {
+        assert_eq!(acl_iri("/~/notes/"), "/~/notes/.acl");
+        assert_eq!(acl_iri("/~/notes/first"), "/~/notes/first.acl");
+        assert_eq!(
+            acl_iri("https://alice.brolly.id/~/"),
+            "https://alice.brolly.id/~/.acl"
+        );
+    }
+
+    /// `acl_iri` is not [`governed`] run backwards, and the two answer
+    /// different questions: `governed` asks whose `Control` guards this,
+    /// `acl_iri` asks which IRI holds the rules. Collapsing them is how the
+    /// `.acl.acl` link got written in the first place.
+    #[test]
+    fn acl_iri_is_not_the_inverse_of_governed() {
+        assert_eq!(governed("/~/x.acl.acl"), Some("/~/x"));
+        assert_eq!(acl_iri("/~/x.acl.acl"), "/~/x.acl.acl");
+        assert_eq!(acl_iri(governed("/~/x.acl").unwrap()), "/~/x.acl");
     }
 }

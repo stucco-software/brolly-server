@@ -1,7 +1,9 @@
 //! HTTP wiring for the pod: subdomain resolution and the LDP routes.
 //!
 //! Routing follows ADR 0010 exactly. `/~/**` reaches the LDP handlers; the
-//! protocol resources are explicit routes; everything else on a subdomain is a
+//! protocol resources are explicit routes, and the storage description
+//! (`/.well-known/solid`) is one of them, generated here rather than stored;
+//! everything else on a subdomain is a
 //! `404` with no fallback. The catch-all lives *inside* the storage prefix, so
 //! it cannot shadow a protocol endpoint.
 
@@ -9,6 +11,7 @@ use axum::extract::{OriginalUri, Path, State};
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use brolly_authz::AccessMode;
+use brolly_domain::{syntax, vocab};
 use brolly_identity::db::{self, User};
 use brolly_identity::dpop::DpopError;
 use brolly_identity::routing::{SubdomainRoute, subdomain_route};
@@ -18,7 +21,8 @@ use brolly_solid::ldp::{self, Description, LdpError};
 use brolly_solid::oidc::tokens;
 use brolly_solid::patch;
 use brolly_solid::storage;
-use brolly_store::resources::Pod;
+use brolly_solid::storage_description;
+use brolly_store::resources::{Kind, Pod};
 use std::sync::Arc;
 
 use crate::AppState;
@@ -37,6 +41,9 @@ pub struct PodRequest {
     /// The instance's apex origin, for `WWW-Authenticate`'s `as_uri` (H3).
     pub apex: String,
     pub storage_root: String,
+    /// The member's WebID: `solid:owner` on the storage root (H6), and the
+    /// only place in a pod response that names the person rather than the pod.
+    pub webid: String,
 }
 
 /// Resolve the subdomain to a user, and the credential to a [`Caller`].
@@ -99,6 +106,7 @@ async fn resolve(
     };
     Ok(PodRequest {
         storage_root: routing::storage_root(&username, &state.base_domain),
+        webid: webid::webid(&username, &state.base_domain),
         base,
         apex,
         user,
@@ -413,10 +421,13 @@ fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Response {
         LdpError::Denied => challenge_response(dpop_challenge(apex, None)),
         // Only a caller who holds the mode ever gets here; see `ldp::read`.
         LdpError::NotFound => (StatusCode::NOT_FOUND, "not found").into_response(),
-        // Stage 0's 403, unchanged by this chunk. 5b's chunk 3 makes this 405
-        // with an `Allow` (H12, H16).
+        // `delete` answers this itself, with the caller's `Allow`: a 405
+        // without one breaks RFC 9110 §15.5.6 (H16), and the `Allow` depends
+        // on modes this function can't see. Nothing else produces it, so
+        // reaching here means a new producer that needs the same treatment.
         LdpError::Undeletable => {
-            (StatusCode::FORBIDDEN, "the storage root cannot be deleted").into_response()
+            tracing::error!("Undeletable reached ldp_error; its caller must build the 405");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
         // Stage 0's 403, unchanged by this chunk. 5b's chunk 5 makes this 409
         // with a body describing the problem, which Solid Protocol §5.4
@@ -454,6 +465,30 @@ fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Response {
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
+}
+
+/// A 405 for a resource that exists and can't be deleted: the storage root, or
+/// its ACL (Solid Protocol §5.4, H12).
+///
+/// Only reached after `ldp` has authorized the DELETE. A caller without the
+/// mode got 401 or 403 before `Undeletable` could be returned (H4:
+/// authorization before method availability), so the `Allow` here, from the
+/// same description `OPTIONS` would give, tells the caller nothing it couldn't
+/// have asked for. H4's table already leaves `DELETE` out for these two
+/// targets. No `Link` goes out: H6 is for successful reads and creates.
+fn refuse_deletion(request: &PodRequest, path: &str) -> Response {
+    let description = match ldp::describe(&request.pod, &request.base, path, &request.subject) {
+        Ok(description) => description,
+        Err(e) => return ldp_error(e, request.authenticated, &request.apex),
+    };
+    let resource = format!("{}{path}", request.base);
+    let allow = allowed(&description, &resource, &request.storage_root).join(", ");
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, allow)],
+        "the storage root and its ACL can't be deleted",
+    )
+        .into_response()
 }
 
 fn wac_allow(granted: &[brolly_authz::AccessMode]) -> String {
@@ -577,6 +612,93 @@ fn apply(response: &mut Response, headers: Vec<(header::HeaderName, String)>) {
     }
 }
 
+/// H6's `Link` set: what this resource is, where its rules are, which storage
+/// it belongs to, and — on the root — whose it is.
+///
+/// One `Link` field with a value per link, comma-joined. `type` repeats its
+/// relation for each class rather than listing several URIs under one `rel=`,
+/// because that is the only form RFC 8288 defines and the only one every
+/// client parser handles; it is also what LDP's own examples show.
+///
+/// `kind` is `None` when the target doesn't exist — an `OPTIONS` asking "may I
+/// create here?" (H4). Then no `rel="type"` goes out at all: LDP §4.2.1.4 asks
+/// for one on every response to an LDPR's URI, and we narrow it deliberately,
+/// because a response about a resource that isn't there must not imply what
+/// kind of thing would be. The `acl` and `storageDescription` links still go:
+/// both exist whether or not the target does, and the ACL link is what a
+/// client needs to *create* the rules for what it is about to write.
+fn links(
+    base: &str,
+    resource: &str,
+    storage_root: &str,
+    owner: &str,
+    kind: Option<Kind>,
+) -> String {
+    let is_root = resource == storage_root;
+    let mut values: Vec<String> = Vec::new();
+
+    if let Some(kind) = kind {
+        let mut types = vec![vocab::LDP_RESOURCE];
+        match kind {
+            // Solid and CTS name `ldp:BasicContainer`; generic LDP clients
+            // match `ldp:Container`. Sending one of them blinds the other.
+            Kind::Container => {
+                types.push(vocab::LDP_CONTAINER);
+                types.push(vocab::LDP_BASIC_CONTAINER);
+            }
+            Kind::NonRdfSource => types.push(vocab::LDP_NON_RDF_SOURCE),
+            // An `.acl` is an RDF source like any other document: LDP names no
+            // auxiliary class, and inventing one would be ours alone.
+            Kind::RdfSource | Kind::Auxiliary => types.push(vocab::LDP_RDF_SOURCE),
+        }
+        if is_root {
+            // Solid Protocol §4.1: the storage MUST say so on its own URI.
+            types.push(vocab::PIM_STORAGE);
+        }
+        values.extend(types.into_iter().map(|t| format!("<{t}>; rel=\"type\"")));
+    }
+
+    values.push(format!("<{}>; rel=\"acl\"", ldp::acl_iri(resource)));
+    values.push(format!(
+        "<{}>; rel=\"{}\"",
+        storage_description::iri(base),
+        vocab::SOLID_STORAGE_DESCRIPTION
+    ));
+    if is_root {
+        // §4.1 constrains the form and leaves the choice to us. We advertise
+        // it because the description names an owner anyway, and a client
+        // holding the root shouldn't need a second request to learn whose.
+        values.push(format!("<{owner}>; rel=\"{}\"", vocab::SOLID_OWNER));
+    }
+    values.join(", ")
+}
+
+/// Every header a pod resource's `GET`, `HEAD` and `OPTIONS` carry about the
+/// resource and the caller: H4's `Allow`, H5's `Accept-*` and H6's `Link`.
+///
+/// The one entry point for all three methods, so SolidOS — which draws its
+/// affordances from whichever it made last — can't get two answers for one
+/// resource. [`affordances`] is the part that depends only on the
+/// description; this adds what depends on the pod.
+fn headers_for(
+    request: &PodRequest,
+    resource: &str,
+    description: &Description,
+) -> Vec<(header::HeaderName, String)> {
+    let mut out = affordances(description, resource, &request.storage_root);
+    out.push((
+        header::LINK,
+        links(
+            &request.base,
+            resource,
+            &request.storage_root,
+            &request.webid,
+            description.kind(),
+        ),
+    ));
+    out
+}
+
 /// A request's `If-Match` and `If-None-Match`.
 ///
 /// Each header may arrive on several lines, which mean the same as one line
@@ -647,21 +769,17 @@ pub async fn get(
                 header::HeaderName::from_static("wac-allow"),
                 wac_allow(&outcome.description.granted),
             ),
-            (
-                header::LINK,
-                format!("<{}{path}.acl>; rel=\"acl\"", request.base),
-            ),
             (header::ETAG, etag),
         ],
         outcome.body,
     )
         .into_response();
-    // H4/H5: the same builder `OPTIONS` uses, over the description `read`
+    // H4–H6: the same builder `OPTIONS` uses, over the description `read`
     // took from the body's own snapshot.
     let resource = format!("{}{path}", request.base);
     apply(
         &mut response,
-        affordances(&outcome.description, &resource, &request.storage_root),
+        headers_for(&request, &resource, &outcome.description),
     );
     // Omitted rather than wrong if the stored time isn't one we can render.
     if let Some(date) = conditional::http_date(&outcome.modified)
@@ -833,6 +951,7 @@ pub async fn delete(
         &preconditions(&headers),
     ) {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(LdpError::Undeletable) => refuse_deletion(&request, &path),
         Err(e) => ldp_error(e, request.authenticated, &request.apex),
     }
 }
@@ -859,6 +978,46 @@ pub async fn post_root(
     body: axum::body::Bytes,
 ) -> Response {
     post(state, method, uri, headers, Path(String::new()), body).await
+}
+
+/// `PUT /~/`.
+///
+/// The wildcard route doesn't match an empty remainder (see [`get_root`]).
+/// Without these entries, axum's method router answered every write to the
+/// root with its own 405, before any handler ran. `ldp`'s root protections
+/// were unreachable over HTTP, and a caller with no access was told the
+/// target is special (H12). Each one delegates, so WAC runs first and
+/// refuses in the ordinary way.
+pub async fn put_root(
+    state: State<AppState>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    put(state, method, uri, headers, Path(String::new()), body).await
+}
+
+/// `PATCH /~/`. See [`put_root`].
+pub async fn patch_root(
+    state: State<AppState>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    patch(state, method, uri, headers, Path(String::new()), body).await
+}
+
+/// `DELETE /~/`. Always refused: after the Write check, `ldp::delete_in`
+/// answers `Undeletable`, which is a 405 (§5.4). See [`put_root`].
+pub async fn delete_root(
+    state: State<AppState>,
+    method: Method,
+    uri: OriginalUri,
+    headers: HeaderMap,
+) -> Response {
+    delete(state, method, uri, headers, Path(String::new())).await
 }
 
 /// `OPTIONS /~/*path`: what *this* caller may do with *this* resource.
@@ -900,7 +1059,7 @@ pub async fn options(
     let mut response = StatusCode::NO_CONTENT.into_response();
     apply(
         &mut response,
-        affordances(&description, &resource, &request.storage_root),
+        headers_for(&request, &resource, &description),
     );
     response
 }
@@ -928,10 +1087,19 @@ pub async fn options_root(
 pub async fn subdomain_fallback(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let path = uri.path();
     match subdomain_route(path) {
-        SubdomainRoute::UserStorage => {
-            // Reached only if the storage routes did not match, e.g. a bad method.
-            (StatusCode::METHOD_NOT_ALLOWED, "unsupported method").into_response()
-        }
+        SubdomainRoute::UserStorage => (
+            // Every method under `/~/` is routed, and a method axum doesn't
+            // route there gets axum's own 405, which carries its own `Allow`.
+            // So this arm serves the bare `/~` alone: the storage prefix
+            // without its slash, which no route matches and which supports no
+            // method. RFC 9110 §15.5.6 requires `Allow` on a 405 (H16), and
+            // §10.2.1 lets it be empty, which is the true answer here. Whether
+            // `/~` should redirect to `/~/` belongs to 5c's `/foo` vs `/foo/`.
+            StatusCode::METHOD_NOT_ALLOWED,
+            [(header::ALLOW, "")],
+            "user storage lives under /~/",
+        )
+            .into_response(),
         SubdomainRoute::ProtocolResource => (
             StatusCode::NOT_IMPLEMENTED,
             "this protocol resource is not implemented yet",
@@ -946,6 +1114,78 @@ pub async fn subdomain_fallback(State(state): State<AppState>, uri: axum::http::
             "not found; user storage lives under /~/",
         )
             .into_response(),
+    }
+}
+
+/// `/.well-known/solid` — the storage description (Solid Protocol §4.1, H8).
+///
+/// World-readable and read-only, and WAC never enters into it. It says what a
+/// client needs to know *before* it has a credential — which storage this is
+/// and whose — and it is generated from the routing table, so there is no
+/// stored resource for an ACL to govern.
+///
+/// Routed in `app()` beside `webfinger` and `nodeinfo`, so it never reaches
+/// [`subdomain_fallback`] and has no entry in `USER_PROTOCOL_RESOURCES`, which
+/// feeds only that fallback. Routes aren't host-scoped, so the subdomain is
+/// resolved here, as `/profile` resolves it, and the apex 404s.
+///
+/// Every method is routed here (`any`), so this decides: the apex and an
+/// unknown pod are 404 whatever the method — a 405 there would say the
+/// resource exists — and on a pod anything but a read is 405 with our own
+/// `Allow` (H16).
+pub async fn storage_description(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
+    const ALLOW: &str = "GET, HEAD, OPTIONS";
+
+    let host = headers
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default();
+    let Some(username) = extract::subdomain_user(host, &state.base_domain) else {
+        return (StatusCode::NOT_FOUND, "no such pod").into_response();
+    };
+    match db::find_by_username(&state.pool, &username).await {
+        Ok(Some(user)) if user.is_active() => {}
+        Ok(_) => return (StatusCode::NOT_FOUND, "no such pod").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "pod lookup failed serving a storage description");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    match method {
+        // Axum strips the body from a HEAD at the top-level route, whichever
+        // method router endpoint answered it.
+        Method::GET | Method::HEAD => {}
+        Method::OPTIONS => {
+            return (StatusCode::NO_CONTENT, [(header::ALLOW, ALLOW)]).into_response();
+        }
+        _ => {
+            return (
+                StatusCode::METHOD_NOT_ALLOWED,
+                [(header::ALLOW, ALLOW)],
+                "the storage description is generated, and read-only",
+            )
+                .into_response();
+        }
+    }
+
+    let base = format!("https://{username}.{}", state.base_domain);
+    let quads = storage_description::document(&base, &webid::webid(&username, &state.base_domain));
+    let format = syntax::negotiate(headers.get(header::ACCEPT).and_then(|h| h.to_str().ok()));
+    match syntax::serialize(&quads, format) {
+        Ok(body) => (
+            [(header::CONTENT_TYPE, format.media_type().to_string())],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "serialising a storage description failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -1028,16 +1268,18 @@ mod tests {
         );
     }
 
-    /// Chunk 3 makes the first a 405 with an `Allow`, and chunk 5 makes the
-    /// second a 409 with a body. Pinned at today's answer so this chunk is
-    /// provably a no-op for them — if either moves early, a `DELETE` of a
-    /// populated container starts claiming the method isn't allowed.
+    /// `delete` builds `Undeletable`'s 405 itself, because its `Allow` needs
+    /// the caller's modes. Reaching `ldp_error` with it means a new producer
+    /// that skipped that, and a loud 500 beats a 405 without `Allow`
+    /// (RFC 9110 §15.5.6). `NotEmpty` stays 403 until chunk 5 makes it a 409
+    /// with a body; if it moved early to anything but 409, a `DELETE` of a
+    /// populated container would claim the method isn't allowed.
     #[test]
-    fn the_undeletable_root_and_the_populated_container_still_answer_403() {
+    fn undeletable_is_built_by_delete_and_a_populated_container_is_still_403() {
         let apex = "https://brolly.test";
         assert_eq!(
             ldp_error(LdpError::Undeletable, true, apex).status(),
-            StatusCode::FORBIDDEN
+            StatusCode::INTERNAL_SERVER_ERROR
         );
         assert_eq!(
             ldp_error(LdpError::NotEmpty, true, apex).status(),
@@ -1220,5 +1462,129 @@ mod tests {
         assert_eq!(accept_put(DOC), "*/*");
         assert_eq!(accept_put(&format!("{ROOT}photo.png")), "*/*");
         assert!(!rdf.contains("rdf+xml"), "ADR 0007");
+    }
+
+    // --- H6 and H7: what a resource says about itself -------------------------
+
+    const TEST_BASE: &str = "https://alice.brolly.test";
+    const TEST_OWNER: &str = "https://alice.brolly.test/profile#me";
+
+    fn links_for(resource: &str, kind: Option<Kind>) -> String {
+        links(TEST_BASE, resource, ROOT, TEST_OWNER, kind)
+    }
+
+    /// The failure this guards: no `rel="type"` anywhere, so a client had to
+    /// parse the body to tell a container from a document — which it cannot do
+    /// at all for a binary.
+    #[test]
+    fn a_resource_announces_its_ldp_kinds() {
+        let document = links_for(&format!("{ROOT}note"), Some(Kind::RdfSource));
+        assert!(
+            document.contains("<http://www.w3.org/ns/ldp#Resource>; rel=\"type\""),
+            "{document}"
+        );
+        assert!(
+            document.contains("<http://www.w3.org/ns/ldp#RDFSource>; rel=\"type\""),
+            "{document}"
+        );
+
+        let binary = links_for(&format!("{ROOT}paper.pdf"), Some(Kind::NonRdfSource));
+        assert!(
+            binary.contains("ldp#NonRDFSource>; rel=\"type\""),
+            "{binary}"
+        );
+
+        // Both classes: Solid and CTS name `ldp:BasicContainer`, generic LDP
+        // clients match `ldp:Container`, and one of the two audiences goes
+        // blind if only one goes out.
+        let container = links_for(&format!("{ROOT}notes/"), Some(Kind::Container));
+        assert!(
+            container.contains("ldp#Container>; rel=\"type\""),
+            "{container}"
+        );
+        assert!(
+            container.contains("ldp#BasicContainer>; rel=\"type\""),
+            "{container}"
+        );
+
+        // An `.acl` is an RDF source like any other document. Nothing in LDP
+        // names an auxiliary class, and inventing one would be a lie a client
+        // would have to special-case.
+        let acl = links_for(&format!("{ROOT}notes/.acl"), Some(Kind::Auxiliary));
+        assert!(acl.contains("ldp#RDFSource>; rel=\"type\""), "{acl}");
+    }
+
+    /// §4.1's MUST. Without it a client that walks up from a resource never
+    /// learns where the storage begins, and 5a stated it only inside a body
+    /// the client had to already be reading.
+    #[test]
+    fn only_the_storage_root_is_a_storage_and_has_an_owner() {
+        let root = links_for(ROOT, Some(Kind::Container));
+        assert!(
+            root.contains("<http://www.w3.org/ns/pim/space#Storage>; rel=\"type\""),
+            "{root}"
+        );
+        assert!(
+            root.contains(
+                "<https://alice.brolly.test/profile#me>; \
+                 rel=\"http://www.w3.org/ns/solid/terms#owner\""
+            ),
+            "{root}"
+        );
+
+        let inside = links_for(&format!("{ROOT}notes/"), Some(Kind::Container));
+        assert!(!inside.contains("space#Storage"), "{inside}");
+        assert!(!inside.contains("terms#owner"), "{inside}");
+    }
+
+    /// H7 over the wire. The old concatenation pointed a client at
+    /// `x.acl.acl`, which it would then create as an ordinary resource.
+    #[test]
+    fn the_acl_link_is_the_acl_that_governs_the_target() {
+        let document = links_for(&format!("{ROOT}note"), Some(Kind::RdfSource));
+        assert!(
+            document.contains("<https://alice.brolly.test/~/note.acl>; rel=\"acl\""),
+            "{document}"
+        );
+
+        let acl = links_for(&format!("{ROOT}note.acl"), Some(Kind::Auxiliary));
+        assert!(
+            acl.contains("<https://alice.brolly.test/~/note.acl>; rel=\"acl\""),
+            "{acl}"
+        );
+        assert!(!acl.contains(".acl.acl"), "{acl}");
+    }
+
+    /// Every resource in a storage links its description (§4.1), whatever kind
+    /// it is and whether or not it exists.
+    #[test]
+    fn every_resource_points_at_the_storage_description() {
+        for (resource, kind) in [
+            (format!("{ROOT}note"), Some(Kind::RdfSource)),
+            (ROOT.to_string(), Some(Kind::Container)),
+            (format!("{ROOT}nothing-here"), None),
+        ] {
+            let link = links_for(&resource, kind);
+            assert!(
+                link.contains(
+                    "<https://alice.brolly.test/.well-known/solid>; \
+                     rel=\"http://www.w3.org/ns/solid/terms#storageDescription\""
+                ),
+                "{resource}: {link}"
+            );
+        }
+    }
+
+    /// An `OPTIONS` asking "may I create here?" (H4) gets an answer that
+    /// claims no kind: a target that doesn't exist has none, and implying one
+    /// would make the header an existence oracle.
+    #[test]
+    fn a_target_that_does_not_exist_claims_no_kind() {
+        let link = links_for(&format!("{ROOT}nothing-here"), None);
+        assert!(!link.contains("rel=\"type\""), "{link}");
+        assert!(
+            link.contains("<https://alice.brolly.test/~/nothing-here.acl>; rel=\"acl\""),
+            "{link}"
+        );
     }
 }

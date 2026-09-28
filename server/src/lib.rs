@@ -10,7 +10,7 @@
 use axum::Router;
 use axum::http::{Method, header};
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use sqlx::PgPool;
 use tower_http::services::ServeDir;
 
@@ -285,6 +285,12 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             "/.well-known/nodeinfo",
             get(activitypub::nodeinfo_discovery),
         )
+        // The storage description (Solid Protocol §4.1). Served on every pod
+        // subdomain; the handler resolves the host itself, as `/profile`
+        // does, and 404s on the apex. `any`, not `get`: the method router's
+        // own 405 would answer on the apex too, where the resource doesn't
+        // exist, and the handler's 405 carries an `Allow` we chose.
+        .route("/.well-known/solid", any(pod::storage_description))
         .route("/nodeinfo/2.1", get(activitypub::nodeinfo))
         // Mastodon owns the bare OAuth paths, because its clients hardcode
         // them and it is the only protocol with no discovery document to be
@@ -316,10 +322,17 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
                 .delete(pod::delete)
                 .options(pod::options),
         )
+        // The storage root. The wildcard above doesn't match an empty
+        // remainder, so the root needs every method of its own. That includes
+        // the ones it always refuses: without a route, axum answers 405 before
+        // WAC runs, and the root's protections are unreachable (5b, H12).
         .route(
             "/~/",
             get(pod::get_root)
+                .put(pod::put_root)
                 .post(pod::post_root)
+                .patch(pod::patch_root)
+                .delete(pod::delete_root)
                 .options(pod::options_root),
         )
         .nest_service("/static", ServeDir::new(static_dir))

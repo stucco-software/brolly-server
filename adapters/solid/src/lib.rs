@@ -15,5 +15,6 @@ pub mod oidc;
 pub mod patch;
 pub mod profile;
 pub mod storage;
+pub mod storage_description;
 
 pub use ldp::{LdpError, LdpOutcome};
