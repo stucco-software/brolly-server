@@ -238,7 +238,7 @@ fn wac_governs_a_binary_exactly_as_it_governs_a_graph() {
         None,
     );
     assert!(
-        matches!(refused, Err(LdpError::NotFound)),
+        matches!(refused, Err(LdpError::Denied)),
         "an unauthorized reader must not get the bytes"
     );
 
@@ -252,7 +252,9 @@ fn wac_governs_a_binary_exactly_as_it_governs_a_graph() {
         "image/png",
         ROOT,
     );
-    assert!(matches!(write, Err(LdpError::Forbidden)));
+    // The pre-lock check for a non-RDF body. If this stayed `Forbidden`, the
+    // status would depend on the `Content-Type`.
+    assert!(matches!(write, Err(LdpError::Denied)));
 }
 
 #[test]

@@ -11,7 +11,7 @@
 //! one.
 
 use axum::extract::{Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use brolly_activitypub::actor;
 use brolly_identity::db::{self, User};
@@ -277,7 +277,11 @@ pub async fn following_collection(State(state): State<AppState>, headers: Header
 /// 404 rather than 403 for a caller who is not the owner, matching
 /// `require_admin`: 403 confirms the resource exists and that the caller found
 /// a real member, which is a disclosure with nothing on the other side of it.
-pub async fn inbox_collection(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn inbox_collection(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
     let Some(username) = extract::subdomain_user(host_of(&headers), &state.base_domain) else {
         return not_found();
     };
@@ -286,8 +290,20 @@ pub async fn inbox_collection(State(state): State<AppState>, headers: HeaderMap)
     };
 
     let inbox = webid::inbox(&username, &state.base_domain);
-    let subject = crate::pod::subject_for(&state, &headers, "GET", &inbox).await;
-    if subject.user_id != Some(user.id) {
+    let caller = match crate::pod::subject_for(&state, &headers, &method, &inbox).await {
+        Ok(caller) => caller,
+        // H2 reaches here too. Without it, a client whose token expired is
+        // downgraded to anonymous, this handler's owner check then fails, and
+        // the member is told their own inbox does not exist.
+        Err(refused) => {
+            return crate::pod::unauthorized(refused, &format!("https://{}", state.base_domain));
+        }
+    };
+    // Stage 0's rule stands: a caller who is not the owner gets 404, because
+    // 403 would confirm both that the inbox exists and that the caller found a
+    // real member. H1's table is about WAC on pod resources; this collection
+    // is not one (H15).
+    if caller.subject.user_id != Some(user.id) {
         return not_found();
     }
 

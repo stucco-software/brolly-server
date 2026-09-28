@@ -174,7 +174,7 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
     assert!(
         matches!(
             ldp::read(&store, None, BASE, "/~/shared/.acl", &bob(), None),
-            Err(LdpError::NotFound)
+            Err(LdpError::Denied)
         ),
         "inherited Read must not reveal who else has access"
     );
@@ -189,7 +189,7 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
             "text/turtle",
             ROOT
         ),
-        Err(LdpError::Forbidden)
+        Err(LdpError::Denied)
     ));
     assert!(matches!(
         ldp::append(
@@ -202,7 +202,7 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
             "text/turtle",
             ROOT
         ),
-        Err(LdpError::Forbidden)
+        Err(LdpError::Denied)
     ));
     assert!(
         !ldp::may_write(&store.read_store(), BASE, "/~/shared/.acl", &bob()).unwrap(),
@@ -210,7 +210,7 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
     );
     assert!(matches!(
         ldp::delete(&store, BASE, "/~/shared/.acl", &bob(), ROOT),
-        Err(LdpError::Forbidden)
+        Err(LdpError::Denied)
     ));
 
     // Nothing above landed: Bob still holds exactly what he was given.
@@ -252,7 +252,7 @@ fn bob_cannot_create_the_acl_of_a_document_he_can_write() {
                 "text/turtle",
                 ROOT
             ),
-            Err(LdpError::Forbidden)
+            Err(LdpError::Denied)
         ),
         "Write on a document must not let Bob create its ACL"
     );
@@ -277,7 +277,7 @@ fn bob_cannot_read_an_acl_of_an_acl() {
 
     assert!(matches!(
         ldp::read(&store, None, BASE, "/~/shared/doc.acl.acl", &bob(), None),
-        Err(LdpError::NotFound)
+        Err(LdpError::Denied)
     ));
 }
 
@@ -677,6 +677,6 @@ fn an_empty_acl_governs_and_grants_nothing() {
     );
     assert!(matches!(
         ldp::read(&store, None, BASE, "/~/shared/doc", &bob(), None),
-        Err(LdpError::NotFound)
+        Err(LdpError::Denied)
     ));
 }

@@ -4,6 +4,8 @@
 //! DPoP-bound token, and the pod has to turn that token back into the `Subject`
 //! WAC evaluates. Until it did, `subject_for` mapped every Bearer and DPoP
 //! credential to anonymous and an app with a perfectly good token got a 404.
+//! Since 5b, a credential that doesn't verify is a 401 naming what was wrong
+//! with it (H2), not a quiet downgrade.
 //!
 //! The negative cases matter more than the positive one. A token is only worth
 //! its binding if presenting it without the key fails.
@@ -29,6 +31,13 @@ const POD_HOST: &str = "alice.brolly.test";
 const POD: &str = "https://alice.brolly.test";
 const ROOT: &str = "https://alice.brolly.test/~/";
 const NOTE: &str = "https://alice.brolly.test/~/note";
+/// A resource whose path a client must percent-encode. `+` is a sub-delimiter,
+/// so an encoding client sends `%2B` and a decoding server sees `+`; the two
+/// spellings are both legal IRIs and they are not equal, which is what makes
+/// this a test rather than a coincidence.
+const DRAFT: &str = "https://alice.brolly.test/~/note+draft";
+const DRAFT_PATH: &str = "/~/note%2Bdraft";
+const DRAFT_URL: &str = "https://alice.brolly.test/~/note%2Bdraft";
 const ACL: &str = "http://www.w3.org/ns/auth/acl#";
 const REDIRECT: &str = "https://app.example/cb";
 
@@ -82,6 +91,13 @@ async fn harness() -> Harness {
         w.create_root(ROOT)?;
         w.put(&g, Content::Auxiliary(&grant))?;
         w.put(NOTE, Content::Rdf(&note))?;
+        let draft = [t(
+            DRAFT,
+            DRAFT,
+            "https://example.org/title",
+            "https://example.org/b",
+        )];
+        w.put(DRAFT, Content::Rdf(&draft))?;
         Ok(())
     })
     .unwrap();
@@ -130,6 +146,23 @@ async fn send(harness: &Harness, request: Request<Body>) -> (StatusCode, String)
         .to_string();
     (status, body)
 }
+
+/// A request's status and its `WWW-Authenticate`, for H3's assertions. The
+/// header is the only thing a refused client can act on, so asserting the
+/// status alone would let the two error codes collapse into one unnoticed.
+async fn challenged(harness: &Harness, request: Request<Body>) -> (StatusCode, String) {
+    let response = harness.router.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let challenge = response
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .map(|v| v.to_str().unwrap().to_string())
+        .unwrap_or_default();
+    (status, challenge)
+}
+
+const INVALID_TOKEN: &str = r#"error="invalid_token""#;
+const INVALID_PROOF: &str = r#"error="invalid_dpop_proof""#;
 
 fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
@@ -337,13 +370,17 @@ async fn a_token_without_its_proof_is_not_accepted() {
     let key = client_key();
     let token = access_token(&harness, &key).await;
 
-    let (status, _) = send(&harness, read_note(Some(&format!("DPoP {token}")), None)).await;
+    let (status, challenge) =
+        challenged(&harness, read_note(Some(&format!("DPoP {token}")), None)).await;
 
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
+        StatusCode::UNAUTHORIZED,
         "an unproven token must not read the pod"
     );
+    // The token is fine; the proof is missing. `invalid_token` would send the
+    // client to refresh a good token and present the same absent proof again.
+    assert!(challenge.contains(INVALID_PROOF), "got: {challenge}");
 }
 
 #[tokio::test]
@@ -358,7 +395,7 @@ async fn a_stolen_token_proven_with_the_wrong_key_is_not_accepted() {
         NOTE,
         Some(&B64.encode(Sha256::digest(token.as_bytes()))),
     );
-    let (status, _) = send(
+    let (status, challenge) = challenged(
         &harness,
         read_note(Some(&format!("DPoP {token}")), Some(&proof)),
     )
@@ -366,9 +403,11 @@ async fn a_stolen_token_proven_with_the_wrong_key_is_not_accepted() {
 
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
+        StatusCode::UNAUTHORIZED,
         "a proof from another key must not satisfy this token's binding"
     );
+    // The token is the victim's and it is fine; the proof is the thief's.
+    assert!(challenge.contains(INVALID_PROOF), "got: {challenge}");
 }
 
 #[tokio::test]
@@ -385,13 +424,15 @@ async fn a_proof_for_another_request_is_not_accepted() {
         "https://alice.brolly.test/~/somewhere-else",
         Some(&B64.encode(Sha256::digest(token.as_bytes()))),
     );
-    let (status, _) = send(
+    let (status, challenge) = challenged(
         &harness,
         read_note(Some(&format!("DPoP {token}")), Some(&elsewhere)),
     )
     .await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // An `htu` mismatch is the proof's fault, not the token's.
+    assert!(challenge.contains(INVALID_PROOF), "got: {challenge}");
 }
 
 #[tokio::test]
@@ -403,13 +444,15 @@ async fn a_proof_without_the_token_hash_is_not_accepted() {
     let token = access_token(&harness, &key).await;
 
     let no_ath = dpop_proof(&key, "GET", NOTE, None);
-    let (status, _) = send(
+    let (status, challenge) = challenged(
         &harness,
         read_note(Some(&format!("DPoP {token}")), Some(&no_ath)),
     )
     .await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // A missing `ath` is the proof's fault, not the token's.
+    assert!(challenge.contains(INVALID_PROOF), "got: {challenge}");
 }
 
 #[tokio::test]
@@ -426,13 +469,19 @@ async fn a_solid_token_presented_as_a_bearer_is_not_accepted() {
         NOTE,
         Some(&B64.encode(Sha256::digest(token.as_bytes()))),
     );
-    let (status, _) = send(
+    let (status, challenge) = challenged(
         &harness,
         read_note(Some(&format!("Bearer {token}")), Some(&proof)),
     )
     .await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // A bare bearer gets a `Bearer` challenge: whatever sent it has no key to
+    // sign a proof with, and a `DPoP` challenge would loop.
+    assert_eq!(
+        challenge, r#"Bearer error="invalid_token""#,
+        "got: {challenge}"
+    );
 }
 
 #[tokio::test]
@@ -465,22 +514,34 @@ async fn a_forged_token_is_not_accepted() {
         NOTE,
         Some(&B64.encode(Sha256::digest(forged.as_bytes()))),
     );
-    let (status, _) = send(
+    let (status, challenge) = challenged(
         &harness,
         read_note(Some(&format!("DPoP {forged}")), Some(&proof)),
     )
     .await;
 
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The signature is the token's, not the proof's.
+    assert!(challenge.contains(INVALID_TOKEN), "got: {challenge}");
 }
 
+/// Without a credential, a resource that isn't public gets a challenge. The
+/// member's note is still not disclosed: the challenge is identical for a note
+/// that doesn't exist (`pod_http.rs`,
+/// `an_anonymous_refusal_is_the_same_for_a_real_and_a_fictive_resource`).
 #[tokio::test]
 async fn an_anonymous_request_still_gets_the_default_deny() {
     let harness = harness().await;
-    let (status, _) = send(&harness, read_note(None, None)).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, challenge) = challenged(&harness, read_note(None, None)).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        challenge,
+        format!(r#"DPoP algs="ES256", as_uri="https://{BASE_DOMAIN}""#)
+    );
 }
 
+/// Refused with `invalid_dpop_proof`, so the client signs a fresh proof rather
+/// than refreshing a token that never expired.
 #[tokio::test]
 async fn a_resource_proof_is_good_for_one_request() {
     // `ath` binds a proof to the token and `htu` to the resource, but neither
@@ -495,14 +556,77 @@ async fn a_resource_proof_is_good_for_one_request() {
     let (status, body) = send(&harness, read_note(Some(&authorization), Some(&proof))).await;
     assert_eq!(status, StatusCode::OK, "body: {body}");
 
-    let (status, _) = send(&harness, read_note(Some(&authorization), Some(&proof))).await;
+    let (status, challenge) =
+        challenged(&harness, read_note(Some(&authorization), Some(&proof))).await;
     assert_eq!(
         status,
-        StatusCode::NOT_FOUND,
-        "a replayed proof must leave the caller anonymous"
+        StatusCode::UNAUTHORIZED,
+        "a replayed proof must be refused, not silently downgraded"
     );
+    assert!(challenge.contains(INVALID_PROOF), "got: {challenge}");
 
     let fresh = dpop_proof(&key, "GET", NOTE, Some(&ath));
     let (status, _) = send(&harness, read_note(Some(&authorization), Some(&fresh))).await;
     assert_eq!(status, StatusCode::OK, "the token itself is still good");
+}
+
+/// A correct client signs `htm: HEAD` on a HEAD. Handing the verifier the
+/// literal `"GET"` made that proof fail, the caller was downgraded to
+/// anonymous, and the member's own resource answered as if it did not exist —
+/// so `HEAD` was unusable for exactly the cache revalidation it exists for.
+/// CTS signs HEAD proofs (`read-method-allow.feature`).
+#[tokio::test]
+async fn a_head_is_authenticated_as_a_head() {
+    let harness = harness().await;
+    let key = client_key();
+    let token = access_token(&harness, &key).await;
+
+    let proof = dpop_proof(
+        &key,
+        "HEAD",
+        NOTE,
+        Some(&B64.encode(Sha256::digest(token.as_bytes()))),
+    );
+    let request = Request::builder()
+        .method("HEAD")
+        .uri("/~/note")
+        .header(header::HOST, POD_HOST)
+        .header(header::AUTHORIZATION, format!("DPoP {token}"))
+        .header("DPoP", proof)
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&harness, request).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body.is_empty(), "HEAD sent a body: {body}");
+}
+
+/// `htu_matches` is exact string equality after stripping query and fragment
+/// (`identity/src/dpop.rs:397`), so the URL the proof is checked against has to
+/// be the one the client signed. Building it from the decoded `Path` made
+/// every escaped character in a path a silent authentication failure.
+#[tokio::test]
+async fn a_proof_is_checked_against_the_undecoded_path() {
+    let harness = harness().await;
+    let key = client_key();
+    let token = access_token(&harness, &key).await;
+
+    let proof = dpop_proof(
+        &key,
+        "GET",
+        DRAFT_URL,
+        Some(&B64.encode(Sha256::digest(token.as_bytes()))),
+    );
+    let request = Request::builder()
+        .method("GET")
+        .uri(DRAFT_PATH)
+        .header(header::HOST, POD_HOST)
+        .header(header::AUTHORIZATION, format!("DPoP {token}"))
+        .header("DPoP", proof)
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(&harness, request).await;
+
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body.contains("example.org/b"), "got: {body}");
 }

@@ -241,6 +241,11 @@ and containers alike.
 **Refusals** look the same as today: a caller without the required mode gets
 `NotFound`, so existence isn't disclosed, and a write gets the existing refusal.
 
+**Superseded in stage 5b** (`docs/specs/2026-09-23-solid-http-surface.md`,
+H1): a caller without the mode gets 401 if unauthenticated and 403 if not,
+the same for a resource that exists and one that doesn't. Existence is still
+not disclosed; only a caller who holds the mode can get a 404.
+
 ### B0. Outbound HTTPS
 
 reqwest 0.13.4 has two TLS features, `rustls` and `rustls-no-provider`. Neither

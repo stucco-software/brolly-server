@@ -216,9 +216,26 @@ fn an_unauthorized_reader_cannot_tell_the_resource_exists() {
     let missing = ldp::read(&store, None, BASE, "/~/does-not-exist", &stranger(), None);
     let forbidden = ldp::read(&store, None, BASE, "/~/secret", &stranger(), None);
 
-    // Identical responses, so probing cannot enumerate a pod.
-    assert!(matches!(missing, Err(LdpError::NotFound)));
-    assert!(matches!(forbidden, Err(LdpError::NotFound)));
+    // Identical responses, so probing cannot enumerate a pod. `Denied` for
+    // both: the stranger holds no Read on either IRI, and H1 decides the
+    // status from the modes alone, never from whether the target is there.
+    assert!(matches!(missing, Err(LdpError::Denied)));
+    assert!(matches!(forbidden, Err(LdpError::Denied)));
+}
+
+/// The third row of H1's table, and the only reason to distinguish the two
+/// refusals at all: a caller who *may* read learns that there is nothing
+/// there. Without this, `Denied` could quietly swallow every missing resource
+/// and the owner of a pod could never tell an empty path from a broken one.
+#[test]
+fn a_permitted_reader_of_a_missing_resource_is_told_it_is_missing() {
+    let (_m, _d, store) = pod();
+    let absent = ldp::read(&store, None, BASE, "/~/does-not-exist", &alice(), None);
+    assert!(
+        matches!(absent, Err(LdpError::NotFound)),
+        "got {:?}",
+        absent.as_ref().err()
+    );
 }
 
 #[test]
@@ -235,7 +252,7 @@ fn anonymous_writes_are_refused() {
         ROOT,
     )
     .unwrap_err();
-    assert!(matches!(err, LdpError::Forbidden));
+    assert!(matches!(err, LdpError::Denied));
 }
 
 #[test]
@@ -363,7 +380,7 @@ fn a_non_empty_container_cannot_be_deleted() {
 
     let err = ldp::delete(&store, BASE, "/~/a/", &alice(), ROOT).unwrap_err();
     assert!(
-        matches!(err, LdpError::Forbidden),
+        matches!(err, LdpError::NotEmpty),
         "deleting a populated container would orphan its subtree"
     );
 }
@@ -424,7 +441,7 @@ fn append_permission_does_not_confer_replace() {
                 "text/turtle",
                 ROOT
             ),
-            Err(LdpError::Forbidden)
+            Err(LdpError::Denied)
         ),
         "Append must not permit PUT — replacing is not adding"
     );
@@ -683,7 +700,7 @@ fn a_container_with_members_cannot_be_emptied_by_put_and_then_deleted() {
     );
     assert!(matches!(
         ldp::delete(&store, BASE, "/~/c/", &alice(), ROOT),
-        Err(LdpError::Forbidden)
+        Err(LdpError::NotEmpty)
     ));
     assert!(ldp::read(&store, None, BASE, "/~/c/m", &alice(), None).is_ok());
 }
@@ -693,7 +710,7 @@ fn the_storage_root_cannot_be_deleted() {
     let (_m, _d, store) = pod();
     assert!(matches!(
         ldp::delete(&store, BASE, "/~/", &alice(), ROOT),
-        Err(LdpError::Forbidden)
+        Err(LdpError::Undeletable)
     ));
     assert!(meta(&store, ROOT).is_some());
 }

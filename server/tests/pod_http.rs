@@ -269,17 +269,33 @@ async fn the_storage_root_is_reachable() {
     assert!(body.contains("pim/space#Storage"), "got: {body}");
 }
 
+/// The failure this guards is a member's own resource vanishing when it should
+/// ask them to authenticate. An app whose access token expired mid-session used
+/// to get a 404 and conclude the note had been deleted. H1 answers 401, with a
+/// challenge it can act on.
+///
+/// Stage 0's A2 rule gave 404 so that existence wasn't disclosed. That
+/// guarantee still holds, and
+/// `an_anonymous_refusal_is_the_same_for_a_real_and_a_fictive_resource` pins
+/// it. The 401 is the same whether the resource is there or not.
 #[tokio::test]
 async fn an_anonymous_reader_gets_nothing() {
     let h = harness().await;
     h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
         .await;
 
-    let (status, _, _) = h.send("GET", "/~/note", None, false).await;
-    assert_eq!(
-        status,
-        StatusCode::NOT_FOUND,
-        "existence itself is a disclosure"
+    let (status, body, headers) = h.send("GET", "/~/note", None, false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!body.contains("Written over HTTP"), "got: {body}");
+    let challenge = headers[header::WWW_AUTHENTICATE].to_str().unwrap();
+    assert!(challenge.starts_with("DPoP "), "got: {challenge}");
+    assert!(
+        challenge.contains(r#"as_uri="https://brolly.test""#),
+        "Solid-OIDC §9.1 makes as_uri a MUST: {challenge}"
+    );
+    assert!(
+        !challenge.contains("error="),
+        "nothing was presented, so nothing was refused: {challenge}"
     );
 }
 
@@ -539,8 +555,11 @@ async fn a_binary_is_invisible_to_a_caller_without_read() {
     )
     .await;
 
-    let (status, _, _) = h.send("GET", "/~/private.pdf", None, false).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, body, _) = h.send("GET", "/~/private.pdf", None, false).await;
+    // 401, not the bytes. The same refusal as for a graph: a binary is not a
+    // side door around WAC.
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!body.contains("%PDF"), "the bytes leaked: {body}");
 }
 
 #[tokio::test]
@@ -970,7 +989,8 @@ async fn bob_cannot_patch_an_acl_he_does_not_control() {
 }
 
 /// The same takeover by replacing the whole document. `ldp::put` refuses with
-/// `Forbidden`, which `pod.rs::ldp_error` answers with 403.
+/// `Denied`, which `pod.rs::ldp_error` answers with 403 to an authenticated
+/// caller.
 #[tokio::test]
 async fn bob_cannot_put_an_acl_he_does_not_control() {
     let h = harness().await;
@@ -1006,7 +1026,7 @@ async fn bob_cannot_put_an_acl_he_does_not_control() {
 }
 
 /// Deleting the container's ACL would drop Alice's grants on `/~/shared/` and
-/// fall back to the root ACL. `ldp::delete` refuses with `Forbidden` before it
+/// fall back to the root ACL. `ldp::delete` refuses with `Denied` before it
 /// looks for the resource, so this is a 403, not a 404.
 #[tokio::test]
 async fn bob_cannot_delete_an_acl_he_does_not_control() {
@@ -1026,6 +1046,10 @@ async fn bob_cannot_delete_an_acl_he_does_not_control() {
     );
 }
 
+/// Bob has authenticated and lacks Control, so he gets 403 (H1). A 401 would
+/// ask him for a credential he has already presented. What must never happen
+/// is a mode appearing in `WAC-Allow` on an ACL he can't read, because that
+/// would be an edit affordance the next request refuses.
 #[tokio::test]
 async fn wac_allow_on_an_acl_names_nothing_for_bob() {
     let h = harness().await;
@@ -1033,7 +1057,11 @@ async fn wac_allow_on_an_acl_names_nothing_for_bob() {
     let bob = member_session(&h, "bob").await;
 
     let (status, _, headers) = send_as(&h, &bob, "GET", "/~/shared/.acl", None).await;
-    assert_eq!(status, StatusCode::NOT_FOUND, "existence is a disclosure");
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(
+        headers.get(header::WWW_AUTHENTICATE).is_none(),
+        "Bob has already authenticated"
+    );
     // A refusal carries no WAC-Allow at all, and an empty one would do too.
     // What must never appear is a mode.
     let allowed = headers
@@ -1047,6 +1075,158 @@ async fn wac_allow_on_an_acl_names_nothing_for_bob() {
     let (status, _, headers) = h.send("GET", "/~/shared/.acl", None, true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(headers["wac-allow"], "user=\"read write append control\"");
+}
+
+// --- refusals (stage 5b, H1–H3) -------------------------------------------------
+
+/// This is the core of H1's safety argument: the status depends on the
+/// caller's effective modes, never on whether the target exists. If these two
+/// responses ever differed, the pod would be an existence oracle for anyone on
+/// the internet.
+#[tokio::test]
+async fn an_anonymous_refusal_is_the_same_for_a_real_and_a_fictive_resource() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (real, real_body, real_headers) = h.send("GET", "/~/note", None, false).await;
+    let (fictive, fictive_body, fictive_headers) =
+        h.send("GET", "/~/no-such-note", None, false).await;
+
+    assert_eq!(real, StatusCode::UNAUTHORIZED);
+    assert_eq!(fictive, StatusCode::UNAUTHORIZED);
+    assert_eq!(real_body, fictive_body);
+    assert_eq!(
+        real_headers.get(header::WWW_AUTHENTICATE),
+        fictive_headers.get(header::WWW_AUTHENTICATE)
+    );
+}
+
+/// The same argument for a caller who *did* authenticate: 403, and again the
+/// same answer whether the resource exists or not. CTS checks this
+/// (`read-access-public.feature`: public → 401, Bob → 403).
+#[tokio::test]
+async fn a_member_without_access_is_forbidden_rather_than_challenged() {
+    let h = harness().await;
+    let bob = member_session(&h, "bob").await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    for path in ["/~/note", "/~/no-such-note"] {
+        let (status, _, headers) = send_as(&h, &bob, "GET", path, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+        assert!(
+            headers.get(header::WWW_AUTHENTICATE).is_none(),
+            "{path}: a challenge Bob has already satisfied"
+        );
+    }
+}
+
+/// This is why the split exists. Only a caller who may read learns the
+/// difference between empty and refused, and that is the information they
+/// need. CTS: a *permitted* caller reading a fictive resource gets 404.
+#[tokio::test]
+async fn a_permitted_reader_of_a_missing_resource_gets_a_404() {
+    let h = harness().await;
+    let (status, _, headers) = h.send("GET", "/~/no-such-note", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(headers.get(header::WWW_AUTHENTICATE).is_none());
+}
+
+/// The status must not depend on the `Content-Type`. `Target::prepare`'s WAC
+/// check runs only for a non-RDF body. If it still returned `Forbidden`, an
+/// anonymous PNG would get 403 while anonymous Turtle got 401. That second
+/// code path is easy to miss, so this pins both paths.
+#[tokio::test]
+async fn an_anonymous_write_is_challenged_whatever_its_body() {
+    let h = harness().await;
+    for (content_type, body) in [("text/turtle", NOTE), ("application/pdf", PDF)] {
+        let (status, _, headers) = h
+            .send("PUT", "/~/anonymous", Some((content_type, body)), false)
+            .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{content_type}");
+        assert!(
+            headers.contains_key(header::WWW_AUTHENTICATE),
+            "{content_type}"
+        );
+    }
+}
+
+/// H2 applies only to the `Authorization` header. `brolly_session` is
+/// `SameSite=Lax`, so a browser sends it on any top-level navigation. A
+/// logged-out member opening a public image in their own pod would otherwise be
+/// challenged for a credential they never offered. The missing `error=` shows
+/// that the stale cookie was treated as no credential at all.
+#[tokio::test]
+async fn a_stale_cookie_falls_through_to_anonymous() {
+    let h = harness().await;
+    let (status, _, headers) = run(
+        h.router.clone(),
+        conditional_request("GET", "/~/note", None, Some("not-a-session"), &[]),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let challenge = headers[header::WWW_AUTHENTICATE].to_str().unwrap();
+    assert!(
+        !challenge.contains("error="),
+        "a cookie the browser sent unasked is not a presented credential: {challenge}"
+    );
+}
+
+/// The other side of that line: an `Authorization` header *is* a presented
+/// credential, so one we can't parse is refused rather than ignored. This
+/// guards against a client with a broken header looking exactly like a client
+/// with none, and never learning why it sees nothing. A session cookie sent
+/// alongside the header does not rescue it, because the explicit header is
+/// the one the client meant (`extract::credential`'s precedence).
+#[tokio::test]
+async fn an_authorization_header_we_cannot_parse_is_refused() {
+    let h = harness().await;
+    let (status, _, headers) = run(
+        h.router.clone(),
+        conditional_request(
+            "GET",
+            "/~/note",
+            None,
+            Some(h.session.as_str()),
+            &[("authorization", "Basic cGxlYXNl")],
+        ),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let challenge = headers[header::WWW_AUTHENTICATE].to_str().unwrap();
+    assert!(
+        challenge.contains(r#"error="invalid_token""#),
+        "got: {challenge}"
+    );
+}
+
+/// H2 applies to the inbox too. Without it, a client whose credential no
+/// longer verifies is downgraded to anonymous, fails the owner check, and is
+/// told its member's inbox does not exist.
+#[tokio::test]
+async fn a_broken_credential_on_the_inbox_is_challenged_not_hidden() {
+    let h = harness().await;
+    let request = Request::builder()
+        .method("GET")
+        .uri("/inbox")
+        .header(header::HOST, HOST)
+        .header(header::ACCEPT, "application/activity+json")
+        .header(header::AUTHORIZATION, "DPoP not-a-token")
+        .body(Body::empty())
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let challenge = response.headers()[header::WWW_AUTHENTICATE]
+        .to_str()
+        .unwrap();
+    assert!(
+        challenge.contains(r#"error="invalid_token""#),
+        "got: {challenge}"
+    );
 }
 
 // --- conditional requests (stage 5a) -------------------------------------------

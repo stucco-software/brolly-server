@@ -44,9 +44,19 @@ use crate::storage;
 
 #[derive(Debug)]
 pub enum LdpError {
-    /// No grant. Deliberately distinct from `NotFound` only *after* the ACL
-    /// says the caller may know the resource exists — see [`read`].
-    Forbidden,
+    /// The caller does not hold the mode this operation needs.
+    ///
+    /// Deliberately distinct from [`LdpError::NotFound`], which now means only
+    /// *the caller holds the mode and there is nothing there*. `pod.rs` turns
+    /// this into 401 or 403 from its own knowledge of the credential, which is
+    /// the one thing this crate has no reason to know (spec 5b, H1).
+    ///
+    /// **It never depends on whether the resource exists.** Effective modes
+    /// come from the nearest ACL up the path, which exists whether or not the
+    /// resource does, so an unauthenticated caller sees the same refusal for
+    /// `/~/secret` and `/~/does-not-exist` and cannot tell them apart.
+    Denied,
+    /// The caller holds the mode and there is nothing at this IRI.
     NotFound,
     Syntax(SyntaxError),
     Store(String),
@@ -59,6 +69,15 @@ pub enum LdpError {
     /// container's current members. Membership changes only by creating or
     /// deleting members (Solid Protocol §5.3).
     ContainmentChange,
+    /// The storage root, which a pod cannot be without. Solid Protocol §5.4
+    /// names it and the root's own ACL as the two resources a server must
+    /// refuse to delete. 5b's chunk 3 answers it 405 with an `Allow`; until
+    /// then it keeps stage 0's 403.
+    Undeletable,
+    /// A container that still has members. Not "you may not" — "not while it
+    /// has members". 5b's chunk 5 answers it 409 *with a body describing the
+    /// error*, which §5.4 requires; until then it keeps stage 0's 403.
+    NotEmpty,
     /// A binary's bytes vanished between `prepare` and the write: a
     /// concurrent delete released identical bytes. Prepare again and retry
     /// once (spec 5a, R12).
@@ -71,7 +90,7 @@ pub enum LdpError {
 impl std::fmt::Display for LdpError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            LdpError::Forbidden => write!(f, "forbidden"),
+            LdpError::Denied => write!(f, "no grant for this operation"),
             LdpError::NotFound => write!(f, "not found"),
             LdpError::Syntax(e) => write!(f, "{e}"),
             LdpError::Store(e) => write!(f, "storage: {e}"),
@@ -81,6 +100,8 @@ impl std::fmt::Display for LdpError {
                 f,
                 "a container's members change only by creating or deleting them"
             ),
+            LdpError::Undeletable => write!(f, "this resource cannot be deleted"),
+            LdpError::NotEmpty => write!(f, "this container still has members"),
             LdpError::BlobMissing => write!(f, "the blob was released before it was recorded"),
             LdpError::PreconditionFailed => write!(f, "precondition failed"),
         }
@@ -107,8 +128,9 @@ impl From<StoreError> for LdpError {
             // `put` refuses an IRI outside the pod's root. The outer functions
             // check first, so this is the same refusal reached another way.
             StoreError::NotUnderRoot => LdpError::OutsideStorage,
-            // Stage 0's answer to a populated container, until 5b's 409.
-            StoreError::ContainerNotEmpty => LdpError::Forbidden,
+            // Stage 0's answer to a populated container, until 5b's chunk 5
+            // turns it into a 409 with a body.
+            StoreError::ContainerNotEmpty => LdpError::NotEmpty,
             StoreError::BlobMissing => LdpError::BlobMissing,
             other => LdpError::Store(other.to_string()),
         }
@@ -231,9 +253,10 @@ pub fn granted_modes(
 
 /// `GET` / `HEAD` an LDP resource, from one snapshot.
 ///
-/// A caller without Read gets `NotFound`, not `Forbidden`: telling an
-/// unauthorized caller that a resource exists is itself a disclosure, and the
-/// predecessor's WAC leaked existence this way.
+/// A caller without Read gets [`LdpError::Denied`], not `NotFound`: telling
+/// them the resource exists would be a disclosure, and so would telling them
+/// it doesn't. `pod.rs` answers both with the same status for the same caller,
+/// so the two are indistinguishable from outside (spec 5b, H1).
 pub fn read(
     pod: &Pod,
     blobs: Option<&BlobStore>,
@@ -256,7 +279,7 @@ pub fn read_in(
 ) -> Result<LdpOutcome, LdpError> {
     let resource = format!("{base}{path}");
     if !check(r, base, path, subject, AccessMode::Read)? {
-        return Err(LdpError::NotFound);
+        return Err(LdpError::Denied);
     }
     let Some(meta) = r.meta(&resource)? else {
         return Err(LdpError::NotFound);
@@ -371,8 +394,9 @@ impl Target<'_> {
     ///   POST) refuse a binary body here, before its bytes reach the disk.
     ///   `put_in`/`append_in` refuse it too, for callers that skip this.
     /// - WAC is checked against the committed store *before* any bytes land,
-    ///   so a caller who may not write leaves nothing in the blob store.
-    ///   `put_in`/`append_in` check again inside the transaction.
+    ///   so a caller who may not write leaves nothing in the blob store and
+    ///   gets `Denied` whatever the body's type. `put_in`/`append_in` check
+    ///   again inside the transaction.
     fn prepare(
         &self,
         blobs: Option<&BlobStore>,
@@ -399,7 +423,7 @@ impl Target<'_> {
                 mode,
             )?
         {
-            return Err(LdpError::Forbidden);
+            return Err(LdpError::Denied);
         }
         prepare(blobs, body, content_type)
     }
@@ -526,7 +550,7 @@ pub fn put_in(
         return Err(LdpError::OutsideStorage);
     }
     if !check(&*w, base, path, subject, AccessMode::Write)? {
-        return Err(LdpError::Forbidden);
+        return Err(LdpError::Denied);
     }
     let current = w.meta(&resource)?.map(|meta| meta.version);
     preconditions.check_write(conditional::Method::Put, current.as_deref())?;
@@ -768,7 +792,7 @@ pub fn append_in(
         return Err(LdpError::OutsideStorage);
     }
     if !check(&*w, base, path, subject, AccessMode::Append)? {
-        return Err(LdpError::Forbidden);
+        return Err(LdpError::Denied);
     }
     // A POST's precondition is about the container (or the document appended
     // to), which is what the client addressed and holds a tag for.
@@ -866,21 +890,22 @@ pub fn delete_in(
         return Err(LdpError::OutsideStorage);
     }
     if !check(&*w, base, path, subject, AccessMode::Write)? {
-        return Err(LdpError::Forbidden);
+        return Err(LdpError::Denied);
     }
     let Some(meta) = w.meta(&resource)? else {
         return Err(LdpError::NotFound);
     };
     preconditions.check_write(conditional::Method::Delete, Some(meta.version.as_str()))?;
     // Without its root a pod has nowhere to put anything, and only
-    // provisioning records one. 5b answers 405 here.
+    // provisioning records one. Solid Protocol §5.4; chunk 3 answers 405.
     if resource == storage_root {
-        return Err(LdpError::Forbidden);
+        return Err(LdpError::Undeletable);
     }
     // Refusing to delete a non-empty container is LDP's rule, and it is the
     // difference between removing a resource and silently orphaning a subtree.
+    // Chunk 5 answers 409 with the body §5.4 requires.
     if matches!(meta.kind, Kind::Container) && !w.members(&resource)?.is_empty() {
-        return Err(LdpError::Forbidden);
+        return Err(LdpError::NotEmpty);
     }
     w.remove(&resource)?;
     Ok(())
@@ -951,7 +976,7 @@ pub fn patch_in(
         return Err(PatchError::Ldp(LdpError::OutsideStorage));
     }
     if !check(&*w, base, path, subject, AccessMode::Write).map_err(PatchError::Ldp)? {
-        return Err(PatchError::Ldp(LdpError::Forbidden));
+        return Err(PatchError::Ldp(LdpError::Denied));
     }
     let current = w.meta(&resource)?.map(|meta| meta.version);
     preconditions.check_write(conditional::Method::Patch, current.as_deref())?;
