@@ -8,7 +8,8 @@
 use brolly_authz::AccessMode;
 use brolly_domain::vocab;
 use brolly_identity::{Scope, Subject, Via};
-use brolly_solid::ldp::{self, LdpError};
+use brolly_solid::ldp::{self, LdpError, PatchBody};
+use brolly_solid::patch::PatchError;
 use brolly_store::StoreManager;
 use brolly_store::resources::{Content, Kind, Pod, PodRead, ResourceMeta};
 use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -146,6 +147,43 @@ fn put_then_get_round_trips() {
     assert!(body.contains("First note"), "got: {body}");
     assert_eq!(out.media_type, "text/turtle");
     assert!(out.description.holds(AccessMode::Write));
+}
+
+/// LDP and every Solid client branch on 201 vs 204, and the only place that
+/// knows which happened is the write itself: `put_in` already reads the
+/// target's metadata for its preconditions, so the answer is free. Deriving it
+/// in `pod.rs` from a read before or after the write would race.
+#[test]
+fn a_put_says_whether_it_created_or_replaced() {
+    let (_m, _d, store) = pod();
+    assert_eq!(
+        put_turtle(&store, "/~/note", NOTE).unwrap(),
+        ldp::Written::Created
+    );
+    assert_eq!(
+        put_turtle(&store, "/~/note", NOTE).unwrap(),
+        ldp::Written::Replaced
+    );
+
+    // A container answers the same way.
+    assert_eq!(
+        put_turtle(&store, "/~/c/", b"").unwrap(),
+        ldp::Written::Created
+    );
+    assert_eq!(
+        put_turtle(&store, "/~/c/", b"").unwrap(),
+        ldp::Written::Replaced
+    );
+
+    // An intermediate container a PUT created on the way is not the target.
+    assert_eq!(
+        put_turtle(&store, "/~/d/e", NOTE).unwrap(),
+        ldp::Written::Created
+    );
+    assert_eq!(
+        put_turtle(&store, "/~/d/", b"").unwrap(),
+        ldp::Written::Replaced
+    );
 }
 
 #[test]
@@ -509,7 +547,7 @@ fn own_graph(pod: &Pod, resource: &str) -> Vec<Quad> {
         .collect()
 }
 
-fn put_turtle(store: &Pod, path: &str, body: &[u8]) -> Result<(), LdpError> {
+fn put_turtle(store: &Pod, path: &str, body: &[u8]) -> Result<ldp::Written, LdpError> {
     ldp::put(store, None, BASE, path, &alice(), body, "text/turtle", ROOT)
 }
 
@@ -619,6 +657,173 @@ fn a_container_put_echoing_its_listing_succeeds() {
         own.is_empty(),
         "the echoed types and containment are the server's, not stored: {own:?}"
     );
+}
+
+/// The listing a client reads back, with one statement altered — the shape of
+/// a client that "fixed up" a timestamp, or of a stale description written
+/// after someone else's edit. §4.2.1 makes it a 409, not a silent store of a
+/// number the server will contradict on the next GET.
+#[test]
+fn a_container_put_that_changes_a_members_modified_time_is_refused() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    let listing = ntriples(&store, "/~/c/");
+    let own = meta(&store, &format!("{ROOT}c/m")).unwrap().modified;
+    let altered = listing.replace(&own, "1999-01-01T00:00:00.000Z");
+    assert_ne!(altered, listing, "setup: the listing carries the time");
+
+    let err = put_turtle(&store, "/~/c/", altered.as_bytes()).unwrap_err();
+    assert!(matches!(err, LdpError::MemberMetadata), "got {err:?}");
+    assert_eq!(
+        meta(&store, &format!("{ROOT}c/m")).unwrap().modified,
+        own,
+        "a refused PUT moved a member's modified time",
+    );
+    assert!(
+        own_graph(&store, &format!("{ROOT}c/")).is_empty(),
+        "a refused PUT stored something",
+    );
+}
+
+/// The same rule for the other two predicates, so a client can't reach one of
+/// them by picking a different one of §4.2.1's statements.
+#[test]
+fn a_container_put_that_changes_a_members_mtime_or_size_is_refused() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    let member = format!("{ROOT}c/m");
+
+    for (predicate, object) in [
+        (vocab::STAT_MTIME, "0"),
+        // We serve no size for an RDF source, so any value differs from ours.
+        (vocab::STAT_SIZE, "4096"),
+    ] {
+        let body = format!("<{member}> <{predicate}> {object} .");
+        let err = put_turtle(&store, "/~/c/", body.as_bytes()).unwrap_err();
+        assert!(
+            matches!(err, LdpError::MemberMetadata),
+            "{predicate}: {err:?}"
+        );
+    }
+}
+
+/// The rule is per statement and by value. A client that round-trips a
+/// listing through JSON-LD or a date library respells the literal; refusing
+/// that would refuse every read-modify-write Inrupt's solid-client, LDO and
+/// SolidOS do.
+#[test]
+fn a_member_statement_respelled_but_unchanged_is_still_an_echo() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    let member = format!("{ROOT}c/m");
+    let modified = meta(&store, &member).unwrap().modified;
+    // The same instant with an explicit zero offset, and the same integer
+    // with a leading `+`.
+    let respelled = modified.replace('Z', "+00:00");
+    let seconds = brolly_store::resources::modified_ms(&modified).unwrap() / 1000;
+    let body = format!(
+        "<{member}> <{}> \"{respelled}\"^^<{}> ; <{}> \"+{seconds}\"^^<{}> .",
+        vocab::DCTERMS_MODIFIED,
+        vocab::XSD_DATE_TIME,
+        vocab::STAT_MTIME,
+        vocab::XSD_INTEGER
+    );
+
+    put_turtle(&store, "/~/c/", body.as_bytes()).unwrap();
+    assert!(
+        own_graph(&store, &format!("{ROOT}c/")).is_empty(),
+        "an echo was stored as content",
+    );
+}
+
+/// `rdf:type` is not on the list, because we don't serve it: `<…/m> a
+/// schema:Note` in a container's description is the client's own data, and so
+/// is any other predicate on a member. A blanket "nothing about a member" rule
+/// would make a container's description useless.
+#[test]
+fn ordinary_statements_about_a_member_are_kept() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    let member = format!("{ROOT}c/m");
+    let body = format!(
+        "<{member}> <{}> <https://schema.org/Note> ; <http://www.w3.org/2000/01/rdf-schema#label> \"First\" .",
+        vocab::RDF_TYPE
+    );
+
+    put_turtle(&store, "/~/c/", body.as_bytes()).unwrap();
+    let served = ntriples(&store, "/~/c/");
+    assert!(served.contains("schema.org/Note"), "{served}");
+    assert!(served.contains("\"First\""), "{served}");
+}
+
+/// The race §4.2.1's rule creates, and the reason the 409 has to carry a body.
+/// A member's `dcterms:modified` moves on every write to that member, not only
+/// on create and delete — so a client that reads a listing, edits a member, and
+/// then writes the container's own description back is refused for metadata it
+/// never touched. The answer is to re-read, which the body has to say.
+#[test]
+fn a_description_written_after_a_member_changed_is_refused_until_a_re_read() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    let stale = ntriples(&store, "/~/c/");
+
+    // The client edits the member, then writes back the description it read
+    // before the edit.
+    put_turtle(
+        &store,
+        "/~/c/m",
+        br#"<> <https://example.org/title> "Edited" ."#,
+    )
+    .unwrap();
+    let err = put_turtle(&store, "/~/c/", stale.as_bytes()).unwrap_err();
+    assert!(matches!(err, LdpError::MemberMetadata), "got {err:?}");
+
+    // Re-reading and retrying is the resolution, and it succeeds.
+    let fresh = ntriples(&store, "/~/c/");
+    put_turtle(&store, "/~/c/", fresh.as_bytes()).unwrap();
+}
+
+/// §4.2.1 names PATCH as well as PUT and POST. `ldp::patch` routes a container
+/// through the same `container_body`, so the rule holds for the verb a client
+/// is most likely to reach for when editing one statement — and a PATCH that
+/// leaves a member's metadata alone still goes through.
+#[test]
+fn a_patch_cannot_rewrite_a_members_modified_time() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/m", NOTE).unwrap();
+    let member = format!("{ROOT}c/m");
+
+    let rewrite = format!(
+        "INSERT DATA {{ <{member}> <{}> \"1999-01-01T00:00:00.000Z\"^^<{}> }}",
+        vocab::DCTERMS_MODIFIED,
+        vocab::XSD_DATE_TIME
+    );
+    let err = ldp::patch(
+        &store,
+        BASE,
+        "/~/c/",
+        &alice(),
+        PatchBody::SparqlUpdate(&rewrite),
+        ROOT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, PatchError::Ldp(LdpError::MemberMetadata)),
+        "got {err:?}"
+    );
+
+    let label = format!(
+        "INSERT DATA {{ <{member}> <http://www.w3.org/2000/01/rdf-schema#label> \"First\" }}"
+    );
+    ldp::patch(
+        &store,
+        BASE,
+        "/~/c/",
+        &alice(),
+        PatchBody::SparqlUpdate(&label),
+        ROOT,
+    )
+    .unwrap();
 }
 
 #[test]

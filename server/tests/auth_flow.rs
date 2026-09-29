@@ -492,9 +492,10 @@ async fn registering_provisions_a_pod_the_member_can_write_to() {
         .await
         .unwrap();
 
+    // 201: the note didn't exist, and a PUT that creates says so (5b, H11).
     assert_eq!(
         response.status(),
-        StatusCode::NO_CONTENT,
+        StatusCode::CREATED,
         "a newly registered member cannot write to their own pod"
     );
 }

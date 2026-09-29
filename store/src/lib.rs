@@ -31,5 +31,5 @@ pub use manager::{StoreError, StoreManager};
 pub use oxigraph::store::Store;
 pub use resources::{
     BlobMeta, Content, Kind, METADATA_GRAPH, Pod, PodRead, PodWrite, ReadStore, ResourceMeta,
-    ResourceRead,
+    ResourceRead, container_triples, modified_ms,
 };

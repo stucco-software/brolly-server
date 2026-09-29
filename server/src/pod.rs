@@ -429,14 +429,12 @@ fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Response {
             tracing::error!("Undeletable reached ldp_error; its caller must build the 405");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
-        // Stage 0's 403, unchanged by this chunk. 5b's chunk 5 makes this 409
-        // with a body describing the problem, which Solid Protocol §5.4
-        // requires.
-        LdpError::NotEmpty => (
-            StatusCode::FORBIDDEN,
-            "a container with members cannot be deleted",
-        )
-            .into_response(),
+        // §5.4 and §4.2.1 both require the body, not just the status: a client
+        // that gets a bare 409 has nothing to act on. The body is the error's
+        // own `Display`, so the two have one source.
+        error @ (LdpError::NotEmpty | LdpError::MemberMetadata) => {
+            (StatusCode::CONFLICT, error.to_string()).into_response()
+        }
         LdpError::OutsideStorage => (
             StatusCode::NOT_FOUND,
             "not found; user storage lives under /~/",
@@ -744,6 +742,39 @@ fn preconditions(headers: &HeaderMap) -> Preconditions {
     )
 }
 
+/// The request's `Content-Type`, or `None` for Solid §2.1's 400
+/// ([`missing_content_type`]).
+///
+/// `empty_is_rdf` is true for `PUT` and `POST`, where a body with no bytes is
+/// an empty RDF document — the way a client creates an empty resource (5a), and
+/// the one case `ldp::prepare` still needs a default for. It is false for
+/// `PATCH`: there is no empty patch, so a PATCH with no type is refused
+/// whatever its length.
+///
+/// Checked after `resolve`, so a caller whose credential doesn't verify still
+/// gets the 401 CTS expects on every method, rather than a 400 for a header
+/// they forgot. A header that isn't valid UTF-8 is treated as absent: it can't
+/// name a media type we parse, and a 415 for it would send the client guessing.
+fn content_type<'h>(headers: &'h HeaderMap, body: &[u8], empty_is_rdf: bool) -> Option<&'h str> {
+    match headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|h| h.to_str().ok())
+    {
+        Some(value) => Some(value),
+        None if empty_is_rdf && body.is_empty() => Some("text/turtle"),
+        None => None,
+    }
+}
+
+/// Solid §2.1's 400, naming the header that was missing.
+fn missing_content_type() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "a request with a body needs a Content-Type header (Solid Protocol §2.1)",
+    )
+        .into_response()
+}
+
 /// `GET /~/*path`, and `HEAD`, which axum routes here without the body.
 ///
 /// Sends `ETag` — the resource's version and the representation's syntax,
@@ -900,10 +931,9 @@ pub async fn put(
         Ok(r) => r,
         Err(response) => return response,
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("text/turtle");
+    let Some(content_type) = content_type(&headers, &body, true) else {
+        return missing_content_type();
+    };
 
     match ldp::put_if(
         &request.pod,
@@ -916,7 +946,35 @@ pub async fn put(
         &request.storage_root,
         &preconditions(&headers),
     ) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // LDP's rule, and what every Solid client branches on. The `Link` set
+        // is H6's, from the same helper a GET uses, so a client that creates a
+        // resource learns its kind without a second request.
+        Ok(ldp::Written::Created) => {
+            let resource = format!("{}{path}", request.base);
+            let mut response =
+                (StatusCode::CREATED, [(header::LOCATION, resource.clone())]).into_response();
+            // A description that fails to read doesn't undo the write: the 201
+            // and its `Location` still go out.
+            if let Ok(description) =
+                ldp::describe(&request.pod, &request.base, &path, &request.subject)
+            {
+                apply(
+                    &mut response,
+                    vec![(
+                        header::LINK,
+                        links(
+                            &request.base,
+                            &resource,
+                            &request.storage_root,
+                            &request.webid,
+                            description.kind(),
+                        ),
+                    )],
+                );
+            }
+            response
+        }
+        Ok(ldp::Written::Replaced) => StatusCode::NO_CONTENT.into_response(),
         Err(e) => ldp_error(e, request.authenticated, &request.apex),
     }
 }
@@ -935,10 +993,9 @@ pub async fn post(
         Ok(r) => r,
         Err(response) => return response,
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("text/turtle");
+    let Some(content_type) = content_type(&headers, &body, true) else {
+        return missing_content_type();
+    };
 
     match ldp::append_if(
         &request.pod,
@@ -970,10 +1027,9 @@ pub async fn patch(
         Ok(r) => r,
         Err(response) => return response,
     };
-    let content_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or_default();
+    let Some(content_type) = content_type(&headers, &body, false) else {
+        return missing_content_type();
+    };
 
     let patch_body = match content_type.split(';').next().unwrap_or_default().trim() {
         "text/n3" => ldp::PatchBody::N3(&body),
@@ -1367,20 +1423,40 @@ mod tests {
     /// `delete` builds `Undeletable`'s 405 itself, because its `Allow` needs
     /// the caller's modes. Reaching `ldp_error` with it means a new producer
     /// that skipped that, and a loud 500 beats a 405 without `Allow`
-    /// (RFC 9110 §15.5.6). `NotEmpty` stays 403 until chunk 5 makes it a 409
-    /// with a body; if it moved early to anything but 409, a `DELETE` of a
-    /// populated container would claim the method isn't allowed.
+    /// (RFC 9110 §15.5.6).
     #[test]
-    fn undeletable_is_built_by_delete_and_a_populated_container_is_still_403() {
-        let apex = "https://brolly.test";
+    fn undeletable_is_built_by_delete_not_by_ldp_error() {
         assert_eq!(
-            ldp_error(LdpError::Undeletable, true, apex).status(),
+            ldp_error(LdpError::Undeletable, true, "https://brolly.test").status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
-        assert_eq!(
-            ldp_error(LdpError::NotEmpty, true, apex).status(),
-            StatusCode::FORBIDDEN
-        );
+    }
+
+    /// §5.4 and §4.2.1 require the status *and* a body describing the error,
+    /// so a client can tell "empty it first" or "re-read and retry" from "you
+    /// may not". A 403 said the last of those, which was never true.
+    #[test]
+    fn a_populated_container_and_changed_member_metadata_are_409s_with_a_body() {
+        for (error, section) in [
+            (LdpError::NotEmpty, "Solid Protocol §5.4"),
+            (LdpError::MemberMetadata, "Solid Protocol §4.2.1"),
+        ] {
+            let said = error.to_string();
+            let response = ldp_error(error, true, "https://brolly.test");
+            assert_eq!(response.status(), StatusCode::CONFLICT, "{section}");
+            let body = body_text(response);
+            assert_eq!(body, said, "{section}: the body is the error's own text");
+        }
+    }
+
+    /// A response's body, which these tests build in memory and never stream.
+    fn body_text(response: Response) -> String {
+        let bytes = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     /// H3's challenge is the only thing a refused client can act on, so its

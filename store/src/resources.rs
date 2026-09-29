@@ -1071,6 +1071,18 @@ fn parse_modified(text: &str) -> Option<i64> {
     i64::try_from(at.unix_timestamp_nanos() / 1_000_000).ok()
 }
 
+/// A stored `dcterms:modified` as milliseconds since the epoch, or `None` if
+/// it isn't a time we wrote.
+///
+/// Public because `ldp` compares a client's echo of a member's modified time
+/// against the one we serve, and must compare *values*: `.007Z` and
+/// `.0070+00:00` are one instant. `brolly-solid`'s `time` has `formatting` but
+/// not `parsing`, so this is the one parser, and it is the same one `meta()`
+/// normalises through.
+pub fn modified_ms(modified: &str) -> Option<i64> {
+    parse_modified(modified)
+}
+
 /// A stored `modified`, in the fixed-width form every reader gets.
 fn normalise_modified(stored: &str) -> String {
     parse_modified(stored)
@@ -1100,7 +1112,19 @@ fn ulid(ms: u64, randomness: [u8; 10]) -> String {
 
 /// What a GET of `container` serves from metadata, in the container's own
 /// graph: its types (`ldp:Resource`, `ldp:Container`, `ldp:BasicContainer`,
-/// and `pim:Storage` at the root) and one `ldp:contains` per member.
+/// and `pim:Storage` at the root), one `ldp:contains` per member, and each
+/// member's server-managed metadata (Solid Protocol §4.2.1).
+///
+/// Member metadata is `dcterms:modified`, `stat:mtime`, and `stat:size` for a
+/// binary. All three come through the same path as [`PodRead::meta`], not
+/// from the raw quads: a stored `xsd:dateTime` reads back shortened (`.750Z`
+/// as `.75Z`), and a listing that disagreed with the member's own
+/// `Last-Modified` would be worse than no listing. `stat:size` is omitted for
+/// an RDF source, whose length depends on the syntax negotiated.
+///
+/// One metadata read per member. `ldp` reuses this one call for both the body
+/// it serves and the §4.2.1 check on a write, so a container is read once
+/// either way.
 ///
 /// `ldp::read_in` adds these to the container's content graph, and a container
 /// PUT is checked against them, so the echo of a GET round-trips.
@@ -1135,6 +1159,48 @@ pub fn container_triples(r: &impl PodRead, container: &str) -> Result<Vec<Quad>,
                 ));
             }
         }
+    }
+
+    // §4.2.1, for every member `out` now names.
+    let members: Vec<NamedNode> = out
+        .iter()
+        .filter(|q| q.predicate.as_str() == vocab::LDP_CONTAINS)
+        .filter_map(|q| match &q.object {
+            Term::NamedNode(member) => Some(member.clone()),
+            _ => None,
+        })
+        .collect();
+    for member in members {
+        let Some(meta) = read_meta(r, member.as_str())? else {
+            // Listed but with no record: a broken pod, not a reason to refuse
+            // the whole listing. The `ldp:contains` still goes out.
+            continue;
+        };
+        let subject = NamedOrBlankNode::NamedNode(member);
+        let mut facts = vec![(
+            vocab::DCTERMS_MODIFIED,
+            Literal::new_typed_literal(meta.modified.clone(), iri(vocab::XSD_DATE_TIME)),
+        )];
+        if let Some(ms) = parse_modified(&meta.modified) {
+            facts.push((
+                vocab::STAT_MTIME,
+                Literal::new_typed_literal((ms / 1000).to_string(), iri(vocab::XSD_INTEGER)),
+            ));
+        }
+        if let Some(blob) = &meta.blob {
+            facts.push((
+                vocab::STAT_SIZE,
+                Literal::new_typed_literal(blob.byte_size.to_string(), iri(vocab::XSD_INTEGER)),
+            ));
+        }
+        out.extend(facts.into_iter().map(|(predicate, object)| {
+            Quad::new(
+                subject.clone(),
+                iri(predicate),
+                Term::Literal(object),
+                graph.clone(),
+            )
+        }));
     }
     Ok(out)
 }

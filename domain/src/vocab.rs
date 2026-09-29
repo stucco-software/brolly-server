@@ -103,6 +103,19 @@ pub const BROLLY_BLOB_DIGEST: &str = "https://brolly.id/ns#blobDigest";
 pub const BROLLY_MEDIA_TYPE: &str = "https://brolly.id/ns#mediaType";
 pub const BROLLY_BYTE_SIZE: &str = "https://brolly.id/ns#byteSize";
 
+// --- contained resource metadata (stage 5b, H13) ---------------------------
+
+/// POSIX file metadata, which Solid Protocol §4.2.1 uses to describe a
+/// container's members. Neither term declares a range, so both are written as
+/// `xsd:integer` by our choice.
+pub const STAT: &str = "http://www.w3.org/ns/posix/stat#";
+/// A member's modified time in seconds since the epoch: the same instant as
+/// its `dcterms:modified`, in the second form §4.2.1 names.
+pub const STAT_MTIME: &str = "http://www.w3.org/ns/posix/stat#mtime";
+/// A binary member's length in bytes. Not served for an RDF source, whose
+/// serialized length depends on the syntax the client asked for.
+pub const STAT_SIZE: &str = "http://www.w3.org/ns/posix/stat#size";
+
 // --- discovery (stage 5b, H6 and H8) ---------------------------------------
 //
 // The link relations a pod read advertises. The LDP classes above are the
@@ -160,6 +173,12 @@ mod tests {
             BROLLY_BYTE_SIZE,
         ] {
             assert!(term.starts_with(BROLLY), "{term}");
+        }
+        // The Solid Protocol's prefix table writes `stat:` without the `#`,
+        // but the vocabulary's terms carry it: `statsize` is not a term.
+        assert_eq!(STAT, "http://www.w3.org/ns/posix/stat#");
+        for term in [STAT_MTIME, STAT_SIZE] {
+            assert!(term.starts_with(STAT), "{term}");
         }
     }
 

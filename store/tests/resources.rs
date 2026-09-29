@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
+use brolly_store::resources::{container_triples, modified_ms};
 use brolly_store::{
     BlobMeta, Content, Kind, METADATA_GRAPH, Pod, PodRead, StoreError, StoreManager,
 };
@@ -993,6 +994,156 @@ fn modified_moves_past_a_stored_time_oxigraph_shortened() {
 
     let next = pod.write(|w| w.put(&at("doc"), Content::Rdf(&[]))).unwrap();
     assert_eq!(next.modified, "2999-01-01T00:00:00.751Z");
+}
+
+// --- a container's listing (5b, H13) -------------------------------------------
+
+/// The object of `<member> <predicate>` in `container`'s listing, as served.
+fn listed(pod: &Pod, container: &str, member: &str, predicate: &str) -> Option<Term> {
+    container_triples(&pod.read_store(), container)
+        .unwrap()
+        .into_iter()
+        .find(|q| {
+            q.subject.to_string() == format!("<{member}>") && q.predicate.as_str() == predicate
+        })
+        .map(|q| q.object)
+}
+
+/// Solid Protocol §4.2.1: a file manager draws a listing without a `HEAD` per
+/// member. Without this it has to make one request per row, and a container of
+/// a hundred notes costs a hundred round trips.
+#[test]
+fn a_listing_carries_each_members_modified_time_and_mtime() {
+    let (_dir, stores) = manager(60);
+    let pod = provisioned(&stores);
+    pod.write(|w| w.put(&at("c/m"), Content::Rdf(&[]))).unwrap();
+
+    let own = pod.read_store().meta(&at("c/m")).unwrap().unwrap();
+    assert_eq!(
+        listed(
+            &pod,
+            &at("c/"),
+            &at("c/m"),
+            brolly_domain::vocab::DCTERMS_MODIFIED
+        ),
+        Some(Term::Literal(Literal::new_typed_literal(
+            own.modified.clone(),
+            node(brolly_domain::vocab::XSD_DATE_TIME),
+        ))),
+        "the listing must agree with the member's own modified time",
+    );
+    let ms = modified_ms(&own.modified).unwrap();
+    assert_eq!(
+        listed(
+            &pod,
+            &at("c/"),
+            &at("c/m"),
+            brolly_domain::vocab::STAT_MTIME
+        ),
+        Some(Term::Literal(Literal::new_typed_literal(
+            (ms / 1000).to_string(),
+            node(brolly_domain::vocab::XSD_INTEGER),
+        ))),
+        "stat:mtime is the same instant in seconds",
+    );
+}
+
+/// §4.2.1 excuses inapplicable metadata. An RDF source's serialized length
+/// changes with the `Accept` header, so a `stat:size` on one would be a number
+/// that contradicts `Content-Length` on most reads.
+#[test]
+fn only_a_binary_member_is_listed_with_a_size() {
+    let (_dir, stores) = manager(60);
+    let pod = provisioned(&stores);
+    let blob = blob(&pod, b"0123456789");
+    pod.write(|w| {
+        w.put(&at("c/doc"), Content::Rdf(&[]))?;
+        w.put(&at("c/pic.png"), Content::Binary(blob.clone()))?;
+        Ok(())
+    })
+    .unwrap();
+
+    assert_eq!(
+        listed(
+            &pod,
+            &at("c/"),
+            &at("c/pic.png"),
+            brolly_domain::vocab::STAT_SIZE
+        ),
+        Some(Term::Literal(Literal::new_typed_literal(
+            "10",
+            node(brolly_domain::vocab::XSD_INTEGER),
+        ))),
+    );
+    assert_eq!(
+        listed(
+            &pod,
+            &at("c/"),
+            &at("c/doc"),
+            brolly_domain::vocab::STAT_SIZE
+        ),
+        None,
+        "an RDF source has no one length to report",
+    );
+}
+
+/// Oxigraph normalises an `xsd:dateTime` on the way in, so a listing built
+/// from the raw quads would say `.75Z` where the member's own `Last-Modified`
+/// says `.750Z` — about one write in ten (commit 9d58082). The listing has to
+/// go through the same `meta()` path every other reader does.
+#[test]
+fn a_listed_modified_time_is_the_fixed_width_one_meta_returns() {
+    let (_dir, stores) = manager(60);
+    let pod = provisioned(&stores);
+    pod.write(|w| w.put(&at("c/m"), Content::Rdf(&[]))).unwrap();
+
+    // Plant the shortened form Oxigraph produces, in place of what was stored.
+    let subject = NamedOrBlankNode::NamedNode(node(&at("c/m")));
+    let predicate = node(brolly_domain::vocab::DCTERMS_MODIFIED);
+    let graph = GraphName::NamedNode(node(METADATA_GRAPH));
+    let raw = pod.raw_store();
+    let stale: Vec<Quad> = raw
+        .quads_for_pattern(
+            Some((&subject).into()),
+            Some(predicate.as_ref()),
+            None,
+            Some(graph.as_ref()),
+        )
+        .map(Result::unwrap)
+        .collect();
+    for quad in &stale {
+        raw.remove(quad).unwrap();
+    }
+    raw.insert(&Quad::new(
+        subject,
+        predicate,
+        Term::Literal(Literal::new_typed_literal(
+            "2999-01-01T00:00:00.75Z",
+            node(brolly_domain::vocab::XSD_DATE_TIME),
+        )),
+        graph,
+    ))
+    .unwrap();
+
+    let listed = listed(
+        &pod,
+        &at("c/"),
+        &at("c/m"),
+        brolly_domain::vocab::DCTERMS_MODIFIED,
+    );
+    let Some(Term::Literal(value)) = listed else {
+        panic!("no modified time in the listing: {listed:?}");
+    };
+    assert_eq!(
+        value.value(),
+        "2999-01-01T00:00:00.750Z",
+        "the listing must not serve the shortened form",
+    );
+    assert_eq!(
+        value.value(),
+        pod.read_store().meta(&at("c/m")).unwrap().unwrap().modified,
+        "the listing and meta() must not disagree",
+    );
 }
 
 // --- large containers --------------------------------------------------------------

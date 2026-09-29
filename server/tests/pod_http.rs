@@ -220,6 +220,38 @@ impl Harness {
         .await
     }
 
+    /// A request with a body and **no** `Content-Type`, as the owner. The
+    /// tuple-shaped helpers above always send one, so §2.1 can't be tested
+    /// through them.
+    async fn send_untyped(
+        &self,
+        method: &str,
+        path: &str,
+        body: &str,
+    ) -> (StatusCode, String, axum::http::HeaderMap) {
+        let request = Request::builder()
+            .method(method)
+            .uri(path)
+            .header(header::HOST, HOST)
+            .header(header::COOKIE, format!("brolly_session={}", self.session))
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        run(self.router.clone(), request).await
+    }
+
+    /// A resource's stored `dcterms:modified`, read from the pod rather than a
+    /// header, so a test about the value doesn't depend on how it is rendered.
+    fn modified(&self, path: &str) -> String {
+        self.stores
+            .pod(self.user)
+            .unwrap()
+            .read_store()
+            .meta(&format!("{BASE}{path}"))
+            .unwrap()
+            .unwrap()
+            .modified
+    }
+
     /// The `ETag` the owner sees on `path`.
     async fn etag(&self, path: &str) -> String {
         let (status, body, headers) = self.send("GET", path, None, true).await;
@@ -242,7 +274,11 @@ async fn put_then_get_over_http() {
     let (status, _, _) = h
         .send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
         .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a PUT that creates is a 201 (H11)"
+    );
 
     let (status, body, headers) = h.send("GET", "/~/note", None, true).await;
     assert_eq!(status, StatusCode::OK);
@@ -546,7 +582,11 @@ async fn a_binary_put_and_got_over_http_keeps_its_bytes_and_its_type() {
     let (status, _, _) = h
         .send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
         .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a PUT that creates is a 201 (H11)"
+    );
 
     let (status, body, headers) = h.send("GET", "/~/paper.pdf", None, true).await;
     assert_eq!(status, StatusCode::OK);
@@ -1430,7 +1470,11 @@ async fn a_binary_refused_by_a_precondition_leaves_no_bytes_behind() {
     let (status, _, _) = h
         .send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
         .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "a PUT that creates is a 201 (H11)"
+    );
 
     let (status, _, _) = h
         .send_if(
@@ -2955,4 +2999,210 @@ async fn a_preflight_is_answered_with_the_headers_it_asked_for() {
         !allowed.contains("accept"),
         "named a header the preflight didn't ask for: {allowed}"
     );
+}
+
+// --- write responses and bodies (stage 5b, H11–H13, H17) ------------------------
+
+/// Solid §2.1: a server MUST reject a PUT, POST or PATCH that contains content
+/// but lacks `Content-Type`. Guessing `text/turtle` turns a client bug into
+/// stored garbage that parses, and PATCH's 415 tells a client its media type
+/// was unsupported when it never sent one — the wrong thing to retry.
+#[tokio::test]
+async fn a_body_without_a_content_type_is_refused() {
+    let h = harness().await;
+    for (method, path) in [("PUT", "/~/note"), ("POST", "/~/"), ("PATCH", "/~/note")] {
+        let (status, body, _) = h.send_untyped(method, path, NOTE).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{method}: {body}");
+        assert!(
+            body.to_lowercase().contains("content-type"),
+            "{method}: the 400 must name the missing header: {body}",
+        );
+    }
+    // Nothing was guessed into the pod.
+    let (status, _, _) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // A PATCH with a type we don't parse is still a 415: the client sent one,
+    // and it is the media type that's wrong.
+    let (status, _, _) = h
+        .send("PATCH", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+/// §2.1's MUST is about requests that "contain content". An empty body is how
+/// a client creates an empty resource, which 5a made possible, and refusing it
+/// would take that away — `ldp::prepare` still needs a type to reach
+/// `Content::Rdf(&[])`, so the default survives for exactly this case.
+#[tokio::test]
+async fn an_empty_body_without_a_content_type_creates_an_empty_resource() {
+    let h = harness().await;
+    let (status, body, _) = h.send_untyped("PUT", "/~/empty", "").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body, _) = h.send("GET", "/~/empty", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.trim().is_empty(), "got: {body}");
+
+    // A container, the same way.
+    let (status, body, _) = h.send_untyped("PUT", "/~/c/", "").await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+}
+
+/// LDP and every Solid client expect 201 from a PUT that creates, and a
+/// `Location` they can follow. Before 5b a create and a replace were both 204,
+/// so a client had to GET to find out whether it had just made something.
+#[tokio::test]
+async fn a_put_that_creates_answers_201_with_a_location_and_its_kinds() {
+    let h = harness().await;
+
+    let (status, _, headers) = h
+        .send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(headers[header::LOCATION], format!("{BASE}/~/note"));
+    let link = links(&headers);
+    assert!(link.contains("ldp#RDFSource>; rel=\"type\""), "got: {link}");
+    assert!(link.contains("rel=\"acl\""), "got: {link}");
+
+    // The same PUT again replaced something, and says so.
+    let (status, _, headers) = h
+        .send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(
+        headers.get(header::LOCATION).is_none(),
+        "204 with a Location"
+    );
+}
+
+/// Solid Protocol §5.4 requires the status *and* a body describing the error.
+/// Before 5b this was a 403, which says "you may not" when the truth is "not
+/// while it has members" — a client can act on the second and not the first.
+#[tokio::test]
+async fn deleting_a_non_empty_container_is_a_409_that_says_what_to_do() {
+    let h = harness().await;
+    h.send("PUT", "/~/c/m", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, body, _) = h.send("DELETE", "/~/c/", None, true).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        body.contains("members"),
+        "the body must name the problem: {body}"
+    );
+
+    // Emptying it is the way through, and the caller had the access all along.
+    h.send("DELETE", "/~/c/m", None, true).await;
+    let (status, _, _) = h.send("DELETE", "/~/c/", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// The read-modify-write every Solid client does on a container. Inrupt's
+/// solid-client, LDO and SolidOS all GET a listing, change one triple and PUT
+/// the whole thing back; §4.2.1's protection has to tolerate the echo or none
+/// of them can edit a container's description at all. Each syntax respells
+/// the literals its own way, which is where the by-value comparison earns its
+/// keep.
+#[tokio::test]
+async fn a_container_listing_put_back_unchanged_is_accepted() {
+    let h = harness().await;
+    h.send("PUT", "/~/c/m", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    for accept in [
+        "text/turtle",
+        "application/ld+json",
+        "application/n-triples",
+    ] {
+        let (status, listing, _) = h.send_if("GET", "/~/c/", None, &[("accept", accept)]).await;
+        assert_eq!(status, StatusCode::OK, "{accept}: {listing}");
+        assert!(listing.contains("modified"), "{accept}: no member metadata");
+
+        let (status, body, _) = h
+            .send("PUT", "/~/c/", Some((accept, listing.as_str())), true)
+            .await;
+        assert!(
+            status.is_success(),
+            "{accept}: the echo was refused: {body}"
+        );
+    }
+
+    // And the listing still comes from metadata rather than from what was
+    // stored: the member's modified time is listed once, not twice.
+    let (_, listing, _) = h
+        .send_if("GET", "/~/c/", None, &[("accept", "application/n-triples")])
+        .await;
+    let member = format!("{ROOT}c/m");
+    assert_eq!(
+        listing
+            .matches(&format!("<{member}> <http://purl.org/dc/terms/modified>"))
+            .count(),
+        1,
+        "an echoed statement was stored beside the generated one: {listing}",
+    );
+}
+
+/// §4.2.1's MUST. Without it a client could GET a listing, change a member's
+/// modified time, PUT it back, and have the wrong number stored as content —
+/// served beside the generated one, stale forever, with no way to remove it
+/// except by finding it.
+#[tokio::test]
+async fn changing_a_members_modified_time_in_a_listing_is_a_409() {
+    let h = harness().await;
+    h.send("PUT", "/~/c/m", Some(("text/turtle", NOTE)), true)
+        .await;
+    let (_, listing, _) = h
+        .send_if("GET", "/~/c/", None, &[("accept", "application/n-triples")])
+        .await;
+    let altered = listing.replace(&h.modified("/~/c/m"), "1999-01-01T00:00:00.000Z");
+    assert_ne!(altered, listing, "setup: the listing carries the time");
+
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/c/",
+            Some(("application/n-triples", altered.as_str())),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(
+        body.contains("re-read"),
+        "the 409 must tell the client how to resolve it: {body}",
+    );
+}
+
+/// The race §4.2.1's rule creates, which containment's set-wise rule doesn't
+/// have: a member's modified time moves on *every* write to it, not only on
+/// create and delete. So a client that reads a listing, saves a member, and
+/// then writes the container's own description back is refused for metadata it
+/// never touched — and the only thing it can do is re-read. That is why the
+/// 409 carries a body and why the body says so.
+#[tokio::test]
+async fn a_listing_written_back_after_a_member_changed_is_a_409_the_client_re_reads() {
+    let h = harness().await;
+    h.send("PUT", "/~/c/m", Some(("text/turtle", NOTE)), true)
+        .await;
+    let (_, stale, _) = h
+        .send_if("GET", "/~/c/", None, &[("accept", "text/turtle")])
+        .await;
+
+    // The client edits the member it was listing.
+    h.send("PUT", "/~/c/m", Some(("text/turtle", EDITED)), true)
+        .await;
+
+    let (status, body, _) = h
+        .send("PUT", "/~/c/", Some(("text/turtle", stale.as_str())), true)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+
+    // Re-reading and retrying is the resolution, and it works.
+    let (_, fresh, _) = h
+        .send_if("GET", "/~/c/", None, &[("accept", "text/turtle")])
+        .await;
+    let (status, body, _) = h
+        .send("PUT", "/~/c/", Some(("text/turtle", fresh.as_str())), true)
+        .await;
+    assert!(status.is_success(), "the retry was refused too: {body}");
 }

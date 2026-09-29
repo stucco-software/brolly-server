@@ -26,7 +26,7 @@
 //! the graph a client writes, so an `ldp:contains` or `brolly:blobDigest`
 //! triple in an ordinary document is inert data.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use brolly_authz::{AccessMode, authorize, effective_acl};
 use brolly_domain::syntax::{self, ReadFormat, SyntaxError};
@@ -69,13 +69,19 @@ pub enum LdpError {
     /// container's current members. Membership changes only by creating or
     /// deleting members (Solid Protocol §5.3).
     ContainmentChange,
+    /// A write named one of the server-managed statements a container's
+    /// listing carries about a contained resource — `dcterms:modified`,
+    /// `stat:mtime` or `stat:size` — with a value other than the one we serve
+    /// (409, Solid Protocol §4.2.1). An exact echo is dropped instead, so a
+    /// read-modify-write of a container still works.
+    MemberMetadata,
     /// The storage root or the root's own ACL: the two resources Solid
     /// Protocol §5.4 says a server must refuse to delete. `pod.rs` answers it
     /// 405 with the caller's `Allow`.
     Undeletable,
-    /// A container that still has members. Not "you may not" — "not while it
-    /// has members". 5b's chunk 5 answers it 409 *with a body describing the
-    /// error*, which §5.4 requires; until then it keeps stage 0's 403.
+    /// A `DELETE` of a container that still has members (409, Solid Protocol
+    /// §5.4). Not "you may not" — "not while it has members": the caller may
+    /// delete this container once it is empty, and the body says so.
     NotEmpty,
     /// A binary's bytes vanished between `prepare` and the write: a
     /// concurrent delete released identical bytes. Prepare again and retry
@@ -99,8 +105,17 @@ impl std::fmt::Display for LdpError {
                 f,
                 "a container's members change only by creating or deleting them"
             ),
+            LdpError::MemberMetadata => write!(
+                f,
+                "a contained resource's modified time and size are the server's; \
+                 re-read this container and send its current description"
+            ),
             LdpError::Undeletable => write!(f, "this resource cannot be deleted"),
-            LdpError::NotEmpty => write!(f, "this container still has members"),
+            LdpError::NotEmpty => write!(
+                f,
+                "this container still has members; delete them first, \
+                 then re-read the container and retry"
+            ),
             LdpError::BlobMissing => write!(f, "the blob was released before it was recorded"),
             LdpError::PreconditionFailed => write!(f, "precondition failed"),
         }
@@ -127,8 +142,8 @@ impl From<StoreError> for LdpError {
             // `put` refuses an IRI outside the pod's root. The outer functions
             // check first, so this is the same refusal reached another way.
             StoreError::NotUnderRoot => LdpError::OutsideStorage,
-            // Stage 0's answer to a populated container, until 5b's chunk 5
-            // turns it into a 409 with a body.
+            // Solid Protocol §5.4. `delete_in` refuses first, so this is the
+            // same refusal reached by a caller composing its own transaction.
             StoreError::ContainerNotEmpty => LdpError::NotEmpty,
             StoreError::BlobMissing => LdpError::BlobMissing,
             other => LdpError::Store(other.to_string()),
@@ -176,6 +191,14 @@ pub struct LdpOutcome {
     /// `dcterms:modified` from that snapshot, as stored (`xsd:dateTime`): the
     /// `Last-Modified`.
     pub modified: String,
+}
+
+/// What a `PUT` did. LDP answers 201 for one and 204 for the other, and a
+/// client that creates with `If-None-Match: *` branches on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Written {
+    Created,
+    Replaced,
 }
 
 fn iri(s: &str) -> NamedNode {
@@ -575,7 +598,7 @@ pub fn put_if(
     content_type: &str,
     storage_root: &str,
     preconditions: &Preconditions,
-) -> Result<(), LdpError> {
+) -> Result<Written, LdpError> {
     let resource = format!("{base}{path}");
     let rdf_only = storage::is_container(&resource) || governed(&resource).is_some();
     let target = Target {
@@ -585,7 +608,7 @@ pub fn put_if(
         subject,
         storage_root,
     };
-    let attempt = || -> Result<(), LdpError> {
+    let attempt = || -> Result<Written, LdpError> {
         let body = target.prepare(blobs, rdf_only, AccessMode::Write, body, content_type)?;
         let written = in_write(pod, |w| {
             put_in(w, base, path, subject, &body, storage_root, preconditions)
@@ -611,7 +634,7 @@ pub fn put(
     body: &[u8],
     content_type: &str,
     storage_root: &str,
-) -> Result<(), LdpError> {
+) -> Result<Written, LdpError> {
     put_if(
         pod,
         blobs,
@@ -661,6 +684,11 @@ fn release_refused_bytes<T>(pod: &Pod, body: &Body, written: &Result<T, LdpError
 /// written, against this transaction's view of the resource, so no other write
 /// can land between the check and this one. Pass `Preconditions::NONE` when not
 /// answering an HTTP request.
+///
+/// Answers [`Written::Created`] when the target had no metadata before this
+/// write and [`Written::Replaced`] when it did, from the same read the
+/// precondition uses. A container this write created on the way to the target
+/// is not the target: only the resource addressed decides.
 pub fn put_in(
     w: &mut PodWrite<'_>,
     base: &str,
@@ -669,7 +697,7 @@ pub fn put_in(
     body: &Body,
     storage_root: &str,
     preconditions: &Preconditions,
-) -> Result<(), LdpError> {
+) -> Result<Written, LdpError> {
     let resource = format!("{base}{path}");
     if !resource.starts_with(storage_root) {
         return Err(LdpError::OutsideStorage);
@@ -679,17 +707,22 @@ pub fn put_in(
     }
     let current = w.meta(&resource)?.map(|meta| meta.version);
     preconditions.check_write(conditional::Method::Put, current.as_deref())?;
+    // The same read the precondition used, so nothing can land between them.
+    let written = match current {
+        Some(_) => Written::Replaced,
+        None => Written::Created,
+    };
 
     if governed(&resource).is_some() {
         let quads = rdf_quads(body, &resource)?;
         w.put(&resource, Content::Auxiliary(&quads))?;
-        return Ok(());
+        return Ok(written);
     }
     if storage::is_container(&resource) {
         let quads = rdf_quads(body, &resource)?;
         let kept = container_body(&*w, &resource, quads)?;
         w.put(&resource, Content::Container(&kept))?;
-        return Ok(());
+        return Ok(written);
     }
 
     let previous = w
@@ -721,7 +754,7 @@ pub fn put_in(
     {
         w.release_blob(&previous);
     }
-    Ok(())
+    Ok(written)
 }
 
 /// Parse an RDF body into `resource`'s own graph, or refuse a binary.
@@ -741,6 +774,16 @@ fn rdf_quads(body: &Body, resource: &str) -> Result<Vec<Quad>, LdpError> {
 ///   metadata.
 /// - **Echoed server types** are dropped: `ldp:Resource`, `ldp:Container`,
 ///   `ldp:BasicContainer`, and `pim:Storage` at the root.
+/// - **A member's server-managed metadata** — `dcterms:modified`, `stat:mtime`
+///   and `stat:size` on a contained resource (§4.2.1) — is dropped when its
+///   value equals what we would serve and `MemberMetadata` when it differs or
+///   won't parse. Per statement, and by value: `1790000000` and
+///   `"1790000000"^^xsd:integer` are one number, and a timestamp a client
+///   round-tripped through JSON-LD may be spelled a third way. Without the echo
+///   tolerance every read-modify-write of a container would 409.
+///   `rdf:type` is **not** on the list, because we don't serve it; nor is any
+///   other predicate on a member, nor any of the three on a subject that isn't
+///   a member. Both stay ordinary content.
 /// - **The rest** is kept.
 fn container_body(
     r: &impl PodRead,
@@ -748,13 +791,37 @@ fn container_body(
     quads: Vec<Quad>,
 ) -> Result<Vec<Quad>, LdpError> {
     let node = NamedOrBlankNode::NamedNode(iri(container));
-    // What a GET serves from metadata: the types and the listing.
+    // What a GET serves from metadata: the types, the listing, and each
+    // member's metadata. One read, shared by the rules below, so the check
+    // cannot disagree with what a GET would say.
     let served = resources::container_triples(r, container)?;
     let members: BTreeSet<String> = served
         .iter()
         .filter(|q| q.predicate.as_str() == vocab::LDP_CONTAINS)
         .map(|q| q.object.to_string())
         .collect();
+    let member_iris: BTreeSet<&str> = served
+        .iter()
+        .filter(|q| q.predicate.as_str() == vocab::LDP_CONTAINS)
+        .filter_map(|q| match &q.object {
+            Term::NamedNode(member) => Some(member.as_str()),
+            _ => None,
+        })
+        .collect();
+    // (member, predicate) -> the value we serve, reduced the same way the
+    // client's will be.
+    let mut ours: BTreeMap<(&str, &str), i64> = BTreeMap::new();
+    for quad in &served {
+        let Some(subject) = subject_iri(&quad.subject) else {
+            continue;
+        };
+        let predicate = quad.predicate.as_str();
+        if member_iris.contains(subject)
+            && let Some(value) = member_value(predicate, &quad.object)
+        {
+            ours.insert((subject, predicate), value);
+        }
+    }
     let is_root = served
         .iter()
         .any(|q| matches!(&q.object, Term::NamedNode(t) if t.as_str() == vocab::PIM_STORAGE));
@@ -771,14 +838,64 @@ fn container_body(
         let echoed = about_it
             && quad.predicate.as_str() == vocab::RDF_TYPE
             && is_served_type(&quad.object, is_root);
-        if !echoed {
-            kept.push(quad);
+        if echoed {
+            continue;
         }
+        // §4.2.1: a member's metadata is ours. An exact echo is not an update.
+        let predicate = quad.predicate.as_str();
+        if MANAGED_MEMBER_PREDICATES.contains(&predicate)
+            && let Some(subject) = subject_iri(&quad.subject)
+            && member_iris.contains(subject)
+        {
+            let sent = member_value(predicate, &quad.object);
+            let mine = ours.get(&(subject, predicate)).copied();
+            if sent.is_some() && sent == mine {
+                continue;
+            }
+            return Err(LdpError::MemberMetadata);
+        }
+        kept.push(quad);
     }
     if !named.is_empty() && named != members {
         return Err(LdpError::ContainmentChange);
     }
     Ok(kept)
+}
+
+/// The statements a container's listing makes about each member, which §4.2.1
+/// forbids a client to change. `rdf:type` is absent deliberately: we serve none
+/// for a member, so a client naming one isn't echoing us.
+const MANAGED_MEMBER_PREDICATES: [&str; 3] =
+    [vocab::DCTERMS_MODIFIED, vocab::STAT_MTIME, vocab::STAT_SIZE];
+
+fn subject_iri(subject: &NamedOrBlankNode) -> Option<&str> {
+    match subject {
+        NamedOrBlankNode::NamedNode(node) => Some(node.as_str()),
+        NamedOrBlankNode::BlankNode(_) => None,
+    }
+}
+
+/// One of [`MANAGED_MEMBER_PREDICATES`] reduced to a number, so two spellings
+/// of one value compare equal.
+///
+/// `dcterms:modified` becomes milliseconds since the epoch through `store`'s
+/// own parser — the same one `meta()` normalises through, and the only RFC 3339
+/// parser this workspace has (`brolly-solid`'s `time` has `formatting` but not
+/// `parsing`). The two `stat:` terms are integers. Every comparison is between
+/// two values of the *same* predicate, so both sides are always reduced the
+/// same way. `None` means "not a value we can compare", which the caller treats
+/// as a change rather than an echo: failing closed refuses a body we couldn't
+/// check, and the client re-reads.
+fn member_value(predicate: &str, object: &Term) -> Option<i64> {
+    let Term::Literal(literal) = object else {
+        return None;
+    };
+    let text = literal.value().trim();
+    match predicate {
+        vocab::DCTERMS_MODIFIED => resources::modified_ms(text),
+        vocab::STAT_MTIME | vocab::STAT_SIZE => text.parse().ok(),
+        _ => None,
+    }
 }
 
 fn is_served_type(object: &Term, is_root: bool) -> bool {
@@ -1036,7 +1153,7 @@ pub fn delete_in(
     }
     // Refusing to delete a non-empty container is LDP's rule, and it is the
     // difference between removing a resource and silently orphaning a subtree.
-    // Chunk 5 answers 409 with the body §5.4 requires.
+    // 409, not 403: the caller holds Write, and emptying it is the way through.
     if matches!(meta.kind, Kind::Container) && !w.members(&resource)?.is_empty() {
         return Err(LdpError::NotEmpty);
     }
