@@ -4,9 +4,12 @@
 <!-- The spec names files this stage creates, so not every path it cites
      resolves until it's implemented. -->
 
-**Status:** Draft (2026-09-23), revised after three adversarial reviews against
-the Solid Protocol, WAC, Solid-OIDC, LDP, RFC 9110/9449/6750, the CTS feature
-files, and axum's own routing source
+**Status:** Implemented, 2026-09-29, in five commits: `013e8c8` (refusals),
+`6d36880` (`describe`, `Allow`, `Accept-*`), `459df46` (discovery),
+`63ec0ee` (caching and CORS), `854d8f1` (write responses and bodies). Drafted
+2026-09-23 and revised after three adversarial reviews against the Solid
+Protocol, WAC, Solid-OIDC, LDP, RFC 9110/9449/6750, the CTS feature files, and
+axum's own routing source
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 5, part b. Part a
 (`docs/specs/2026-09-22-solid-resource-metadata.md`) landed the state this part
 reports. Parts c (write semantics) and d (auxiliary resources and the
