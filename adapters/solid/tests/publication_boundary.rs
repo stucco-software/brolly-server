@@ -143,10 +143,15 @@ fn a_container_named_outbox_inside_the_pod_is_just_a_container() {
         A_REAL_POST,
         "text/turtle",
         ROOT,
+        None,
+        ldp::RequestedKind::Auto,
     )
     .unwrap();
 
-    assert!(created.starts_with(ROOT), "it is ordinary pod storage");
+    assert!(
+        created.member.starts_with(ROOT),
+        "it is ordinary pod storage"
+    );
     assert!(
         index_is_empty(&f.manager),
         "naming a pod container 'outbox' must not make it a publication surface"

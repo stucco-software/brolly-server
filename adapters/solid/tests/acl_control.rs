@@ -200,7 +200,9 @@ fn bob_cannot_read_rewrite_or_delete_the_containers_acl() {
             &bob(),
             takeover.as_bytes(),
             "text/turtle",
-            ROOT
+            ROOT,
+            None,
+            ldp::RequestedKind::Auto,
         ),
         Err(LdpError::Denied)
     ));
@@ -430,23 +432,32 @@ fn an_acl_is_not_a_member_of_its_container() {
         ROOT,
     )
     .unwrap();
-    let appended = ldp::append(
+    // 5c H3: POST is a container method; the ACL is written by `PUT`, and a
+    // member minted by POST into the container is contained — the contrast
+    // the test exists to draw.
+    let minted = ldp::append(
         &store,
         None,
         BASE,
-        "/~/shared/.acl",
+        "/~/shared/",
         &alice(),
-        acl_granting(CAROL, &format!("{ROOT}shared/")).as_bytes(),
+        NOTE,
         "text/turtle",
         ROOT,
+        Some("member"),
+        ldp::RequestedKind::Auto,
     )
     .unwrap();
-    assert_eq!(appended, format!("{ROOT}shared/.acl"));
+    assert_eq!(minted.member, format!("{ROOT}shared/member"));
 
     let members = members(&store, &format!("{ROOT}shared/"));
     assert!(
         members.contains(&doc),
         "an ordinary resource is still contained"
+    );
+    assert!(
+        members.contains(&minted.member),
+        "a POST-minted member is contained: {members:?}"
     );
     assert!(
         !members.contains(&format!("{ROOT}shared/doc.acl")),

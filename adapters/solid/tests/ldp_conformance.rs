@@ -373,11 +373,324 @@ fn posting_to_a_container_mints_a_member() {
         NOTE,
         "text/turtle",
         ROOT,
+        None,
+        ldp::RequestedKind::Auto,
     )
     .unwrap();
 
-    assert!(created.starts_with(ROOT));
-    assert!(members(&store, ROOT).contains(&created));
+    assert!(created.member.starts_with(ROOT));
+    assert_eq!(created.kind, Kind::RdfSource);
+    assert!(members(&store, ROOT).contains(&created.member));
+}
+
+/// H1 (spec 5c): a POST's `Slug` names the minted member, and the 201's
+/// `Location` — the `member` here — is the name the client can bookmark.
+#[test]
+fn a_slug_names_the_minted_member() {
+    let (_m, _d, store) = pod();
+    let created = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+        Some("hello"),
+        ldp::RequestedKind::Auto,
+    )
+    .unwrap();
+    assert_eq!(created.member, format!("{ROOT}hello"));
+    assert!(members(&store, ROOT).contains(&created.member));
+}
+
+/// H1: a taken name is disambiguated `-1`, `-2`, … before any extension —
+/// the contract CSS implements and `solid-client` depends on.
+#[test]
+fn a_colliding_slug_is_disambiguated_before_the_extension() {
+    let (_m, _d, store) = pod();
+    for _ in 0..3 {
+        ldp::append(
+            &store,
+            None,
+            BASE,
+            "/~/",
+            &alice(),
+            NOTE,
+            "text/turtle",
+            ROOT,
+            Some("note.ttl"),
+            ldp::RequestedKind::Auto,
+        )
+        .unwrap();
+    }
+    let members = members(&store, ROOT);
+    assert!(members.contains(&format!("{ROOT}note.ttl")));
+    assert!(members.contains(&format!("{ROOT}note-1.ttl")));
+    assert!(members.contains(&format!("{ROOT}note-2.ttl")));
+}
+
+/// H1: the slug is raw bytes, not a pre-encoded segment, so a `%` survives
+/// as `%25` — lossless, and unambiguous where passing it through would not be.
+#[test]
+fn a_slug_is_percent_encoded_not_passed_through() {
+    let (_m, _d, store) = pod();
+    let created = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+        Some("a%20b"),
+        ldp::RequestedKind::Auto,
+    )
+    .unwrap();
+    assert_eq!(created.member, format!("{ROOT}a%2520b"));
+}
+
+/// H1: a slug that cannot be made one safe segment is refused with the rule,
+/// because a silent UUID would leave the client building links to a name it
+/// was never given.
+#[test]
+fn slugs_that_are_not_one_safe_segment_are_refused() {
+    let (_m, _d, store) = pod();
+    for slug in ["a/b", "a?b", "a#b", ".", "..", "note.acl", "a\u{0}b"] {
+        let err = ldp::append(
+            &store,
+            None,
+            BASE,
+            "/~/",
+            &alice(),
+            NOTE,
+            "text/turtle",
+            ROOT,
+            Some(slug),
+            ldp::RequestedKind::Auto,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, LdpError::InvalidSlug(rule) if rule.contains(slug.trim())),
+            "{slug:?}: got {err:?}"
+        );
+    }
+    // Nothing was minted by any of them.
+    assert!(members(&store, ROOT).is_empty());
+}
+
+/// H1: the cap is 128 bytes of UTF-8.
+#[test]
+fn a_slug_over_128_bytes_is_refused() {
+    let (_m, _d, store) = pod();
+    let slug = "x".repeat(129);
+    let err = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+        Some(&slug),
+        ldp::RequestedKind::Auto,
+    )
+    .unwrap_err();
+    assert!(matches!(err, LdpError::InvalidSlug(_)), "got {err:?}");
+}
+
+/// H1: no slug, an empty one, and a whitespace one all mint a UUID, as they
+/// always have.
+#[test]
+fn absent_and_blank_slugs_mint_a_uuid() {
+    let (_m, _d, store) = pod();
+    for slug in [None, Some(""), Some("   ")] {
+        let created = ldp::append(
+            &store,
+            None,
+            BASE,
+            "/~/",
+            &alice(),
+            NOTE,
+            "text/turtle",
+            ROOT,
+            slug,
+            ldp::RequestedKind::Auto,
+        )
+        .unwrap();
+        assert!(
+            created.member.trim_start_matches(ROOT).len() == 36,
+            "{}: not a UUID",
+            created.member
+        );
+    }
+}
+
+/// H2 (spec 5c): a container-typed POST mints a container — the IRI ends in
+/// `/` whatever the slug ended with — and its content goes through
+/// `Content::Container`, so the containment protections apply from birth.
+#[test]
+fn a_container_typed_post_mints_a_container() {
+    let (_m, _d, store) = pod();
+    let created = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/",
+        &alice(),
+        b"",
+        "text/turtle",
+        ROOT,
+        Some("docs"),
+        ldp::RequestedKind::Container,
+    )
+    .unwrap();
+    assert_eq!(created.member, format!("{ROOT}docs/"));
+    assert_eq!(created.kind, Kind::Container);
+    assert!(members(&store, ROOT).contains(&created.member));
+    // It is a container: it can hold members, and it takes RDF only.
+    let inside = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/docs/",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+        Some("note"),
+        ldp::RequestedKind::Auto,
+    )
+    .unwrap();
+    assert_eq!(inside.member, format!("{ROOT}docs/note"));
+}
+
+/// H2: a container-typed POST with a binary body is the existing `NotRdf`
+/// 415 — containers take RDF. (The blob-carrying fixture lives in
+/// `ldp_nonrdf.rs`; this one drives the refusal without bytes to store.)
+#[test]
+fn a_container_typed_post_takes_rdf_only() {
+    let (_m, _d, store) = pod();
+    let err = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/",
+        &alice(),
+        b"not rdf",
+        "application/octet-stream",
+        ROOT,
+        Some("pics"),
+        ldp::RequestedKind::Container,
+    )
+    .unwrap_err();
+    assert!(matches!(err, LdpError::NotRdf), "got {err:?}");
+    assert!(members(&store, ROOT).is_empty());
+}
+
+/// H3 (spec 5c): POST is a container method. A document-shaped target is
+/// `NotAPostTarget`, not an append — the insertion it used to perform is a
+/// `PATCH` with `INSERT`.
+#[test]
+fn a_post_to_a_document_is_not_a_post_target() {
+    let (_m, _d, store) = pod();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+    let err = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+        None,
+        ldp::RequestedKind::Auto,
+    )
+    .unwrap_err();
+    assert!(matches!(err, LdpError::NotAPostTarget), "got {err:?}");
+    // And nothing was appended.
+    let after = ldp::read(&store, None, BASE, "/~/note", &alice(), None).unwrap();
+    let body = String::from_utf8(after.body).unwrap();
+    assert_eq!(
+        body.matches("First note").count(),
+        1,
+        "the refused POST changed the document: {body}"
+    );
+}
+
+/// H3: the refusal comes after the WAC check, so a caller with no mode at all
+/// still sees `Denied` — the 405 must not become an existence oracle.
+#[test]
+fn a_post_to_a_document_refuses_a_modeless_caller_first() {
+    let (_m, _d, store) = pod();
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .unwrap();
+    let stranger = Subject::local(
+        Uuid::new_v4(),
+        "did:plc:stranger".into(),
+        "https://stranger.example/profile#me".into(),
+        Scope::parse("webid"),
+        Via::SolidDpop,
+    );
+    let err = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/note",
+        &stranger,
+        NOTE,
+        "text/turtle",
+        ROOT,
+        None,
+        ldp::RequestedKind::Auto,
+    )
+    .unwrap_err();
+    assert!(matches!(err, LdpError::Denied), "got {err:?}");
+}
+
+/// H3: a POST to a missing container path keeps today's auto-creation of the
+/// intermediate container — it matches `PUT`'s behaviour on missing parents.
+#[test]
+fn a_post_to_a_missing_container_auto_creates_it() {
+    let (_m, _d, store) = pod();
+    let created = ldp::append(
+        &store,
+        None,
+        BASE,
+        "/~/newdir/",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+        Some("note"),
+        ldp::RequestedKind::Auto,
+    )
+    .unwrap();
+    assert_eq!(created.member, format!("{ROOT}newdir/note"));
+    assert!(meta(&store, &format!("{ROOT}newdir/")).is_some());
 }
 
 #[test]
@@ -462,7 +775,9 @@ fn append_permission_does_not_confer_replace() {
             &bob,
             NOTE,
             "text/turtle",
-            ROOT
+            ROOT,
+            None,
+            ldp::RequestedKind::Auto,
         )
         .is_ok(),
         "Append should permit POST"

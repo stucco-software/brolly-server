@@ -418,12 +418,15 @@ fn posting_a_binary_to_a_container_mints_a_member() {
         PNG,
         "image/png",
         ROOT,
+        None,
+        ldp::RequestedKind::Auto,
     )
     .unwrap();
 
-    assert!(created.starts_with(&format!("{BASE}/~/media/")));
+    assert!(created.member.starts_with(&format!("{BASE}/~/media/")));
+    assert_eq!(created.kind, Kind::NonRdfSource);
     let members = members(&pod.store, &format!("{BASE}/~/media/"));
-    assert!(members.contains(&created));
+    assert!(members.contains(&created.member));
 }
 
 #[test]
@@ -455,8 +458,12 @@ fn a_binary_cannot_be_patched() {
     );
 }
 
+/// 5c H3: POST is a container method. A document-shaped target is
+/// `NotAPostTarget` — the non-standard append is gone, and the insertion it
+/// performed is a `PATCH` with `INSERT` — whatever the body's type would have
+/// said about it.
 #[test]
-fn a_non_rdf_post_to_a_document_is_not_rdf() {
+fn a_post_to_a_document_is_not_a_post_target_whatever_the_body() {
     let pod = pod();
     ldp::put(
         &pod.store,
@@ -478,9 +485,11 @@ fn a_non_rdf_post_to_a_document_is_not_rdf() {
         PNG,
         "image/png",
         ROOT,
+        None,
+        ldp::RequestedKind::Auto,
     )
     .unwrap_err();
-    assert!(matches!(err, LdpError::NotRdf), "got {err:?}");
+    assert!(matches!(err, LdpError::NotAPostTarget), "got {err:?}");
 }
 
 /// `describe` takes no `BlobStore` — that is the point. `OPTIONS` on a 40 MB

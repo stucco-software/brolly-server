@@ -458,6 +458,18 @@ fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Response {
         LdpError::PreconditionFailed => {
             (StatusCode::PRECONDITION_FAILED, "precondition failed").into_response()
         }
+        // `post` answers this itself, with the target's `Allow`: RFC 9110
+        // §15.5.6 requires one on a 405, and it depends on modes this function
+        // can't see. Nothing else produces it, so reaching here means a new
+        // producer that needs the same treatment.
+        LdpError::NotAPostTarget => {
+            tracing::error!("NotAPostTarget reached ldp_error; its caller must build the 405");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+        // The body names the slug and the rule (spec 5c H1): a client that
+        // asked for a name it can't have needs to know which and why, not
+        // just that it can't.
+        LdpError::InvalidSlug(rule) => (StatusCode::BAD_REQUEST, rule).into_response(),
         LdpError::Store(e) => {
             tracing::error!(error = %e, "ldp storage failure");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
@@ -487,6 +499,121 @@ fn refuse_deletion(request: &PodRequest, path: &str) -> Response {
         "the storage root and its ACL can't be deleted",
     )
         .into_response()
+}
+
+/// A 405 for a POST to a document-shaped target (spec 5c, H3): POST is a
+/// container method, and the append it used to perform is a `PATCH` with
+/// `INSERT`.
+///
+/// Only reached after `ldp` has authorized the POST, so a caller with no mode
+/// at all got 401 or 403 before `NotAPostTarget` could be returned, and the
+/// `Allow` here — from the same builder `OPTIONS` uses, whose `POST` line is
+/// the same container-shape rule — tells the caller nothing an `OPTIONS`
+/// wouldn't, and cannot disagree with it.
+fn refuse_post(request: &PodRequest, path: &str) -> Response {
+    let description = match ldp::describe(&request.pod, &request.base, path, &request.subject) {
+        Ok(description) => description,
+        Err(e) => return ldp_error(e, request.authenticated, &request.apex),
+    };
+    let resource = format!("{}{path}", request.base);
+    let allow = allowed(&description, &resource, &request.storage_root).join(", ");
+    (
+        StatusCode::METHOD_NOT_ALLOWED,
+        [(header::ALLOW, allow)],
+        "POST is a container method; POST to this resource is not supported",
+    )
+        .into_response()
+}
+
+/// Does this request's `Link` headers ask for a container member (spec 5c,
+/// H2)?
+///
+/// Parsed per RFC 8288: several `Link` fields, comma-separated values within
+/// one, quoted parameter values, and a `rel` that is itself a
+/// space-separated token list. The type target must match `ldp:BasicContainer`
+/// or `ldp:Container` **exactly** — never by substring — and only a `rel`
+/// token that is `type` decides anything. Any other type target is ignored:
+/// the body's content type decides document vs binary, because that is the
+/// one creation fact a body *can* express.
+fn link_requests_container(headers: &HeaderMap) -> bool {
+    headers
+        .get_all(header::LINK)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .any(|value| {
+            split_link_value(value, ',')
+                .iter()
+                .any(|field| field_names_container(field))
+        })
+}
+
+/// One comma-separated `Link` value: does it name a container type?
+fn field_names_container(field: &str) -> bool {
+    let mut params = split_link_value(field, ';').into_iter();
+    let Some(target) = params.next().and_then(|p| link_target(p)) else {
+        return false;
+    };
+    if target != vocab::LDP_BASIC_CONTAINER && target != vocab::LDP_CONTAINER {
+        return false;
+    }
+    params.any(|param| {
+        let mut name_value = param.splitn(2, '=');
+        if !name_value
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .eq_ignore_ascii_case("rel")
+        {
+            return false;
+        }
+        match name_value.next() {
+            // `rel="type"` or `rel="alternate type"`: a token list, quoted
+            // or bare, case-insensitive (RFC 8288 §3).
+            Some(value) => unquote(value)
+                .split_whitespace()
+                .any(|token| token.eq_ignore_ascii_case("type")),
+            None => false,
+        }
+    })
+}
+
+/// The `<iri>` at the head of a `Link` field, if there is one.
+fn link_target(param: &str) -> Option<&str> {
+    let param = param.trim();
+    param.strip_prefix('<')?.strip_suffix('>')
+}
+
+/// Strip one pair of surrounding double quotes, if the value carries them.
+fn unquote(value: &str) -> &str {
+    let value = value.trim();
+    value
+        .strip_prefix('"')
+        .and_then(|v| v.strip_suffix('"'))
+        .unwrap_or(value)
+}
+
+/// Split a `Link` value on `sep`, outside a `<...>` target or a `"..."`
+/// quoted parameter (RFC 8288's `link-value` grammar: a URI-Reference may
+/// carry separators, and a quoted string may carry anything).
+fn split_link_value(value: &str, sep: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut in_target = false;
+    let mut in_quotes = false;
+    for (i, b) in value.char_indices() {
+        match b {
+            '<' => in_target = true,
+            '>' => in_target = false,
+            '"' => in_quotes = !in_quotes,
+            c if c == sep && !in_target && !in_quotes => {
+                parts.push(&value[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&value[start..]);
+    parts
 }
 
 /// One `WAC-Allow` field value (WAC §6.1).
@@ -528,9 +655,13 @@ const ACCEPT_PATCH: &str = "text/n3, application/sparql-update";
 
 /// H4: the methods this caller may use on this target, in a fixed order.
 ///
-/// Computed from the caller's modes and whether the target exists. Nothing is
-/// decided by kind: `POST` is offered on documents too, because `append_in`
-/// appends to one and [`post`] routes it.
+/// Computed from the caller's modes, whether the target exists, and — for
+/// `POST` alone — the target's shape: POST is a container method (spec 5c,
+/// H3), offered iff the target IRI ends in `/` and the caller holds
+/// Append-or-Write on it. Existence is irrelevant, the same way it is for
+/// `PUT` and `PATCH`, the other creation methods: a missing container-shaped
+/// target is POSTable, and its intermediate containers are auto-created on
+/// the way in.
 fn allowed(description: &Description, resource: &str, storage_root: &str) -> Vec<&'static str> {
     let exists = description.exists();
     let write = description.holds(AccessMode::Write);
@@ -541,9 +672,7 @@ fn allowed(description: &Description, resource: &str, storage_root: &str) -> Vec
     if write {
         methods.push("PUT");
     }
-    // Needs an existing target: there is no container to mint a member in,
-    // and no document to append to.
-    if exists && (write || description.holds(AccessMode::Append)) {
+    if storage::is_container(resource) && (write || description.holds(AccessMode::Append)) {
         methods.push("POST");
     }
     // Not offered to an Append-only caller, though the protocol would allow
@@ -979,7 +1108,14 @@ pub async fn put(
     }
 }
 
-/// `POST /~/*path`
+/// `POST /~/*path` — create a member of a container (spec 5c, H1–H4).
+///
+/// `Slug` names the member when it can be made one safe segment; `Link
+/// rel="type"` naming an LDP container class asks for a container. A
+/// document-shaped target is a 405 with the target's own `Allow`. The 201
+/// carries the same `Link` set a creating `PUT` sends, so a client that just
+/// made a container learns its kind and its ACL IRI in the response that
+/// minted it.
 pub async fn post(
     State(state): State<AppState>,
     method: Method,
@@ -996,6 +1132,15 @@ pub async fn post(
     let Some(content_type) = content_type(&headers, &body, true) else {
         return missing_content_type();
     };
+    // Read before the write; `append_in` refuses a document-shaped target
+    // (H3) before it validates either, so an unpostable target is refused
+    // whatever the headers say.
+    let slug = headers.get("slug").and_then(|value| value.to_str().ok());
+    let requested = if link_requests_container(&headers) {
+        ldp::RequestedKind::Container
+    } else {
+        ldp::RequestedKind::Auto
+    };
 
     match ldp::append_if(
         &request.pod,
@@ -1007,8 +1152,35 @@ pub async fn post(
         content_type,
         &request.storage_root,
         &preconditions(&headers),
+        slug,
+        requested,
     ) {
-        Ok(created) => (StatusCode::CREATED, [(header::LOCATION, created)]).into_response(),
+        Ok(ldp::Minted { member, kind }) => {
+            let mut response =
+                (StatusCode::CREATED, [(header::LOCATION, member.clone())]).into_response();
+            // H4: the same `Link` set a creating `PUT` sends (5b H6), so the
+            // client learns what it made and where its rules are without a
+            // second request. A `links` that fails to build doesn't undo the
+            // write: the 201 and its `Location` still go out.
+            apply(
+                &mut response,
+                vec![(
+                    header::LINK,
+                    links(
+                        &request.base,
+                        &member,
+                        &request.storage_root,
+                        &request.webid,
+                        Some(kind),
+                    ),
+                )],
+            );
+            response
+        }
+        // H3: `append_in` already ran the WAC check, so a caller with no mode
+        // saw 401 or 403 before this. The `Allow` is the same builder `OPTIONS`
+        // uses, and its `POST` line follows the same container-shape rule.
+        Err(LdpError::NotAPostTarget) => refuse_post(&request, &path),
         Err(e) => ldp_error(e, request.authenticated, &request.apex),
     }
 }

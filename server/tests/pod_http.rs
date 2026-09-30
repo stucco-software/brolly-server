@@ -1924,20 +1924,21 @@ async fn options_tells_this_caller_what_it_may_do_with_this_resource() {
 
     let (status, _, headers) = h.send("OPTIONS", "/~/note", None, true).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "CTS accepts 204 or 200");
+    // 5c H3: POST is a container method, so a document's `Allow` no longer
+    // offers it — and `Accept-Post` went with it.
     assert_eq!(
         header_of(&headers, "allow"),
-        "GET, HEAD, PUT, POST, PATCH, DELETE, OPTIONS"
+        "GET, HEAD, PUT, PATCH, DELETE, OPTIONS"
     );
     // Each Accept-* is sent because its method is in Allow.
     assert_eq!(
         header_of(&headers, "accept-patch"),
         "text/n3, application/sparql-update"
     );
-    let post = header_of(&headers, "accept-post");
-    assert!(post.contains("text/turtle"), "got: {post}");
-    // ADR 0007: RDF/XML is served and never parsed, so advertising it as a
-    // write body would be advertising a guaranteed 415.
-    assert!(!post.contains("rdf+xml"), "got: {post}");
+    assert!(
+        headers.get("accept-post").is_none(),
+        "a document is not a POST target"
+    );
     assert_eq!(
         header_of(&headers, "accept-put"),
         "*/*",
@@ -1958,7 +1959,29 @@ async fn options_offers_creation_where_nothing_exists_yet() {
     assert_eq!(header_of(&headers, "accept-put"), "*/*");
     assert!(
         headers.get("accept-post").is_none(),
-        "there is nothing to post into"
+        "a missing document-shaped target is not a POST target either (5c H3)"
+    );
+
+    // 5c H3: a missing container-shaped target is POSTable — existence is
+    // irrelevant to the creation methods, the same way it is for `PUT` and
+    // `PATCH` — and the intermediate containers are auto-created on the way in.
+    let (status, _, headers) = h.send("OPTIONS", "/~/newdir/", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "a writer may ask");
+    assert_eq!(header_of(&headers, "allow"), "PUT, POST, PATCH, OPTIONS");
+    assert!(header_of(&headers, "accept-post").contains("text/turtle"));
+
+    let (status, _, headers) = h
+        .send_if(
+            "POST",
+            "/~/newdir/",
+            Some(("text/turtle", NOTE)),
+            &[("slug", "note")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "the offer was honest");
+    assert_eq!(
+        header_of(&headers, "location"),
+        format!("{ROOT}newdir/note")
     );
 
     let (status, _, _) = h.send("GET", "/~/not-yet", None, true).await;
@@ -2002,7 +2025,18 @@ async fn the_storage_root_and_its_own_acl_are_never_offered_for_deletion() {
         // 5a's NotRdf refusal, made discoverable: both take RDF and only RDF.
         let put = header_of(&headers, "accept-put");
         assert!(!put.contains("*/*"), "{path} accepts anything: {put}");
-        assert_eq!(put, header_of(&headers, "accept-post"), "{path}");
+        // Only the root is a container (5c H3): POST is a container method,
+        // offered there and advertised with the same RDF list, and offered
+        // nowhere on the root's own ACL.
+        if path == "/~/" {
+            assert_eq!(put, header_of(&headers, "accept-post"), "{path}");
+        } else {
+            assert!(!allow.contains("POST"), "{path} offered POST: {allow}");
+            assert!(
+                headers.get("accept-post").is_none(),
+                "{path} advertised POST"
+            );
+        }
     }
 
     // Any other ACL may be deleted by a caller with Control. WAC §3.2 makes
@@ -2080,6 +2114,270 @@ async fn an_append_only_caller_can_discover_that_it_may_post() {
     assert_eq!(status, StatusCode::CREATED);
 }
 
+/// 5c H1: a POST's `Slug` names the minted member, and the 201's `Location`
+/// is the name the client can bookmark and reconstruct.
+#[tokio::test]
+async fn a_slug_names_the_minted_member() {
+    let h = harness().await;
+    let (status, _, headers) = h
+        .send_if(
+            "POST",
+            "/~/",
+            Some(("text/turtle", NOTE)),
+            &[("slug", "hello")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(header_of(&headers, "location"), format!("{ROOT}hello"));
+
+    // A taken name is disambiguated `-1`, `-2`, … before any extension — the
+    // contract CSS implements and `solid-client` depends on.
+    for expect in ["note.ttl", "note-1.ttl", "note-2.ttl"] {
+        let (status, _, headers) = h
+            .send_if(
+                "POST",
+                "/~/",
+                Some(("text/turtle", NOTE)),
+                &[("slug", "note.ttl")],
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED);
+        assert_eq!(header_of(&headers, "location"), format!("{ROOT}{expect}"));
+    }
+}
+
+/// H1: the slug is raw bytes, not a pre-encoded segment, so a `%` survives as
+/// `%25` — lossless, and unambiguous where passing it through would not be.
+#[tokio::test]
+async fn a_slug_is_percent_encoded_not_passed_through() {
+    let h = harness().await;
+    let (status, _, headers) = h
+        .send_if(
+            "POST",
+            "/~/",
+            Some(("text/turtle", NOTE)),
+            &[("slug", "a%20b")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    assert_eq!(header_of(&headers, "location"), format!("{ROOT}a%2520b"));
+}
+
+/// H1: a slug that cannot be made one safe segment is a 400 naming the slug
+/// and the rule — a silent UUID would leave the client building links to a
+/// name it was never given.
+#[tokio::test]
+async fn slugs_that_cannot_be_a_segment_are_refused() {
+    let h = harness().await;
+    for slug in ["a/b", "a?b", "a#b", ".", "..", "note.acl", "a\tb"] {
+        let (status, body, _) = h
+            .send_if(
+                "POST",
+                "/~/",
+                Some(("text/turtle", NOTE)),
+                &[("slug", slug)],
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{slug:?}: {body}");
+        assert!(
+            body.contains(slug.trim()),
+            "{slug:?}: the 400 must name it: {body}"
+        );
+    }
+    // Nothing was minted by any of them.
+    let (_, body, _) = h.send("GET", "/~/", None, true).await;
+    assert!(!body.contains("note.acl"), "a refused slug landed: {body}");
+}
+
+/// H2: `Link rel="type"` naming an LDP container class creates a container —
+/// the way every Solid library does — with the trailing slash, the container
+/// types on the 201 (H4), and members it can hold.
+#[tokio::test]
+async fn a_link_typed_post_creates_a_container() {
+    let h = harness().await;
+    let (status, _, headers) = h
+        .send_if(
+            "POST",
+            "/~/",
+            Some(("text/turtle", "")),
+            &[(
+                "link",
+                r#"<http://www.w3.org/ns/ldp#BasicContainer>; rel="type""#,
+            )],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let location = header_of(&headers, "location");
+    assert!(
+        location.ends_with('/'),
+        "a container's IRI ends in `/`: {location}"
+    );
+    let link = header_of(&headers, "link");
+    assert!(link.contains("ldp#BasicContainer"), "got: {link}");
+    assert!(link.contains("ldp#Container"), "got: {link}");
+    // H4: the 201's `Link` set names the ACL too — the client learns where
+    // the rules go in the same round trip that minted the container.
+    assert!(link.contains(r#"rel="acl""#), "got: {link}");
+
+    // It is a container: it holds a member.
+    let path = location.strip_prefix(BASE).unwrap();
+    let (status, _, headers) = h
+        .send_if(
+            "POST",
+            path,
+            Some(("text/turtle", NOTE)),
+            &[("slug", "note")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "a container holds members");
+    assert_eq!(header_of(&headers, "location"), format!("{location}note"));
+}
+
+/// H2: only an exact `ldp:BasicContainer`/`ldp:Container` target with a `rel`
+/// token list that includes `type` decides anything. A target that merely
+/// *contains* the IRI, or a `rel` that is not `type`, is ignored — the body's
+/// content type decides, as it always has.
+#[tokio::test]
+async fn only_an_exact_container_type_link_decides() {
+    let h = harness().await;
+    for link in [
+        r#"<http://www.w3.org/ns/ldp#BasicContainerish>; rel="type""#,
+        r#"<http://www.w3.org/ns/ldp#NotBasicContainer>; rel="type""#,
+        r#"<http://www.w3.org/ns/ldp#BasicContainer>; rel="alternate""#,
+        r#"<http://www.w3.org/ns/ldp#BasicContainer>; title="type""#,
+    ] {
+        let (status, _, headers) = h
+            .send_if(
+                "POST",
+                "/~/",
+                Some(("text/turtle", NOTE)),
+                &[("link", link)],
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{link}");
+        let location = header_of(&headers, "location");
+        assert!(
+            !location.ends_with('/'),
+            "{link}: decided anyway: {location}"
+        );
+    }
+
+    // The positive control: the rel is a token list, quoted or bare, and the
+    // deciding field may sit among others on the same header — it decides.
+    for link in [
+        r#"<http://www.w3.org/ns/ldp#Container>; rel="alternate type""#,
+        r#"<http://www.w3.org/ns/ldp#BasicContainer>; rel=type"#,
+        r#"<http://example.org/x>; rel="describedby", <http://www.w3.org/ns/ldp#BasicContainer>; rel="type""#,
+    ] {
+        let (status, _, headers) = h
+            .send_if("POST", "/~/", Some(("text/turtle", "")), &[("link", link)])
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{link}");
+        assert!(
+            header_of(&headers, "location").ends_with('/'),
+            "{link}: a container was not minted"
+        );
+    }
+}
+
+/// H2: a container-typed POST takes RDF or empty — a binary body is the
+/// existing 415, whatever the `Link` header says.
+#[tokio::test]
+async fn a_container_typed_post_takes_rdf_only() {
+    let h = harness().await;
+    let (status, body, _) = h
+        .send_if(
+            "POST",
+            "/~/",
+            Some(("image/png", "not really a png")),
+            &[(
+                "link",
+                r#"<http://www.w3.org/ns/ldp#BasicContainer>; rel="type""#,
+            )],
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+}
+
+/// H3: POST is a container method. A document-shaped target — existing or
+/// not — is a 405 whose `Allow` comes from the same builder `OPTIONS` uses,
+/// so the two cannot disagree.
+#[tokio::test]
+async fn a_post_to_a_document_is_a_405_with_the_targets_allow() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, body, headers) = h
+        .send("POST", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{body}");
+    let allow = allowed(&headers);
+    assert!(!allow.iter().any(|m| m == "POST"), "{allow:?}");
+    for method in ["GET", "HEAD", "PUT", "PATCH", "DELETE", "OPTIONS"] {
+        assert!(
+            allow.iter().any(|m| m == method),
+            "{method} missing: {allow:?}"
+        );
+    }
+    // The append it used to perform is a `PATCH` with `INSERT` now, and it
+    // didn't land anything on the way out.
+    let (status, body, _) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.matches("Written over HTTP").count(), 1, "{body}");
+
+    // Absent target, same answer: the 405 is about the method and the shape.
+    let (status, _, headers) = h
+        .send("POST", "/~/absent", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(header_of(&headers, "allow"), "PUT, PATCH, OPTIONS");
+}
+
+/// H3: the 405 comes after authorization, so a caller with no mode at all
+/// still sees 401 — the 405 must not become an existence oracle.
+#[tokio::test]
+async fn a_post_to_a_document_refuses_an_anonymous_caller_first() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let (status, _, headers) = h
+        .send("POST", "/~/note", Some(("text/turtle", NOTE)), false)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(
+        headers.get("www-authenticate").is_some(),
+        "401 carries its challenge (5b H1)"
+    );
+}
+
+/// H4: a creating POST carries the same `Link` set a creating `PUT` sends:
+/// what it made, where its rules are, which storage it belongs to.
+#[tokio::test]
+async fn a_creating_post_carries_the_link_set() {
+    let h = harness().await;
+    let (status, _, headers) = h
+        .send_if(
+            "POST",
+            "/~/",
+            Some(("text/turtle", NOTE)),
+            &[("slug", "posted")],
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let link = header_of(&headers, "link");
+    assert!(
+        link.contains(r#"<http://www.w3.org/ns/ldp#Resource>; rel="type""#),
+        "got: {link}"
+    );
+    assert!(
+        link.contains(r#"<http://www.w3.org/ns/ldp#RDFSource>; rel="type""#),
+        "got: {link}"
+    );
+    assert!(link.contains(r#"rel="acl""#), "got: {link}");
+    assert!(link.contains("storageDescription"), "got: {link}");
+}
+
 /// `OPTIONS` must not become the existence oracle the rest of the surface
 /// refuses to be. A caller holding nothing gets H1's refusal, the same one
 /// whether or not the target is there, and no `Allow` with it.
@@ -2111,18 +2409,28 @@ async fn get_and_head_carry_the_same_affordances_as_options() {
     let h = harness().await;
     h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
         .await;
+    h.send("PUT", "/~/docs/", Some(("text/turtle", "")), true)
+        .await;
 
-    let (_, _, options) = h.send("OPTIONS", "/~/note", None, true).await;
-    for method in ["GET", "HEAD"] {
-        let (status, _, headers) = h.send(method, "/~/note", None, true).await;
-        assert_eq!(status, StatusCode::OK, "{method}");
-        for name in ["allow", "accept-patch", "accept-post", "accept-put"] {
-            assert!(options.get(name).is_some(), "OPTIONS sent no {name}");
-            assert_eq!(
-                headers.get(name),
-                options.get(name),
-                "{method} and OPTIONS disagree about {name}"
-            );
+    // A document carries no `Accept-Post` (5c H3: POST is a container
+    // method); a container does. Both must agree with `OPTIONS` either way.
+    for (path, with_post) in [("/~/note", false), ("/~/docs/", true)] {
+        let (_, _, options) = h.send("OPTIONS", path, None, true).await;
+        assert_eq!(
+            options.get("accept-post").is_some(),
+            with_post,
+            "{path}: a document is not a POST target (5c H3)"
+        );
+        for method in ["GET", "HEAD"] {
+            let (status, _, headers) = h.send(method, path, None, true).await;
+            assert_eq!(status, StatusCode::OK, "{method} {path}");
+            for name in ["allow", "accept-patch", "accept-post", "accept-put"] {
+                assert_eq!(
+                    headers.get(name),
+                    options.get(name),
+                    "{method} and OPTIONS disagree about {name} on {path}"
+                );
+            }
         }
     }
 }
@@ -2874,15 +3182,35 @@ async fn a_304_carries_what_the_200_carried() {
     assert_eq!(status, StatusCode::NOT_MODIFIED);
     assert!(body.is_empty(), "a 304 has no body: {body}");
 
-    for name in [
-        "etag",
-        "last-modified",
-        "link",
-        "allow",
-        "accept-patch",
-        "accept-post",
-        "accept-put",
-        "wac-allow",
+    // 5c H3 removed `Accept-Post` from a document — POST is a container
+    // method — so the container case is where that header's 200/304 agreement
+    // is checked.
+    h.send("PUT", "/~/docs/", Some(("text/turtle", "")), true)
+        .await;
+    let (_, _, ok_docs) = h
+        .send_if("GET", "/~/docs/", None, &[("accept", "text/turtle")])
+        .await;
+    let (_, _, not_modified_docs) = h
+        .send_if(
+            "GET",
+            "/~/docs/",
+            None,
+            &[
+                ("accept", "text/turtle"),
+                ("if-none-match", ok_docs[header::ETAG].to_str().unwrap()),
+            ],
+        )
+        .await;
+
+    for (name, (ok, not_modified)) in [
+        ("etag", (&ok, &not_modified)),
+        ("last-modified", (&ok, &not_modified)),
+        ("link", (&ok, &not_modified)),
+        ("allow", (&ok, &not_modified)),
+        ("accept-patch", (&ok, &not_modified)),
+        ("accept-post", (&ok_docs, &not_modified_docs)),
+        ("accept-put", (&ok, &not_modified)),
+        ("wac-allow", (&ok, &not_modified)),
     ] {
         let on_200 = ok.get_all(name).iter().collect::<Vec<_>>();
         let on_304 = not_modified.get_all(name).iter().collect::<Vec<_>>();

@@ -90,6 +90,19 @@ pub enum LdpError {
     /// An `If-Match` or `If-None-Match` didn't hold (412). Evaluated after WAC,
     /// so only a caller holding the needed mode can see it.
     PreconditionFailed,
+    /// A POST to a target whose IRI does not end in `/` (405, spec 5c H3).
+    /// POST is a container method; the non-standard append to a document is
+    /// gone, and the insertion it performed is a `PATCH` with `INSERT`.
+    /// Produced after the WAC check, so a caller with no mode at all still
+    /// sees [`LdpError::Denied`], and before any `Slug` or `Link` validation —
+    /// the method is wrong for the target whatever the headers say.
+    NotAPostTarget,
+    /// A `Slug` that cannot be made one safe path segment (400, spec 5c H1):
+    /// it spans segments, names a query or fragment, carries control bytes,
+    /// is `.` or `..`, is over the 128-byte cap, or ends in `.acl`. The body
+    /// names the offending slug and the rule it broke, because a silent UUID
+    /// would leave the client building links to a name it was never given.
+    InvalidSlug(String),
 }
 
 impl std::fmt::Display for LdpError {
@@ -118,6 +131,11 @@ impl std::fmt::Display for LdpError {
             ),
             LdpError::BlobMissing => write!(f, "the blob was released before it was recorded"),
             LdpError::PreconditionFailed => write!(f, "precondition failed"),
+            LdpError::NotAPostTarget => write!(
+                f,
+                "POST is a container method; this target does not end in `/`"
+            ),
+            LdpError::InvalidSlug(rule) => write!(f, "{rule}"),
         }
     }
 }
@@ -941,14 +959,44 @@ fn refuse_rdf_xml(content_type: &str) -> Result<(), LdpError> {
     }
 }
 
-/// `POST` — create a member of a container, or append triples to a document.
+/// What a POST's `Link rel="type"` asked the minted member to be (spec 5c,
+/// H2). The one creation fact a body cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequestedKind {
+    /// `rel="type"` naming `ldp:BasicContainer` or `ldp:Container`: the
+    /// member is a container whatever the body's content type says, its IRI
+    /// ends in `/`, and its content goes through `Content::Container`, so the
+    /// containment protections apply to it from birth.
+    Container,
+    /// Nothing asked: the body's content type decides document or binary,
+    /// as it always has.
+    Auto,
+}
+
+/// What a POST minted (spec 5c, H4): the member's IRI, and its kind, so the
+/// 201 can carry the same `Link` set a creating `PUT` sends — a client that
+/// just made a container learns its ACL IRI in the same response that minted
+/// it, without a second request.
+#[derive(Debug, Clone)]
+pub struct Minted {
+    /// The minted member's full IRI: the `Location` the 201 answers with.
+    pub member: String,
+    /// What was minted, for the 201's `Link rel="type"`.
+    pub kind: Kind,
+}
+
+/// `POST` — create a member of a container (spec 5c, H1–H4).
 ///
 /// Requires Append, which Write satisfies (`acl:Write` implies `acl:Append`).
+/// The member's name is the sanitized `Slug` when there is one that can be
+/// made a safe segment, disambiguated on collision, and a UUID otherwise.
+/// `requested` says whether the `Link rel="type"` header asked for a
+/// container. A document-shaped target is [`LdpError::NotAPostTarget`].
 ///
 /// `preconditions` is evaluated in [`append_in`], after the WAC check and
-/// before anything is written. It is about the container posted to (or the
-/// document appended to), not the member a POST mints.
-// One over `clippy.toml`'s threshold. `append` keeps the old eight for every
+/// before anything is written. It is about the container posted to, not the
+/// member a POST mints.
+// Two over `clippy.toml`'s threshold. `append` keeps the old eight for every
 // caller that isn't HTTP; folding the request into a struct is 5b's
 // HTTP-surface work.
 #[allow(clippy::too_many_arguments)]
@@ -962,10 +1010,9 @@ pub fn append_if(
     content_type: &str,
     storage_root: &str,
     preconditions: &Preconditions,
-) -> Result<String, LdpError> {
-    // Appending to a document takes RDF; a container's new member may be a
-    // binary.
-    let rdf_only = !storage::is_container(&format!("{base}{path}"));
+    slug: Option<&str>,
+    requested: RequestedKind,
+) -> Result<Minted, LdpError> {
     let target = Target {
         pod,
         base,
@@ -973,10 +1020,40 @@ pub fn append_if(
         subject,
         storage_root,
     };
-    let attempt = || -> Result<String, LdpError> {
-        let body = target.prepare(blobs, rdf_only, AccessMode::Append, body, content_type)?;
+    let attempt = || -> Result<Minted, LdpError> {
+        // A container-typed POST takes RDF or empty (H2); a plain POST to a
+        // container may mint a binary member, as it always has. A
+        // document-shaped target is prepared not at all: `append_in` refuses
+        // it (H3) before it reads `body`, so nothing about the body decides
+        // anything and no blob bytes reach the disk for a request that cannot
+        // land. The empty Turtle body stands in for the body that is never
+        // looked at.
+        let body = if storage::is_container(&format!("{base}{path}")) {
+            target.prepare(
+                blobs,
+                requested == RequestedKind::Container,
+                AccessMode::Append,
+                body,
+                content_type,
+            )?
+        } else {
+            Body::Rdf {
+                bytes: Vec::new(),
+                format: ReadFormat::Turtle,
+            }
+        };
         let written = in_write(pod, |w| {
-            append_in(w, base, path, subject, &body, storage_root, preconditions)
+            append_in(
+                w,
+                base,
+                path,
+                subject,
+                &body,
+                storage_root,
+                preconditions,
+                slug,
+                requested,
+            )
         });
         release_refused_bytes(pod, &body, &written);
         written
@@ -988,6 +1065,7 @@ pub fn append_if(
 }
 
 /// [`append_if`] with no preconditions.
+#[allow(clippy::too_many_arguments)]
 pub fn append(
     pod: &Pod,
     blobs: Option<&BlobStore>,
@@ -997,7 +1075,9 @@ pub fn append(
     body: &[u8],
     content_type: &str,
     storage_root: &str,
-) -> Result<String, LdpError> {
+    slug: Option<&str>,
+    requested: RequestedKind,
+) -> Result<Minted, LdpError> {
     append_if(
         pod,
         blobs,
@@ -1008,18 +1088,25 @@ pub fn append(
         content_type,
         storage_root,
         &Preconditions::NONE,
+        slug,
+        requested,
     )
 }
 
 /// [`append`] inside the caller's write.
 ///
-/// POST to a container is a `put` of the minted member. POST to a document is
-/// stage 0's append, unchanged until 5c, and takes RDF only.
+/// POST to a container is a `put` of the minted member: RDF or binary by the
+/// body, a container when `requested` says the `Link rel="type"` header asked
+/// for one (spec 5c, H2). POST to a document-shaped target is
+/// [`LdpError::NotAPostTarget`] (H3): POST is a container method, and the
+/// insertion it used to perform is a `PATCH` with `INSERT`.
 ///
 /// `preconditions` is evaluated after the WAC check and before anything is
 /// written, against this transaction's view of the target, so no other write
 /// can land between the check and this one. Pass `Preconditions::NONE` when not
 /// answering an HTTP request.
+// One over `clippy.toml`'s threshold, like `append_if` above it.
+#[allow(clippy::too_many_arguments)]
 pub fn append_in(
     w: &mut PodWrite<'_>,
     base: &str,
@@ -1028,7 +1115,9 @@ pub fn append_in(
     body: &Body,
     storage_root: &str,
     preconditions: &Preconditions,
-) -> Result<String, LdpError> {
+    slug: Option<&str>,
+    requested: RequestedKind,
+) -> Result<Minted, LdpError> {
     let target = format!("{base}{path}");
     if !target.starts_with(storage_root) {
         return Err(LdpError::OutsideStorage);
@@ -1036,17 +1125,54 @@ pub fn append_in(
     if !check(&*w, base, path, subject, AccessMode::Append)? {
         return Err(LdpError::Denied);
     }
-    // A POST's precondition is about the container (or the document appended
-    // to), which is what the client addressed and holds a tag for.
+    // H3: the refusal comes after the WAC check — a caller with no mode at
+    // all still sees `Denied` — and before any `Slug` or `Link` validation:
+    // the method is wrong for the target whatever the headers say. It leaks
+    // nothing an `OPTIONS` would not; the target's kind is decided by the
+    // IRI's shape.
+    if !storage::is_container(&target) {
+        return Err(LdpError::NotAPostTarget);
+    }
+    // H1: the slug is sanitized (or refused) before the preconditions run,
+    // and the preconditions before anything is written. A POST's precondition
+    // is about the container, which is what the client addressed and holds a
+    // tag for.
+    let slug = sanitize_slug(slug)?;
     let current = w.meta(&target)?.map(|meta| meta.version);
     preconditions.check_write(conditional::Method::Post, current.as_deref())?;
 
-    if storage::is_container(&target) {
-        let member = format!("{target}{}", uuid::Uuid::new_v4());
-        match body {
+    // The member's name: the sanitized slug, disambiguated against what
+    // already exists (H1), or a UUID when the client asked for none.
+    let member = match slug {
+        Some(slug) => disambiguate(&*w, &target, &slug, requested)?,
+        None => match requested {
+            RequestedKind::Container => format!("{target}{}/", uuid::Uuid::new_v4()),
+            RequestedKind::Auto => format!("{target}{}", uuid::Uuid::new_v4()),
+        },
+    };
+
+    match requested {
+        // H2: the content goes through `Content::Container`, so
+        // `container_body`'s containment protections apply to it from birth.
+        // A binary body never gets this far: `prepare` refused it with the
+        // existing `NotRdf` 415.
+        RequestedKind::Container => {
+            let quads = rdf_quads(body, &member)?;
+            let kept = container_body(&*w, &member, quads)?;
+            w.put(&member, Content::Container(&kept))?;
+            Ok(Minted {
+                member,
+                kind: Kind::Container,
+            })
+        }
+        RequestedKind::Auto => match body {
             Body::Rdf { .. } => {
                 let quads = rdf_quads(body, &member)?;
                 w.put(&member, Content::Rdf(&quads))?;
+                Ok(Minted {
+                    member,
+                    kind: Kind::RdfSource,
+                })
             }
             Body::Binary(blob) => {
                 w.put(
@@ -1057,14 +1183,116 @@ pub fn append_in(
                         byte_size: blob.byte_size,
                     }),
                 )?;
+                Ok(Minted {
+                    member,
+                    kind: Kind::NonRdfSource,
+                })
+            }
+        },
+    }
+}
+
+/// Sanitize a POST's `Slug` into one safe path segment (spec 5c, H1).
+///
+/// `None` in, `None` out: no slug, an empty one, or one that is only
+/// whitespace mints a UUID, as it always has. A slug that cannot be made a
+/// segment — it spans segments, names a query or fragment, carries control
+/// bytes, is `.` or `..`, is over the 128-byte cap, or ends in `.acl` — is a
+/// 400 naming the slug and the rule, because a silent UUID would leave the
+/// client building links to a name it was never given. What survives is the
+/// slug's raw bytes percent-encoded into a segment: bytes outside RFC 3986
+/// unreserved are encoded, `%` included (`%` → `%25`), so `Slug: a%20b` yields
+/// `a%2520b` — lossless, and unambiguous where passing the `%` through would
+/// not be. The slug is a *hint* (LDP §4.2.3 makes the server's naming final),
+/// but a representable one.
+fn sanitize_slug(slug: Option<&str>) -> Result<Option<String>, LdpError> {
+    let Some(slug) = slug.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let refuse = |rule: &str| {
+        LdpError::InvalidSlug(format!("the Slug header must be one path segment; {rule}"))
+    };
+    if slug == "." || slug == ".." {
+        return Err(refuse(&format!(
+            "`{slug}` is a dot segment, not a name; a client resolving it would walk out of the pod or normalize it away"
+        )));
+    }
+    if slug.len() > 128 {
+        return Err(refuse(&format!(
+            "`{}` is {} bytes; the cap is 128",
+            slug.chars().take(48).collect::<String>(),
+            slug.len()
+        )));
+    }
+    if slug.ends_with(".acl") {
+        return Err(refuse(&format!(
+            "`{slug}` ends in `.acl`; an ACL is written under the `acl:Control` check the POST never passed"
+        )));
+    }
+    if slug
+        .as_bytes()
+        .iter()
+        .any(|&b| b == b'/' || b == b'?' || b == b'#' || b.is_ascii_control())
+    {
+        return Err(refuse(&format!(
+            "`{}` carries a `/`, `?`, `#`, or control byte, and so names more than one segment or no segment at all",
+            slug.chars().take(48).collect::<String>()
+        )));
+    }
+    Ok(Some(encode_segment(slug)))
+}
+
+/// Encode raw slug bytes as one RFC 3986 path segment: unreserved bytes pass
+/// through, everything else — `%` included — is percent-encoded.
+fn encode_segment(slug: &str) -> String {
+    let mut out = String::with_capacity(slug.len());
+    for &b in slug.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{b:02X}"));
             }
         }
-        return Ok(member);
     }
+    out
+}
 
-    let quads = rdf_quads(body, &target)?;
-    w.append(&target, &quads)?;
-    Ok(target)
+/// The member IRI for a sanitized `slug`: `{container}{slug}`, or — when that
+/// IRI is taken — `{container}{stem}-N{ext}` with the `-N` before any
+/// extension (spec 5c, H1), the disambiguation CSS implements and
+/// `solid-client` depends on. A 409 would make the common
+/// create-with-preferred-name flow a retry loop.
+fn disambiguate(
+    r: &impl PodRead,
+    container: &str,
+    slug: &str,
+    requested: RequestedKind,
+) -> Result<String, LdpError> {
+    // `note.ttl` → stem `note`, extension `.ttl`; a slug that is all
+    // extension (`.hidden`) or has none keeps its whole self as the stem.
+    let (stem, ext) = match slug.rfind('.') {
+        Some(0) | None => (slug, ""),
+        Some(i) => slug.split_at(i),
+    };
+    for n in 0u32.. {
+        let name = match n {
+            0 => slug.to_string(),
+            _ => format!("{stem}-{n}{ext}"),
+        };
+        let member = match requested {
+            RequestedKind::Container => format!("{container}{name}/"),
+            RequestedKind::Auto => format!("{container}{name}"),
+        };
+        if r.meta(&member)?.is_none() {
+            return Ok(member);
+        }
+    }
+    Err(LdpError::Store(
+        "no free member IRI in this container".into(),
+    ))
 }
 
 /// May this subject write to `path`? For callers outside a write; `patch_in`
