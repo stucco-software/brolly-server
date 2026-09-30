@@ -675,9 +675,11 @@ fn allowed(description: &Description, resource: &str, storage_root: &str) -> Vec
     if storage::is_container(resource) && (write || description.holds(AccessMode::Append)) {
         methods.push("POST");
     }
-    // Not offered to an Append-only caller, though the protocol would allow
-    // it: `ldp::patch_in` requires Write, and 5c owns that change.
-    if write {
+    // H5: insert-only patches are an Append operation, so an Append-only
+    // caller is offered PATCH — and `Accept-Patch` with it, since each
+    // `Accept-*` follows its method. A deleting patch still needs Write, and
+    // `ldp::patch_in` says so.
+    if write || description.holds(AccessMode::Append) {
         methods.push("PATCH");
     }
     // Authorization is decided before this: a caller without Write gets H1's
@@ -1232,7 +1234,36 @@ pub async fn patch(
         &request.storage_root,
         &preconditions(&headers),
     ) {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        // H4: creation and modification are not indistinguishable on the
+        // wire. The `Link` set is the same one a creating `PUT` sends, so a
+        // client that just made a resource learns its kind and where its
+        // rules are without a second request. A description that fails to
+        // read doesn't undo the write: the 201 and its `Location` still go
+        // out.
+        Ok(ldp::Written::Created) => {
+            let resource = format!("{}{path}", request.base);
+            let mut response =
+                (StatusCode::CREATED, [(header::LOCATION, resource.clone())]).into_response();
+            if let Ok(description) =
+                ldp::describe(&request.pod, &request.base, &path, &request.subject)
+            {
+                apply(
+                    &mut response,
+                    vec![(
+                        header::LINK,
+                        links(
+                            &request.base,
+                            &resource,
+                            &request.storage_root,
+                            &request.webid,
+                            description.kind(),
+                        ),
+                    )],
+                );
+            }
+            response
+        }
+        Ok(ldp::Written::Replaced) => StatusCode::NO_CONTENT.into_response(),
         Err(patch::PatchError::Ldp(e)) => ldp_error(e, request.authenticated, &request.apex),
         Err(patch::PatchError::Precondition(m)) => (StatusCode::CONFLICT, m).into_response(),
         Err(patch::PatchError::NotCurrent) => {
@@ -1240,7 +1271,7 @@ pub async fn patch(
         }
         Err(patch::PatchError::EscapesGraph) => (
             StatusCode::FORBIDDEN,
-            "a PATCH may not name a GRAPH or WITH",
+            "a PATCH may only insert or delete in the resource it addresses",
         )
             .into_response(),
         Err(patch::PatchError::Malformed(m) | patch::PatchError::NotAPatch(m)) => {
@@ -1718,22 +1749,35 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
-    /// H4's table, row by row, on a document that exists. What this guards is
-    /// a method promised to a caller whose mode `ldp` will refuse it for.
+    /// H4's table, row by row. What this guards is a method promised to a
+    /// caller whose mode `ldp` will refuse it for. POST is a container method
+    /// (spec 5c, H3) and PATCH an Append operation (H5), so the document rows
+    /// and the container rows disagree on purpose.
     #[test]
     fn allow_names_only_what_the_modes_permit() {
         let doc = Some(Kind::RdfSource);
+        let container = Some(Kind::Container);
         assert_eq!(
             allow_line(doc, &ALL, DOC),
-            "GET, HEAD, PUT, POST, PATCH, DELETE, OPTIONS"
+            "GET, HEAD, PUT, PATCH, DELETE, OPTIONS"
         );
         assert_eq!(allow_line(doc, &[Read], DOC), "GET, HEAD, OPTIONS");
-        // POST appends to a document as well as minting a container's member.
-        // PATCH needs Write in `ldp::patch_in`, so an appender isn't offered it.
-        assert_eq!(allow_line(doc, &[Append], DOC), "POST, OPTIONS");
+        // An Append-only caller may insert (H5), but not POST into — nor
+        // PUT, replace, or delete — a document.
+        assert_eq!(allow_line(doc, &[Append], DOC), "PATCH, OPTIONS");
         assert_eq!(
             allow_line(doc, &[Read, Append], DOC),
-            "GET, HEAD, POST, OPTIONS"
+            "GET, HEAD, PATCH, OPTIONS"
+        );
+        // POST is offered on the container's shape, whatever the caller holds
+        // beyond the Append that creating in it needs.
+        assert_eq!(
+            allow_line(container, &ALL, &format!("{ROOT}notes/")),
+            "GET, HEAD, PUT, POST, PATCH, DELETE, OPTIONS"
+        );
+        assert_eq!(
+            allow_line(container, &[Append], &format!("{ROOT}notes/")),
+            "POST, PATCH, OPTIONS"
         );
         // Control governs the resource's ACL, not the resource.
         assert_eq!(allow_line(doc, &[Control], DOC), "OPTIONS");
@@ -1744,7 +1788,9 @@ mod tests {
     #[test]
     fn an_absent_target_is_offered_creation_and_not_reading() {
         assert_eq!(allow_line(None, &ALL, DOC), "PUT, PATCH, OPTIONS");
-        assert_eq!(allow_line(None, &[Read, Append], DOC), "OPTIONS");
+        // A creating, insert-only PATCH is an Append operation (H5), so an
+        // Append holder is offered the creation method it may use.
+        assert_eq!(allow_line(None, &[Read, Append], DOC), "PATCH, OPTIONS");
     }
 
     /// Solid Protocol §5.4 names exactly two undeletable resources. Any other
@@ -1768,14 +1814,22 @@ mod tests {
     #[test]
     fn each_accept_header_follows_its_method() {
         let doc = Some(Kind::RdfSource);
+        let container = Some(Kind::Container);
 
+        // A document takes PATCH and PUT, and never POST (spec 5c, H3: POST is
+        // a container method).
         let full = affordances(&described(doc, &ALL), DOC, ROOT);
         assert_eq!(value_of(&full, "accept-patch"), Some(ACCEPT_PATCH));
+        assert_eq!(value_of(&full, "accept-post"), None);
+        assert_eq!(value_of(&full, "accept-put"), Some("*/*"));
+
+        // A container takes all three write methods.
+        let full_container =
+            affordances(&described(container, &ALL), &format!("{ROOT}notes/"), ROOT);
         assert_eq!(
-            value_of(&full, "accept-post"),
+            value_of(&full_container, "accept-post"),
             Some(ldp::accepted_write_types())
         );
-        assert_eq!(value_of(&full, "accept-put"), Some("*/*"));
 
         let reader = affordances(&described(doc, &[Read]), DOC, ROOT);
         assert_eq!(value_of(&reader, "allow"), Some("GET, HEAD, OPTIONS"));
@@ -1784,8 +1838,10 @@ mod tests {
         }
 
         let appender = affordances(&described(doc, &[Append]), DOC, ROOT);
-        assert!(value_of(&appender, "accept-post").is_some());
-        assert_eq!(value_of(&appender, "accept-patch"), None);
+        // H5: insert-only patches are an Append operation, so PATCH — and its
+        // `Accept-Patch` — are the appender's.
+        assert!(value_of(&appender, "accept-post").is_none());
+        assert_eq!(value_of(&appender, "accept-patch"), Some(ACCEPT_PATCH));
         assert_eq!(value_of(&appender, "accept-put"), None);
     }
 

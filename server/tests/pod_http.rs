@@ -2101,13 +2101,42 @@ async fn an_append_only_caller_can_discover_that_it_may_post() {
 
     let (status, _, headers) = h.send("OPTIONS", "/~/drop/", None, false).await;
     assert_eq!(status, StatusCode::NO_CONTENT, "Append is a mode");
-    assert_eq!(header_of(&headers, "allow"), "POST, OPTIONS");
+    assert_eq!(header_of(&headers, "allow"), "POST, PATCH, OPTIONS");
     assert!(header_of(&headers, "accept-post").contains("text/turtle"));
-    // PATCH needs Write (`ldp::patch_in`) until 5c.
-    assert!(headers.get("accept-patch").is_none());
+    // H5: an insert-only PATCH is an Append operation, so PATCH — and its
+    // `Accept-Patch` — are the appender's.
+    assert!(header_of(&headers, "accept-patch").contains("text/n3"));
     assert!(headers.get("accept-put").is_none());
 
-    // And the promise holds.
+    // And the promise holds: an insert-only PATCH lands (204, the container
+    // already exists), and a deleting one is refused.
+    let insert = format!("INSERT DATA {{ <{ROOT}drop/> <https://example.org/tag> \"added\" }}");
+    let (status, body, _) = h
+        .send(
+            "PATCH",
+            "/~/drop/",
+            Some(("application/sparql-update", insert.as_str())),
+            false,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+    let remove = format!("DELETE DATA {{ <{ROOT}drop/> <https://example.org/tag> \"added\" }}");
+    let (status, _, _) = h
+        .send(
+            "PATCH",
+            "/~/drop/",
+            Some(("application/sparql-update", remove.as_str())),
+            false,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "Append must not permit removal — and an anonymous caller is challenged"
+    );
+
+    // And the POST promise still holds.
     let (status, _, _) = h
         .send("POST", "/~/drop/", Some(("text/turtle", NOTE)), false)
         .await;
@@ -2376,6 +2405,47 @@ async fn a_creating_post_carries_the_link_set() {
     );
     assert!(link.contains(r#"rel="acl""#), "got: {link}");
     assert!(link.contains("storageDescription"), "got: {link}");
+}
+
+/// 5c H4: a PATCH that creates answers 201 with the `Location` and the same
+/// `Link` set a creating `PUT` or `POST` sends, not the 204 a modifying patch
+/// answers — creation and modification are not indistinguishable on the wire.
+#[tokio::test]
+async fn a_creating_patch_answers_201_with_the_link_set() {
+    let h = harness().await;
+    let update =
+        r#"INSERT DATA { <https://alice.brolly.test/~/made> <https://example.org/title> "x" }"#;
+    let (status, body, headers) = h
+        .send(
+            "PATCH",
+            "/~/made",
+            Some(("application/sparql-update", update)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(
+        header_of(&headers, "location"),
+        "https://alice.brolly.test/~/made"
+    );
+    let link = header_of(&headers, "link");
+    assert!(
+        link.contains(r#"<http://www.w3.org/ns/ldp#RDFSource>; rel="type""#),
+        "got: {link}"
+    );
+    assert!(link.contains(r#"rel="acl""#), "got: {link}");
+
+    // The same patch again is a modification now: 204, and no `Location`.
+    let (status, _, headers) = h
+        .send(
+            "PATCH",
+            "/~/made",
+            Some(("application/sparql-update", update)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(headers.get("location").is_none());
 }
 
 /// `OPTIONS` must not become the existence oracle the rest of the surface

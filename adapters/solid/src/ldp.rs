@@ -1398,7 +1398,8 @@ pub enum PatchBody<'a> {
 }
 
 /// `PATCH`: WAC, the preconditions, the patch, and the write, in one
-/// transaction.
+/// transaction. Answers [`Written`] so a patch that creates (spec 5c, H4) can
+/// answer 201 where one that modifies stays 204.
 pub fn patch_if(
     pod: &Pod,
     base: &str,
@@ -1407,7 +1408,7 @@ pub fn patch_if(
     body: PatchBody<'_>,
     storage_root: &str,
     preconditions: &Preconditions,
-) -> Result<(), PatchError> {
+) -> Result<Written, PatchError> {
     in_write(pod, |w| {
         patch_in(w, base, path, subject, body, storage_root, preconditions)
     })
@@ -1421,7 +1422,7 @@ pub fn patch(
     subject: &Subject,
     body: PatchBody<'_>,
     storage_root: &str,
-) -> Result<(), PatchError> {
+) -> Result<Written, PatchError> {
     patch_if(
         pod,
         base,
@@ -1433,13 +1434,20 @@ pub fn patch(
     )
 }
 
-/// [`patch`] inside the caller's write. A patch mutates, so it needs Write
-/// (Control, on an ACL). A binary has no triples to patch.
+/// [`patch`] inside the caller's write. The patch is parsed and classified
+/// **before** the mode is checked (spec 5c, H5): inserts only are authorized
+/// by **Append** — WAC's Append is "add … without the right to modify or
+/// remove" — and any delete needs **Write**; a patch on an ACL needs Control,
+/// as ever. A binary has no triples to patch.
 ///
 /// `preconditions` is evaluated after the WAC check and before anything is
 /// written, against this transaction's view of the resource, so no other write
 /// can land between the check and this one. Pass `Preconditions::NONE` when not
 /// answering an HTTP request.
+///
+/// Answers [`Written::Created`] when the target had no metadata before this
+/// patch and [`Written::Replaced`] when it did, from the same read the
+/// precondition uses (spec 5c, H4).
 pub fn patch_in(
     w: &mut PodWrite<'_>,
     base: &str,
@@ -1448,25 +1456,32 @@ pub fn patch_in(
     body: PatchBody<'_>,
     storage_root: &str,
     preconditions: &Preconditions,
-) -> Result<(), PatchError> {
+) -> Result<Written, PatchError> {
     let resource = format!("{base}{path}");
     if !resource.starts_with(storage_root) {
         return Err(PatchError::Ldp(LdpError::OutsideStorage));
     }
-    if !check(&*w, base, path, subject, AccessMode::Write).map_err(PatchError::Ldp)? {
+    // H5: the parse is classified, and the classified mode is what WAC
+    // evaluates — so the check runs inside the transaction, on the classified
+    // mode, and a `DELETE` inside a string literal classifies as an insert.
+    let prepared = patch::prepare(body, &resource)?;
+    if !check(&*w, base, path, subject, prepared.mode()).map_err(PatchError::Ldp)? {
         return Err(PatchError::Ldp(LdpError::Denied));
     }
     let current = w.meta(&resource)?.map(|meta| meta.version);
     preconditions.check_write(conditional::Method::Patch, current.as_deref())?;
+    // The same read the precondition used, so nothing can land between them.
+    let written = match current {
+        Some(_) => Written::Replaced,
+        None => Written::Created,
+    };
     if w.meta(&resource)?
         .is_some_and(|meta| matches!(meta.kind, Kind::NonRdfSource))
     {
         return Err(PatchError::Ldp(LdpError::NotRdf));
     }
-    match body {
-        PatchBody::N3(body) => patch::apply_n3_patch(w, &resource, body),
-        PatchBody::SparqlUpdate(sparql) => patch::apply_sparql_update(w, &resource, sparql),
-    }
+    prepared.apply(w, &resource)?;
+    Ok(written)
 }
 
 /// Write a patched graph with the `Content` its target calls for: an ACL as
@@ -1474,8 +1489,9 @@ pub fn patch_in(
 /// an RDF document. A patch that creates a resource contains it, because `put`
 /// does.
 ///
-/// A patch's `solid:where` can't match a container's `ldp:contains`, because
-/// containment isn't in the content graph (a known limitation; 5c revisits it).
+/// A container's `solid:where` sees what a `GET` serves, `ldp:contains`
+/// included, because [`patch::apply_scoped`] seeds the scratch graph with it
+/// (spec 5c, H6) — and still cannot rewrite it, because the write lands here.
 pub(crate) fn store_patched(
     w: &mut PodWrite<'_>,
     resource: &str,

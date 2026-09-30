@@ -798,6 +798,64 @@ fn append_permission_does_not_confer_replace() {
         ),
         "Append must not permit PUT — replacing is not adding"
     );
+
+    // H5: an insert-only PATCH is an Append operation, so it is Bob's to
+    // send — to Alice's existing document, and to a target that does not
+    // exist yet, where the effective ACL (Bob's Append on the root, by
+    // default) is what authorizes the creation.
+    let insert = format!("INSERT DATA {{ <{ROOT}note> <https://example.org/tag> \"added\" }}");
+    ldp::patch(
+        &store,
+        BASE,
+        "/~/note",
+        &bob,
+        ldp::PatchBody::SparqlUpdate(&insert),
+        ROOT,
+    )
+    .unwrap();
+    let made = format!("INSERT DATA {{ <{ROOT}made/by-bob> <https://example.org/title> \"x\" }}");
+    assert_eq!(
+        ldp::patch(
+            &store,
+            BASE,
+            "/~/made/by-bob",
+            &bob,
+            ldp::PatchBody::SparqlUpdate(&made),
+            ROOT,
+        )
+        .unwrap(),
+        ldp::Written::Created
+    );
+
+    // A deleting patch — either syntax — is refused: removal is modification.
+    let remove = format!("DELETE DATA {{ <{ROOT}note> <https://example.org/tag> \"added\" }}");
+    assert!(matches!(
+        ldp::patch(
+            &store,
+            BASE,
+            "/~/note",
+            &bob,
+            ldp::PatchBody::SparqlUpdate(&remove),
+            ROOT,
+        ),
+        Err(PatchError::Ldp(LdpError::Denied))
+    ));
+    let n3_delete = format!(
+        "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+         _:p a solid:InsertDeletePatch ;\n\
+           solid:deletes {{ <{ROOT}note> <https://example.org/tag> \"added\" . }} ."
+    );
+    assert!(matches!(
+        ldp::patch(
+            &store,
+            BASE,
+            "/~/note",
+            &bob,
+            ldp::PatchBody::N3(n3_delete.as_bytes()),
+            ROOT,
+        ),
+        Err(PatchError::Ldp(LdpError::Denied))
+    ));
 }
 
 #[test]
@@ -1189,15 +1247,33 @@ fn an_ordinary_document_serves_containment_and_digest_triples_as_data() {
 fn a_patch_that_creates_a_resource_lists_it() {
     let (_m, _d, store) = pod();
     let update = format!(r#"INSERT DATA {{ <{ROOT}made/new> <https://example.org/title> "x" }}"#);
-    ldp::patch(
-        &store,
-        BASE,
-        "/~/made/new",
-        &alice(),
-        ldp::PatchBody::SparqlUpdate(&update),
-        ROOT,
-    )
-    .unwrap();
+    // H4: a creating PATCH answers 201, not the 204 a modifying one does —
+    // creation and modification are not indistinguishable on the wire.
+    assert_eq!(
+        ldp::patch(
+            &store,
+            BASE,
+            "/~/made/new",
+            &alice(),
+            ldp::PatchBody::SparqlUpdate(&update),
+            ROOT,
+        )
+        .unwrap(),
+        ldp::Written::Created
+    );
+    // The same patch again is a modification now: 5b's Written, the other arm.
+    assert_eq!(
+        ldp::patch(
+            &store,
+            BASE,
+            "/~/made/new",
+            &alice(),
+            ldp::PatchBody::SparqlUpdate(&update),
+            ROOT,
+        )
+        .unwrap(),
+        ldp::Written::Replaced
+    );
 
     assert_eq!(
         members(&store, &format!("{ROOT}made/")),

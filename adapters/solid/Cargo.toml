@@ -12,6 +12,10 @@ brolly-store.workspace = true
 brolly-authz.workspace = true
 brolly-identity.workspace = true
 oxigraph = "0.5.9"
+# The SPARQL algebra oxigraph parses into, so the patch path can classify and
+# allow-list a *parsed* update rather than pattern-match its bytes (spec 5c,
+# H5 and H7). Already in the tree as oxigraph's own parser.
+spargebra = "0.4.6"
 uuid = { version = "1.25.0", features = ["v4"] }
 oxttl = "0.2.3"
 base64 = "0.23.1"
