@@ -2771,7 +2771,7 @@ async fn an_unknown_pod_has_no_storage_description() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
-// --- the storage root (stage 5b, H12 and H16) --------------------------------
+// --- the storage root (stage 5b, H12 and H16; stage 5c, H9) -------------------
 
 /// The methods an `Allow` field names. Axum's own 405 joins them with `,` and
 /// ours with `, `; a test asking whether a method is offered shouldn't care.
@@ -2880,17 +2880,90 @@ async fn the_storage_root_takes_a_put_and_a_patch() {
     assert!(root.contains("Home") && root.contains("Mine"), "{root}");
 }
 
-/// RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and `subdomain_fallback`'s
-/// storage arm sent none. `/~` without its slash is the one path that still
-/// reaches it (H16).
+/// H9 (spec 5c): `/~` without its slash is the storage prefix, not a resource,
+/// and every method on it answers 308 (Permanent Redirect) to `/~/`. 308 and
+/// not 301: RFC 9110 §15.4.9 forbids a client changing the method when it
+/// follows one, where §15.4.2 lets a 301 turn a `PUT /~` into a `GET /~/`.
+/// This was 5b's 405 with an empty `Allow` (H16) — the one path that reaches
+/// `subdomain_fallback`'s storage arm.
 #[tokio::test]
-async fn the_bare_storage_path_answers_its_405_with_an_allow() {
+async fn the_bare_storage_path_redirects_to_the_storage_root() {
     let h = harness().await;
-    for method in ["GET", "DELETE"] {
-        let (status, _, headers) = h.send(method, "/~", None, true).await;
-        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
-        assert!(headers.contains_key(header::ALLOW), "{method}: {headers:?}");
+    for method in ["GET", "HEAD", "PUT", "POST", "PATCH", "DELETE", "OPTIONS"] {
+        let body = matches!(method, "PUT" | "POST" | "PATCH").then_some(("text/turtle", NOTE));
+        let (status, _, headers) = h.send(method, "/~", body, true).await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT, "{method}");
+        assert_eq!(header_of(&headers, "location"), "/~/", "{method}");
     }
+
+    // The redirect is the prefix's, not a resource's: it is the same for a
+    // caller with no credential, because it says where storage lives and
+    // nothing about what is in it.
+    let (status, _, headers) = h
+        .send("PUT", "/~", Some(("text/turtle", NOTE)), false)
+        .await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    let location = header_of(&headers, "location");
+
+    // A client that follows re-sends the method and the body, and lands on
+    // the storage root: the PUT it meant is the PUT that happens.
+    let (status, body, _) = h
+        .send("PUT", &location, Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (status, root, _) = h.send("GET", &location, None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(root.contains("Written over HTTP"), "{root}");
+}
+
+/// A redirect that dropped the query would send a different request than the
+/// one it was given, which is what H9's "preserving" rules out.
+#[tokio::test]
+async fn the_bare_storage_path_keeps_its_query_when_it_redirects() {
+    let h = harness().await;
+    let (status, _, headers) = h.send("GET", "/~?ext=ttl", None, true).await;
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(header_of(&headers, "location"), "/~/?ext=ttl");
+}
+
+/// H9's second bullet (spec 5c): `/foo` and `/foo/` are two IRIs and two
+/// resources, and neither redirects to the other. Both may exist at once — a
+/// document and a container — so a redirect would make one of them
+/// unreachable.
+#[tokio::test]
+async fn a_trailing_slash_names_a_different_resource_and_never_redirects() {
+    let h = harness().await;
+    let (status, body, _) = h
+        .send("PUT", "/~/thing", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // The container-shaped twin is simply not there.
+    let (status, _, headers) = h.send("GET", "/~/thing/", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!headers.contains_key(header::LOCATION), "{headers:?}");
+
+    let (status, body, _) = h
+        .send("PUT", "/~/thing/", Some(("text/turtle", "")), true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // Both exist now, each its own kind.
+    let (status, document, headers) = h.send("GET", "/~/thing", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(document.contains("Written over HTTP"), "{document}");
+    assert!(!header_of(&headers, "link").contains("ldp#BasicContainer"));
+    let (status, _, headers) = h.send("GET", "/~/thing/", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(header_of(&headers, "link").contains("ldp#BasicContainer"));
+
+    // And a container that exists without its document twin doesn't redirect
+    // the slashless IRI either.
+    h.send("PUT", "/~/only/", Some(("text/turtle", "")), true)
+        .await;
+    let (status, _, headers) = h.send("GET", "/~/only", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(!headers.contains_key(header::LOCATION), "{headers:?}");
 }
 
 /// Solid Protocol §5.4 names two undeletable resources, the storage root and
@@ -3603,4 +3676,131 @@ async fn a_listing_written_back_after_a_member_changed_is_a_409_the_client_re_re
         .send("PUT", "/~/c/", Some(("text/turtle", fresh.as_str())), true)
         .await;
     assert!(status.is_success(), "the retry was refused too: {body}");
+}
+
+// --- a PUT cannot change a kind (stage 5c, H8) ----------------------------------
+
+/// H8 (spec 5c): a `PUT` cannot change an existing resource's kind. 422
+/// (RFC 9110 §15.5.21) and neither 415 nor 409: the request is well-formed and
+/// the media type is one this server stores — just not over *this* resource —
+/// and no other request is in the way. The body names the recorded kind and
+/// the incoming content type, so a client can tell which of the two to change,
+/// and the old representation is untouched.
+#[tokio::test]
+async fn a_put_that_would_change_a_resources_kind_is_a_422() {
+    let h = harness().await;
+
+    // A binary over an RDF document.
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let tag = h.etag("/~/note").await;
+    let (status, body, _) = h
+        .send("PUT", "/~/note", Some(("application/pdf", PDF)), true)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("ldp:RDFSource"), "{body}");
+    assert!(body.contains("application/pdf"), "{body}");
+    let (status, served, headers) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(served.contains("Written over HTTP"), "{served}");
+    assert_eq!(
+        header_of(&headers, "etag"),
+        tag,
+        "the refusal wrote something"
+    );
+
+    // RDF over a binary.
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+    let tag = h.etag("/~/paper.pdf").await;
+    let (status, body, _) = h
+        .send("PUT", "/~/paper.pdf", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert!(body.contains("ldp:NonRDFSource"), "{body}");
+    assert!(body.contains("text/turtle"), "{body}");
+    let (status, served, headers) = h.send("GET", "/~/paper.pdf", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(served, PDF, "the refused PUT replaced the bytes");
+    assert_eq!(headers[header::CONTENT_TYPE], "application/pdf");
+    assert_eq!(
+        header_of(&headers, "etag"),
+        tag,
+        "the refusal wrote something"
+    );
+}
+
+/// H8 refuses after the upload's bytes are on disk (R12: they are written
+/// before the write lock is taken), exactly as a 412 does. The refusal has to
+/// hand them back, or a caller who can be refused repeatedly fills the volume
+/// one 422 at a time.
+#[tokio::test]
+async fn a_binary_refused_as_a_kind_change_leaves_no_bytes_behind() {
+    use sha2::{Digest, Sha256};
+
+    let h = harness().await;
+    let refused: String = Sha256::digest(PDF.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    let (status, body, _) = h
+        .send("PUT", "/~/note", Some(("application/pdf", PDF)), true)
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    let blobs = h.stores.blobs(h.user).unwrap();
+    assert!(
+        !blobs.contains(&refused),
+        "the refused upload's bytes are still on disk"
+    );
+}
+
+/// H8 is authorization-gated like every other refusal (5b, H1): a caller
+/// without Write gets the same 401 for a kind-changing `PUT` as for any other,
+/// and learns nothing about what kind of resource is there.
+#[tokio::test]
+async fn a_kind_change_is_not_disclosed_to_a_caller_who_may_not_write() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, body, _) = h
+        .send("PUT", "/~/note", Some(("application/pdf", PDF)), false)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(!body.contains("RDFSource"), "{body}");
+}
+
+/// H8's two edges. A container IRI never takes a binary, so a binary `PUT`
+/// over an existing container is the 415 it always was, not a 422; and a
+/// binary replaced by new bytes is the same kind, so it is the 204 it always
+/// was.
+#[tokio::test]
+async fn a_binary_on_a_container_is_still_a_415_and_a_same_kind_put_still_replaces() {
+    let h = harness().await;
+
+    h.send("PUT", "/~/c/", Some(("text/turtle", "")), true)
+        .await;
+    let (status, body, _) = h
+        .send("PUT", "/~/c/", Some(("application/pdf", PDF)), true)
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+
+    const OTHER: &str = "%PDF-1.4\n1 0 obj\n<< /Type /Nothing >>\nendobj\n";
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/paper.pdf",
+            Some(("application/pdf", OTHER)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+    let (_, served, _) = h.send("GET", "/~/paper.pdf", None, true).await;
+    assert_eq!(served, OTHER);
 }

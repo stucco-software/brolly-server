@@ -1217,6 +1217,149 @@ fn a_container_put_with_a_non_rdf_body_is_not_rdf() {
     assert!(meta(&store, &format!("{ROOT}c/")).is_none());
 }
 
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n pretend this is an image";
+
+/// `PUT` with a body of any type, and the pod's own blob store behind it.
+fn put_typed(
+    store: &Pod,
+    path: &str,
+    body: &[u8],
+    content_type: &str,
+) -> Result<ldp::Written, LdpError> {
+    ldp::put(
+        store,
+        Some(store.blobs()),
+        BASE,
+        path,
+        &alice(),
+        body,
+        content_type,
+        ROOT,
+    )
+}
+
+/// H8 (spec 5c): a `PUT` cannot change an existing resource's kind. RDF over
+/// a binary is refused with the recorded kind and the incoming content type —
+/// what `pod.rs` turns into the 422's body — and the binary is exactly as it
+/// was: same kind, same version, same bytes.
+#[test]
+fn an_rdf_put_over_a_binary_is_a_kind_change() {
+    let (_m, _d, store) = pod();
+    put_typed(&store, "/~/avatar", PNG, "image/png").unwrap();
+    let before = meta(&store, &format!("{ROOT}avatar")).unwrap();
+
+    let err = put_typed(&store, "/~/avatar", NOTE, "text/turtle").unwrap_err();
+    let LdpError::KindChange { recorded, incoming } = &err else {
+        panic!("got {err:?}");
+    };
+    assert_eq!(*recorded, Kind::NonRdfSource);
+    assert_eq!(incoming, "text/turtle");
+    let said = err.to_string();
+    assert!(said.contains("ldp:NonRDFSource"), "{said}");
+    assert!(said.contains("text/turtle"), "{said}");
+
+    let after = meta(&store, &format!("{ROOT}avatar")).unwrap();
+    assert_eq!(after.kind, Kind::NonRdfSource);
+    assert_eq!(after.version, before.version, "the refusal wrote something");
+    assert_eq!(after.blob, before.blob);
+    let served = ldp::read(
+        &store,
+        Some(store.blobs()),
+        BASE,
+        "/~/avatar",
+        &alice(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(served.body, PNG);
+    assert_eq!(served.media_type, "image/png");
+}
+
+/// H8, the other direction: a binary over an RDF document. The document keeps
+/// its triples and its version, and the refused bytes — written before the
+/// lock was taken (R12) — are handed back rather than left on disk with
+/// nothing naming them.
+#[test]
+fn a_binary_put_over_a_document_is_a_kind_change() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/note", NOTE).unwrap();
+    let before = meta(&store, &format!("{ROOT}note")).unwrap();
+    // The digest the refused upload would be stored under.
+    let digest = store.blobs().put(PNG).unwrap();
+    store.blobs().remove(&digest).unwrap();
+
+    let err = put_typed(&store, "/~/note", PNG, "image/png").unwrap_err();
+    let LdpError::KindChange { recorded, incoming } = &err else {
+        panic!("got {err:?}");
+    };
+    assert_eq!(*recorded, Kind::RdfSource);
+    assert_eq!(incoming, "image/png");
+    let said = err.to_string();
+    assert!(said.contains("ldp:RDFSource"), "{said}");
+    assert!(said.contains("image/png"), "{said}");
+
+    let after = meta(&store, &format!("{ROOT}note")).unwrap();
+    assert_eq!(after.kind, Kind::RdfSource);
+    assert_eq!(after.version, before.version, "the refusal wrote something");
+    assert!(after.blob.is_none());
+    assert!(ntriples(&store, "/~/note").contains("First note"));
+    assert!(
+        !store.blobs().contains(&digest),
+        "the refused upload's bytes are still on disk"
+    );
+}
+
+/// H8's first edge: a container IRI never takes a binary at all, so a binary
+/// `PUT` over an *existing* container is still the `NotRdf` 415 it was before
+/// the container existed — not a kind change.
+#[test]
+fn a_binary_put_over_an_existing_container_is_still_not_rdf() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/c/", b"").unwrap();
+    let before = meta(&store, &format!("{ROOT}c/")).unwrap();
+
+    let err = put_typed(&store, "/~/c/", PNG, "image/png").unwrap_err();
+    assert!(matches!(err, LdpError::NotRdf), "got {err:?}");
+    assert_eq!(
+        meta(&store, &format!("{ROOT}c/")).unwrap().version,
+        before.version
+    );
+}
+
+/// H8's second edge: replacement within a kind is untouched. A binary takes
+/// new bytes — under a different media type, even — and a document takes RDF
+/// in another syntax. Kind is RDF-or-not, never the media type.
+#[test]
+fn a_put_of_the_same_kind_still_replaces() {
+    let (_m, _d, store) = pod();
+
+    put_typed(&store, "/~/avatar", PNG, "image/png").unwrap();
+    assert_eq!(
+        put_typed(&store, "/~/avatar", b"GIF89a, say", "image/gif").unwrap(),
+        ldp::Written::Replaced
+    );
+    let avatar = meta(&store, &format!("{ROOT}avatar")).unwrap();
+    assert_eq!(avatar.kind, Kind::NonRdfSource);
+    assert_eq!(avatar.blob.unwrap().media_type, "image/gif");
+
+    put_turtle(&store, "/~/note", NOTE).unwrap();
+    assert_eq!(
+        put_typed(
+            &store,
+            "/~/note",
+            format!("<{ROOT}note> <https://example.org/title> \"Second note\" .").as_bytes(),
+            "application/n-triples",
+        )
+        .unwrap(),
+        ldp::Written::Replaced
+    );
+    assert_eq!(
+        meta(&store, &format!("{ROOT}note")).unwrap().kind,
+        Kind::RdfSource
+    );
+    assert!(ntriples(&store, "/~/note").contains("Second note"));
+}
+
 #[test]
 fn an_ordinary_document_serves_containment_and_digest_triples_as_data() {
     let (_m, _d, store) = pod();

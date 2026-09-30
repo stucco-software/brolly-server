@@ -74,6 +74,18 @@ impl ReadFormat {
             },
         }
     }
+
+    /// The registered media type for this syntax — what a refusal names when
+    /// it has to say what it was sent.
+    pub fn media_type(self) -> &'static str {
+        match self {
+            ReadFormat::Turtle => "text/turtle",
+            ReadFormat::NTriples => "application/n-triples",
+            ReadFormat::NQuads => "application/n-quads",
+            ReadFormat::TriG => "application/trig",
+            ReadFormat::JsonLd => "application/ld+json",
+        }
+    }
 }
 
 impl WriteFormat {

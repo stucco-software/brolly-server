@@ -446,6 +446,14 @@ fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Response {
             "this resource takes an RDF body",
         )
             .into_response(),
+        // 422, not 415 or 409 (spec 5c, H8): the request is well-formed and
+        // the media type is one this server stores, just not over a resource
+        // of the other kind, and no other request is in the way. The body is
+        // the error's own `Display`, which names the recorded kind and the
+        // incoming content type, so a client knows which of the two to change.
+        error @ LdpError::KindChange { .. } => {
+            (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()).into_response()
+        }
         LdpError::ContainmentChange => (
             StatusCode::CONFLICT,
             "a container's members change only by creating or deleting them",
@@ -1439,22 +1447,41 @@ pub async fn options_root(
 ///
 /// ADR 0010's default-deny. There is no LDP fallback here, which is why a
 /// misrouted OAuth request cannot become a pod write.
+///
+/// The bare storage prefix, `/~`, is the one trailing-slash redirect there is
+/// (spec 5c, H9): it names no resource, so sending it to `/~/` merges nothing.
+/// Inside storage, `/foo` and `/foo/` stay two distinct resources with no
+/// redirect in either direction. They are distinct IRIs; the storage layer,
+/// the ACL placement (`ldp::acl_iri`) and 5a's kind rules already treat them
+/// so; and both may exist at once — a document and a container — so a
+/// redirect would make two resources one.
 pub async fn subdomain_fallback(State(state): State<AppState>, uri: axum::http::Uri) -> Response {
     let path = uri.path();
     match subdomain_route(path) {
-        SubdomainRoute::UserStorage => (
+        SubdomainRoute::UserStorage => {
             // Every method under `/~/` is routed, and a method axum doesn't
             // route there gets axum's own 405, which carries its own `Allow`.
             // So this arm serves the bare `/~` alone: the storage prefix
-            // without its slash, which no route matches and which supports no
-            // method. RFC 9110 §15.5.6 requires `Allow` on a 405 (H16), and
-            // §10.2.1 lets it be empty, which is the true answer here. Whether
-            // `/~` should redirect to `/~/` belongs to 5c's `/foo` vs `/foo/`.
-            StatusCode::METHOD_NOT_ALLOWED,
-            [(header::ALLOW, "")],
-            "user storage lives under /~/",
-        )
-            .into_response(),
+            // without its slash, which no route matches. Every method on it
+            // is sent to `/~/` (spec 5c, H9). 308 and not 301: RFC 9110
+            // §15.4.9 has the client repeat the method and the body, where a
+            // 301 lets an over-helpful one turn `PUT /~` into `GET /~/`
+            // (§15.4.2). The query goes along, or the redirect would name a
+            // different request. A browser doesn't follow a redirect that
+            // answers a CORS preflight, so a preflighted script aimed at `/~`
+            // fails as it did under the 405 this replaces; the redirect is
+            // for the clients that do follow.
+            let location = match uri.query() {
+                Some(query) => format!("{}?{query}", routing::USER_STORAGE_ROOT),
+                None => routing::USER_STORAGE_ROOT.to_string(),
+            };
+            (
+                StatusCode::PERMANENT_REDIRECT,
+                [(header::LOCATION, location)],
+                "user storage lives under /~/",
+            )
+                .into_response()
+        }
         SubdomainRoute::ProtocolResource => (
             StatusCode::NOT_IMPLEMENTED,
             "this protocol resource is not implemented yet",
@@ -1575,6 +1602,25 @@ mod tests {
             ldp_error(LdpError::BlobMissing, true, apex).status(),
             StatusCode::INTERNAL_SERVER_ERROR
         );
+    }
+
+    /// H8 (spec 5c): a kind-changing `PUT` is a 422 whose body names the
+    /// recorded kind and the incoming content type — the two facts a client
+    /// needs to see which one it got wrong.
+    #[test]
+    fn a_kind_change_is_a_422_naming_the_kind_and_the_content_type() {
+        let response = ldp_error(
+            LdpError::KindChange {
+                recorded: Kind::NonRdfSource,
+                incoming: "text/turtle".into(),
+            },
+            true,
+            "https://brolly.test",
+        );
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = body_text(response);
+        assert!(body.contains("ldp:NonRDFSource"), "{body}");
+        assert!(body.contains("text/turtle"), "{body}");
     }
 
     /// H1's table at the only place that knows both halves. The failure this

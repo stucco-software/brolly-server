@@ -103,6 +103,28 @@ pub enum LdpError {
     /// names the offending slug and the rule it broke, because a silent UUID
     /// would leave the client building links to a name it was never given.
     InvalidSlug(String),
+    /// A `PUT` whose body would change an existing resource's kind (422, spec
+    /// 5c H8): RDF over a [`Kind::NonRdfSource`], or a binary over an RDF
+    /// resource. Not [`LdpError::NotRdf`]: the media type is one this target's
+    /// IRI accepts — a document-shaped IRI takes either — and what the request
+    /// asks for is impossible only because of what is already there. Carries
+    /// the recorded kind and the incoming media type, which the 422's body
+    /// names. Produced after the WAC check, so only a caller holding Write
+    /// learns the kind.
+    KindChange {
+        recorded: Kind,
+        incoming: String,
+    },
+}
+
+/// The LDP class a recorded kind is served as, for a refusal's body.
+fn kind_name(kind: Kind) -> &'static str {
+    match kind {
+        Kind::Container => "ldp:BasicContainer",
+        Kind::RdfSource => "ldp:RDFSource",
+        Kind::NonRdfSource => "ldp:NonRDFSource",
+        Kind::Auxiliary => "auxiliary resource",
+    }
 }
 
 impl std::fmt::Display for LdpError {
@@ -136,6 +158,12 @@ impl std::fmt::Display for LdpError {
                 "POST is a container method; this target does not end in `/`"
             ),
             LdpError::InvalidSlug(rule) => write!(f, "{rule}"),
+            LdpError::KindChange { recorded, incoming } => write!(
+                f,
+                "a PUT cannot change a resource's kind: this one is recorded as \
+                 {} and the body is {incoming}; delete it first to store the other kind",
+                kind_name(*recorded)
+            ),
         }
     }
 }
@@ -512,6 +540,16 @@ pub enum Body {
     Binary(BlobMeta),
 }
 
+impl Body {
+    /// The media type this body arrived as, parameters stripped.
+    fn media_type(&self) -> &str {
+        match self {
+            Body::Rdf { format, .. } => format.media_type(),
+            Body::Binary(blob) => &blob.media_type,
+        }
+    }
+}
+
 /// Get a body ready to write.
 ///
 /// A non-RDF body's bytes go into the blob store here, **before** the pod's
@@ -669,15 +707,18 @@ pub fn put(
 /// Give back the bytes a refused binary write left in the blob store.
 ///
 /// [`prepare`] writes a binary body before the lock is taken, and a failed
-/// precondition then records no digest, so the file would sit there
-/// unreferenced. Under the lock, `release_blob` deletes it only if nothing
+/// precondition or a refused kind change (spec 5c, H8) then records no digest,
+/// so the file would sit there unreferenced. Under the lock, `release_blob`
+/// deletes it only if nothing
 /// references it: bytes identical to a live resource (this one's own, sent
 /// with a stale tag, say) survive, and a concurrent upload of the same bytes
 /// either committed first or gets `BlobMissing` and writes them again (R12).
-/// A failure here leaves an orphan file, not a wrong answer, so the 412 still
-/// stands.
+/// A failure here leaves an orphan file, not a wrong answer, so the 412 or
+/// 422 still stands.
 fn release_refused_bytes<T>(pod: &Pod, body: &Body, written: &Result<T, LdpError>) {
-    let (Err(LdpError::PreconditionFailed), Body::Binary(blob)) = (written, body) else {
+    let (Err(LdpError::PreconditionFailed | LdpError::KindChange { .. }), Body::Binary(blob)) =
+        (written, body)
+    else {
         return;
     };
     let _swept: Result<(), StoreError> = pod.write(|w| {
@@ -695,6 +736,14 @@ fn release_refused_bytes<T>(pod: &Pod, body: &Body, written: &Result<T, LdpError
 ///   rule, as `Content::Container`; its members are untouched;
 /// - a document: `Content::Rdf`, stored exactly as sent;
 /// - a binary: `Content::Binary`, then the previous blob, if any, is released.
+///
+/// The last two replace only their own kind (spec 5c, H8): RDF over an
+/// existing binary, or a binary over an existing RDF resource, is
+/// [`LdpError::KindChange`] and the old representation stays as it was. A
+/// binary addressed to a container or an ACL is still [`LdpError::NotRdf`],
+/// because those targets never take one whatever is there. Replacing a binary
+/// with new bytes is the same kind and unaffected; it still drops the
+/// description triples until 5d moves them to `.meta`.
 ///
 /// Every refusal comes before the first write.
 ///
@@ -743,10 +792,20 @@ pub fn put_in(
         return Ok(written);
     }
 
-    let previous = w
-        .meta(&resource)?
-        .and_then(|meta| meta.blob)
-        .map(|blob| blob.digest);
+    let recorded = w.meta(&resource)?;
+    // H8: a document-shaped IRI takes RDF or a binary, but not one over the
+    // other. After WAC, so the kind is told only to a caller who may write
+    // here, and after the precondition, like every refusal that depends on
+    // what is stored.
+    if let Some(meta) = &recorded
+        && matches!(meta.kind, Kind::NonRdfSource) == matches!(body, Body::Rdf { .. })
+    {
+        return Err(LdpError::KindChange {
+            recorded: meta.kind,
+            incoming: body.media_type().to_string(),
+        });
+    }
+    let previous = recorded.and_then(|meta| meta.blob).map(|blob| blob.digest);
     let current = match body {
         Body::Rdf { .. } => {
             let quads = rdf_quads(body, &resource)?;
