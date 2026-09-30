@@ -4,10 +4,12 @@
 <!-- The spec names files and behaviours this stage creates, so not every
      path it cites resolves until it's implemented. -->
 
-**Status:** Draft (2026-09-29), revised after one adversarial review against
-LDP, WAC, SPARQL Update, RFC 3986/8288/9110, and the code it cites — every
-claim in the Problem was checked against the tree. Stage 5a and 5b were each
-revised through three passes before approval; this one awaits a second.
+**Status:** Implemented, 2026-09-30, in three commits: `be9a909` (`POST`),
+`1d8a1f1` (`PATCH`), `85e4f15` (`PUT` and the prefix). Drafted 2026-09-29 and
+revised after one adversarial review against LDP, WAC, SPARQL Update, RFC
+3986/8288/9110, and the code it cites — every claim in the Problem was
+checked against the tree. Stage 5a and 5b were each revised through three
+passes before approval; this one was implemented after its first.
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 5, part c. Parts
 a (`docs/specs/2026-09-22-solid-resource-metadata.md`) and b
 (`docs/specs/2026-09-23-solid-http-surface.md`) landed the state this part
