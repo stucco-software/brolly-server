@@ -9,10 +9,14 @@
 //! insert. Two `foaf:name` triples is not "a name that was edited"; it is a
 //! profile with two names, and every reader downstream has to pick one.
 
+use brolly_domain::syntax;
 use brolly_domain::vocab;
 use brolly_store::StoreError;
-use brolly_store::resources::{PodRead, PodWrite};
+use brolly_store::resources::{Pod, PodRead, PodWrite};
 use oxigraph::model::{GraphName, GraphNameRef, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
+
+use crate::ldp::{self, LdpError, PatchBody};
+use crate::patch::{self, PatchError};
 
 fn iri(s: &str) -> NamedNode {
     NamedNode::new_unchecked(s)
@@ -186,6 +190,11 @@ pub fn write(
 /// handed a WebID dereferences it and reads that triple to learn where to send
 /// the member to authenticate; without it there is no way in, however well the
 /// OIDC endpoints themselves work.
+///
+/// Since spec 6 (H1) the derived five are **unconditional**: whatever the
+/// member stored at those positions, the served value is the deployment's —
+/// their copy is not served beside it, and a self-asserted storage root or
+/// issuer is not served at all.
 pub fn document(
     store: &impl PodRead,
     webid: &str,
@@ -194,9 +203,11 @@ pub fn document(
     issuer: &str,
 ) -> Vec<Quad> {
     let graph = iri(document);
-    let subject = NamedOrBlankNode::NamedNode(iri(webid));
 
-    // Whatever the member has written, verbatim.
+    // Whatever the member has written, verbatim — except at the five reserved
+    // positions, which the projection derives below. Their stored copy is not
+    // served beside the derived one: two values on a predicate whose readers
+    // expect one.
     let mut quads: Vec<Quad> = store
         .quads_for_pattern(
             None,
@@ -205,39 +216,169 @@ pub fn document(
             Some(GraphNameRef::NamedNode(graph.as_ref())),
         )
         .filter_map(Result::ok)
+        .filter(|q| !at_reserved_position(q, webid, document))
         .collect();
 
-    let derived = [
+    quads.extend(reserved(webid, document, storage_root, issuer));
+    quads
+}
+
+// --- writing over Solid (spec 6, H1) -----------------------------------------
+
+/// The five positions the projection derives (spec 6, H1), as quads in the
+/// document's graph with the deployment's values.
+/// [`at_reserved_position`] decides what a write may not seat there.
+fn reserved(webid: &str, document: &str, storage_root: &str, issuer: &str) -> Vec<Quad> {
+    let graph = iri(document);
+    let doc = NamedOrBlankNode::NamedNode(graph.clone());
+    let me = NamedOrBlankNode::NamedNode(iri(webid));
+    let object = |value: &str| Term::NamedNode(iri(value));
+    vec![
         // The document describes the person; it is not the person. That
         // distinction is what the `#me` fragment exists for.
-        (
-            NamedOrBlankNode::NamedNode(graph.clone()),
-            vocab::RDF_TYPE,
-            vocab::FOAF_PERSONAL_PROFILE_DOCUMENT,
-        ),
-        (
-            NamedOrBlankNode::NamedNode(graph.clone()),
-            vocab::FOAF_PRIMARY_TOPIC,
-            webid,
-        ),
-        (subject.clone(), vocab::RDF_TYPE, vocab::FOAF_PERSON),
-        (subject.clone(), vocab::SOLID_OIDC_ISSUER, issuer),
-        (subject.clone(), vocab::SPACE_STORAGE, storage_root),
-    ];
-
-    for (s, p, o) in derived {
-        let quad = Quad::new(
-            s,
-            iri(p),
-            Term::NamedNode(iri(o)),
+        Quad::new(
+            doc.clone(),
+            iri(vocab::RDF_TYPE),
+            object(vocab::FOAF_PERSONAL_PROFILE_DOCUMENT),
             GraphName::NamedNode(graph.clone()),
-        );
-        // A member could have written one of these themselves. Theirs stands;
-        // duplicating it would put two values on a predicate whose readers
-        // expect one.
-        if !quads.contains(&quad) {
-            quads.push(quad);
-        }
+        ),
+        Quad::new(
+            doc,
+            iri(vocab::FOAF_PRIMARY_TOPIC),
+            object(webid),
+            GraphName::NamedNode(graph.clone()),
+        ),
+        Quad::new(
+            me.clone(),
+            iri(vocab::RDF_TYPE),
+            object(vocab::FOAF_PERSON),
+            GraphName::NamedNode(graph.clone()),
+        ),
+        Quad::new(
+            me.clone(),
+            iri(vocab::SOLID_OIDC_ISSUER),
+            object(issuer),
+            GraphName::NamedNode(graph.clone()),
+        ),
+        Quad::new(
+            me,
+            iri(vocab::SPACE_STORAGE),
+            object(storage_root),
+            GraphName::NamedNode(graph),
+        ),
+    ]
+}
+
+/// Does this quad sit at one of the five reserved positions (spec 6, H1)?
+///
+/// Three are reserved as exact (subject, predicate, object) triples: the two
+/// `rdf:type` positions and `foaf:primaryTopic`. Never by predicate alone —
+/// `rdf:type` is at once a reserved position and the commonest predicate in a
+/// hand-written profile, so filtering on the predicate would drop
+/// `<#me> a schema:Person` and every other type a member asserts about
+/// themselves. The exact object is what leaves those their own.
+///
+/// The other two are the deployment facts — `solid:oidcIssuer` and
+/// `space:storage` on `#me` — and they are reserved as whole (subject,
+/// predicate) slots: whatever object a member writes there is a self-assertion
+/// of a deployment fact, and the projection serves the deployment's value, so
+/// theirs is dropped whatever it says. A member writing
+/// `space:storage <https://elsewhere/>` must not be able to point every client
+/// that trusts the profile at storage we do not serve.
+fn at_reserved_position(quad: &Quad, webid: &str, document: &str) -> bool {
+    let doc = NamedOrBlankNode::NamedNode(iri(document));
+    let me = NamedOrBlankNode::NamedNode(iri(webid));
+    let exact = |subject: &NamedOrBlankNode, predicate: &str, object: &str| {
+        quad.subject == *subject
+            && quad.predicate == iri(predicate)
+            && quad.object == Term::NamedNode(iri(object))
+    };
+    // The two type positions and the primary topic: exact triples, so a
+    // member's own types survive beside them.
+    if exact(&doc, vocab::RDF_TYPE, vocab::FOAF_PERSONAL_PROFILE_DOCUMENT)
+        || exact(&doc, vocab::FOAF_PRIMARY_TOPIC, webid)
+        || exact(&me, vocab::RDF_TYPE, vocab::FOAF_PERSON)
+    {
+        return true;
     }
+    // The two deployment facts: whole slots, whatever the object.
+    let slot = |subject: &NamedOrBlankNode, predicate: &str| {
+        quad.subject == *subject && quad.predicate == iri(predicate)
+    };
+    slot(&me, vocab::SOLID_OIDC_ISSUER) || slot(&me, vocab::SPACE_STORAGE)
+}
+
+/// Drop the reserved positions from a graph bound for the pod (spec 6, H1):
+/// what a `PUT` stores and what a `PATCH` writes back hold the member's own
+/// triples and nothing the projection derives.
+fn unreserved(quads: Vec<Quad>, webid: &str, document: &str) -> Vec<Quad> {
     quads
+        .into_iter()
+        .filter(|q| !at_reserved_position(q, webid, document))
+        .collect()
+}
+
+/// `PUT` the profile document's graph (spec 6, H1) — LDP `PUT` semantics over
+/// the projection's backing graph, delegated to the LDP write path's body
+/// handling: RDF only, parsed into the document's own named graph exactly as a
+/// `PUT` under `/~/` is.
+///
+/// The body replaces the graph wholesale, so one that omits the dashboard's
+/// predicates clears them — `as:manuallyApprovesFollowers` absent reads as
+/// *false*, so a locked account comes back unlocked. That is LDP `PUT`
+/// semantics, the same here as for any resource, and H1 owns it: reserving the
+/// five instead would make the `PUT` silently drop triples it accepted, which
+/// is a lie about what was stored.
+///
+/// The reserved positions are dropped on the way in; the graph holds the
+/// member's triples and nothing the projection derives.
+pub fn put(
+    pod: &Pod,
+    webid: &str,
+    document: &str,
+    body: &[u8],
+    content_type: &str,
+) -> Result<(), LdpError> {
+    // The same refusals a pod `PUT` makes before it takes the lock, in the
+    // same order (`Target::prepare`): RDF/XML is served and never parsed
+    // (ADR 0007), and this resource takes RDF only.
+    ldp::refuse_rdf_xml(content_type)?;
+    if !syntax::is_parseable_rdf(content_type) {
+        return Err(LdpError::NotRdf);
+    }
+    let format = syntax::read_format(content_type)?;
+    let quads = ldp::parse_into_graph(body, format, document)?;
+    let kept = unreserved(quads, webid, document);
+    // The profile graph is outside the storage root, so it stores as a bare
+    // graph — the same family `write` above uses — rather than as a recorded
+    // resource with metadata and containment.
+    ldp::in_write(pod, move |w| {
+        w.replace_graph(document, &kept)?;
+        Ok(())
+    })
+}
+
+/// `PATCH` the profile document's graph (spec 6, H1): the same solver every
+/// other patch takes (`patch::Prepared::solve`), scoped to the profile graph,
+/// with 5c's parse and classification of the body and the reserved positions
+/// filtered from the result.
+///
+/// The classification — inserts only are Append, any delete is Write — gates
+/// nothing here, because the owner check that authorized this call already
+/// authorized Write; it is part of the same path, and the parse that produces
+/// it is what refuses a malformed patch or a SPARQL Update in a form a `PATCH`
+/// may not take, exactly as on the pod surface.
+pub fn patch(
+    pod: &Pod,
+    webid: &str,
+    document: &str,
+    body: PatchBody<'_>,
+) -> Result<(), PatchError> {
+    ldp::in_write(pod, |w| {
+        let prepared = patch::prepare(body, document)?;
+        let patched = prepared.solve(w, document)?;
+        let kept = unreserved(patched, webid, document);
+        w.replace_graph(document, &kept)?;
+        Ok(())
+    })
 }

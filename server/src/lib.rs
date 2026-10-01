@@ -302,7 +302,19 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // The WebID profile document. Subdomain-only: the apex's identity is
         // an actor, not a person. This is what a Solid client dereferences to
         // discover the issuer, so without it WebID login is impossible.
-        .route("/profile", get(profile::profile_document))
+        // Since spec 6 (H1) it is writable by its owner: `PUT` replaces the
+        // graph and `PATCH` patches it, both through the LDP write path with
+        // the profile graph as the target. `DELETE` and `POST` — and any other
+        // method — get the method router's own 405, which carries its `Allow`
+        // (5b, H16). `/profile` stays a protocol resource in
+        // `USER_PROTOCOL_RESOURCES`: this is a write handler on a projection,
+        // not LDP content under `/~/`.
+        .route(
+            "/profile",
+            get(profile::profile_document)
+                .put(profile::put_document)
+                .patch(profile::patch_document),
+        )
         .route("/actor", get(activitypub::actor_document))
         // The actor's collections. Followers and following are public, as the
         // fediverse expects; the inbox is the member's home timeline (D6) and

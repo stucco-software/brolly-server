@@ -309,14 +309,27 @@ impl Prepared {
         }
     }
 
-    /// Run the patch against `resource`, inside the caller's write.
-    pub fn apply(self, w: &mut PodWrite<'_>, resource: &str) -> Result<(), PatchError> {
+    /// Run the patch against `resource`'s graph and return the patched
+    /// triples, without storing them.
+    ///
+    /// The profile document takes the solver and not the write-back: its graph
+    /// is outside the storage root, so it stores as a bare graph through
+    /// `PodWrite`'s outside-root family rather than as a recorded resource, and
+    /// it filters the reserved positions out of the result first (spec 6, H1).
+    /// Every other caller wants [`Prepared::apply`], which stores too.
+    pub fn solve(self, w: &mut PodWrite<'_>, resource: &str) -> Result<Vec<Quad>, PatchError> {
         match self {
-            Prepared::N3 { patch, update } => apply_scoped(w, resource, update, |scratch| {
+            Prepared::N3 { patch, update } => solve_scoped(w, resource, update, |scratch| {
                 check_preconditions(scratch, &patch)
             }),
-            Prepared::Sparql { update } => apply_scoped(w, resource, update, |_| Ok(())),
+            Prepared::Sparql { update } => solve_scoped(w, resource, update, |_| Ok(())),
         }
+    }
+
+    /// Run the patch against `resource`, inside the caller's write.
+    pub fn apply(self, w: &mut PodWrite<'_>, resource: &str) -> Result<(), PatchError> {
+        let patched = self.solve(w, resource)?;
+        ldp::store_patched(w, resource, patched).map_err(PatchError::Ldp)
     }
 }
 
@@ -356,12 +369,13 @@ fn parse_update(text: &str, base: &str) -> Result<spargebra::Update, PatchError>
         .map_err(|e| PatchError::Malformed(e.to_string()))
 }
 
-/// Run an update against one resource, in isolation.
+/// Run an update against one resource, in isolation, and return the result.
 ///
 /// The resource's triples are copied into a scratch in-memory store as its
-/// **default graph**, the update runs there verbatim, and the result replaces
-/// the resource's named graph inside the caller's write. The write goes
-/// through `PodWrite::put`, so a patch that creates a resource contains it.
+/// **default graph**, the update runs there verbatim, and the result comes
+/// back as the resource's named graph for the caller to store — for a pod
+/// resource, via [`ldp::store_patched`]; the profile stores it as a bare
+/// outside-root graph instead (spec 6, H1).
 ///
 /// This avoids rewriting the client's SPARQL. Wrapping text in `WITH <g>` only
 /// works for the `DELETE/INSERT … WHERE` form — `INSERT DATA`, which is what
@@ -379,14 +393,14 @@ fn parse_update(text: &str, base: &str) -> Result<spargebra::Update, PatchError>
 /// member's `dcterms:modified`/`stat:size` — the same one call `read_in`
 /// makes, not a `contains`-only subset, because the rule is "match what a
 /// listing shows" and a listing shows all of it. The write-back path is
-/// unchanged: `store_patched` → `Content::Container` → `container_body`, so
-/// the patch can *read* the members and still cannot rewrite them.
-fn apply_scoped(
+/// unchanged: `store_patched` → `Content::Container` → `container_body`, so the
+/// patch can *read* the members and still cannot rewrite them.
+fn solve_scoped(
     w: &mut PodWrite<'_>,
     resource: &str,
     update: spargebra::Update,
     precondition: impl Fn(&Store) -> Result<(), PatchError>,
-) -> Result<(), PatchError> {
+) -> Result<Vec<Quad>, PatchError> {
     let graph = NamedNode::new_unchecked(resource);
 
     let scratch = Store::new().map_err(|e| PatchError::Store(e.to_string()))?;
@@ -419,15 +433,11 @@ fn apply_scoped(
     precondition(&scratch)?;
     run_update(&scratch, update)?;
 
-    let patched: Vec<Quad> = scratch
+    Ok(scratch
         .quads_for_pattern(None, None, None, Some(GraphNameRef::DefaultGraph))
         .filter_map(Result::ok)
         .map(|q| Quad::new(q.subject, q.predicate, q.object, graph.clone()))
-        .collect();
-
-    // The target's kind decides the `Content`, and a container's body is held
-    // to the containment rule, exactly as a PUT would be.
-    ldp::store_patched(w, resource, patched).map_err(PatchError::Ldp)
+        .collect())
 }
 
 /// Check the preconditions SPARQL cannot express.

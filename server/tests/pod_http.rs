@@ -3,12 +3,17 @@
 
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
 use brolly_server::{AppState, app};
 use brolly_store::StoreManager;
 use brolly_store::resources::{Content, Pod, PodRead};
 use http_body_util::BodyExt;
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use p256::ecdsa::SigningKey;
+use p256::ecdsa::signature::Signer;
+use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
 const HOST: &str = "alice.brolly.test";
@@ -760,6 +765,400 @@ async fn the_members_own_triples_are_still_there() {
     assert!(body.contains("Alice Example"), "got: {body}");
     // ...alongside the derived ones.
     assert!(body.contains("oidcIssuer"), "got: {body}");
+}
+
+// --- the WebID profile document: writing (spec 6, H1) -------------------------
+
+/// The profile graph's IRIs, for the write tests.
+const PROFILE: &str = "https://alice.brolly.test/profile";
+const ME: &str = "https://alice.brolly.test/profile#me";
+const FOAF: &str = "http://xmlns.com/foaf/0.1/";
+const SPACE: &str = "http://www.w3.org/ns/pim/space#";
+const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
+
+/// The owner replaces their profile over HTTP, and what the projection serves
+/// is what was stored plus the derived five.
+#[tokio::test]
+async fn the_owner_puts_their_profile() {
+    let h = harness().await;
+    let (status, text, _) = h
+        .send(
+            "PUT",
+            "/profile",
+            Some((
+                "text/turtle",
+                r#"<#me> <http://xmlns.com/foaf/0.1/name> "Put over HTTP" ."#,
+            )),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert!(body.contains("Put over HTTP"), "got: {body}");
+    // The graph holds what was written; the five the projection derives are
+    // served beside it, not stored.
+    let pod = h.stores.pod(h.user).unwrap();
+    assert!(!holds(
+        &pod,
+        &t(PROFILE, ME, RDF_TYPE, &format!("{FOAF}Person"))
+    ));
+}
+
+/// What the projection serves, written back, is what the projection serves:
+/// the round trip a read-modify-write client (SolidOS, Penny) performs is
+/// lossless — the derived five are dropped on the way in and derived again on
+/// the way out, and the dashboard's five carry.
+#[tokio::test]
+async fn a_read_modify_write_round_trip_is_lossless() {
+    let h = harness().await;
+    let pod = h.stores.pod(h.user).unwrap();
+    pod.write(|w| {
+        brolly_solid::profile::write(
+            w,
+            ME,
+            PROFILE,
+            &brolly_solid::profile::Profile {
+                display_name: "Alice Example".into(),
+                bio: "Founder".into(),
+                locked: true,
+                ..brolly_solid::profile::Profile::blank()
+            },
+        )
+    })
+    .unwrap();
+
+    let (_, first, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    let (status, text, _) = h
+        .send(
+            "PUT",
+            "/profile",
+            Some(("text/turtle", first.as_str())),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    let (_, second, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert_eq!(second, first, "the round trip must be lossless");
+    // The dashboard's five carried, not cleared: a locked account stays
+    // locked (H1 — a read-modify-write is what every Solid client does).
+    assert!(brolly_solid::profile::read(&pod.read_store(), ME, PROFILE).locked);
+}
+
+/// A `PUT` that omits the dashboard's predicates clears them — LDP `PUT`
+/// semantics, owned by H1. The consequence the spec records:
+/// `as:manuallyApprovesFollowers` absent reads as *false*, so a locked account
+/// comes back unlocked. A client that hand-builds its body instead of editing
+/// what it read pays it; one that read-modify-writes does not.
+#[tokio::test]
+async fn a_put_that_omits_the_dashboards_predicates_clears_them() {
+    let h = harness().await;
+    let pod = h.stores.pod(h.user).unwrap();
+    pod.write(|w| {
+        brolly_solid::profile::write(
+            w,
+            ME,
+            PROFILE,
+            &brolly_solid::profile::Profile {
+                display_name: "Alice Example".into(),
+                locked: true,
+                ..brolly_solid::profile::Profile::blank()
+            },
+        )
+    })
+    .unwrap();
+
+    let (status, text, _) = h
+        .send(
+            "PUT",
+            "/profile",
+            Some((
+                "text/turtle",
+                r#"<#me> <http://xmlns.com/foaf/0.1/nick> "Hand-built" ."#,
+            )),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    let profile = brolly_solid::profile::read(&pod.read_store(), ME, PROFILE);
+    assert_eq!(profile.display_name, "", "the PUT replaced the graph");
+    // The locked-account consequence H1 owns: absent reads as false.
+    assert!(!profile.locked, "a locked account came back unlocked");
+    // ...and what was written is there.
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert!(body.contains("Hand-built"), "got: {body}");
+    assert!(!body.contains("Alice Example"), "got: {body}");
+}
+
+/// A self-asserted storage root is dropped on write and the deployment's value
+/// is served on read; a member's own type survives. Positions, not predicates:
+/// `rdf:type` is at once a reserved position and the commonest predicate in a
+/// hand-written profile, and `<#me> a schema:Person` is an ordinary triple.
+#[tokio::test]
+async fn a_self_asserted_storage_root_is_dropped_and_the_deployments_is_served() {
+    let h = harness().await;
+    let (status, text, _) = h
+        .send(
+            "PUT",
+            "/profile",
+            Some((
+                "text/turtle",
+                "<#me> <http://www.w3.org/ns/pim/space#storage> <https://elsewhere.example/~carol/> ;\n<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://schema.org/Person> .",
+            )),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    // Dropped on write: the stored graph holds the member's type, not their
+    // storage root.
+    let pod = h.stores.pod(h.user).unwrap();
+    assert!(holds(
+        &pod,
+        &t(PROFILE, ME, RDF_TYPE, "http://schema.org/Person")
+    ));
+    assert!(!holds(
+        &pod,
+        &t(
+            PROFILE,
+            ME,
+            &format!("{SPACE}storage"),
+            "https://elsewhere.example/~carol/"
+        )
+    ));
+
+    // The deployment's value is served on read — and it is the only one.
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert!(!body.contains("elsewhere"), "got: {body}");
+    assert!(body.contains(ROOT), "the deployment's storage root: {body}");
+    assert_eq!(
+        body.matches(&format!("{SPACE}storage")).count(),
+        1,
+        "one storage root, the deployment's: {body}"
+    );
+    assert!(
+        body.contains("http://schema.org/Person"),
+        "a member's own type survives: {body}"
+    );
+}
+
+/// Nobody but the owner writes the profile (H1): anonymous gets 401 with a
+/// challenge, another member 403, a foreign WebID 401 naming the token — per
+/// stage 5b's H1 table, from the credential alone.
+#[tokio::test]
+async fn nobody_but_the_owner_writes_the_profile() {
+    let h = harness().await;
+    const BODY: &str = r#"<#me> <http://xmlns.com/foaf/0.1/name> "No" ."#;
+
+    // Anonymous: 401 and a challenge, like every unauthenticated refusal.
+    let (status, _, headers) = h
+        .send("PUT", "/profile", Some(("text/turtle", BODY)), false)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let challenge = headers[header::WWW_AUTHENTICATE].to_str().unwrap();
+    assert!(challenge.starts_with("DPoP "), "got: {challenge}");
+
+    // Another member: authenticated, and not the owner.
+    let bob = db::create_user(&h._db.pool, "bob", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let bob = db::create_session(&h._db.pool, bob.id, time::Duration::hours(1), None)
+        .await
+        .unwrap();
+    let (status, body, _) = run(
+        h.router.clone(),
+        conditional_request(
+            "PUT",
+            "/profile",
+            Some(("text/turtle", BODY)),
+            Some(&bob),
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    // A foreign WebID: a token that verifies but names a WebID this instance
+    // doesn't host, so it is the token that is wrong (stage 5, `solid_subject`).
+    let key = SigningKey::from_slice(&[7u8; 32]).unwrap();
+    let sec1 = key.verifying_key().to_sec1_bytes();
+    let jkt = brolly_identity::dpop::thumbprint(&brolly_identity::dpop::PublicJwk {
+        kty: "EC".into(),
+        crv: "P-256".into(),
+        x: B64.encode(&sec1[1..33]),
+        y: B64.encode(&sec1[33..65]),
+    });
+    let provider_key = brolly_solid::oidc::store::load_or_create_key(&h._db.pool)
+        .await
+        .unwrap();
+    let token = brolly_solid::oidc::tokens::issue_access(
+        &provider_key,
+        "https://brolly.test",
+        "https://elsewhere.example/carol#me",
+        "https://app.example",
+        "webid",
+        &jkt,
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
+    .unwrap();
+    let proof = dpop_proof(
+        &key,
+        "PUT",
+        PROFILE,
+        Some(&B64.encode(Sha256::digest(token.as_bytes()))),
+    );
+    let (status, _, headers) = run(
+        h.router.clone(),
+        conditional_request(
+            "PUT",
+            "/profile",
+            Some(("text/turtle", BODY)),
+            None,
+            &[
+                (header::AUTHORIZATION.as_str(), &format!("DPoP {token}")),
+                ("dpop", &proof),
+            ],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let challenge = headers[header::WWW_AUTHENTICATE].to_str().unwrap();
+    assert!(challenge.contains("invalid_token"), "got: {challenge}");
+}
+
+/// A DPoP proof, as `solid_token_access.rs` builds one: the profile's foreign
+/// caller has to arrive with a token that verifies, or the refusal is the
+/// token's and not the WebID's.
+fn dpop_proof(key: &SigningKey, method: &str, url: &str, ath: Option<&str>) -> String {
+    let sec1 = key.verifying_key().to_sec1_bytes();
+    let header = serde_json::json!({
+        "alg": "ES256",
+        "typ": "dpop+jwt",
+        "jwk": {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": B64.encode(&sec1[1..33]),
+            "y": B64.encode(&sec1[33..65]),
+        },
+    });
+    let mut claims = serde_json::json!({
+        "htm": method,
+        "htu": url,
+        "jti": uuid::Uuid::new_v4().to_string(),
+        "iat": time::OffsetDateTime::now_utc().unix_timestamp(),
+    });
+    if let Some(ath) = ath {
+        claims["ath"] = serde_json::Value::String(ath.to_string());
+    }
+    let signed = format!(
+        "{}.{}",
+        B64.encode(serde_json::to_vec(&header).unwrap()),
+        B64.encode(serde_json::to_vec(&claims).unwrap())
+    );
+    let signature: p256::ecdsa::Signature = key.sign(signed.as_bytes());
+    format!("{signed}.{}", B64.encode(signature.to_bytes()))
+}
+
+/// `DELETE` and `POST` are 405 with an `Allow` naming what the profile takes
+/// (5b, H16): the method router's own refusal, which carries its own list.
+#[tokio::test]
+async fn the_profile_cannot_be_deleted_or_posted_to() {
+    let h = harness().await;
+    for method in ["DELETE", "POST"] {
+        let (status, _, headers) = h
+            .send(method, "/profile", Some(("text/turtle", NOTE)), true)
+            .await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{method}");
+        let allow = headers[header::ALLOW].to_str().unwrap();
+        for expected in ["GET", "HEAD", "PUT", "PATCH"] {
+            assert!(allow.contains(expected), "{method}: Allow was {allow}");
+        }
+    }
+}
+
+/// A patch inserts, deletes, and refuses what every other patch refuses —
+/// through the same solver, scoped to the profile graph (H1).
+#[tokio::test]
+async fn the_owner_patches_their_profile() {
+    let h = harness().await;
+    h.send(
+        "PUT",
+        "/profile",
+        Some((
+            "text/turtle",
+            r#"<#me> <http://xmlns.com/foaf/0.1/name> "Before" ."#,
+        )),
+        true,
+    )
+    .await;
+
+    // An insert-only patch — Append, in 5c's classification — inserts.
+    let insert = r#"@prefix solid: <http://www.w3.org/ns/solid/terms#> .
+_:p a solid:InsertDeletePatch ;
+  solid:inserts { <#me> <http://xmlns.com/foaf/0.1/nick> "Patchy" . } ."#;
+    let (status, text, _) = h
+        .send("PATCH", "/profile", Some(("text/n3", insert)), true)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert!(body.contains("Patchy"), "got: {body}");
+    // An insert, not a replace: what was there is still there.
+    assert!(body.contains("Before"), "got: {body}");
+
+    // A deleting patch — Write, in 5c's classification — deletes.
+    let delete = r#"@prefix solid: <http://www.w3.org/ns/solid/terms#> .
+_:p a solid:InsertDeletePatch ;
+  solid:deletes { <#me> <http://xmlns.com/foaf/0.1/nick> "Patchy" . } ."#;
+    let (status, text, _) = h
+        .send("PATCH", "/profile", Some(("text/n3", delete)), true)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert!(!body.contains("Patchy"), "got: {body}");
+
+    // A delete of an absent triple is the 409 every other patch answers (5c):
+    // the solver is the same, so its preconditions are too.
+    let absent = r#"@prefix solid: <http://www.w3.org/ns/solid/terms#> .
+_:p a solid:InsertDeletePatch ;
+  solid:deletes { <#me> <http://xmlns.com/foaf/0.1/nick> "Never there" . } ."#;
+    let (status, text, _) = h
+        .send("PATCH", "/profile", Some(("text/n3", absent)), true)
+        .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{text}");
+}
+
+/// The reserved-position filter applies to a patch's result as it applies to a
+/// `PUT`'s body: a patch may not seat a self-asserted storage root either.
+#[tokio::test]
+async fn a_patch_cannot_seat_a_self_asserted_storage_root() {
+    let h = harness().await;
+    let insert = r#"@prefix solid: <http://www.w3.org/ns/solid/terms#> .
+_:p a solid:InsertDeletePatch ;
+  solid:inserts { <#me> <http://www.w3.org/ns/pim/space#storage> <https://elsewhere.example/~carol/> . } ."#;
+    let (status, text, _) = h
+        .send("PATCH", "/profile", Some(("text/n3", insert)), true)
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    let pod = h.stores.pod(h.user).unwrap();
+    assert!(!holds(
+        &pod,
+        &t(
+            PROFILE,
+            ME,
+            &format!("{SPACE}storage"),
+            "https://elsewhere.example/~carol/"
+        )
+    ));
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert!(!body.contains("elsewhere"), "got: {body}");
+    assert_eq!(
+        body.matches(&format!("{SPACE}storage")).count(),
+        1,
+        "one storage root, the deployment's: {body}"
+    );
 }
 
 // --- the actor's collections --------------------------------------------------

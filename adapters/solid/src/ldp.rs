@@ -1078,7 +1078,7 @@ fn is_served_type(object: &Term, is_root: bool) -> bool {
 /// `Pod::write` speaks `StoreError`. When `f` refuses, the closure returns an
 /// `Err`, so the transaction rolls back, and the refusal is handed back as it
 /// was.
-fn in_write<T, E: From<StoreError>>(
+pub(crate) fn in_write<T, E: From<StoreError>>(
     pod: &Pod,
     f: impl FnOnce(&mut PodWrite<'_>) -> Result<T, E>,
 ) -> Result<T, E> {
@@ -1099,7 +1099,7 @@ fn in_write<T, E: From<StoreError>>(
 /// ADR 0007: we serve RDF/XML but never parse it, and it must not become an
 /// opaque blob either — storing it defers the parse rather than avoiding it,
 /// and the two live `quick-xml` advisories are reachable either way.
-fn refuse_rdf_xml(content_type: &str) -> Result<(), LdpError> {
+pub(crate) fn refuse_rdf_xml(content_type: &str) -> Result<(), LdpError> {
     match syntax::read_format(content_type) {
         Err(e @ SyntaxError::RdfXmlNotAccepted) => Err(LdpError::Syntax(e)),
         _ => Ok(()),
@@ -1661,7 +1661,7 @@ pub(crate) fn store_patched(
 ///
 /// A body may carry its own graph names; honouring them would let a `PUT` to
 /// one resource write triples into another.
-fn parse_into_graph(
+pub(crate) fn parse_into_graph(
     body: &[u8],
     format: ReadFormat,
     resource: &str,

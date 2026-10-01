@@ -428,7 +428,10 @@ async fn solid_subject(state: &AppState, claims: tokens::AccessClaims) -> Result
 /// while keeping what that rule protected. An unauthenticated caller gets 401
 /// for `/~/secret` and for `/~/does-not-exist` and can't tell them apart. An
 /// authenticated one gets 403 for both.
-fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Response {
+///
+/// The profile's writes answer from the same table (spec 6, H1): its owner
+/// check is an authorization decision, and `Denied` is the same refusal.
+pub(crate) fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Response {
     match error {
         LdpError::Denied if authenticated => (StatusCode::FORBIDDEN, "forbidden").into_response(),
         // No credential, or a cookie that no longer resolves. Credentials that
@@ -942,7 +945,11 @@ fn preconditions(headers: &HeaderMap) -> Preconditions {
 /// gets the 401 CTS expects on every method, rather than a 400 for a header
 /// they forgot. A header that isn't valid UTF-8 is treated as absent: it can't
 /// name a media type we parse, and a 415 for it would send the client guessing.
-fn content_type<'h>(headers: &'h HeaderMap, body: &[u8], empty_is_rdf: bool) -> Option<&'h str> {
+pub(crate) fn content_type<'h>(
+    headers: &'h HeaderMap,
+    body: &[u8],
+    empty_is_rdf: bool,
+) -> Option<&'h str> {
     match headers
         .get(header::CONTENT_TYPE)
         .and_then(|h| h.to_str().ok())
@@ -954,12 +961,62 @@ fn content_type<'h>(headers: &'h HeaderMap, body: &[u8], empty_is_rdf: bool) -> 
 }
 
 /// Solid §2.1's 400, naming the header that was missing.
-fn missing_content_type() -> Response {
+pub(crate) fn missing_content_type() -> Response {
     (
         StatusCode::BAD_REQUEST,
         "a request with a body needs a Content-Type header (Solid Protocol §2.1)",
     )
         .into_response()
+}
+
+/// A PATCH body by its content type (5c, H7): `text/n3` is an N3 Patch,
+/// `application/sparql-update` a SPARQL Update, and anything else is a 415
+/// naming what a PATCH takes.
+///
+/// One builder for every PATCH handler — the pod's and the profile's (spec 6,
+/// H1) — so the two surfaces refuse identically.
+#[allow(clippy::result_large_err)] // a `Response` is the refusal; boxing it would tax every caller
+pub(crate) fn patch_body<'b>(
+    content_type: &str,
+    body: &'b [u8],
+) -> Result<ldp::PatchBody<'b>, Response> {
+    match content_type.split(';').next().unwrap_or_default().trim() {
+        "text/n3" => Ok(ldp::PatchBody::N3(body)),
+        "application/sparql-update" => match std::str::from_utf8(body) {
+            Ok(sparql) => Ok(ldp::PatchBody::SparqlUpdate(sparql)),
+            Err(_) => Err((StatusCode::BAD_REQUEST, "body is not UTF-8").into_response()),
+        },
+        other => Err((
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            format!("PATCH accepts text/n3 or application/sparql-update, not {other}"),
+        )
+            .into_response()),
+    }
+}
+
+/// A [`PatchError`] into a response, shared by every PATCH handler — the pod's
+/// and the profile's (spec 6, H1) — so a 409 or a 403 cannot mean two things on
+/// two surfaces.
+pub(crate) fn patch_error(error: patch::PatchError, authenticated: bool, apex: &str) -> Response {
+    match error {
+        patch::PatchError::Ldp(e) => ldp_error(e, authenticated, apex),
+        patch::PatchError::Precondition(m) => (StatusCode::CONFLICT, m).into_response(),
+        patch::PatchError::NotCurrent => {
+            (StatusCode::PRECONDITION_FAILED, "precondition failed").into_response()
+        }
+        patch::PatchError::EscapesGraph => (
+            StatusCode::FORBIDDEN,
+            "a PATCH may only insert or delete in the resource it addresses",
+        )
+            .into_response(),
+        patch::PatchError::Malformed(m) | patch::PatchError::NotAPatch(m) => {
+            (StatusCode::BAD_REQUEST, m).into_response()
+        }
+        e => {
+            tracing::error!(error = %e, "patch failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
 }
 
 /// `GET /~/*path`, and `HEAD`, which axum routes here without the body.
@@ -1261,21 +1318,9 @@ pub async fn patch(
         return missing_content_type();
     };
 
-    let patch_body = match content_type.split(';').next().unwrap_or_default().trim() {
-        "text/n3" => ldp::PatchBody::N3(&body),
-        "application/sparql-update" => match std::str::from_utf8(&body) {
-            Ok(sparql) => ldp::PatchBody::SparqlUpdate(sparql),
-            Err(_) => {
-                return (StatusCode::BAD_REQUEST, "body is not UTF-8").into_response();
-            }
-        },
-        other => {
-            return (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                format!("PATCH accepts text/n3 or application/sparql-update, not {other}"),
-            )
-                .into_response();
-        }
+    let patch_body = match patch_body(content_type, &body) {
+        Ok(body) => body,
+        Err(response) => return response,
     };
 
     // WAC, the preconditions, the patch and the write, in one transaction.
@@ -1320,23 +1365,7 @@ pub async fn patch(
             response
         }
         Ok(ldp::Written::Replaced) => StatusCode::NO_CONTENT.into_response(),
-        Err(patch::PatchError::Ldp(e)) => ldp_error(e, request.authenticated, &request.apex),
-        Err(patch::PatchError::Precondition(m)) => (StatusCode::CONFLICT, m).into_response(),
-        Err(patch::PatchError::NotCurrent) => {
-            (StatusCode::PRECONDITION_FAILED, "precondition failed").into_response()
-        }
-        Err(patch::PatchError::EscapesGraph) => (
-            StatusCode::FORBIDDEN,
-            "a PATCH may only insert or delete in the resource it addresses",
-        )
-            .into_response(),
-        Err(patch::PatchError::Malformed(m) | patch::PatchError::NotAPatch(m)) => {
-            (StatusCode::BAD_REQUEST, m).into_response()
-        }
-        Err(e) => {
-            tracing::error!(error = %e, "patch failed");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Err(e) => patch_error(e, request.authenticated, &request.apex),
     }
 }
 
