@@ -830,8 +830,8 @@ fn release_refused_bytes<T>(pod: &Pod, body: &Body, written: &Result<T, LdpError
 /// [`LdpError::KindChange`] and the old representation stays as it was. A
 /// binary addressed to a container or an auxiliary is still [`LdpError::NotRdf`],
 /// because those targets never take one whatever is there. Replacing a binary
-/// with new bytes is the same kind and unaffected; it still drops the
-/// description triples until 5d moves them to `.meta`.
+/// with new bytes is the same kind and unaffected; the description triples
+/// live in its `.meta` now (spec 5d, H6), so they survive the replacement.
 ///
 /// Every refusal comes before the first write.
 ///

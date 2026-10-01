@@ -41,6 +41,18 @@ fn says(graph: &str, value: &str) -> Quad {
     )
 }
 
+/// `<resource> ex:says "value"`, in `resource`'s `.meta`'s graph — the shape
+/// of a description triple under spec 5d, H6: about the resource, stored in
+/// the description.
+fn describes(resource: &str, value: &str) -> Quad {
+    Quad::new(
+        NamedOrBlankNode::NamedNode(node(resource)),
+        node(SAYS),
+        Term::Literal(Literal::new_simple_literal(value)),
+        GraphName::NamedNode(node(&format!("{resource}.meta"))),
+    )
+}
+
 /// Every quad in one graph, through any reader.
 fn graph(read: &impl PodRead, name: &str) -> Vec<Quad> {
     read.quads_for_pattern(
@@ -917,39 +929,78 @@ fn the_raw_store_fixture_sees_what_readers_see() {
 #[test]
 fn a_description_replaces_the_one_before_it() {
     // Mastodon alt text: a second description must replace the first, not sit
-    // beside it, and the binary keeps its bytes.
+    // beside it. The description is the `.meta`'s content — its own resource
+    // (spec 5d, H6) — so the binary keeps its bytes, its blob metadata and its
+    // version, and it is the `.meta`'s record that comes back.
     let (_dir, stores) = manager(60);
     let pod = provisioned(&stores);
     let meta = blob(&pod, b"a small dog");
-    pod.write(|w| w.put(&at("dog.png"), Content::Binary(meta.clone())))
+    let put = pod
+        .write(|w| w.put(&at("dog.png"), Content::Binary(meta.clone())))
         .unwrap();
     let first = pod
-        .write(|w| w.set_description(&at("dog.png"), &[says(&at("dog.png"), "a dog")]))
+        .write(|w| w.set_description(&at("dog.png"), &[describes(&at("dog.png"), "a dog")]))
         .unwrap();
     let second = pod
-        .write(|w| w.set_description(&at("dog.png"), &[says(&at("dog.png"), "a small dog")]))
+        .write(|w| w.set_description(&at("dog.png"), &[describes(&at("dog.png"), "a small dog")]))
         .unwrap();
 
+    // The `.meta` is an auxiliary resource with its own moving version, and
+    // one description, not two.
     assert_ne!(first.version, second.version, "the version didn't move");
-    assert_eq!(second.blob.as_ref().map(|b| &b.digest), Some(&meta.digest));
-    let described = pod
-        .read_store()
-        .quads_for_pattern(
-            None,
-            None,
-            None,
-            Some(GraphNameRef::NamedNode(node(&at("dog.png")).as_ref())),
-        )
-        .count();
-    assert_eq!(described, 1, "the old description is still there");
+    assert!(second.blob.is_none(), "the description has no bytes");
+    assert_eq!(second.kind, Kind::Auxiliary);
+    let described = graph(&pod.read_store(), &at("dog.png.meta"));
+    assert_eq!(
+        described,
+        vec![describes(&at("dog.png"), "a small dog")],
+        "the old description is still there"
+    );
+
+    // The binary keeps what it had: bytes, blob metadata, version.
+    let binary = pod.read(|r| r.meta(&at("dog.png"))).unwrap().unwrap();
+    assert_eq!(
+        binary.version, put.version,
+        "the description moved the binary's version"
+    );
+    assert_eq!(binary.blob.as_ref().map(|b| &b.digest), Some(&meta.digest));
+    assert!(graph(&pod.read_store(), &at("dog.png")).is_empty());
+    assert_eq!(pod.read(|r| r.members(ROOT)).unwrap(), vec![at("dog.png")]);
 
     // Only a binary has a description.
     pod.write(|w| w.put(&at("doc"), Content::Rdf(&[]))).unwrap();
-    let refused = pod.write(|w| w.set_description(&at("doc"), &[says(&at("doc"), "x")]));
+    let refused = pod.write(|w| w.set_description(&at("doc"), &[describes(&at("doc"), "x")]));
     assert!(
         matches!(refused, Err(StoreError::Invalid(_))),
         "got {refused:?}"
     );
+}
+
+#[test]
+fn replacing_the_bytes_keeps_the_description() {
+    // Spec 5d, H6's deliberate behaviour change: the image changed; the
+    // member's description of it is theirs to change deliberately. Under the
+    // old rules a `PUT` of new bytes dropped the description triples, because
+    // they sat in the binary's own graph; in its own resource, they survive.
+    let (_dir, stores) = manager(60);
+    let pod = provisioned(&stores);
+    pod.write(|w| {
+        w.put(&at("dog.png"), Content::Binary(blob(&pod, b"a small dog")))?;
+        w.set_description(&at("dog.png"), &[describes(&at("dog.png"), "a small dog")])?;
+        Ok(())
+    })
+    .unwrap();
+
+    let replacement = blob(&pod, b"a different dog");
+    pod.write(|w| w.put(&at("dog.png"), Content::Binary(replacement)))
+        .unwrap();
+
+    assert_eq!(
+        graph(&pod.read_store(), &at("dog.png.meta")),
+        vec![describes(&at("dog.png"), "a small dog")],
+        "replacing the bytes dropped the description"
+    );
+    assert!(graph(&pod.read_store(), &at("dog.png")).is_empty());
 }
 
 #[test]

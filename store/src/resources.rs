@@ -708,10 +708,14 @@ impl PodWrite<'_> {
         Ok(meta)
     }
 
-    /// Replace a binary's description triples (today, Mastodon alt text) and
-    /// move its version. Replaces rather than appends, so a second description
-    /// doesn't sit beside the first. Keeps the bytes and the blob metadata.
-    /// Refuses anything that isn't an existing binary.
+    /// Replace a binary's description triples (today, Mastodon alt text) in
+    /// its `.meta`'s graph, recording the `.meta` as an auxiliary resource
+    /// (spec 5d, H6). Replaces rather than appends, so a second description
+    /// doesn't sit beside the first. The binary keeps its bytes, its blob
+    /// metadata and its version: the description is its own resource with its
+    /// own version, which is also why replacing the binary's bytes keeps the
+    /// description. Refuses anything that isn't an existing binary, and
+    /// answers the new `.meta`'s record.
     pub fn set_description(
         &mut self,
         resource: &str,
@@ -720,22 +724,26 @@ impl PodWrite<'_> {
         let previous = self.meta(resource)?;
         let Some(ResourceMeta {
             kind: Kind::NonRdfSource,
-            blob: Some(blob),
+            blob: Some(_),
             ..
-        }) = previous.clone()
+        }) = previous.as_ref()
         else {
             return Err(StoreError::Invalid(format!(
                 "{resource} is not a binary, so it has no description"
             )));
         };
-        let root = self.root_for(resource)?;
-        check_graph(resource, quads)?;
+        // H6 (spec 5d): the description is the `.meta`'s content — its own
+        // resource, never the binary's own graph — so replacing the bytes
+        // keeps it and replacing it doesn't touch the binary. A binary can't
+        // be recorded at an auxiliary IRI, so the `.meta` is never a double.
+        let meta = format!("{resource}.meta");
+        refuse_double_auxiliary(&meta)?;
+        check_graph(&meta, quads)?;
+        let previous_meta = self.meta(&meta)?;
         self.transaction
-            .clear_graph(GraphNameRef::NamedNode(iri(resource).as_ref()))?;
+            .clear_graph(GraphNameRef::NamedNode(iri(&meta).as_ref()))?;
         insert_quads_in(&mut self.transaction, quads);
-        let meta = self.record(resource, Kind::NonRdfSource, previous.as_ref(), Some(blob))?;
-        self.contain(resource, &root)?;
-        Ok(meta)
+        self.record(&meta, Kind::Auxiliary, previous_meta.as_ref(), None)
     }
 
     /// Remove `resource` if present, returning whether it was there: a no-op

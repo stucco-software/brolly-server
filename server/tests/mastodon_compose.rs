@@ -359,6 +359,48 @@ async fn an_upload_reads_back_from_metadata_with_its_alt_text() {
         .count();
     assert_eq!(pointers, 0, "a blob pointer is still in the content graph");
 
+    // The alt text lives in the upload's `.meta`, its description (spec 5d,
+    // H6) — about the upload, never in the upload's own graph — and the
+    // `.meta` is the auxiliary carrying it.
+    let description = format!("{iri}.meta");
+    let described = pod
+        .read(|r| r.meta(&description))
+        .unwrap()
+        .expect("the description is its own resource");
+    assert!(matches!(described.kind, Kind::Auxiliary));
+    let alt: Vec<String> = pod
+        .read_store()
+        .quads_for_pattern(
+            None,
+            Some(NamedNodeRef::new_unchecked("https://brolly.id/ns#altText")),
+            None,
+            Some(GraphNameRef::NamedNode(NamedNodeRef::new_unchecked(&description))),
+        )
+        .map(|q| q.unwrap())
+        .filter(|q| {
+            matches!(&q.subject, oxigraph::model::NamedOrBlankNode::NamedNode(s) if s.as_str() == iri)
+        })
+        .map(|q| match q.object {
+            oxigraph::model::Term::Literal(l) => l.value().to_string(),
+            _ => String::new(),
+        })
+        .collect();
+    assert_eq!(
+        alt,
+        vec!["a small dog"],
+        "the alt text must be in the .meta, about the upload"
+    );
+    let own = pod
+        .read_store()
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(NamedNodeRef::new_unchecked(&iri))),
+        )
+        .count();
+    assert_eq!(own, 0, "the upload's own graph must be empty");
+
     // Alt text added later reads back through the same path.
     let later = upload(&h, &token, None).await;
     let updated = send(

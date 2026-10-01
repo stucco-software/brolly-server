@@ -27,7 +27,7 @@ use oxigraph::model::{
 
 use super::{
     BlobMeta, Content, Kind, METADATA_GRAPH, Pod, PodRead, PodWrite, ResourceMeta, containment,
-    is_double_auxiliary, meta_quad, parent_container,
+    iri, is_double_auxiliary, meta_quad, parent_container,
 };
 use crate::blobs::BlobStore;
 use crate::manager::StoreError;
@@ -74,12 +74,15 @@ pub struct UpgradeReport {
     /// auxiliary, or a binary at a `.meta` IRI, neither of which can exist
     /// under the new rules (spec 5d, H1 and H4).
     pub fictions_removed: usize,
+    /// Layout 2 → 3: binaries whose description triples moved from their own
+    /// graphs to a `.meta` auxiliary (spec 5d, H6).
+    pub descriptions_moved: usize,
 }
 
 impl UpgradeReport {
     /// Did the layout-2 → 3 migration change anything?
     fn migrated(&self) -> bool {
-        self.metas_retyped > 0 || self.fictions_removed > 0
+        self.metas_retyped > 0 || self.fictions_removed > 0 || self.descriptions_moved > 0
     }
 }
 
@@ -296,6 +299,11 @@ fn record(
     // 2, 4 and 5. The root first, then each resource through `put`, which
     //    contains it (step 4) and replaces its graph with the stripped one
     //    (step 5). Parents sort before children, but `put` doesn't need them to.
+    //    A binary's description triples — its graph without the blob pointers —
+    //    are held back for after the loop: a `.meta` this pod already carried
+    //    is put as the auxiliary it is now, and the description lands beside
+    //    its content, not under it (spec 5d, H6).
+    let mut descriptions = Vec::new();
     w.create_root(root)?;
     for (resource, kind) in found {
         match kind {
@@ -314,11 +322,15 @@ fn record(
             Found::Binary { blob, rest } => {
                 w.put(&resource, Content::Binary(blob))?;
                 if !rest.is_empty() {
-                    w.append(&resource, &rest)?;
+                    descriptions.push((resource, rest));
                 }
             }
         }
         report.resources += 1;
+    }
+    for (resource, rest) in descriptions {
+        move_description(w, &resource, &rest)?;
+        report.descriptions_moved += 1;
     }
     Ok(report)
 }
@@ -532,6 +544,8 @@ fn is_server_container_triple(quad: &Quad) -> bool {
 /// - An auxiliary of an auxiliary, and a `.meta` holding bytes — a binary
 ///   at a `.meta` IRI, which is RDF-only now (H4) — can't exist under the
 ///   new rules. Both are removed: graph, record, blob and containment.
+/// - A binary's description triples lived in its own graph under layout 2.
+///   They become its `.meta`'s content (H6), and the own-graph copies go.
 fn migrate(w: &mut PodWrite<'_>, report: &mut UpgradeReport) -> Result<(), StoreError> {
     for (resource, meta) in recorded(&*w)? {
         // No auxiliary of an auxiliary (spec 5d, H1). Layout 2 recorded any
@@ -576,6 +590,59 @@ fn migrate(w: &mut PodWrite<'_>, report: &mut UpgradeReport) -> Result<(), Store
             report.metas_retyped += 1;
         }
     }
+
+    // H6 (spec 5d), the second half: every binary's own-graph triples are its
+    // description, and move to its `.meta` — re-read rather than carried over
+    // from the pass above, so a `.meta` that pass retyped or removed is seen
+    // as it is now. A fresh `.meta` is recorded as the auxiliary carrying the
+    // description; a retyped one carries it beside the content it kept.
+    for (resource, meta) in recorded(&*w)? {
+        if !matches!(meta.kind, Kind::NonRdfSource) {
+            continue;
+        }
+        let described: Vec<Quad> = w
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(iri(&resource).as_ref())),
+            )
+            .collect::<Result<_, _>>()?;
+        if described.is_empty() {
+            continue;
+        }
+        move_description(w, &resource, &described)?;
+        report.descriptions_moved += 1;
+    }
+    Ok(())
+}
+
+/// Move `resource`'s description triples — `quads`, in its own graph — into
+/// its `.meta`'s graph, and record the `.meta` (spec 5d, H6). `append`, not
+/// `put`: a `.meta` this pod already carries keeps its content, and the
+/// description lands beside it. The quads' subjects are untouched — the
+/// description is still *about* `resource` — and only the graph changes.
+/// The binary's own record is untouched: bytes, blob metadata and version are
+/// what the member last saw.
+fn move_description(
+    w: &mut PodWrite<'_>,
+    resource: &str,
+    quads: &[Quad],
+) -> Result<(), StoreError> {
+    let meta = format!("{resource}.meta");
+    let moved: Vec<Quad> = quads
+        .iter()
+        .map(|q| {
+            Quad::new(
+                q.subject.clone(),
+                q.predicate.clone(),
+                q.object.clone(),
+                iri(&meta),
+            )
+        })
+        .collect();
+    w.append(&meta, &moved)?;
+    remove_quads_in(&mut w.transaction, quads);
     Ok(())
 }
 
@@ -959,5 +1026,201 @@ mod tests {
         let (_dir, pod) = layout_2_pod(&quads);
 
         assert!(upgrade(&pod).is_err(), "a newer server wrote this pod");
+    }
+
+    /// A layout-2 record for a binary, with its blob metadata — the shape
+    /// layout 2's `record` wrote for a `Content::Binary` put.
+    fn binary_2(resource: &str, digest: &str) -> Vec<Quad> {
+        let mut quads = record_2(resource, Kind::NonRdfSource);
+        quads.extend([
+            lit(METADATA_GRAPH, resource, vocab::BROLLY_BLOB_DIGEST, digest),
+            lit(
+                METADATA_GRAPH,
+                resource,
+                vocab::BROLLY_MEDIA_TYPE,
+                "image/png",
+            ),
+            Quad::new(
+                n(resource),
+                n(vocab::BROLLY_BYTE_SIZE),
+                Literal::new_typed_literal(PNG.len().to_string(), n(vocab::XSD_INTEGER)),
+                GraphName::NamedNode(n(METADATA_GRAPH)),
+            ),
+        ]);
+        quads
+    }
+
+    #[test]
+    fn a_binarys_description_moves_to_its_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let pod = Pod::open(dir.path()).unwrap();
+        let digest = pod.blobs().put(PNG).unwrap();
+        let photo = format!("{ROOT}photo.png");
+        let mut quads = vec![mark_2()];
+        quads.extend(root_2());
+        quads.extend(binary_2(&photo, &digest));
+        quads.push(iri(METADATA_GRAPH, ROOT, vocab::LDP_CONTAINS, &photo));
+        // The description, as layout 2 left it: in the binary's own graph.
+        quads.push(lit(&photo, &photo, TITLE, "a small dog"));
+        pod.raw_store().extend(quads.iter().cloned()).unwrap();
+
+        assert_eq!(
+            upgrade(&pod).unwrap(),
+            UpgradeOutcome::Upgraded(UpgradeReport {
+                root: ROOT.to_string(),
+                descriptions_moved: 1,
+                ..UpgradeReport::default()
+            })
+        );
+
+        // The `.meta` carries the description, about the photo, and is
+        // recorded as the auxiliary it is now.
+        let meta = format!("{photo}.meta");
+        assert_eq!(
+            pod.read(|r| r.meta(&meta)).unwrap().map(|m| m.kind),
+            Some(Kind::Auxiliary)
+        );
+        let described: Vec<Quad> = pod
+            .read_store()
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(n(&meta).as_ref())),
+            )
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            described,
+            vec![lit(&meta, &photo, TITLE, "a small dog")],
+            "the description moved with its subject and changed only its graph"
+        );
+
+        // The binary keeps what the member last saw: its record, its bytes,
+        // and an empty own graph. The root lists it, never the description.
+        let binary = pod.read(|r| r.meta(&photo)).unwrap().unwrap();
+        assert_eq!(binary.kind, Kind::NonRdfSource);
+        assert_eq!(binary.version, "0LAYOUT2VERSION000000000");
+        assert_eq!(binary.blob.unwrap().digest, digest);
+        let own: Vec<Quad> = pod
+            .read_store()
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(n(&photo).as_ref())),
+            )
+            .map(Result::unwrap)
+            .collect();
+        assert!(own.is_empty(), "the own-graph copy stayed: {own:?}");
+        assert_eq!(pod.read(|r| r.members(ROOT)).unwrap(), vec![photo.clone()]);
+    }
+
+    #[test]
+    fn a_description_lands_beside_a_stray_metas_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let pod = Pod::open(dir.path()).unwrap();
+        let digest = pod.blobs().put(PNG).unwrap();
+        let photo = format!("{ROOT}photo.png");
+        let meta = format!("{photo}.meta");
+        let mut quads = vec![mark_2()];
+        quads.extend(root_2());
+        quads.extend(binary_2(&photo, &digest));
+        quads.push(iri(METADATA_GRAPH, ROOT, vocab::LDP_CONTAINS, &photo));
+        quads.push(lit(&photo, &photo, TITLE, "a small dog"));
+        // And a stray `.meta` document the member wrote beside the photo.
+        quads.extend(stray_meta(&meta));
+        pod.raw_store().extend(quads.iter().cloned()).unwrap();
+
+        assert_eq!(
+            upgrade(&pod).unwrap(),
+            UpgradeOutcome::Upgraded(UpgradeReport {
+                root: ROOT.to_string(),
+                metas_retyped: 1,
+                descriptions_moved: 1,
+                ..UpgradeReport::default()
+            })
+        );
+
+        // Both live on: the stray's content, and the description beside it.
+        let described: Vec<Quad> = pod
+            .read_store()
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(n(&meta).as_ref())),
+            )
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(
+            described,
+            vec![
+                lit(&meta, &meta, TITLE, "a description"),
+                lit(&meta, &photo, TITLE, "a small dog"),
+            ],
+            "the description must land beside the stray's content, not under it"
+        );
+        assert_eq!(
+            pod.read(|r| r.members(ROOT)).unwrap(),
+            vec![photo.clone()],
+            "the retyped .meta must not be re-contained"
+        );
+    }
+
+    #[test]
+    fn a_layout_1_binarys_description_becomes_its_meta() {
+        let dir = tempfile::tempdir().unwrap();
+        let pod = Pod::open(dir.path()).unwrap();
+        let digest = pod.blobs().put(PNG).unwrap();
+        let photo = format!("{ROOT}photo.png");
+        // Layout 1: everything in the resource's own graph — the root's
+        // types and listing, the blob pointer, and the alt text beside it.
+        let quads = [
+            iri(ROOT, ROOT, vocab::RDF_TYPE, vocab::LDP_BASIC_CONTAINER),
+            iri(ROOT, ROOT, vocab::RDF_TYPE, vocab::PIM_STORAGE),
+            iri(ROOT, ROOT, vocab::LDP_CONTAINS, &photo),
+            lit(&photo, &photo, vocab::BROLLY_BLOB_DIGEST, &digest),
+            lit(&photo, &photo, TITLE, "a small dog"),
+        ];
+        pod.raw_store().extend(quads.iter().cloned()).unwrap();
+
+        assert_eq!(
+            upgrade(&pod).unwrap(),
+            UpgradeOutcome::Upgraded(UpgradeReport {
+                root: ROOT.to_string(),
+                resources: 2,
+                descriptions_moved: 1,
+                ..UpgradeReport::default()
+            })
+        );
+
+        let meta = format!("{photo}.meta");
+        assert_eq!(
+            pod.read(|r| r.meta(&meta)).unwrap().map(|m| m.kind),
+            Some(Kind::Auxiliary)
+        );
+        let described: Vec<Quad> = pod
+            .read_store()
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(n(&meta).as_ref())),
+            )
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(described, vec![lit(&meta, &photo, TITLE, "a small dog")]);
+        let own: Vec<Quad> = pod
+            .read_store()
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(n(&photo).as_ref())),
+            )
+            .map(Result::unwrap)
+            .collect();
+        assert!(own.is_empty(), "the own-graph copy stayed: {own:?}");
     }
 }

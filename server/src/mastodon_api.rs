@@ -592,20 +592,21 @@ pub async fn upload_media(
         .into_response()
 }
 
-/// The triple recording an upload's alt text, in the upload's own graph.
+/// The triple recording an upload's alt text, in its `.meta`'s graph — the
+/// description is the `.meta`'s content, about the upload (spec 5d, H6),
+/// which is why a member writing their own `.meta` can change it.
 fn alt_text_quad(iri: &str, text: &str) -> oxigraph_model::Quad {
     use oxigraph_model::{GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
-    let node = NamedNode::new_unchecked(iri);
     Quad::new(
-        NamedOrBlankNode::NamedNode(node.clone()),
+        NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(iri)),
         NamedNode::new_unchecked(ALT_TEXT),
         Term::Literal(Literal::new_simple_literal(text)),
-        GraphName::NamedNode(node),
+        GraphName::NamedNode(NamedNode::new_unchecked(format!("{iri}.meta"))),
     )
 }
 
 fn alt_text(pod: &impl PodRead, iri: &str) -> Option<String> {
-    brolly_store::collection::literal(pod, iri, ALT_TEXT)
+    brolly_store::collection::literal_in(pod, iri, ALT_TEXT, &format!("{iri}.meta"))
 }
 
 /// What the Mastodon API shows of an upload.
@@ -618,7 +619,8 @@ struct Media {
 ///
 /// One snapshot. The media type comes from the pod's resource metadata, which
 /// the server records and no client write reaches. Only the alt text is read
-/// from the upload's own graph, because a member writes it.
+/// from the upload's `.meta` — its description, the member's to write
+/// (spec 5d, H6).
 fn media(pod: &Pod, iri: &str) -> Result<Option<Media>, StoreError> {
     pod.read(|r| {
         let Some(blob) = r.meta(iri)?.and_then(|meta| meta.blob) else {

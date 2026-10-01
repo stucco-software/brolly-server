@@ -287,8 +287,9 @@ fn every_step_runs_on_an_old_layout_pod() {
         vec![format!("{ROOT}unlisted/deep/")]
     );
 
-    // The binary: metadata, containment, and a graph holding only its alt text
-    // (and the old type triples, which aren't blob triples).
+    // The binary: metadata, containment, and an empty own graph — the
+    // description is its `.meta`'s content now (spec 5d, H6), about the
+    // binary, and the `.meta` is the auxiliary carrying it.
     let pic_meta = meta(&pod, &pic).unwrap();
     assert!(matches!(pic_meta.kind, Kind::NonRdfSource));
     let blob = pic_meta.blob.expect("blob metadata");
@@ -298,7 +299,19 @@ fn every_step_runs_on_an_old_layout_pod() {
     assert_eq!(members(&pod, &format!("{ROOT}media/")), vec![pic.clone()]);
     let pic_graph = content(&pod, &pic);
     assert!(
-        pic_graph.iter().any(|q| q.predicate.as_str() == ALT),
+        pic_graph.is_empty(),
+        "the binary's own graph must be empty: {pic_graph:?}"
+    );
+    let description = format!("{pic}.meta");
+    assert!(matches!(
+        meta(&pod, &description).unwrap().kind,
+        Kind::Auxiliary
+    ));
+    let description_graph = content(&pod, &description);
+    assert!(
+        description_graph
+            .iter()
+            .any(|q| q.predicate.as_str() == ALT && about(q, &pic)),
         "alt text lost"
     );
     for blob_term in [
@@ -307,8 +320,10 @@ fn every_step_runs_on_an_old_layout_pod() {
         vocab::BROLLY_BYTE_SIZE,
     ] {
         assert!(
-            !pic_graph.iter().any(|q| q.predicate.as_str() == blob_term),
-            "{blob_term} left in the binary's graph"
+            !description_graph
+                .iter()
+                .any(|q| q.predicate.as_str() == blob_term),
+            "{blob_term} moved with the description"
         );
     }
 
