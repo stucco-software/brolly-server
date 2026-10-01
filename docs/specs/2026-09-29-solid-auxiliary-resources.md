@@ -246,6 +246,65 @@ push alongside `check` and `deny`:
   mode table, H8's 422, H9's 308) are expected guests on the list until
   triaged.
 
+**Outcome (2026-10-01): deferred — the spike ran, the wiring did not.** The
+spike read solid-contrib/conformance-test-harness @ main (= v1.2.2's
+behaviour) against brolly @ HEAD; the local compose run was cut short once
+the findings were clear, so what follows is source-verified, with no
+captured run log. Every finding is independently fatal, and every one of
+them is a deliberate, advertised brolly design: brolly is within its
+advertised surface in each case, and accommodating the harness would mean
+weakening that surface — machine-drivable consent, RS256 acceptance, a
+credentials grant — for tooling convenience. Brolly-side concessions shaped
+by this tooling are not wanted. The deferral and its re-entry conditions
+are O9 (`docs/greenfield-implementation-plan.md` §6).
+
+- **The harness is not what this section assumed.** solid/
+  conformance-test-harness redirects to
+  solid-contrib/conformance-test-harness: Java/Quarkus/Karate, distributed
+  as the Docker image solidproject/conformance-test-harness (v1.2.2,
+  amd64-only, embedding specification-tests v0.0.19). There is no npm
+  package; "Node is installed in the job" is moot.
+- **Authentication is unconditional.** `runTestSuites` → `setupTestHarness`
+  → `registerClients` → `AuthManager.authenticate("alice"/"bob")` runs
+  before any feature; a failure exits 1 with zero tests and no report.
+  `UserCredentials` carries webid/refreshtoken/clientid/clientsecret/idp/
+  username/password only — no pre-minted access-token field, no anonymous
+  mode.
+- **DPoP algorithm mismatch.** The harness signs DPoP proofs RS256/RSA-2048
+  (`JwsUtils.generateDpopToken` — ES256 sits commented out as a TODO;
+  `createClientKey` generates RSA-2048 per run). Brolly requires ES256/P-256
+  (`identity/src/dpop.rs`, the alg check and `verifying_key`) and advertises
+  exactly that (`dpop_signing_alg_values_supported`, the discovery document
+  in `adapters/solid/src/oidc/tokens.rs`). Every proof the harness can send
+  is rejected at the token endpoint, whatever the grant.
+- **The auth-code flow cannot cross the consent screen.** The harness's
+  `requestAuthorizationCode` follows redirects and recognizes only login
+  forms, POSTing email/password to whatever form it finds. Brolly's
+  authorize renders a consent form for a logged-in session (request +
+  decision=allow, `server/templates/consent.html`) and `decide` 422s
+  anything else; brolly's login form wants `username`, not `email`.
+- **Refresh tokens cannot be handed over.** Brolly binds every refresh
+  token to the minting key's jkt (`issue_refresh(..., Some(jkt))` in both
+  grant paths, `server/src/solid_oidc.rs`; the refresh grant refuses a
+  different key). The harness's key is generated inside its JVM per run and
+  cannot be fixed by config, so out-of-band-minted tokens are refused at
+  first use.
+- **No client-credentials grant.** The token endpoint supports
+  authorization_code and refresh_token only (the discovery document).
+- **Plain HTTP cannot work either.** Brolly hardcodes https into the issuer
+  (`server/src/solid_oidc.rs:42-44`), the WebIDs and pod bases
+  (`server/src/pod.rs:114-115`), and both DPoP `htu` checks; the harness
+  validates issuer equality at discovery. TLS termination in front of the
+  plain-HTTP server would be needed regardless. (Harness quirk, for the
+  record: its `SOLID_IDENTITY_PROVIDER` handling appends "/", which fails
+  brolly's exact-issuer match — `USERS_x_IDP` is the usable spelling.)
+- **Registration through the real doors is human-fronted by design**
+  (bootstrap invite on stderr, invite-gated `/register`). The harness's
+  `USER_REGISTRATION_ENDPOINT` posts a CSS-shaped form
+  (email/password/confirmPassword/podName/register/createWebId/createPod)
+  that brolly rejects. "No test-only registration path exists and none is
+  added" stands.
+
 ## What this changes in the code
 
 | File | Change |
@@ -255,8 +314,8 @@ push alongside `check` and `deny`:
 | `server/src/pod.rs` | `links` gains `describedby`, `describes` on a `.meta`, and the subject's `acl` on a `.meta` (H3); `.meta` 404s for double-suffix paths (H1) |
 | `server/src/mastodon_api.rs` | `alt_text` reads the `.meta` graph (H6) |
 | `domain/src/vocab.rs` | `describedby`/`describes` relations |
-| `.github/workflows/ci.yml` | the `conformance` job (H7) |
-| `tools/cts-accepted-failures.txt` | new: the accepted list, seeded by the spike |
+| `.github/workflows/ci.yml` | the `conformance` job (H7) — **not landed**: H7 deferred after the spike |
+| `tools/cts-accepted-failures.txt` | new: the accepted list, seeded by the spike — **not created**: H7 deferred after the spike |
 
 **Tests whose expectations change:** `pod_http.rs`'s `Link` assertions gain
 `describedby`; `ldp_conformance.rs`'s delete tests assert the `.meta` dies
@@ -279,7 +338,11 @@ Three, one commit each:
 3. **CTS in CI.** The spike, the job, the accepted list, the first green
    run with the list populated. *Last, because everything before it is
    what the harness exercises; landing it earlier would file this stage's
-   own gaps against unfinished parts.*
+   own gaps against unfinished parts.* **Outcome (2026-10-01): only the
+   spike ran; the job, the accepted list and the wiring did not land** —
+   every finding is fatal and each is brolly working as designed (H7's
+   outcome, above). The deferral is recorded as O9
+   (`docs/greenfield-implementation-plan.md` §6).
 
 ## Decisions
 
@@ -291,4 +354,4 @@ Three, one commit each:
 | H4 | `.meta` is RDF-only, minting one by slug is 400 | An auxiliary is an RDF document by definition; the `.acl` rules were right and are reused |
 | H5 | `remove` forgets both auxiliaries; direct `DELETE` of a `.meta` takes Write on the subject | §"When a subject resource is deleted its auxiliary resources are also deleted"; removal is a write to the description, not to the bytes |
 | H6 | Description triples live in the `.meta`; migration on pod open; alt text survives byte replacement | It is the only place a Solid client can reach them; the Mastodon read becomes a projection like the profile; the survive-change is recorded because it is observable |
-| H7 | CTS on every push; failures green only against an owner-annotated accepted list; stale acceptances red; wiring frozen only after a manual spike | The roadmap's finish line; a list that can rot is a list that lies; and nobody here has run CTS yet — a plan pretending otherwise would repeat O1's line-count verdict table |
+| H7 | CTS on every push; failures green only against an owner-annotated accepted list; stale acceptances red; wiring frozen only after a manual spike. **Outcome (2026-10-01): deferred** — the spike ran, the wiring did not; no conformance job, no accepted list, no brolly-side changes to accommodate the harness. Each finding is a deliberate, advertised brolly design; concessions shaped by this tooling are not wanted. Reopens when any one of: the CTH grows ES256 DPoP and consent-screen handling; a credible runner not shaped around Inrupt's stack appears; stage 6 deliberately decides a machine-client auth path (O9, `docs/greenfield-implementation-plan.md` §6) | The roadmap's finish line; a list that can rot is a list that lies; and nobody here has run CTS yet — a plan pretending otherwise would repeat O1's line-count verdict table. The spike bore the caution out: the harness cannot authenticate to brolly at all, and the reasons are brolly's security posture working as intended (H7's findings) |
