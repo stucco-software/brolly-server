@@ -116,11 +116,13 @@ pub const STAT_MTIME: &str = "http://www.w3.org/ns/posix/stat#mtime";
 /// serialized length depends on the syntax the client asked for.
 pub const STAT_SIZE: &str = "http://www.w3.org/ns/posix/stat#size";
 
-// --- discovery (stage 5b, H6 and H8) ---------------------------------------
+// --- discovery (stage 5b, H6 and H8; 5d, H3) -------------------------------
 //
 // The link relations a pod read advertises. The LDP classes above are the
-// `rel="type"` *values*; these two are relation IRIs, which is what `rel=`
-// carries when no short name is registered.
+// `rel="type"` *values*; the Solid ones are relation IRIs, which is what
+// `rel=` carries when no short name is registered. `describedby` and
+// `describes` are the exception: IANA-registered short names (RFC 6892),
+// carried verbatim.
 
 /// `Link rel="…#owner"` on the storage root, and the predicate the storage
 /// description uses for the same statement. Solid Protocol §4.1.
@@ -129,6 +131,14 @@ pub const SOLID_OWNER: &str = "http://www.w3.org/ns/solid/terms#owner";
 /// (Solid Protocol §4.1). Points at the generated document
 /// `brolly_solid::storage_description` serves.
 pub const SOLID_STORAGE_DESCRIPTION: &str = "http://www.w3.org/ns/solid/terms#storageDescription";
+/// `Link rel="describedby"` on every non-auxiliary resource: where its
+/// description lives, the `.meta` auxiliary (Solid Protocol §4.3). Always
+/// sent, exists or not — the same contract as `rel="acl"`.
+pub const DESCRIBEDBY: &str = "describedby";
+/// `Link rel="describes"` on a `.meta`: the resource it describes (RFC 6892).
+/// The inverse direction, so a client landing on a description knows what
+/// it is looking at.
+pub const DESCRIBES: &str = "describes";
 
 #[cfg(test)]
 mod tests {
@@ -136,7 +146,9 @@ mod tests {
 
     /// These two IRIs are what a `Link` header's `rel=` carries **verbatim**
     /// — Solid has no registered short name for either — so a typo is a link
-    /// relation no client recognises, not a compile error.
+    /// relation no client recognises, not a compile error. `describedby` and
+    /// `describes` are registered short names (RFC 6892), so a typo there is
+    /// the same class of failure.
     #[test]
     fn the_discovery_relations_are_solid_terms() {
         for term in [SOLID_OWNER, SOLID_STORAGE_DESCRIPTION] {
@@ -147,6 +159,8 @@ mod tests {
             SOLID_STORAGE_DESCRIPTION,
             "http://www.w3.org/ns/solid/terms#storageDescription"
         );
+        assert_eq!(DESCRIBEDBY, "describedby");
+        assert_eq!(DESCRIBES, "describes");
     }
 
     #[test]

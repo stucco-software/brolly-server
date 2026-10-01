@@ -99,9 +99,10 @@ pub enum LdpError {
     NotAPostTarget,
     /// A `Slug` that cannot be made one safe path segment (400, spec 5c H1):
     /// it spans segments, names a query or fragment, carries control bytes,
-    /// is `.` or `..`, is over the 128-byte cap, or ends in `.acl`. The body
-    /// names the offending slug and the rule it broke, because a silent UUID
-    /// would leave the client building links to a name it was never given.
+    /// is `.` or `..`, is over the 128-byte cap, or ends in an auxiliary
+    /// suffix, `.acl` or `.meta` (spec 5d, H4). The body names the offending
+    /// slug and the rule it broke, because a silent UUID would leave the
+    /// client building links to a name it was never given.
     InvalidSlug(String),
     /// A `PUT` whose body would change an existing resource's kind (422, spec
     /// 5c H8): RDF over a [`Kind::NonRdfSource`], or a binary over an RDF
@@ -259,12 +260,63 @@ fn iri(s: &str) -> NamedNode {
 /// (which is anyone with Control over `/~/x`'s container, not over `/~/x`)
 /// could reach it. Only the suffix is examined, so this works on a full IRI as
 /// well as on a path.
+///
+/// `/~/x.acl.acl` is itself a fiction now, not a reachable resource: under
+/// spec 5d, H1 a path ending in two auxiliary suffixes is answered 404 before
+/// authorization, with the store's double-suffix refusal under it. The strip
+/// stays as it is — a caller that skips the gate still gets a guard keyed to
+/// Control on the thing at the bottom of the chain.
 pub fn governed(path: &str) -> Option<&str> {
     let mut resource = path.strip_suffix(".acl")?;
     while let Some(shorter) = resource.strip_suffix(".acl") {
         resource = shorter;
     }
     Some(resource)
+}
+
+/// The resource a `.meta` resource describes, or `None` if `path` is not one.
+///
+/// Strips exactly one trailing `.meta` — a sibling of [`governed`]'s rule,
+/// never composed with it (spec 5d, H2): a `.meta` is authorized by the same
+/// mode on the resource it describes, not by `acl:Control`, so folding it
+/// into `governed` would send `.meta` targets down the `Control` arm. A path
+/// ending in both suffixes is a fiction answered 404 before authorization
+/// (H1), so the two rules never meet on a target that can exist. Only the
+/// suffix is examined, so this works on a full IRI as well as on a path.
+pub fn describes(path: &str) -> Option<&str> {
+    path.strip_suffix(".meta")
+}
+
+/// Is `resource` an auxiliary — an `.acl` or a `.meta` (spec 5d, H1)?
+///
+/// The boolean question behind [`governed`] and [`describes`], which answer
+/// separately because the rule that authorizes the target differs —
+/// `acl:Control` on the governed resource, the same mode on the described
+/// one — while what follows from being an auxiliary at all does not: an
+/// RDF-only body, `Content::Auxiliary`, and containment's refusal to list it.
+pub fn is_auxiliary(resource: &str) -> bool {
+    resource.ends_with(".acl") || resource.ends_with(".meta")
+}
+
+/// Is `resource` an auxiliary of an auxiliary (spec 5d, H1)?
+///
+/// Such an IRI — `.acl.acl`, `.acl.meta`, `.meta.acl`, `.meta.meta` — is a
+/// fiction: the resource can never exist, so every method answers 404,
+/// decided by the IRI's shape before any lookup and deliberately before WAC
+/// — the shape is syntactic public knowledge, so there is no existence to
+/// protect (5b H1's auth-before-target rule protects *lookups*, and no
+/// lookup happens). `pod.rs`'s request gate answers it; the store's
+/// double-suffix refusal is the defence in depth under it, for callers that
+/// skip the gate. Only the suffix is examined, so this works on a full IRI
+/// as well as on a path.
+pub fn is_double_auxiliary(resource: &str) -> bool {
+    let Some(stem) = resource
+        .strip_suffix(".acl")
+        .or_else(|| resource.strip_suffix(".meta"))
+    else {
+        return false;
+    };
+    stem.ends_with(".acl") || stem.ends_with(".meta")
 }
 
 /// The IRI of the ACL that holds `target`'s access rules.
@@ -288,6 +340,20 @@ pub fn acl_iri(target: &str) -> String {
     }
 }
 
+/// The IRI of the `.meta` describing `target` (spec 5d, H1).
+///
+/// Always `format!("{target}.meta")`, which is [`acl_iri`]'s placement rule:
+/// beside a document (`/~/note` → `/~/note.meta`), inside a container
+/// (`/~/notes/` → `/~/notes/.meta`, since the IRI already ends in `/`).
+///
+/// No `acl_iri`-style special case for an auxiliary target: a `.meta`'s own
+/// Link set announces its subject, not a description of itself (H3 omits
+/// `describedby` on auxiliaries), so this is asked only about ordinary
+/// resources — the client needs the IRI to create the description.
+pub fn meta_iri(target: &str) -> String {
+    format!("{target}.meta")
+}
+
 /// Resolve and evaluate the ACL governing `resource`.
 ///
 /// An ACL resource is the exception (stage 0, A2). Whatever mode is asked for,
@@ -295,6 +361,13 @@ pub fn acl_iri(target: &str) -> String {
 /// resource's own ACL or an ancestor's `acl:default`. Without this, a caller
 /// with inherited Write could rewrite the ACL above them and grant themselves
 /// anything, and one with inherited Read could list who else has access.
+///
+/// A `.meta` resource is the second exception (spec 5d, H2): whatever mode is
+/// asked for, it is asked of the resource it [`describes`]s. Read on the
+/// subject reads its `.meta`, Write on the subject writes and deletes it, and
+/// Append alone does not — appending is not describing. A description is as
+/// private as what it describes: no more (the `Control` wall is for policy,
+/// not prose) and no less.
 fn check(
     store: &impl PodRead,
     base: &str,
@@ -302,9 +375,15 @@ fn check(
     subject: &Subject,
     mode: AccessMode,
 ) -> Result<bool, LdpError> {
-    let (path, mode) = match governed(path) {
-        Some(resource) => (resource, AccessMode::Control),
-        None => (path, mode),
+    // Two remaps, never composed (spec 5d, H2): a path ending in both
+    // suffixes is answered 404 before authorization (H1), so the arms never
+    // meet on a target that can exist.
+    let (path, mode) = if let Some(resource) = governed(path) {
+        (resource, AccessMode::Control)
+    } else if let Some(resource) = describes(path) {
+        (resource, mode)
+    } else {
+        (path, mode)
     };
     let Some(acl) = effective_acl(store, base, path).map_err(|e| LdpError::Store(e.to_string()))?
     else {
@@ -322,6 +401,10 @@ fn check(
 /// governed resource, so holding it grants all four and lacking it grants none.
 /// Reporting the governed resource's own modes instead would advertise an edit
 /// affordance the request would then refuse.
+///
+/// On a `.meta` it is the modes on the resource described (spec 5d, H2),
+/// which is also the truthful answer for the `.meta` itself: it is
+/// authorized by exactly those modes.
 pub fn granted_modes(
     store: &impl PodRead,
     base: &str,
@@ -341,6 +424,9 @@ pub fn granted_modes(
             _ => Vec::new(),
         };
     }
+
+    // H2 (spec 5d): a `.meta`'s modes are its subject's.
+    let path = describes(path).unwrap_or(path);
 
     let Ok(Some(acl)) = effective_acl(store, base, path) else {
         return Vec::new();
@@ -594,8 +680,8 @@ impl Target<'_> {
     /// Refuse what can be refused without the lock, then [`prepare`] the body.
     ///
     /// - Outside the root is refused first, as before.
-    /// - `rdf_only` targets (a container or an ACL for PUT, a document for
-    ///   POST) refuse a binary body here, before its bytes reach the disk.
+    /// - `rdf_only` targets (a container or an auxiliary for PUT, a document
+    ///   for POST) refuse a binary body here, before its bytes reach the disk.
     ///   `put_in`/`append_in` refuse it too, for callers that skip this.
     /// - WAC is checked against the committed store *before* any bytes land,
     ///   so a caller who may not write leaves nothing in the blob store and
@@ -656,7 +742,9 @@ pub fn put_if(
     preconditions: &Preconditions,
 ) -> Result<Written, LdpError> {
     let resource = format!("{base}{path}");
-    let rdf_only = storage::is_container(&resource) || governed(&resource).is_some();
+    // H4 (spec 5d): an auxiliary — an `.acl` or a `.meta` — joins containers
+    // as an RDF-only target.
+    let rdf_only = storage::is_container(&resource) || is_auxiliary(&resource);
     let target = Target {
         pod,
         base,
@@ -730,8 +818,8 @@ fn release_refused_bytes<T>(pod: &Pod, body: &Body, written: &Result<T, LdpError
 /// [`put`] inside the caller's write. Checks WAC against the transaction's
 /// snapshot, then writes with the `Content` the target calls for:
 ///
-/// - an ACL: `Content::Auxiliary`, RDF only (stage 0's Control rule is in
-///   `check`);
+/// - an auxiliary — an ACL or a `.meta`: `Content::Auxiliary`, RDF only (the
+///   authorization remaps are in `check`, stage 0's A2 and spec 5d's H2);
 /// - a container (the path ends in `/`): RDF only, under [`container_body`]'s
 ///   rule, as `Content::Container`; its members are untouched;
 /// - a document: `Content::Rdf`, stored exactly as sent;
@@ -740,7 +828,7 @@ fn release_refused_bytes<T>(pod: &Pod, body: &Body, written: &Result<T, LdpError
 /// The last two replace only their own kind (spec 5c, H8): RDF over an
 /// existing binary, or a binary over an existing RDF resource, is
 /// [`LdpError::KindChange`] and the old representation stays as it was. A
-/// binary addressed to a container or an ACL is still [`LdpError::NotRdf`],
+/// binary addressed to a container or an auxiliary is still [`LdpError::NotRdf`],
 /// because those targets never take one whatever is there. Replacing a binary
 /// with new bytes is the same kind and unaffected; it still drops the
 /// description triples until 5d moves them to `.meta`.
@@ -780,7 +868,7 @@ pub fn put_in(
         None => Written::Created,
     };
 
-    if governed(&resource).is_some() {
+    if is_auxiliary(&resource) {
         let quads = rdf_quads(body, &resource)?;
         w.put(&resource, Content::Auxiliary(&quads))?;
         return Ok(written);
@@ -1256,7 +1344,8 @@ pub fn append_in(
 /// `None` in, `None` out: no slug, an empty one, or one that is only
 /// whitespace mints a UUID, as it always has. A slug that cannot be made a
 /// segment — it spans segments, names a query or fragment, carries control
-/// bytes, is `.` or `..`, is over the 128-byte cap, or ends in `.acl` — is a
+/// is `.` or `..`, is over the 128-byte cap, or ends in an auxiliary suffix
+/// — `.acl` or `.meta` (spec 5d, H4) — is a
 /// 400 naming the slug and the rule, because a silent UUID would leave the
 /// client building links to a name it was never given. What survives is the
 /// slug's raw bytes percent-encoded into a segment: bytes outside RFC 3986
@@ -1283,9 +1372,9 @@ fn sanitize_slug(slug: Option<&str>) -> Result<Option<String>, LdpError> {
             slug.len()
         )));
     }
-    if slug.ends_with(".acl") {
+    if slug.ends_with(".acl") || slug.ends_with(".meta") {
         return Err(refuse(&format!(
-            "`{slug}` ends in `.acl`; an ACL is written under the `acl:Control` check the POST never passed"
+            "`{slug}` ends in an auxiliary suffix; an auxiliary is written by PUT under the check its own rule demands — `acl:Control` for an `.acl`, Write on what it describes for a `.meta` — and a POST's Append is neither"
         )));
     }
     if slug
@@ -1395,10 +1484,11 @@ pub fn delete(
 
 /// [`delete`] inside the caller's write.
 ///
-/// `remove` takes the resource's `.acl` with it (Solid Protocol §5.4), so a
-/// recreated resource can't quietly get its old grants back, and releases its
-/// blob. Content addressing means two resources can name one blob, which is
-/// why the blob is released rather than deleted here.
+/// `remove` takes the resource's `.acl` and `.meta` with it (Solid Protocol
+/// §5.4), so a recreated resource can't quietly get its old grants or its old
+/// description back, and releases its blob. Content addressing means two
+/// resources can name one blob, which is why the blob is released rather than
+/// deleted here.
 ///
 /// `preconditions` is evaluated after the WAC check and before anything is
 /// written, against this transaction's view of the resource, so no other write
@@ -1543,10 +1633,10 @@ pub fn patch_in(
     Ok(written)
 }
 
-/// Write a patched graph with the `Content` its target calls for: an ACL as
-/// `Auxiliary`, a container under [`container_body`]'s rule, anything else as
-/// an RDF document. A patch that creates a resource contains it, because `put`
-/// does.
+/// Write a patched graph with the `Content` its target calls for: an
+/// auxiliary (an `.acl` or a `.meta`) as `Auxiliary`, a container under
+/// [`container_body`]'s rule, anything else as an RDF document. A patch that
+/// creates a resource contains it, because `put` does.
 ///
 /// A container's `solid:where` sees what a `GET` serves, `ldp:contains`
 /// included, because [`patch::apply_scoped`] seeds the scratch graph with it
@@ -1556,7 +1646,7 @@ pub(crate) fn store_patched(
     resource: &str,
     patched: Vec<Quad>,
 ) -> Result<(), LdpError> {
-    if governed(resource).is_some() {
+    if is_auxiliary(resource) {
         w.put(resource, Content::Auxiliary(&patched))?;
     } else if storage::is_container(resource) {
         let kept = container_body(&*w, resource, patched)?;
@@ -1593,7 +1683,16 @@ pub fn accepted_write_types() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{acl_iri, governed};
+    use super::{acl_iri, check, describes, governed, meta_iri};
+    use brolly_authz::AccessMode;
+    use brolly_identity::{Scope, Subject, Via};
+    use brolly_store::StoreManager;
+    use brolly_store::resources::{Content, Pod};
+    use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+
+    const BASE: &str = "https://alice.brolly.id";
+    const ROOT: &str = "https://alice.brolly.id/~/";
+    const ACL: &str = "http://www.w3.org/ns/auth/acl#";
 
     /// The table in spec A2, row for row.
     #[test]
@@ -1653,5 +1752,135 @@ mod tests {
         assert_eq!(governed("/~/x.acl.acl"), Some("/~/x"));
         assert_eq!(acl_iri("/~/x.acl.acl"), "/~/x.acl.acl");
         assert_eq!(acl_iri(governed("/~/x.acl").unwrap()), "/~/x.acl");
+    }
+
+    /// H2 (spec 5d): `describes` strips exactly one `.meta` — a sibling of
+    /// `governed`'s rule, never composed with it.
+    #[test]
+    fn a_meta_describes_its_path_without_the_suffix() {
+        assert_eq!(describes("/~/notes/first.meta"), Some("/~/notes/first"));
+        assert_eq!(describes("/~/notes/.meta"), Some("/~/notes/"));
+        // Exactly one: `/~/x.meta.meta` describes `/~/x.meta` — itself a
+        // fiction under H1 — not `/~/x`.
+        assert_eq!(describes("/~/x.meta.meta"), Some("/~/x.meta"));
+    }
+
+    #[test]
+    fn other_paths_are_not_descriptions() {
+        assert_eq!(describes("/~/notes"), None);
+        assert_eq!(describes("/~/x.metax"), None);
+        // Not composed with `governed`: the strip stops at the `.meta`, even
+        // where what is left ends in `.acl` — whose `Control` governs that is
+        // the other arm's question, asked of a target that can exist. A path
+        // ending in both suffixes is a fiction H1 answers 404 before
+        // authorization.
+        assert_eq!(describes("/~/x.acl"), None);
+        assert_eq!(describes("/~/x.acl.meta"), Some("/~/x.acl"));
+        assert_eq!(describes("/~/x.meta.acl"), None);
+    }
+
+    /// H1 (spec 5d): `meta_iri` is `acl_iri`'s placement rule — beside a
+    /// document, inside a container — for the second auxiliary suffix.
+    #[test]
+    fn a_containers_meta_is_inside_it_and_a_documents_is_beside_it() {
+        assert_eq!(meta_iri("/~/notes/first"), "/~/notes/first.meta");
+        assert_eq!(meta_iri("/~/notes/"), "/~/notes/.meta");
+        assert_eq!(
+            meta_iri("https://alice.brolly.id/~/"),
+            "https://alice.brolly.id/~/.meta"
+        );
+    }
+
+    fn quad(graph: &str, s: &str, p: &str, o: &str) -> Quad {
+        Quad::new(
+            NamedOrBlankNode::NamedNode(NamedNode::new_unchecked(s)),
+            NamedNode::new_unchecked(p),
+            Term::NamedNode(NamedNode::new_unchecked(o)),
+            GraphName::NamedNode(NamedNode::new_unchecked(graph)),
+        )
+    }
+
+    /// A pod whose root ACL grants Alice Read, Write and Control by default
+    /// and Bob Append only — the two callers H2's `.meta` rule separates.
+    /// Seeded through the pod, not through `ldp`, so the setup doesn't depend
+    /// on the code under test.
+    fn authz_pod() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = StoreManager::open(dir.path(), 1, 60).unwrap();
+        let pod = mgr.pod(uuid::Uuid::new_v4()).unwrap();
+        pod.write(|w| w.create_root(ROOT)).unwrap();
+
+        let g = format!("{ROOT}.acl");
+        let owner = format!("{g}#owner");
+        let bob = format!("{g}#bob");
+        let quads = vec![
+            quad(&g, &owner, &format!("{ACL}default"), ROOT),
+            quad(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            quad(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            quad(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Control")),
+            quad(
+                &g,
+                &owner,
+                &format!("{ACL}agent"),
+                "https://alice.brolly.id/profile#me",
+            ),
+            quad(&g, &bob, &format!("{ACL}default"), ROOT),
+            quad(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Append")),
+            quad(
+                &g,
+                &bob,
+                &format!("{ACL}agent"),
+                "https://bob.example/profile#me",
+            ),
+        ];
+        pod.write(|w| w.put(&g, Content::Auxiliary(&quads)))
+            .unwrap();
+        (mgr, dir, pod)
+    }
+
+    fn alice() -> Subject {
+        Subject::local(
+            uuid::Uuid::new_v4(),
+            "did:plc:alice".into(),
+            "https://alice.brolly.id/profile#me".into(),
+            Scope::parse("webid"),
+            Via::SolidDpop,
+        )
+    }
+
+    fn bob() -> Subject {
+        Subject::local(
+            uuid::Uuid::new_v4(),
+            "did:plc:bob".into(),
+            "https://bob.example/profile#me".into(),
+            Scope::parse("webid"),
+            Via::SolidDpop,
+        )
+    }
+
+    /// H2 (spec 5d): a `.meta` needs the same mode on the resource it
+    /// describes. Read on the subject reads its `.meta` — how Penny shows alt
+    /// text for a shared image — Write on the subject writes and deletes it,
+    /// and Append alone does not, because appending is not describing.
+    #[test]
+    fn a_meta_needs_the_same_mode_on_what_it_describes() {
+        let (_m, _d, pod) = authz_pod();
+        let r = pod.read_store();
+        assert!(
+            check(&r, BASE, "/~/image.meta", &alice(), AccessMode::Read).unwrap(),
+            "Read on the subject reads its `.meta`"
+        );
+        assert!(
+            check(&r, BASE, "/~/image.meta", &alice(), AccessMode::Write).unwrap(),
+            "Write on the subject writes and deletes it"
+        );
+        assert!(
+            !check(&r, BASE, "/~/image.meta", &bob(), AccessMode::Read).unwrap(),
+            "Bob holds no Read on the subject"
+        );
+        assert!(
+            !check(&r, BASE, "/~/image.meta", &bob(), AccessMode::Write).unwrap(),
+            "Append alone does not describe"
+        );
     }
 }

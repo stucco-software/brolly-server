@@ -230,7 +230,8 @@ pub enum Kind {
     Container,
     RdfSource,
     NonRdfSource,
-    /// An auxiliary resource: today only an `.acl`. Recorded, never contained.
+    /// An auxiliary resource: an `.acl` or a `.meta`. Recorded, never
+    /// contained.
     Auxiliary,
 }
 
@@ -263,7 +264,7 @@ pub enum Content<'a> {
     Container(&'a [Quad]),
     /// A binary whose bytes are already in the pod's `BlobStore`.
     Binary(BlobMeta),
-    /// An auxiliary resource: an ACL.
+    /// An auxiliary resource: an ACL or a `.meta` (spec 5d, H1).
     Auxiliary(&'a [Quad]),
 }
 
@@ -650,6 +651,7 @@ impl PodWrite<'_> {
     ) -> Result<ResourceMeta, StoreError> {
         let root = self.root_for(resource)?;
         let kind = kind_of(&content);
+        refuse_double_auxiliary(resource)?;
         check_kind(resource, &root, kind)?;
         let (quads, blob): (&[Quad], _) = match content {
             Content::Rdf(quads) | Content::Container(quads) | Content::Auxiliary(quads) => {
@@ -690,6 +692,7 @@ impl PodWrite<'_> {
     /// existing resource's kind and blob, so alt text can go on a binary.
     pub fn append(&mut self, resource: &str, quads: &[Quad]) -> Result<ResourceMeta, StoreError> {
         let root = self.root_for(resource)?;
+        refuse_double_auxiliary(resource)?;
         check_graph(resource, quads)?;
         let previous = self.meta(resource)?;
         let (kind, blob) = match &previous {
@@ -739,9 +742,12 @@ impl PodWrite<'_> {
     /// on a missing resource, so a Delete that reaches one graph twice doesn't
     /// fail.
     ///
-    /// Deletes the content graph, the metadata, and its `.acl` graph and
-    /// metadata; takes it out of its container (whose version moves); releases
-    /// its blob. Refuses a container that still has members, and the storage
+    /// Deletes the content graph, the metadata, and its auxiliary resources'
+    /// graphs and metadata — the `.acl`, so a recreated resource can't quietly
+    /// get its old grants back, and the `.meta`, which would describe
+    /// something that is no longer there (Solid Protocol §5.4, spec 5d H5);
+    /// takes it out of its container (whose version moves); releases its
+    /// blob. Refuses a container that still has members, and the storage
     /// root.
     pub fn remove(&mut self, resource: &str) -> Result<bool, StoreError> {
         let Some(meta) = self.meta(resource)? else {
@@ -762,9 +768,11 @@ impl PodWrite<'_> {
             self.release_blob(&blob.digest);
         }
         if meta.kind != Kind::Auxiliary {
-            // Deleting a resource deletes its ACL (Solid Protocol §5.4), or
-            // recreating it would quietly bring the old grants back.
+            // Deleting a resource deletes its auxiliary resources (Solid
+            // Protocol §5.4), or recreating it would quietly bring the old
+            // grants and the stale description back.
             self.forget(&format!("{resource}.acl"))?;
+            self.forget(&format!("{resource}.meta"))?;
             if let Some(parent) = parent_container(resource, &root) {
                 let contains = containment(&parent, resource);
                 remove_quads_in(&mut self.transaction, &[contains]);
@@ -989,7 +997,7 @@ fn kind_of(content: &Content<'_>) -> Kind {
 
 /// The kind a new resource gets from its IRI alone, for `append`.
 fn kind_for_iri(resource: &str) -> Kind {
-    if is_acl(resource) {
+    if is_auxiliary(resource) {
         Kind::Auxiliary
     } else if resource.ends_with('/') {
         Kind::Container
@@ -998,17 +1006,46 @@ fn kind_for_iri(resource: &str) -> Kind {
     }
 }
 
-fn is_acl(resource: &str) -> bool {
-    resource.ends_with(".acl")
+/// Is this the IRI of an auxiliary resource: an `.acl` or a `.meta`
+/// (spec 5d, H1)?
+fn is_auxiliary(resource: &str) -> bool {
+    resource.ends_with(".acl") || resource.ends_with(".meta")
 }
 
-/// A container's IRI ends in `/` and nothing else's does; an ACL's ends in
-/// `.acl` and nothing else's does. The root is a container.
+/// Is this the IRI of an auxiliary of an auxiliary — a path ending in two
+/// auxiliary suffixes (`.acl.acl`, `.acl.meta`, `.meta.acl`, `.meta.meta`)?
+/// Such a resource can never exist (spec 5d, H1), so `put` and `append`
+/// refuse it here. The HTTP surface answers such a path 404 before anything
+/// is looked up; this is the defence in depth under it, and the refusal for
+/// every caller that is not HTTP.
+fn is_double_auxiliary(resource: &str) -> bool {
+    let Some(stem) = resource
+        .strip_suffix(".acl")
+        .or_else(|| resource.strip_suffix(".meta"))
+    else {
+        return false;
+    };
+    stem.ends_with(".acl") || stem.ends_with(".meta")
+}
+
+/// Refuse an IRI naming an auxiliary of an auxiliary: no such resource can
+/// exist, so no write may create one (spec 5d, H1).
+fn refuse_double_auxiliary(resource: &str) -> Result<(), StoreError> {
+    if is_double_auxiliary(resource) {
+        return Err(StoreError::Invalid(format!(
+            "{resource} is an auxiliary of an auxiliary, which can't exist"
+        )));
+    }
+    Ok(())
+}
+
+/// A container's IRI ends in `/` and nothing else's does; an auxiliary's ends
+/// in `.acl` or `.meta` and nothing else's does. The root is a container.
 fn check_kind(resource: &str, root: &str, kind: Kind) -> Result<(), StoreError> {
     let fits = match kind {
         Kind::Container => resource.ends_with('/'),
-        Kind::Auxiliary => is_acl(resource),
-        Kind::RdfSource | Kind::NonRdfSource => !resource.ends_with('/') && !is_acl(resource),
+        Kind::Auxiliary => is_auxiliary(resource),
+        Kind::RdfSource | Kind::NonRdfSource => !resource.ends_with('/') && !is_auxiliary(resource),
     };
     if !fits || (resource == root && kind != Kind::Container) {
         return Err(StoreError::Invalid(format!(
@@ -1262,13 +1299,43 @@ mod tests {
         let doc = "https://alice.brolly.test/~/doc";
         let dir = "https://alice.brolly.test/~/dir/";
         let acl = "https://alice.brolly.test/~/doc.acl";
+        let meta = "https://alice.brolly.test/~/doc.meta";
         assert!(check_kind(doc, ROOT, Kind::RdfSource).is_ok());
         assert!(check_kind(doc, ROOT, Kind::NonRdfSource).is_ok());
         assert!(check_kind(dir, ROOT, Kind::Container).is_ok());
         assert!(check_kind(acl, ROOT, Kind::Auxiliary).is_ok());
+        // Spec 5d, H1: a `.meta` is the second auxiliary suffix, and fits the
+        // same kind an `.acl` does.
+        assert!(check_kind(meta, ROOT, Kind::Auxiliary).is_ok());
         assert!(check_kind(doc, ROOT, Kind::Container).is_err());
         assert!(check_kind(dir, ROOT, Kind::RdfSource).is_err());
         assert!(check_kind(acl, ROOT, Kind::RdfSource).is_err());
+        assert!(check_kind(meta, ROOT, Kind::RdfSource).is_err());
         assert!(check_kind(doc, ROOT, Kind::Auxiliary).is_err());
+    }
+
+    /// Spec 5d, H1: no auxiliary of an auxiliary. The four double-suffix
+    /// shapes name resources that can never exist, and a name that is merely
+    /// *like* a suffix is an ordinary document name.
+    #[test]
+    fn no_auxiliary_of_an_auxiliary() {
+        for fiction in [
+            "https://alice.brolly.test/~/doc.acl.acl",
+            "https://alice.brolly.test/~/doc.acl.meta",
+            "https://alice.brolly.test/~/doc.meta.acl",
+            "https://alice.brolly.test/~/doc.meta.meta",
+        ] {
+            assert!(is_double_auxiliary(fiction), "{fiction}");
+        }
+        for real in [
+            "https://alice.brolly.test/~/doc",
+            "https://alice.brolly.test/~/doc.acl",
+            "https://alice.brolly.test/~/doc.meta",
+            "https://alice.brolly.test/~/doc.meta.ttl",
+            "https://alice.brolly.test/~/doc.aclx",
+            "https://alice.brolly.test/~/docx.meta",
+        ] {
+            assert!(!is_double_auxiliary(real), "{real}");
+        }
     }
 }

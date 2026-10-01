@@ -2198,7 +2198,16 @@ async fn a_slug_is_percent_encoded_not_passed_through() {
 #[tokio::test]
 async fn slugs_that_cannot_be_a_segment_are_refused() {
     let h = harness().await;
-    for slug in ["a/b", "a?b", "a#b", ".", "..", "note.acl", "a\tb"] {
+    for slug in [
+        "a/b",
+        "a?b",
+        "a#b",
+        ".",
+        "..",
+        "note.acl",
+        "note.meta",
+        "a\tb",
+    ] {
         let (status, body, _) = h
             .send_if(
                 "POST",
@@ -2216,6 +2225,7 @@ async fn slugs_that_cannot_be_a_segment_are_refused() {
     // Nothing was minted by any of them.
     let (_, body, _) = h.send("GET", "/~/", None, true).await;
     assert!(!body.contains("note.acl"), "a refused slug landed: {body}");
+    assert!(!body.contains("note.meta"), "a refused slug landed: {body}");
 }
 
 /// H2: `Link rel="type"` naming an LDP container class creates a container —
@@ -2404,6 +2414,12 @@ async fn a_creating_post_carries_the_link_set() {
         "got: {link}"
     );
     assert!(link.contains(r#"rel="acl""#), "got: {link}");
+    // H3 (spec 5d): the 201's `Link` set names where the description of what
+    // it made goes, too — the client needs the IRI to create it.
+    assert!(
+        link.contains(&format!(r#"<{ROOT}posted.meta>; rel="describedby""#)),
+        "got: {link}"
+    );
     assert!(link.contains("storageDescription"), "got: {link}");
 }
 
@@ -2434,6 +2450,10 @@ async fn a_creating_patch_answers_201_with_the_link_set() {
         "got: {link}"
     );
     assert!(link.contains(r#"rel="acl""#), "got: {link}");
+    assert!(
+        link.contains(&format!(r#"<{ROOT}made.meta>; rel="describedby""#)),
+        "got: {link}"
+    );
 
     // The same patch again is a modification now: 204, and no `Location`.
     let (status, _, headers) = h
@@ -3803,4 +3823,148 @@ async fn a_binary_on_a_container_is_still_a_415_and_a_same_kind_put_still_replac
     assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
     let (_, served, _) = h.send("GET", "/~/paper.pdf", None, true).await;
     assert_eq!(served, OTHER);
+}
+
+// --- the `.meta` auxiliary (stage 5d, H1–H4) --------------------------------------
+
+/// H3 (spec 5d): every non-auxiliary resource's `Link` set gains
+/// `rel="describedby"` pointing at its `.meta` — always sent, exists or not,
+/// the same contract as `rel="acl"`: the client needs the IRI to create the
+/// description, not to find it.
+#[tokio::test]
+async fn a_resource_links_its_description_exist_or_not() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, _, headers) = h.send("GET", "/~/note", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        link_target(&headers, "describedby"),
+        format!("{ROOT}note.meta")
+    );
+
+    // `OPTIONS` on a target that does not exist yet answers the same question
+    // for a creation (5b, H4): no `rel="type"`, but the description's IRI.
+    let (status, _, headers) = h.send("OPTIONS", "/~/not-yet", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert_eq!(
+        link_target(&headers, "describedby"),
+        format!("{ROOT}not-yet.meta")
+    );
+
+    // The root is no exception: its description lives inside it, like its ACL.
+    let (_, _, headers) = h.send("GET", "/~/", None, true).await;
+    assert_eq!(link_target(&headers, "describedby"), format!("{ROOT}.meta"));
+}
+
+/// H3 (spec 5d): a `.meta`'s own `Link` set answers the inverse —
+/// `rel="describes"` pointing at its subject — and its `rel="acl"` points at
+/// the *subject's* ACL, the one that actually governs it under H2, where
+/// `acl_iri` on the `.meta` itself would name `note.meta.acl`, a fiction.
+/// Neither auxiliary kind carries a `describedby`: their described target is
+/// the subject, announced there.
+#[tokio::test]
+async fn a_meta_links_its_subject_and_its_subjects_acl() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    h.send("PUT", "/~/note.meta", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (status, _, headers) = h.send("GET", "/~/note.meta", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    let link = links(&headers);
+    assert_eq!(link_target(&headers, "describes"), format!("{ROOT}note"));
+    assert_eq!(link_target(&headers, "acl"), format!("{ROOT}note.acl"));
+    assert!(
+        !link.contains("describedby"),
+        "an auxiliary's described target is its subject, announced there: {link}"
+    );
+    // Its types stay `ldp:Resource, ldp:RDFSource` — LDP names no auxiliary
+    // class, and 5b declined to invent one.
+    assert!(link.contains("ldp#RDFSource>; rel=\"type\""), "{link}");
+    assert!(!link.contains("ldp#Container"), "{link}");
+
+    // An `.acl` carries no `describedby` either.
+    share_with_bob(&h);
+    let (status, _, headers) = h.send("GET", "/~/shared/.acl", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!links(&headers).contains("describedby"));
+}
+
+/// H1 (spec 5d): a path ending in two auxiliary suffixes is a fiction — the
+/// resource can never exist — and every method answers 404, decided by the
+/// IRI's shape before any lookup and deliberately before WAC: the shape is
+/// syntactic public knowledge, so there is no existence to protect. Even the
+/// owner, who may write anywhere here, and an anonymous caller, who may do
+/// nothing, get the same 404 — not a store refusal, not a 401.
+#[tokio::test]
+async fn an_auxiliary_of_an_auxiliary_is_a_fiction_every_method_answers_404() {
+    let h = harness().await;
+    let insert = "INSERT DATA { <https://alice.brolly.test/~/x> <https://example.org/t> \"x\" }";
+    for path in [
+        "/~/x.acl.acl",
+        "/~/x.acl.meta",
+        "/~/x.meta.acl",
+        "/~/x.meta.meta",
+        "/~/.acl.acl",
+        "/~/.meta.meta",
+        // The gate reads the decoded path, so a percent-encoded suffix is
+        // the same fiction, not a way around it.
+        "/~/x.meta%2Emeta",
+    ] {
+        for (method, body) in [
+            ("GET", None),
+            ("HEAD", None),
+            ("OPTIONS", None),
+            ("DELETE", None),
+            ("PUT", Some(("text/turtle", NOTE))),
+            ("PATCH", Some(("application/sparql-update", insert))),
+            ("POST", Some(("text/turtle", NOTE))),
+        ] {
+            let (status, text, headers) = h.send(method, path, body, true).await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{method} {path}: {text}");
+            assert!(
+                headers.get("allow").is_none(),
+                "{method} {path}: Allow leaked"
+            );
+        }
+        // Before WAC: the anonymous caller gets the fiction's 404, not the 401
+        // every real target answers with.
+        let (status, _, _) = h.send("GET", path, None, false).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "anonymous GET {path}");
+    }
+    // And nothing was recorded under any of them.
+    let pod = h.stores.pod(h.user).unwrap();
+    for path in ["x.acl.acl", "x.acl.meta", "x.meta.acl", "x.meta.meta"] {
+        assert!(
+            pod.read(|r| r.meta(&format!("{ROOT}{path}")))
+                .unwrap()
+                .is_none(),
+            "{path} was recorded"
+        );
+    }
+}
+
+/// H4 (spec 5d): a `.meta` is RDF-only, like an `.acl` — `Accept-Put`
+/// advertises the RDF types, and a binary `PUT` is the 415 it always was for
+/// an auxiliary target.
+#[tokio::test]
+async fn a_meta_takes_rdf_only() {
+    let h = harness().await;
+    h.send("PUT", "/~/note", Some(("text/turtle", NOTE)), true)
+        .await;
+    h.send("PUT", "/~/note.meta", Some(("text/turtle", NOTE)), true)
+        .await;
+
+    let (_, _, headers) = h.send("OPTIONS", "/~/note.meta", None, true).await;
+    let accept_put = header_of(&headers, "accept-put");
+    assert!(accept_put.contains("text/turtle"), "got: {accept_put}");
+    assert!(!accept_put.contains("*/*"), "got: {accept_put}");
+
+    let (status, text, _) = h
+        .send("PUT", "/~/note.meta", Some(("application/pdf", PDF)), true)
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{text}");
 }

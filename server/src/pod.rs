@@ -51,6 +51,10 @@ pub struct PodRequest {
 /// Handlers never see a header. This is the only path from an HTTP request to a
 /// `Subject` on the pod surface.
 ///
+/// `path` is the request's target inside `/~/`, percent-decoded — the shape
+/// the gate below needs, where `uri`'s raw path could hide a `%2E`-spelled
+/// suffix.
+///
 /// `uri` is the request's **original** URI, before axum's `Path` extractor
 /// percent-decodes anything: `htu_matches` is exact string equality
 /// (`identity/src/dpop.rs:397`), so a URL rebuilt from the decoded path fails
@@ -60,7 +64,19 @@ async fn resolve(
     headers: &HeaderMap,
     method: &Method,
     uri: &Uri,
+    path: &str,
 ) -> Result<PodRequest, Response> {
+    // H1 (spec 5d): an auxiliary of an auxiliary is a fiction, and the 404
+    // for it is decided here — by the IRI's shape alone, before any lookup
+    // and before WAC, so every method answers it, not only the write paths.
+    // The resource can never exist, so 404 is truthful, and it cannot leak
+    // anything: the shape is syntactic public knowledge, and no lookup
+    // happens (5b H1's auth-before-target rule protects *lookups*). The
+    // store's double-suffix refusal is the defence in depth under this.
+    if ldp::is_double_auxiliary(path) {
+        return Err((StatusCode::NOT_FOUND, "no such resource").into_response());
+    }
+
     let host = headers
         .get(header::HOST)
         .and_then(|h| h.to_str().ok())
@@ -709,9 +725,10 @@ fn undeletable(resource: &str, storage_root: &str) -> bool {
 ///
 /// The condition is `ldp::put_if`'s own `rdf_only`, spelled the same way on
 /// purpose, and it reads the IRI, not the metadata: `put_if` refuses a binary
-/// for `/~/new/` whether or not `/~/new/` exists yet.
+/// for `/~/new/` whether or not `/~/new/` exists yet. A `.meta` joins the
+/// `.acl` targets (spec 5d, H4), so its `Accept-Put` advertises the RDF types.
 fn accept_put(resource: &str) -> &'static str {
-    if storage::is_container(resource) || ldp::governed(resource).is_some() {
+    if storage::is_container(resource) || ldp::is_auxiliary(resource) {
         ldp::accepted_write_types()
     } else {
         "*/*"
@@ -768,8 +785,9 @@ fn apply(response: &mut Response, headers: Vec<(header::HeaderName, String)>) {
     }
 }
 
-/// H6's `Link` set: what this resource is, where its rules are, which storage
-/// it belongs to, and — on the root — whose it is.
+/// H6's `Link` set: what this resource is, where its rules and its
+/// description are, which storage it belongs to, and — on the root — whose it
+/// is.
 ///
 /// One `Link` field with a value per link, comma-joined. `type` repeats its
 /// relation for each class rather than listing several URIs under one `rel=`,
@@ -780,9 +798,22 @@ fn apply(response: &mut Response, headers: Vec<(header::HeaderName, String)>) {
 /// create here?" (H4). Then no `rel="type"` goes out at all: LDP §4.2.1.4 asks
 /// for one on every response to an LDPR's URI, and we narrow it deliberately,
 /// because a response about a resource that isn't there must not imply what
-/// kind of thing would be. The `acl` and `storageDescription` links still go:
-/// both exist whether or not the target does, and the ACL link is what a
-/// client needs to *create* the rules for what it is about to write.
+/// kind of thing would be. The `acl`, `describedby` and `storageDescription`
+/// links still go: all three exist whether or not the target does, and the
+/// ACL and description links are what a client needs to *create* the rules
+/// and the description for what it is about to write.
+///
+/// The auxiliary links (spec 5d, H3):
+///
+/// - `describedby` points at `meta_iri(resource)`, on every non-auxiliary
+///   resource, always sent, exists or not — the same contract as `acl`.
+///   Omitted on auxiliaries: their described target is the subject,
+///   announced there.
+/// - A `.meta` sends `describes` (RFC 6892) pointing at its subject, and its
+///   `acl` points at the *subject's* `acl_iri` — the ACL that actually
+///   governs it under H2, where `acl_iri` on the `.meta` itself would name
+///   `x.meta.acl`, a double-suffix fiction H1 answers 404. (An `.acl`'s own
+///   `acl` link stays itself, 5b H7.)
 fn links(
     base: &str,
     resource: &str,
@@ -791,6 +822,7 @@ fn links(
     kind: Option<Kind>,
 ) -> String {
     let is_root = resource == storage_root;
+    let subject = ldp::describes(resource);
     let mut values: Vec<String> = Vec::new();
 
     if let Some(kind) = kind {
@@ -803,8 +835,9 @@ fn links(
                 types.push(vocab::LDP_BASIC_CONTAINER);
             }
             Kind::NonRdfSource => types.push(vocab::LDP_NON_RDF_SOURCE),
-            // An `.acl` is an RDF source like any other document: LDP names no
-            // auxiliary class, and inventing one would be ours alone.
+            // An `.acl` and a `.meta` are RDF sources like any other document:
+            // LDP names no auxiliary class, and inventing one would be ours
+            // alone.
             Kind::RdfSource | Kind::Auxiliary => types.push(vocab::LDP_RDF_SOURCE),
         }
         if is_root {
@@ -814,7 +847,22 @@ fn links(
         values.extend(types.into_iter().map(|t| format!("<{t}>; rel=\"type\"")));
     }
 
-    values.push(format!("<{}>; rel=\"acl\"", ldp::acl_iri(resource)));
+    // H3 (spec 5d): a `.meta` is governed by its subject's rule, so the
+    // subject's ACL is the IRI to advertise.
+    let acl_target = match subject {
+        Some(subject) => ldp::acl_iri(subject),
+        None => ldp::acl_iri(resource),
+    };
+    values.push(format!("<{acl_target}>; rel=\"acl\""));
+    if let Some(subject) = subject {
+        values.push(format!("<{subject}>; rel=\"{}\"", vocab::DESCRIBES));
+    } else if !ldp::is_auxiliary(resource) {
+        values.push(format!(
+            "<{}>; rel=\"{}\"",
+            ldp::meta_iri(resource),
+            vocab::DESCRIBEDBY
+        ));
+    }
     values.push(format!(
         "<{}>; rel=\"{}\"",
         storage_description::iri(base),
@@ -930,7 +978,7 @@ pub async fn get(
     Path(path): Path<String>,
 ) -> Response {
     let path = format!("/~/{path}");
-    let request = match resolve(&state, &headers, &method, &uri).await {
+    let request = match resolve(&state, &headers, &method, &uri, &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -1066,7 +1114,7 @@ pub async fn put(
     body: axum::body::Bytes,
 ) -> Response {
     let path = format!("/~/{path}");
-    let request = match resolve(&state, &headers, &method, &uri).await {
+    let request = match resolve(&state, &headers, &method, &uri, &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -1135,7 +1183,7 @@ pub async fn post(
     body: axum::body::Bytes,
 ) -> Response {
     let path = format!("/~/{path}");
-    let request = match resolve(&state, &headers, &method, &uri).await {
+    let request = match resolve(&state, &headers, &method, &uri, &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -1205,7 +1253,7 @@ pub async fn patch(
     body: axum::body::Bytes,
 ) -> Response {
     let path = format!("/~/{path}");
-    let request = match resolve(&state, &headers, &method, &uri).await {
+    let request = match resolve(&state, &headers, &method, &uri, &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -1301,7 +1349,7 @@ pub async fn delete(
     Path(path): Path<String>,
 ) -> Response {
     let path = format!("/~/{path}");
-    let request = match resolve(&state, &headers, &method, &uri).await {
+    let request = match resolve(&state, &headers, &method, &uri, &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };
@@ -1401,7 +1449,7 @@ pub async fn options(
     Path(path): Path<String>,
 ) -> Response {
     let path = format!("/~/{path}");
-    let request = match resolve(&state, &headers, &method, &uri).await {
+    let request = match resolve(&state, &headers, &method, &uri, &path).await {
         Ok(r) => r,
         Err(response) => return response,
     };

@@ -458,7 +458,16 @@ fn a_slug_is_percent_encoded_not_passed_through() {
 #[test]
 fn slugs_that_are_not_one_safe_segment_are_refused() {
     let (_m, _d, store) = pod();
-    for slug in ["a/b", "a?b", "a#b", ".", "..", "note.acl", "a\u{0}b"] {
+    for slug in [
+        "a/b",
+        "a?b",
+        "a#b",
+        ".",
+        "..",
+        "note.acl",
+        "note.meta",
+        "a\u{0}b",
+    ] {
         let err = ldp::append(
             &store,
             None,
@@ -693,6 +702,9 @@ fn a_post_to_a_missing_container_auto_creates_it() {
     assert!(meta(&store, &format!("{ROOT}newdir/")).is_some());
 }
 
+/// H1 (spec 5d): deleting a subject takes its `.meta` with it, like its
+/// `.acl` — a recreated resource must not quietly get its old description
+/// back.
 #[test]
 fn delete_removes_the_resource_and_its_containment() {
     let (_m, _d, store) = pod();
@@ -707,10 +719,13 @@ fn delete_removes_the_resource_and_its_containment() {
         ROOT,
     )
     .unwrap();
+    put_turtle(&store, "/~/note.meta", DESCRIPTION).unwrap();
     assert!(meta(&store, &format!("{ROOT}note")).is_some());
+    assert!(meta(&store, &format!("{ROOT}note.meta")).is_some());
 
     ldp::delete(&store, BASE, "/~/note", &alice(), ROOT).unwrap();
     assert!(meta(&store, &format!("{ROOT}note")).is_none());
+    assert!(meta(&store, &format!("{ROOT}note.meta")).is_none());
     assert!(!members(&store, ROOT).contains(&format!("{ROOT}note")));
 }
 
@@ -1642,4 +1657,186 @@ fn a_read_carries_the_description_describe_would_have_given() {
     assert_eq!(out.description.public, described.public);
     assert_eq!(out.description.kind(), described.kind());
     assert_eq!(out.version, described.meta.expect("it exists").version);
+}
+
+// --- stage 5d: the `.meta` auxiliary --------------------------------------------
+
+const DESCRIPTION: &[u8] = br#"<> <https://example.org/alt> "A windswept crag." ."#;
+
+/// H2 (spec 5d): a `.meta` is authorized by the subject's rule. Read on the
+/// subject reads its `.meta`, Write on the subject writes and deletes it, and
+/// Append alone does not — appending is not describing.
+#[test]
+fn a_meta_is_authorized_by_the_subjects_rule() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/image", NOTE).unwrap();
+
+    // Bob gets Append on the root, and nothing else.
+    let g = format!("{ROOT}.acl");
+    let a = format!("{g}#bob");
+    grant(
+        &store,
+        &g,
+        &[
+            t(&g, &a, &format!("{ACL}default"), ROOT),
+            t(&g, &a, &format!("{ACL}mode"), &format!("{ACL}Append")),
+            t(
+                &g,
+                &a,
+                &format!("{ACL}agent"),
+                "https://bob.example/profile#me",
+            ),
+        ],
+    );
+    let bob = Subject::local(
+        Uuid::new_v4(),
+        "did:plc:bob".into(),
+        "https://bob.example/profile#me".into(),
+        Scope::parse("webid"),
+        Via::SolidDpop,
+    );
+
+    // Write on the subject writes its `.meta`, recorded as an auxiliary —
+    // and never a member of what contains the subject.
+    assert_eq!(
+        put_turtle(&store, "/~/image.meta", DESCRIPTION).unwrap(),
+        ldp::Written::Created
+    );
+    assert_eq!(
+        meta(&store, &format!("{ROOT}image.meta")).unwrap().kind,
+        Kind::Auxiliary
+    );
+    assert_eq!(members(&store, ROOT), vec![format!("{ROOT}image")]);
+
+    // Append alone does not: appending is not describing.
+    assert!(
+        matches!(
+            ldp::put(
+                &store,
+                None,
+                BASE,
+                "/~/image.meta",
+                &bob,
+                DESCRIPTION,
+                "text/turtle",
+                ROOT,
+            ),
+            Err(LdpError::Denied)
+        ),
+        "Append must not describe"
+    );
+
+    // Read on the subject reads its `.meta`.
+    let out = ldp::read(
+        &store,
+        None,
+        BASE,
+        "/~/image.meta",
+        &alice(),
+        Some("text/turtle"),
+    )
+    .unwrap();
+    let body = String::from_utf8(out.body).unwrap();
+    assert!(body.contains("windswept"), "got: {body}");
+    // A caller with none of the subject's modes cannot even tell it is there.
+    assert!(matches!(
+        ldp::read(
+            &store,
+            None,
+            BASE,
+            "/~/image.meta",
+            &stranger(),
+            Some("text/turtle"),
+        ),
+        Err(LdpError::Denied)
+    ));
+
+    // Write on the subject deletes it, without deleting the subject.
+    ldp::delete(&store, BASE, "/~/image.meta", &alice(), ROOT).unwrap();
+    assert!(meta(&store, &format!("{ROOT}image.meta")).is_none());
+    assert!(meta(&store, &format!("{ROOT}image")).is_some());
+}
+
+/// H2 (spec 5d): `WAC-Allow` on a `.meta` reports the caller's and the
+/// public's modes on the *subject*, which is also the truthful answer for the
+/// `.meta` itself: it is authorized by exactly those modes. A public image's
+/// alt text is the point — a share UI showing it reads the description under
+/// the same Read that showed the bytes.
+#[test]
+fn a_meta_reports_the_subjects_modes() {
+    let (_m, _d, store) = pod();
+    put_turtle(&store, "/~/public", NOTE).unwrap();
+
+    let g = format!("{ROOT}public.acl");
+    let everyone = format!("{g}#everyone");
+    let owner = format!("{g}#owner");
+    grant(
+        &store,
+        &g,
+        &[
+            t(
+                &g,
+                &everyone,
+                &format!("{ACL}accessTo"),
+                &format!("{ROOT}public"),
+            ),
+            t(&g, &everyone, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(
+                &g,
+                &everyone,
+                &format!("{ACL}agentClass"),
+                &format!("{FOAF}Agent"),
+            ),
+            t(
+                &g,
+                &owner,
+                &format!("{ACL}accessTo"),
+                &format!("{ROOT}public"),
+            ),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+            t(
+                &g,
+                &owner,
+                &format!("{ACL}agent"),
+                "https://alice.brolly.id/profile#me",
+            ),
+        ],
+    );
+
+    put_turtle(&store, "/~/public.meta", DESCRIPTION).unwrap();
+    let d = ldp::describe(&store, BASE, "/~/public.meta", &alice()).unwrap();
+    assert_eq!(d.kind(), Some(Kind::Auxiliary));
+    assert_eq!(
+        d.public,
+        vec![AccessMode::Read],
+        "the public's modes on the subject"
+    );
+    assert!(d.holds(AccessMode::Write), "and the caller's, too");
+
+    // Anonymous holds the subject's Read, so anonymous reads its description.
+    let out = ldp::read(
+        &store,
+        None,
+        BASE,
+        "/~/public.meta",
+        &anonymous(),
+        Some("text/turtle"),
+    )
+    .unwrap();
+    assert_eq!(
+        out.description.granted,
+        vec![AccessMode::Read],
+        "the subject's modes are the `.meta`'s"
+    );
+}
+
+/// H4 (spec 5d): a `.meta` takes RDF only, like an `.acl` — a binary body is
+/// the `NotRdf` 415, and nothing is recorded.
+#[test]
+fn a_meta_put_with_a_non_rdf_body_is_not_rdf() {
+    let (_m, _d, store) = pod();
+    let err = put_typed(&store, "/~/image.meta", PNG, "image/png").unwrap_err();
+    assert!(matches!(err, LdpError::NotRdf), "got {err:?}");
+    assert!(meta(&store, &format!("{ROOT}image.meta")).is_none());
 }

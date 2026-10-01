@@ -182,7 +182,9 @@ impl StoreManager {
                 resources = report.resources,
                 dropped_containment = report.dropped_containment,
                 not_binaries = report.not_binaries,
-                "pod upgraded to layout 2"
+                metas_retyped = report.metas_retyped,
+                fictions_removed = report.fictions_removed,
+                "pod upgraded to the current layout"
             ),
             UpgradeOutcome::Fresh | UpgradeOutcome::Current => {}
         }

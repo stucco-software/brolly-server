@@ -261,26 +261,35 @@ fn bob_cannot_create_the_acl_of_a_document_he_can_write() {
     assert!(meta(&store, &format!("{ROOT}shared/doc.acl")).is_none());
 }
 
+/// H1 (spec 5d, the change of heart): `doc.acl.acl` is a fiction now, not a
+/// reachable resource stage 0 guarded — the store refuses to record an
+/// auxiliary of an auxiliary whoever asks, and the 404 that answers the shape
+/// on the wire is `pod.rs`'s gate, later. Under the gate the shape is still
+/// guarded by Control on the thing at the bottom, so Bob's Write on the
+/// container does not read what the path governs.
 #[test]
 fn bob_cannot_read_an_acl_of_an_acl() {
     let (_m, _d, store) = shared_pod();
-    // Alice creates it, so the refusal below means "refused", not "absent".
-    ldp::put(
-        &store,
-        None,
-        BASE,
-        "/~/shared/doc.acl.acl",
-        &alice(),
-        NOTE,
-        "text/turtle",
-        ROOT,
-    )
-    .unwrap();
+    // Not even the owner can bring the fiction into existence.
+    assert!(matches!(
+        ldp::put(
+            &store,
+            None,
+            BASE,
+            "/~/shared/doc.acl.acl",
+            &alice(),
+            NOTE,
+            "text/turtle",
+            ROOT
+        ),
+        Err(LdpError::Store(_))
+    ));
 
     assert!(matches!(
         ldp::read(&store, None, BASE, "/~/shared/doc.acl.acl", &bob(), None),
         Err(LdpError::Denied)
     ));
+    assert!(meta(&store, &format!("{ROOT}shared/doc.acl.acl")).is_none());
 }
 
 #[test]
@@ -340,23 +349,23 @@ fn the_owner_can_do_all_of_it() {
     )
     .unwrap();
     assert!(ldp::read(&store, None, BASE, "/~/shared/doc.acl", &alice(), None).is_ok());
-    ldp::put(
-        &store,
-        None,
-        BASE,
-        "/~/shared/doc.acl.acl",
-        &alice(),
-        NOTE,
-        "text/turtle",
-        ROOT,
-    )
-    .unwrap();
-    assert!(ldp::read(&store, None, BASE, "/~/shared/doc.acl.acl", &alice(), None).is_ok());
+    // `doc.acl.acl` is a fiction (spec 5d, H1): there is no ACL-of-an-ACL to
+    // clear out of the way before the delete below, because nobody can create
+    // one — the store's refusal is the floor under the 404 gate.
+    assert!(matches!(
+        ldp::put(
+            &store,
+            None,
+            BASE,
+            "/~/shared/doc.acl.acl",
+            &alice(),
+            NOTE,
+            "text/turtle",
+            ROOT
+        ),
+        Err(LdpError::Store(_))
+    ));
 
-    // `doc.acl.acl` goes before `doc.acl`. It holds a note, not grants, and
-    // while it exists the old rule takes it as `doc.acl`'s own ACL, which would
-    // refuse the delete for a reason that has nothing to do with this fix.
-    ldp::delete(&store, BASE, "/~/shared/doc.acl.acl", &alice(), ROOT).unwrap();
     ldp::delete(&store, BASE, "/~/shared/doc.acl", &alice(), ROOT).unwrap();
     assert!(meta(&store, &format!("{doc}.acl")).is_none());
 
