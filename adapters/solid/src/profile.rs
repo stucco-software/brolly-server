@@ -195,6 +195,14 @@ pub fn write(
 /// member stored at those positions, the served value is the deployment's —
 /// their copy is not served beside it, and a self-asserted storage root or
 /// issuer is not served at all.
+///
+/// Since H2, three more join them: the links to the settings resources
+/// (`solid:publicTypeIndex`, `solid:privateTypeIndex`,
+/// `space:preferencesFile`), derived from the storage root the same way, so
+/// the per-request derivation stays load-bearing — one image, many
+/// deployments, and a moved base domain moves the links with it. SolidOS
+/// reads these off every profile it is handed, so a profile without them is a
+/// pod it can log into and do nothing with.
 pub fn document(
     store: &impl PodRead,
     webid: &str,
@@ -204,7 +212,7 @@ pub fn document(
 ) -> Vec<Quad> {
     let graph = iri(document);
 
-    // Whatever the member has written, verbatim — except at the five reserved
+    // Whatever the member has written, verbatim — except at the eight reserved
     // positions, which the projection derives below. Their stored copy is not
     // served beside the derived one: two values on a predicate whose readers
     // expect one.
@@ -225,14 +233,18 @@ pub fn document(
 
 // --- writing over Solid (spec 6, H1) -----------------------------------------
 
-/// The five positions the projection derives (spec 6, H1), as quads in the
-/// document's graph with the deployment's values.
+/// The eight positions the projection derives (spec 6, H1 and H2), as quads
+/// in the document's graph with the deployment's values.
 /// [`at_reserved_position`] decides what a write may not seat there.
 fn reserved(webid: &str, document: &str, storage_root: &str, issuer: &str) -> Vec<Quad> {
     let graph = iri(document);
     let doc = NamedOrBlankNode::NamedNode(graph.clone());
     let me = NamedOrBlankNode::NamedNode(iri(webid));
     let object = |value: &str| Term::NamedNode(iri(value));
+    // The settings links (H2), derived from the storage root: the same
+    // reasoning as `space:storage` — deployment facts pointing at
+    // deployment-provisioned resources, so they move with the base domain.
+    let (preferences, public, private) = brolly_store::resources::resource_iris(storage_root);
     vec![
         // The document describes the person; it is not the person. That
         // distinction is what the `#me` fragment exists for.
@@ -261,15 +273,34 @@ fn reserved(webid: &str, document: &str, storage_root: &str, issuer: &str) -> Ve
             GraphName::NamedNode(graph.clone()),
         ),
         Quad::new(
-            me,
+            me.clone(),
             iri(vocab::SPACE_STORAGE),
             object(storage_root),
+            GraphName::NamedNode(graph.clone()),
+        ),
+        Quad::new(
+            me.clone(),
+            iri(vocab::SOLID_PUBLIC_TYPE_INDEX),
+            object(&public),
+            GraphName::NamedNode(graph.clone()),
+        ),
+        Quad::new(
+            me.clone(),
+            iri(vocab::SOLID_PRIVATE_TYPE_INDEX),
+            object(&private),
+            GraphName::NamedNode(graph.clone()),
+        ),
+        Quad::new(
+            me,
+            iri(vocab::SPACE_PREFERENCES_FILE),
+            object(&preferences),
             GraphName::NamedNode(graph),
         ),
     ]
 }
 
-/// Does this quad sit at one of the five reserved positions (spec 6, H1)?
+/// Does this quad sit at one of the eight reserved positions (spec 6, H1 and
+/// H2)?
 ///
 /// Three are reserved as exact (subject, predicate, object) triples: the two
 /// `rdf:type` positions and `foaf:primaryTopic`. Never by predicate alone —
@@ -278,13 +309,16 @@ fn reserved(webid: &str, document: &str, storage_root: &str, issuer: &str) -> Ve
 /// `<#me> a schema:Person` and every other type a member asserts about
 /// themselves. The exact object is what leaves those their own.
 ///
-/// The other two are the deployment facts — `solid:oidcIssuer` and
-/// `space:storage` on `#me` — and they are reserved as whole (subject,
-/// predicate) slots: whatever object a member writes there is a self-assertion
-/// of a deployment fact, and the projection serves the deployment's value, so
-/// theirs is dropped whatever it says. A member writing
-/// `space:storage <https://elsewhere/>` must not be able to point every client
-/// that trusts the profile at storage we do not serve.
+/// The other five are the deployment facts — `solid:oidcIssuer` and
+/// `space:storage` on `#me` from H1, and the three settings links from H2 —
+/// and they are reserved as whole (subject, predicate) slots: whatever object
+/// a member writes there is a self-assertion of a deployment fact, and the
+/// projection serves the deployment's value, so theirs is dropped whatever it
+/// says. A member writing `space:storage <https://elsewhere/>` must not be
+/// able to point every client that trusts the profile at storage we do not
+/// serve; a member writing `solid:publicTypeIndex <https://elsewhere/>` must
+/// not be able to point SolidOS at an index we do not host — the same
+/// precedent, carried forward.
 fn at_reserved_position(quad: &Quad, webid: &str, document: &str) -> bool {
     let doc = NamedOrBlankNode::NamedNode(iri(document));
     let me = NamedOrBlankNode::NamedNode(iri(webid));
@@ -301,11 +335,15 @@ fn at_reserved_position(quad: &Quad, webid: &str, document: &str) -> bool {
     {
         return true;
     }
-    // The two deployment facts: whole slots, whatever the object.
+    // The five deployment facts: whole slots, whatever the object.
     let slot = |subject: &NamedOrBlankNode, predicate: &str| {
         quad.subject == *subject && quad.predicate == iri(predicate)
     };
-    slot(&me, vocab::SOLID_OIDC_ISSUER) || slot(&me, vocab::SPACE_STORAGE)
+    slot(&me, vocab::SOLID_OIDC_ISSUER)
+        || slot(&me, vocab::SPACE_STORAGE)
+        || slot(&me, vocab::SOLID_PUBLIC_TYPE_INDEX)
+        || slot(&me, vocab::SOLID_PRIVATE_TYPE_INDEX)
+        || slot(&me, vocab::SPACE_PREFERENCES_FILE)
 }
 
 /// Drop the reserved positions from a graph bound for the pod (spec 6, H1):
@@ -330,8 +368,9 @@ fn unreserved(quads: Vec<Quad>, webid: &str, document: &str) -> Vec<Quad> {
 /// five instead would make the `PUT` silently drop triples it accepted, which
 /// is a lie about what was stored.
 ///
-/// The reserved positions are dropped on the way in; the graph holds the
-/// member's triples and nothing the projection derives.
+/// The reserved positions — H1's five and H2's three settings links — are
+/// dropped on the way in; the graph holds the member's triples and nothing the
+/// projection derives.
 pub fn put(
     pod: &Pod,
     webid: &str,

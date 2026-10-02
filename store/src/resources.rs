@@ -37,8 +37,10 @@ use crate::blobs::BlobStore;
 use crate::manager::StoreError;
 use crate::write::{insert_quads_in, remove_quads_in};
 
+mod settings;
 mod upgrade;
 
+pub use settings::{provision_settings, resource_iris};
 pub use upgrade::{UpgradeOutcome, UpgradeReport, upgrade};
 
 /// The graph holding every pod's resource metadata.

@@ -185,6 +185,7 @@ impl StoreManager {
                 metas_retyped = report.metas_retyped,
                 fictions_removed = report.fictions_removed,
                 descriptions_moved = report.descriptions_moved,
+                settings_provisioned = report.settings_provisioned,
                 "pod upgraded to the current layout"
             ),
             UpgradeOutcome::Fresh | UpgradeOutcome::Current => {}

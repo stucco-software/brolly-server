@@ -34,10 +34,13 @@ use crate::manager::StoreError;
 use crate::write::remove_quads_in;
 
 /// The layout this code writes and reads.
-const LAYOUT: &str = "3";
-/// The layout before this one. A pod at the prior layout is upgraded by
-/// [`migrate`] and marked current in the same transaction.
-const PRIOR_LAYOUT: &str = "2";
+const LAYOUT: &str = "4";
+/// The layouts before this one. A pod at either is upgraded by [`migrate`]
+/// — whose layout-2 → 3 steps find nothing to do on a pod already at 3 — plus
+/// the settings provisioning (spec 6, H2), and marked current in the same
+/// transaction. Two priors, not one, so a pod that last ran the layout-2 code
+/// upgrades in one hop instead of being refused as unknown.
+const PRIOR_LAYOUTS: [&str; 2] = ["2", "3"];
 
 /// What opening a pod found.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -77,12 +80,19 @@ pub struct UpgradeReport {
     /// Layout 2 → 3: binaries whose description triples moved from their own
     /// graphs to a `.meta` auxiliary (spec 5d, H6).
     pub descriptions_moved: usize,
+    /// Layout 3 → 4: settings resources created for a pod that had none — the
+    /// preferences file, the type indexes, and the public index's world
+    /// grant's ACL (spec 6, H2).
+    pub settings_provisioned: usize,
 }
 
 impl UpgradeReport {
-    /// Did the layout-2 → 3 migration change anything?
+    /// Did the migration to the current layout change anything?
     fn migrated(&self) -> bool {
-        self.metas_retyped > 0 || self.fictions_removed > 0 || self.descriptions_moved > 0
+        self.metas_retyped > 0
+            || self.fictions_removed > 0
+            || self.descriptions_moved > 0
+            || self.settings_provisioned > 0
     }
 }
 
@@ -135,7 +145,8 @@ pub fn upgrade(pod: &Pod) -> Result<UpgradeOutcome, StoreError> {
                         return Ok(UpgradeOutcome::NoRoot { candidates });
                     }
                 };
-                let report = record(w, &pod.blobs, &root)?;
+                let mut report = record(w, &pod.blobs, &root)?;
+                provision_settings(w, &root, &mut report)?;
                 mark(w)?;
                 Ok(UpgradeOutcome::Upgraded(report))
             }
@@ -143,18 +154,20 @@ pub fn upgrade(pod: &Pod) -> Result<UpgradeOutcome, StoreError> {
     })
 }
 
-/// Upgrade a prior-layout pod to the current layout (spec 5d, H6), then mark
-/// it. Answers [`UpgradeOutcome::Current`] when the migration found nothing to
-/// do, which is every pod that never held a stray `.meta`.
+/// Upgrade a prior-layout pod to the current layout (specs 5d, H6 and 6, H2),
+/// then mark it. Answers [`UpgradeOutcome::Current`] when the migration found
+/// nothing to do, which is every pod that never held a stray `.meta` and
+/// already carries its settings.
 fn migrate_marked(w: &mut PodWrite<'_>) -> Result<UpgradeOutcome, StoreError> {
     let root = w
         .storage_root()?
         .ok_or_else(|| StoreError::Backend("a marked pod has no storage root".into()))?;
     let mut report = UpgradeReport {
-        root,
+        root: root.clone(),
         ..UpgradeReport::default()
     };
     migrate(w, &mut report)?;
+    provision_settings(w, &root, &mut report)?;
     mark(w)?;
     Ok(if report.migrated() {
         UpgradeOutcome::Upgraded(report)
@@ -163,8 +176,47 @@ fn migrate_marked(w: &mut PodWrite<'_>) -> Result<UpgradeOutcome, StoreError> {
     })
 }
 
-/// `<METADATA_GRAPH> brolly:layout 3`, in the metadata graph itself. A pod
-/// moving up from the prior layout carries its old mark, which goes first —
+/// Provision the settings resources for a pod the upgrade is bringing to the
+/// current layout (spec 6, H2), counting what it created into `report`.
+///
+/// The owner comes from the root ACL's grant — the one agent it names —
+/// because the upgrade knows a pod, not a member. A pod with no root ACL, or
+/// one whose grant names nobody, is a pod nobody can write to: its settings
+/// stay unprovisioned rather than seeding a public index whose ACL would hold
+/// only the world grant and lock the owner out (see `settings`'s docs). The
+/// next open tries again, so fixing the root ACL fixes this too.
+fn provision_settings(
+    w: &mut PodWrite<'_>,
+    root: &str,
+    report: &mut UpgradeReport,
+) -> Result<(), StoreError> {
+    const ACL: &str = "http://www.w3.org/ns/auth/acl#";
+    let acl = format!("{root}.acl");
+    let owner = w
+        .quads_for_pattern(
+            Some(iri(&format!("{acl}#owner")).as_ref().into()),
+            Some(iri(&format!("{ACL}agent")).as_ref()),
+            None,
+            Some(GraphNameRef::NamedNode(iri(&acl).as_ref())),
+        )
+        .next()
+        .transpose()?;
+    let Some(owner) = owner else {
+        tracing::warn!(
+            %root,
+            "upgrade: no owner in the root ACL; settings left unprovisioned"
+        );
+        return Ok(());
+    };
+    let Term::NamedNode(owner) = owner.object else {
+        return Ok(());
+    };
+    report.settings_provisioned = super::settings::provision_settings(w, root, owner.as_str())?;
+    Ok(())
+}
+
+/// `<METADATA_GRAPH> brolly:layout 4`, in the metadata graph itself. A pod
+/// moving up from a prior layout carries its old mark, which goes first —
 /// or the graph would hold two layouts and [`mark_of`] could read either.
 fn mark(w: &mut PodWrite<'_>) -> Result<(), StoreError> {
     let graph = NamedNode::new_unchecked(METADATA_GRAPH);
@@ -203,7 +255,7 @@ fn mark_of(r: &impl PodRead) -> Result<Mark, StoreError> {
     };
     match quad?.object {
         Term::Literal(layout) if layout.value() == LAYOUT => Ok(Mark::Current),
-        Term::Literal(layout) if layout.value() == PRIOR_LAYOUT => Ok(Mark::Prior),
+        Term::Literal(layout) if PRIOR_LAYOUTS.contains(&layout.value()) => Ok(Mark::Prior),
         other => Err(StoreError::Backend(format!(
             "this pod is at layout {other}, which this server doesn't know"
         ))),
@@ -1019,9 +1071,217 @@ mod tests {
         assert_eq!(layout(&pod), LAYOUT);
     }
 
+    // --- layout 3 → 4: the settings resources (spec 6, H2) -------------------
+
+    /// The root ACL exactly as provisioning writes it, laid out as a
+    /// prior-layout pod held it: a recorded auxiliary whose graph carries the
+    /// owner's grant.
+    fn root_acl_3() -> Vec<Quad> {
+        let acl = format!("{ROOT}.acl");
+        let owner = format!("{acl}#owner");
+        let auth = "http://www.w3.org/ns/auth/acl#";
+        let mut quads = record_2(&acl, Kind::Auxiliary);
+        for (p, o) in [
+            ("accessTo", ROOT),
+            ("default", ROOT),
+            ("mode", &format!("{auth}Read")),
+            ("mode", &format!("{auth}Write")),
+            ("mode", &format!("{auth}Control")),
+            ("agent", "https://alice.brolly.test/profile#me"),
+        ] {
+            quads.push(iri(&acl, &owner, &format!("{auth}{p}"), o));
+        }
+        quads
+    }
+
+    /// A layout-3 pod as the 5d-era code left it: marked 3, with a root, a
+    /// root ACL naming the owner, and whatever content the member had.
+    fn layout_3_pod(quads: &[Quad]) -> (tempfile::TempDir, Pod) {
+        let mut all = vec![mark_of_layout("3")];
+        all.extend(quads.iter().cloned());
+        layout_2_pod(&all)
+    }
+
+    #[test]
+    fn a_layout_3_pod_gains_the_settings_resources_on_open() {
+        let doc = format!("{ROOT}doc");
+        let mut quads = root_2();
+        quads.extend(root_acl_3());
+        quads.extend(record_2(&doc, Kind::RdfSource));
+        quads.push(iri(METADATA_GRAPH, ROOT, vocab::LDP_CONTAINS, &doc));
+        quads.push(lit(&doc, &doc, TITLE, "kept"));
+        let (_dir, pod) = layout_3_pod(&quads);
+
+        assert_eq!(
+            upgrade(&pod).unwrap(),
+            UpgradeOutcome::Upgraded(UpgradeReport {
+                root: ROOT.to_string(),
+                settings_provisioned: 4,
+                ..UpgradeReport::default()
+            })
+        );
+        assert_eq!(layout(&pod), LAYOUT);
+
+        // The three resources, with their types in their own graphs, and the
+        // public index's ACL with both grants — the same content provisioning
+        // writes, by construction the same path.
+        let settings = format!("{ROOT}settings/");
+        let preferences = format!("{settings}preferences.ttl");
+        let public = format!("{settings}publicTypeIndex.ttl");
+        let private = format!("{settings}privateTypeIndex.ttl");
+        let acl = format!("{public}.acl");
+        for (resource, types) in [
+            (&preferences, vec![vocab::SPACE_CONFIGURATION_FILE]),
+            (
+                &public,
+                vec![vocab::SOLID_TYPE_INDEX, vocab::SOLID_LISTED_DOCUMENT],
+            ),
+            (
+                &private,
+                vec![vocab::SOLID_TYPE_INDEX, vocab::SOLID_UNLISTED_DOCUMENT],
+            ),
+        ] {
+            let meta = pod.read(|r| r.meta(resource)).unwrap().expect(resource);
+            assert_eq!(meta.kind, Kind::RdfSource, "{resource}");
+            for class in types {
+                assert_eq!(
+                    pod.read_store()
+                        .quads_for_pattern(
+                            Some(n(resource).as_ref().into()),
+                            Some(n(vocab::RDF_TYPE).as_ref()),
+                            Some(n(class).as_ref().into()),
+                            Some(GraphNameRef::NamedNode(n(resource).as_ref())),
+                        )
+                        .count(),
+                    1,
+                    "{resource} is not typed {class}"
+                );
+            }
+        }
+        let acl_meta = pod
+            .read(|r| r.meta(&acl))
+            .unwrap()
+            .expect("the world's ACL");
+        assert_eq!(acl_meta.kind, Kind::Auxiliary);
+        assert_eq!(
+            pod.read_store()
+                .quads_for_pattern(
+                    None,
+                    Some(n("http://www.w3.org/ns/auth/acl#agentClass").as_ref()),
+                    Some(n("http://xmlns.com/foaf/0.1/Agent").as_ref().into()),
+                    Some(GraphNameRef::NamedNode(n(&acl).as_ref())),
+                )
+                .count(),
+            1,
+            "the world grant is missing from {acl}"
+        );
+
+        // Nothing pre-existing is touched: the member's document keeps its
+        // content, its version and its place, and the root ACL its graph.
+        let doc_meta = pod.read(|r| r.meta(&doc)).unwrap().unwrap();
+        assert_eq!(doc_meta.version, "0LAYOUT2VERSION000000000");
+        assert_eq!(doc_meta.modified, "2026-09-29T12:00:00.000Z");
+        assert_eq!(
+            pod.read_store()
+                .quads_for_pattern(
+                    None,
+                    None,
+                    None,
+                    Some(GraphNameRef::NamedNode(n(&doc).as_ref())),
+                )
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            vec![lit(&doc, &doc, TITLE, "kept")]
+        );
+        let acl_quads: Vec<Quad> = pod
+            .read_store()
+            .quads_for_pattern(
+                None,
+                None,
+                None,
+                Some(GraphNameRef::NamedNode(n(&format!("{ROOT}.acl")).as_ref())),
+            )
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(acl_quads.len(), 6, "the root ACL's grant changed");
+
+        // Running it again changes nothing: the mark is current, and the
+        // settings keep the versions this run gave them.
+        let preferences_version = pod.read(|r| r.meta(&preferences)).unwrap().unwrap().version;
+        assert_eq!(upgrade(&pod).unwrap(), UpgradeOutcome::Current);
+        assert_eq!(
+            pod.read(|r| r.meta(&preferences)).unwrap().unwrap().version,
+            preferences_version
+        );
+    }
+
+    /// A member who already wrote their own preferences file keeps it — the
+    /// upgrade creates what is absent and touches nothing that exists (spec
+    /// 6, H2), which is also what makes it idempotent by construction.
+    #[test]
+    fn a_member_written_settings_resource_is_left_alone() {
+        let preferences = format!("{ROOT}settings/preferences.ttl");
+        let mut quads = root_2();
+        quads.extend(root_acl_3());
+        quads.extend(record_2(&preferences, Kind::RdfSource));
+        quads.push(iri(METADATA_GRAPH, ROOT, vocab::LDP_CONTAINS, &preferences));
+        quads.push(iri(
+            METADATA_GRAPH,
+            &format!("{ROOT}settings/"),
+            vocab::LDP_CONTAINS,
+            &preferences,
+        ));
+        quads.extend(record_2(&format!("{ROOT}settings/"), Kind::Container));
+        quads.push(lit(&preferences, &preferences, TITLE, "mine"));
+        let (_dir, pod) = layout_3_pod(&quads);
+
+        assert_eq!(
+            upgrade(&pod).unwrap(),
+            UpgradeOutcome::Upgraded(UpgradeReport {
+                root: ROOT.to_string(),
+                settings_provisioned: 3,
+                ..UpgradeReport::default()
+            })
+        );
+
+        let meta = pod.read(|r| r.meta(&preferences)).unwrap().unwrap();
+        assert_eq!(meta.version, "0LAYOUT2VERSION000000000");
+        assert_eq!(
+            pod.read_store()
+                .quads_for_pattern(
+                    None,
+                    None,
+                    None,
+                    Some(GraphNameRef::NamedNode(n(&preferences).as_ref())),
+                )
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            vec![lit(&preferences, &preferences, TITLE, "mine")],
+            "the member's preferences file was replaced"
+        );
+    }
+
+    /// A pod with no owner in its root ACL gets no settings: an ACL holding
+    /// only the world grant would lock the owner out of the public index, and
+    /// a pod nobody can write to has worse problems than missing settings.
+    #[test]
+    fn a_pod_with_no_owner_in_its_root_acl_gets_no_settings() {
+        let mut quads = root_2();
+        quads.extend(root_acl_3());
+        quads.retain(|q| q.predicate.as_str() != "http://www.w3.org/ns/auth/acl#agent");
+        let (_dir, pod) = layout_3_pod(&quads);
+
+        assert_eq!(upgrade(&pod).unwrap(), UpgradeOutcome::Current);
+        assert_eq!(
+            pod.read(|r| r.meta(&format!("{ROOT}settings/preferences.ttl")))
+                .unwrap(),
+            None
+        );
+    }
+
     #[test]
     fn a_newer_layout_is_an_error() {
-        let mut quads = vec![mark_of_layout("4")];
+        let mut quads = vec![mark_of_layout("5")];
         quads.extend(root_2());
         let (_dir, pod) = layout_2_pod(&quads);
 

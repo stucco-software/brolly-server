@@ -12,7 +12,7 @@
 use brolly_identity::db::{self, DbError};
 use brolly_identity::{routing, webid};
 use brolly_store::StoreError;
-use brolly_store::resources::{Content, Pod};
+use brolly_store::resources::{Content, Pod, provision_settings};
 use oxigraph_model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -32,15 +32,19 @@ fn triple(graph: &str, subject: &str, predicate: &str, object: &str) -> Quad {
     )
 }
 
-/// Create a member's storage root and the ACL that makes it theirs.
+/// Create a member's storage root, the ACL that makes it theirs, and the
+/// settings resources that make it usable (spec 6, H2).
 ///
 /// One write. `create_root` records the root in the pod's metadata, and only
 /// provisioning calls it. The ACL is stored as an auxiliary resource, so it
 /// exists and has a version but is never a member of the root. A root without
 /// its ACL is a pod its owner can't write to, so the two commit together or
-/// not at all.
+/// not at all — and since spec 6, so do the three settings resources and the
+/// public index's ACL, for the same reason: SolidOS can't boot without them,
+/// so a member whose pod has a root but no settings has an account that works
+/// in theory and in no client.
 ///
-/// The grant carries **both** `acl:accessTo` and `acl:default`: the first
+/// The root grant carries **both** `acl:accessTo` and `acl:default`: the first
 /// governs the container itself, the second governs everything inside it. They
 /// are distinct scopes, and conflating them is how an ACL silently grants more
 /// or less than intended.
@@ -66,6 +70,7 @@ pub fn pod(pod: &Pod, username: &str, base_domain: &str) -> Result<(), StoreErro
     pod.write(|w| {
         w.create_root(&root)?;
         w.put(&acl, Content::Auxiliary(&grant))?;
+        provision_settings(w, &root, &member)?;
         Ok(())
     })
 }

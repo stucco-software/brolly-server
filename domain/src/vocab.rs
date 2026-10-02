@@ -136,9 +136,42 @@ pub const SOLID_STORAGE_DESCRIPTION: &str = "http://www.w3.org/ns/solid/terms#st
 /// sent, exists or not — the same contract as `rel="acl"`.
 pub const DESCRIBEDBY: &str = "describedby";
 /// `Link rel="describes"` on a `.meta`: the resource it describes (RFC 6892).
-/// The inverse direction, so a client landing on a description knows what
-/// it is looking at.
+/// The inverse direction, so a client landing on a description knows what it
+/// is looking at.
 pub const DESCRIBES: &str = "describes";
+
+// --- type indexes and the preferences file (spec 6, H2) ---------------------
+//
+// SolidOS reads these off every profile it is handed: without the pointers it
+// cannot find the type indexes or the preferences file, and without the
+// indexes themselves it cannot discover anything else. The terms come from the
+// Solid Type Indexes spec and the workspace ontology (pim/space); each IRI is
+// pinned byte-for-byte by test below, so a typo is a red build rather than a
+// silently broken workspace on every member's pod.
+
+/// The class of both type index documents (the Solid Type Indexes spec).
+pub const SOLID_TYPE_INDEX: &str = "http://www.w3.org/ns/solid/terms#TypeIndex";
+/// The public type index's other class: its registrations are publicly
+/// discoverable (the Solid Type Indexes spec).
+pub const SOLID_LISTED_DOCUMENT: &str = "http://www.w3.org/ns/solid/terms#ListedDocument";
+/// The private type index's other class: its registrations are not (the Solid
+/// Type Indexes spec).
+pub const SOLID_UNLISTED_DOCUMENT: &str = "http://www.w3.org/ns/solid/terms#UnlistedDocument";
+/// Points from the profile at the public type index.
+pub const SOLID_PUBLIC_TYPE_INDEX: &str = "http://www.w3.org/ns/solid/terms#publicTypeIndex";
+/// Points from the profile at the private type index.
+pub const SOLID_PRIVATE_TYPE_INDEX: &str = "http://www.w3.org/ns/solid/terms#privateTypeIndex";
+/// The preferences file's class. The workspace ontology names it
+/// `ConfigurationFile`, and no source spec defines a `PreferencesFile` — the
+/// solid terms and the workspace ontology were checked, and both NSS's
+/// template and SolidOS's own `preferencesFileDocument` assert this one.
+pub const SPACE_CONFIGURATION_FILE: &str = "http://www.w3.org/ns/pim/space#ConfigurationFile";
+/// Points from the profile at the preferences file.
+pub const SPACE_PREFERENCES_FILE: &str = "http://www.w3.org/ns/pim/space#preferencesFile";
+/// Everyone. `acl:agentClass foaf:Agent` is the one WAC grant that reaches
+/// anonymous callers, which is why the public type index's world grant goes
+/// through it — and why it appears nowhere else in provisioning.
+pub const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
 
 #[cfg(test)]
 mod tests {
@@ -203,5 +236,49 @@ mod tests {
         assert_eq!(BROLLY_BLOB_DIGEST, "https://brolly.id/ns#blobDigest");
         assert_eq!(BROLLY_MEDIA_TYPE, "https://brolly.id/ns#mediaType");
         assert_eq!(BROLLY_BYTE_SIZE, "https://brolly.id/ns#byteSize");
+    }
+
+    /// Spec 6, H2: these IRIs are written into every member's pod and served on
+    /// every profile, and no client negotiates to discover a typo — a wrong
+    /// byte is a silently broken workspace. Pinned byte-for-byte, each against
+    /// its source: the `solid:` terms against the Solid Type Indexes spec and
+    /// the solid terms vocabulary, the `space:` and `foaf:` ones against the
+    /// workspace ontology and WAC's agent classes.
+    #[test]
+    fn the_type_index_and_preferences_terms_are_pinned() {
+        assert_eq!(
+            SOLID_TYPE_INDEX,
+            "http://www.w3.org/ns/solid/terms#TypeIndex"
+        );
+        assert_eq!(
+            SOLID_LISTED_DOCUMENT,
+            "http://www.w3.org/ns/solid/terms#ListedDocument"
+        );
+        assert_eq!(
+            SOLID_UNLISTED_DOCUMENT,
+            "http://www.w3.org/ns/solid/terms#UnlistedDocument"
+        );
+        assert_eq!(
+            SOLID_PUBLIC_TYPE_INDEX,
+            "http://www.w3.org/ns/solid/terms#publicTypeIndex"
+        );
+        assert_eq!(
+            SOLID_PRIVATE_TYPE_INDEX,
+            "http://www.w3.org/ns/solid/terms#privateTypeIndex"
+        );
+        // The preferences file's class. The spec's table says
+        // `pim:PreferencesFile`, but the workspace ontology defines no such
+        // term — `ConfigurationFile` is the one it defines, and the one NSS's
+        // template and SolidOS's own writer both assert, so that is what a pod
+        // must hold for SolidOS to recognise the file.
+        assert_eq!(
+            SPACE_CONFIGURATION_FILE,
+            "http://www.w3.org/ns/pim/space#ConfigurationFile"
+        );
+        assert_eq!(
+            SPACE_PREFERENCES_FILE,
+            "http://www.w3.org/ns/pim/space#preferencesFile"
+        );
+        assert_eq!(FOAF_AGENT, "http://xmlns.com/foaf/0.1/Agent");
     }
 }

@@ -8,9 +8,9 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
 use brolly_server::{AppState, app};
 use brolly_store::StoreManager;
-use brolly_store::resources::{Content, Pod, PodRead};
+use brolly_store::resources::{Content, Kind, Pod, PodRead};
 use http_body_util::BodyExt;
-use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
+use oxigraph::model::{GraphName, GraphNameRef, NamedNode, NamedOrBlankNode, Quad, Term};
 use p256::ecdsa::SigningKey;
 use p256::ecdsa::signature::Signer;
 use sha2::{Digest, Sha256};
@@ -651,6 +651,241 @@ async fn rdf_xml_is_refused_over_http_rather_than_stored_as_a_blob() {
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
 }
 
+// --- the settings resources (spec 6, H2) --------------------------------------
+
+/// The IRIs provisioning creates, as `provision::pod` derives them.
+const PREFERENCES: &str = "https://alice.brolly.test/~/settings/preferences.ttl";
+const PUBLIC_INDEX: &str = "https://alice.brolly.test/~/settings/publicTypeIndex.ttl";
+const PRIVATE_INDEX: &str = "https://alice.brolly.test/~/settings/privateTypeIndex.ttl";
+const SOLID: &str = "http://www.w3.org/ns/solid/terms#";
+
+/// The real provisioning path, on the harness pod. The harness seeds its own
+/// root and root ACL so the LDP tests stand alone; the settings tests layer
+/// the real `provision::pod` over that, which is the path registration takes.
+fn provision(h: &Harness) {
+    let pod = h.stores.pod(h.user).unwrap();
+    brolly_server::provision::pod(&pod, "alice", "brolly.test").unwrap();
+}
+
+/// Provisioning creates the three settings resources with their types, and
+/// the public index's ACL carries exactly the two grants the spec names —
+/// asserted grant by grant, because an ACL that quietly dropped the owner's
+/// half would lock the owner out, and one that quietly added `acl:default`
+/// would publish whatever lands beside the index (spec 6, H2).
+#[tokio::test]
+async fn provisioning_creates_the_settings_and_the_public_indexs_acl() {
+    let h = harness().await;
+    provision(&h);
+    let pod = h.stores.pod(h.user).unwrap();
+
+    // The three resources, with their types as stored content in their own
+    // graphs — not projection.
+    let public_acl = format!("{PUBLIC_INDEX}.acl");
+    for (resource, kind, class) in [
+        (
+            PREFERENCES,
+            "the preferences file",
+            format!("{SPACE}ConfigurationFile"),
+        ),
+        (
+            PUBLIC_INDEX,
+            "the public index",
+            format!("{SOLID}TypeIndex"),
+        ),
+        (
+            PUBLIC_INDEX,
+            "the public index",
+            format!("{SOLID}ListedDocument"),
+        ),
+        (
+            PRIVATE_INDEX,
+            "the private index",
+            format!("{SOLID}TypeIndex"),
+        ),
+        (
+            PRIVATE_INDEX,
+            "the private index",
+            format!("{SOLID}UnlistedDocument"),
+        ),
+    ] {
+        let meta = pod.read(|r| r.meta(resource)).unwrap().expect(kind);
+        assert_eq!(meta.kind, Kind::RdfSource, "{kind}");
+        assert!(
+            holds(&pod, &t(resource, resource, RDF_TYPE, &class)),
+            "{kind} is not typed {class}"
+        );
+    }
+    // No registrations anywhere: the containers are seeded empty, and the
+    // only type triples in the indexes are the indexes' own.
+    assert!(!holds(
+        &pod,
+        &t(
+            PUBLIC_INDEX,
+            PUBLIC_INDEX,
+            RDF_TYPE,
+            &format!("{SOLID}TypeRegistration"),
+        )
+    ));
+
+    // The public index's ACL, grant by grant. The owner's half: the root
+    // grant's shape, `acl:accessTo` the index.
+    let owner = format!("{public_acl}#owner");
+    for grant in [
+        t(&public_acl, &owner, &format!("{ACL}accessTo"), PUBLIC_INDEX),
+        t(
+            &public_acl,
+            &owner,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Read"),
+        ),
+        t(
+            &public_acl,
+            &owner,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Write"),
+        ),
+        t(
+            &public_acl,
+            &owner,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Control"),
+        ),
+        t(
+            &public_acl,
+            &owner,
+            &format!("{ACL}agent"),
+            &format!("{BASE}/profile#me"),
+        ),
+    ] {
+        assert!(
+            holds(&pod, &grant),
+            "the owner's grant is missing {grant:?}"
+        );
+    }
+    // The world's half: one Read, via `acl:agentClass foaf:Agent`.
+    let world = format!("{public_acl}#public");
+    for grant in [
+        t(&public_acl, &world, &format!("{ACL}accessTo"), PUBLIC_INDEX),
+        t(
+            &public_acl,
+            &world,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Read"),
+        ),
+        t(
+            &public_acl,
+            &world,
+            &format!("{ACL}agentClass"),
+            "http://xmlns.com/foaf/0.1/Agent",
+        ),
+    ] {
+        assert!(
+            holds(&pod, &grant),
+            "the world's grant is missing {grant:?}"
+        );
+    }
+    // No `acl:default` on either authorization — nothing inherits either
+    // grant.
+    let defaults: Vec<Quad> = pod
+        .read_store()
+        .quads_for_pattern(
+            None,
+            Some(n(&format!("{ACL}default")).as_ref()),
+            None,
+            Some(GraphNameRef::NamedNode(n(&public_acl).as_ref())),
+        )
+        .map(Result::unwrap)
+        .collect();
+    assert!(defaults.is_empty(), "the index's ACL carries acl:default");
+
+    // And the world grant reaches exactly one resource: the root, the
+    // preferences file and the private index stay owner-only (H2 — this is
+    // the one place provisioning grants to foaf:Agent).
+    let world_grants: Vec<Quad> = pod
+        .read_store()
+        .quads_for_pattern(
+            None,
+            Some(n(&format!("{ACL}agentClass")).as_ref()),
+            Some(n("http://xmlns.com/foaf/0.1/Agent").as_ref().into()),
+            None,
+        )
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        world_grants.len(),
+        1,
+        "the world was granted more than the public index: {world_grants:?}"
+    );
+    for untouched in [PREFERENCES, PRIVATE_INDEX] {
+        assert!(
+            pod.read(|r| r.meta(&format!("{untouched}.acl")))
+                .unwrap()
+                .is_none(),
+            "{untouched} has an ACL of its own"
+        );
+    }
+}
+
+/// The world grant is behavioural, not paperwork: an anonymous caller reads
+/// the public index over HTTP, and is refused on the preferences file and the
+/// private index — the owner-only default everywhere else (spec 6, H2).
+#[tokio::test]
+async fn the_world_reads_the_public_index_and_nothing_else() {
+    let h = harness().await;
+    provision(&h);
+
+    let (status, body, headers) = h
+        .send("GET", "/~/settings/publicTypeIndex.ttl", None, false)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body.contains("TypeIndex"),
+        "the anonymous reader got the index: {body}"
+    );
+    // No challenge: the caller was not asked to authenticate, because nothing
+    // refused them.
+    assert!(headers.get(header::WWW_AUTHENTICATE).is_none());
+
+    for refused in [
+        "/~/settings/preferences.ttl",
+        "/~/settings/privateTypeIndex.ttl",
+    ] {
+        let (status, body, headers) = h.send("GET", refused, None, false).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{refused}: {body}");
+        let challenge = headers[header::WWW_AUTHENTICATE].to_str().unwrap();
+        assert!(challenge.starts_with("DPoP "), "got: {challenge}");
+    }
+}
+
+/// The owner still reads and writes their public index through its own ACL —
+/// the half that must come with the world grant, or the closest ACL would
+/// lock the owner out of their own index (spec 6, H2).
+#[tokio::test]
+async fn the_owner_still_writes_the_public_index() {
+    let h = harness().await;
+    provision(&h);
+
+    let (status, text, _) = h
+        .send(
+            "PUT",
+            "/~/settings/publicTypeIndex.ttl",
+            Some((
+                "text/turtle",
+                "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n<https://alice.brolly.test/~/settings/publicTypeIndex.ttl> a solid:TypeIndex, solid:ListedDocument ;\n  solid:forClass <http://xmlns.com/foaf/0.1/Agent> .\n",
+            )),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    // And the anonymous reader still gets it: the owner's write did not
+    // disturb the world grant.
+    let (status, body, _) = h
+        .send("GET", "/~/settings/publicTypeIndex.ttl", None, false)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 // --- the WebID profile document ----------------------------------------------
 
 /// A GET with an explicit `Accept`, which `send` does not offer.
@@ -941,6 +1176,100 @@ async fn a_self_asserted_storage_root_is_dropped_and_the_deployments_is_served()
     assert!(
         body.contains("http://schema.org/Person"),
         "a member's own type survives: {body}"
+    );
+}
+
+/// The three settings links (H2), derived from the storage root like
+/// `space:storage` is and served unconditionally — SolidOS reads them off
+/// every profile, so a profile without them is a pod it can log into and do
+/// nothing with. A member-written alternative is dropped on write and the
+/// deployment's served alone on read: deployment-fact slots, the H1
+/// `solid:oidcIssuer`/`space:storage` precedent carried forward.
+#[tokio::test]
+async fn the_settings_links_are_derived_and_reserved() {
+    let h = harness().await;
+
+    // Served before any write, pointing at the provisioned resources — the
+    // IRIs derive from the storage root, so no provisioning has to have run
+    // for the links to be right.
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    for (predicate, target) in [
+        (format!("{SOLID}publicTypeIndex"), PUBLIC_INDEX),
+        (format!("{SOLID}privateTypeIndex"), PRIVATE_INDEX),
+        (format!("{SPACE}preferencesFile"), PREFERENCES),
+    ] {
+        assert!(
+            body.contains(&predicate),
+            "no {predicate} on the profile: {body}"
+        );
+        assert!(
+            body.contains(target),
+            "{predicate} does not point at {target}: {body}"
+        );
+        assert_eq!(
+            body.matches(&predicate).count(),
+            1,
+            "one {predicate}, the deployment's: {body}"
+        );
+    }
+
+    // A member's alternatives are dropped on write — all three slots, whole
+    // slots, whatever the object.
+    let (status, text, _) = h
+        .send(
+            "PUT",
+            "/profile",
+            Some((
+                "text/turtle",
+                "<#me> <http://www.w3.org/ns/solid/terms#publicTypeIndex> <https://elsewhere.example/publicTypeIndex.ttl> ;\n<http://www.w3.org/ns/solid/terms#privateTypeIndex> <https://elsewhere.example/privateTypeIndex.ttl> ;\n<http://www.w3.org/ns/pim/space#preferencesFile> <https://elsewhere.example/prefs.ttl> .\n",
+            )),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{text}");
+
+    let pod = h.stores.pod(h.user).unwrap();
+    for predicate in [
+        format!("{SOLID}publicTypeIndex"),
+        format!("{SOLID}privateTypeIndex"),
+        format!("{SPACE}preferencesFile"),
+    ] {
+        assert!(
+            !holds(
+                &pod,
+                &t(
+                    PROFILE,
+                    ME,
+                    &predicate,
+                    "https://elsewhere.example/anything"
+                )
+            ),
+            "{predicate} was stored"
+        );
+        let stored: Vec<Quad> = pod
+            .read_store()
+            .quads_for_pattern(
+                Some(n(ME).as_ref().into()),
+                Some(n(&predicate).as_ref()),
+                None,
+                Some(GraphNameRef::NamedNode(n(PROFILE).as_ref())),
+            )
+            .map(Result::unwrap)
+            .collect();
+        assert!(
+            stored.is_empty(),
+            "{predicate} seated a self-asserted settings link: {stored:?}"
+        );
+    }
+
+    // ...and the deployment's links are served alone on read.
+    let (_, body, _) = get_accepting(&h, "/profile", "text/turtle").await;
+    assert!(!body.contains("elsewhere"), "got: {body}");
+    assert!(
+        body.matches(PUBLIC_INDEX).count() == 1
+            && body.matches(PRIVATE_INDEX).count() == 1
+            && body.matches(PREFERENCES).count() == 1,
+        "the deployment's links, once each: {body}"
     );
 }
 
