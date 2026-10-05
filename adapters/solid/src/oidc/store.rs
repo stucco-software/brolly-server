@@ -254,3 +254,91 @@ pub async fn revoke_app_for_user(
     .await?;
     Ok(result.rows_affected())
 }
+
+/// What one member has allowed one client: the remembered half of a
+/// consent-screen allow (spec 6, H4), consulted only by `prompt=none`.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct RememberedConsent {
+    pub scope: String,
+    pub redirect_uris: Vec<String>,
+}
+
+impl RememberedConsent {
+    /// Does this consent cover a request (spec 6, H4)? Subset matching, not
+    /// string equality, in both directions: the request's scope must be a
+    /// subset of the remembered scope — exact matching would refuse a
+    /// remembered `openid webid` consent for a bare `webid` request, and
+    /// superset matching the other way would silently grant what was never
+    /// approved — and its `redirect_uri` must be among the remembered URIs,
+    /// which is what keeps a remembered consent from outliving the Client ID
+    /// Document that earned it: a changed document falls back to the consent
+    /// screen once, rather than carrying a code to a URI the member never
+    /// saw. (Registered clients' URIs are fixed at registration, so for them
+    /// the column is constant.)
+    pub fn covers(&self, scope: &str, redirect_uri: &str) -> bool {
+        let remembered: std::collections::HashSet<&str> = self.scope.split_whitespace().collect();
+        scope.split_whitespace().all(|s| remembered.contains(s))
+            && self.redirect_uris.iter().any(|u| u == redirect_uri)
+    }
+}
+
+/// Record a consent-screen allow (spec 6, H4).
+///
+/// The write is the union, never the overwrite: both the scope and the
+/// redirect URIs widen monotonically, so a narrower re-grant cannot shrink
+/// what the member already approved. One statement, so two simultaneous
+/// allows cannot race each other into a narrowing; the union is sorted, so
+/// the stored row is deterministic.
+pub async fn remember_consent(
+    pool: &PgPool,
+    user_id: Uuid,
+    client_id: &str,
+    scope: &str,
+    redirect_uri: &str,
+) -> Result<(), DbError> {
+    sqlx::query(
+        "INSERT INTO solid_consents (user_id, client_id, scope, redirect_uris)
+         VALUES ($1, $2, $3, ARRAY[$4]::text[])
+         ON CONFLICT (user_id, client_id) DO UPDATE SET
+           granted_at = now(),
+           scope = COALESCE((
+             SELECT string_agg(word, ' ' ORDER BY word) FROM (
+               SELECT DISTINCT unnest(string_to_array(
+                        solid_consents.scope || ' ' || EXCLUDED.scope, ' ')) AS word
+             ) words
+             WHERE word <> ''
+           ), ''),
+           redirect_uris = (
+             SELECT array_agg(uri ORDER BY uri) FROM (
+               SELECT DISTINCT unnest(
+                        solid_consents.redirect_uris || EXCLUDED.redirect_uris) AS uri
+             ) uris
+           )",
+    )
+    .bind(user_id)
+    .bind(client_id)
+    .bind(scope)
+    .bind(redirect_uri)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The member's remembered consent for one client, if any.
+///
+/// `None` is absence, not an error — the caller's answer to absence is
+/// `consent_required`, not a failure page.
+pub async fn remembered_consent(
+    pool: &PgPool,
+    user_id: Uuid,
+    client_id: &str,
+) -> Result<Option<RememberedConsent>, DbError> {
+    Ok(sqlx::query_as::<_, RememberedConsent>(
+        "SELECT scope, redirect_uris FROM solid_consents
+          WHERE user_id = $1 AND client_id = $2",
+    )
+    .bind(user_id)
+    .bind(client_id)
+    .fetch_optional(pool)
+    .await?)
+}

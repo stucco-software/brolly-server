@@ -263,16 +263,35 @@ async fn a_logged_in_member(harness: &Harness) -> String {
 }
 
 fn authorize_url(client_id: &str, challenge: &str) -> String {
-    let query: String = form_urlencoded::Serializer::new(String::new())
-        .append_pair("response_type", "code")
-        .append_pair("client_id", client_id)
-        .append_pair("redirect_uri", REDIRECT)
-        .append_pair("scope", "openid webid offline_access")
-        .append_pair("state", "opaque-client-state")
-        .append_pair("code_challenge", challenge)
-        .append_pair("code_challenge_method", "S256")
-        .finish();
-    format!("/oauth/solid/authorize?{query}")
+    authorize_query(
+        client_id,
+        REDIRECT,
+        "openid webid offline_access",
+        challenge,
+        None,
+    )
+}
+
+/// An authorize URL with the parts the `prompt` tests vary (spec 6, H4).
+fn authorize_query(
+    client_id: &str,
+    redirect_uri: &str,
+    scope: &str,
+    challenge: &str,
+    prompt: Option<&str>,
+) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("response_type", "code");
+    query.append_pair("client_id", client_id);
+    query.append_pair("redirect_uri", redirect_uri);
+    query.append_pair("scope", scope);
+    query.append_pair("state", "opaque-client-state");
+    query.append_pair("code_challenge", challenge);
+    query.append_pair("code_challenge_method", "S256");
+    if let Some(prompt) = prompt {
+        query.append_pair("prompt", prompt);
+    }
+    format!("/oauth/solid/authorize?{}", query.finish())
 }
 
 /// Pull the signed request token out of the rendered consent form.
@@ -318,6 +337,48 @@ async fn a_code(harness: &Harness, client_id: &str, challenge: &str, cookie: &st
 
 fn urlencode(s: &str) -> String {
     form_urlencoded::byte_serialize(s.as_bytes()).collect()
+}
+
+/// Walk the interactive consent screen to an allow, and return the decision's
+/// answer — the walk that remembers the consent (spec 6, H4).
+async fn allow(harness: &Harness, url: &str, cookie: &str) -> Reply {
+    let consent = get(harness, url, Some(cookie)).await;
+    assert_eq!(
+        consent.status,
+        StatusCode::OK,
+        "authorize: {}",
+        consent.body
+    );
+    let token = request_token(&consent.body);
+    post_form(
+        harness,
+        "/oauth/solid/authorize",
+        &format!("request={}&decision=allow", urlencode(&token)),
+        Some(cookie),
+    )
+    .await
+}
+
+/// Redeem a code at the token endpoint, as the client would.
+async fn redeem(harness: &Harness, client_id: &str, code: &str, verifier: &str) -> Reply {
+    let key = client_key();
+    let url = format!("https://{BASE}/oauth/solid/token");
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("code", code)
+        .append_pair("redirect_uri", REDIRECT)
+        .append_pair("client_id", client_id)
+        .append_pair("code_verifier", verifier)
+        .finish();
+    send(
+        harness,
+        builder("POST", "/oauth/solid/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("DPoP", dpop_proof(&key, "POST", &url, None))
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
 }
 
 // --- discovery --------------------------------------------------------------
@@ -967,6 +1028,601 @@ async fn one_members_consent_token_cannot_be_spent_by_another() {
         StatusCode::BAD_REQUEST,
         "a consent token must only be spendable by the member it was issued to"
     );
+}
+
+// --- prompt, and remembered consents (spec 6, H4) --------------------------
+
+#[tokio::test]
+async fn prompt_none_without_a_session_is_an_error_redirect_not_a_login_page() {
+    // The client asked not to be interacted with; the only correct answer is
+    // an error it can handle (spec 6, H4). The login page would strand a
+    // client that is waiting on a redirect that never comes.
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let (_, challenge) = pkce();
+
+    let reply = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid",
+            &challenge,
+            Some("none"),
+        ),
+        None,
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let location = reply.location.clone().expect("a redirect, not a page");
+    assert!(
+        location.starts_with(&format!("{REDIRECT}?")),
+        "the error goes to the client's redirect_uri, got {location}"
+    );
+    let params = reply.redirect_params();
+    assert_eq!(params["error"], "login_required");
+    assert_eq!(
+        params["state"], "opaque-client-state",
+        "state must return with the error, or the client cannot correlate it"
+    );
+    assert!(!params.contains_key("code"));
+}
+
+#[tokio::test]
+async fn prompt_none_with_a_session_but_no_remembered_consent_is_consent_required() {
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    let reply = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid",
+            &challenge,
+            Some("none"),
+        ),
+        Some(&cookie),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let params = reply.redirect_params();
+    assert_eq!(params["error"], "consent_required");
+    assert_eq!(params["state"], "opaque-client-state");
+    assert!(!params.contains_key("code"));
+}
+
+#[tokio::test]
+async fn prompt_none_with_a_covering_consent_issues_silently_exactly_as_an_allow_would() {
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (verifier, challenge) = pkce();
+
+    // The interactive allow — the walk that also remembers the consent.
+    let allowed = allow(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid offline_access",
+            &challenge,
+            None,
+        ),
+        &cookie,
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::SEE_OTHER, "{}", allowed.body);
+
+    // The silent request: same member, same client, the same scope — a
+    // subset of what was remembered, trivially.
+    let silent = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid offline_access",
+            &challenge,
+            Some("none"),
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(silent.status, StatusCode::SEE_OTHER, "{}", silent.body);
+
+    // Byte-for-byte what the allow produced: the same target, the same
+    // parameters in the same order — a code, then the state. Only the
+    // code's value differs, because every code is freshly random.
+    for reply in [&allowed, &silent] {
+        let location = reply.location.as_deref().expect("a redirect");
+        assert!(
+            location.starts_with(&format!("{REDIRECT}?code="))
+                && location.ends_with("&state=opaque-client-state"),
+            "an issuance redirect is a code then the state, got {location}"
+        );
+    }
+
+    // And the code is a real one: it redeems at the token endpoint exactly
+    // as the interactive flow's code does.
+    let code = silent
+        .redirect_params()
+        .get("code")
+        .cloned()
+        .expect("a code in the silent redirect");
+    let reply = redeem(&harness, &client_id, &code, &verifier).await;
+    assert_eq!(reply.status, StatusCode::OK, "token: {}", reply.body);
+    let tokens = reply.json();
+    assert_eq!(tokens["token_type"], "DPoP");
+    assert!(
+        tokens["refresh_token"].as_str().is_some(),
+        "offline_access was requested"
+    );
+    let access = tokens["access_token"].as_str().unwrap();
+    let claims: serde_json::Value =
+        serde_json::from_slice(&B64.decode(access.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    assert_eq!(claims["cnf"]["jkt"], thumbprint(&client_key()));
+    assert_eq!(claims["webid"], format!("https://alice.{BASE}/profile#me"));
+}
+
+#[tokio::test]
+async fn prompt_none_combined_with_another_value_is_refused_before_any_redirect() {
+    // OIDC Core §3.1.2.1 forbids the combination, and honouring the
+    // interactive half would quietly break the no-interaction contract the
+    // `none` half asked for (spec 6, H4). The 400 comes before any redirect
+    // — here, before the login redirect a sessionless request would
+    // otherwise get, and before the silent path a session would run.
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    for prompt in ["none login", "login none", "none consent"] {
+        let reply = get(
+            &harness,
+            &authorize_query(
+                &client_id,
+                REDIRECT,
+                "openid webid",
+                &challenge,
+                Some(prompt),
+            ),
+            None,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{prompt}");
+        assert!(reply.location.is_none(), "{prompt}: no redirect, ever");
+
+        let reply = get(
+            &harness,
+            &authorize_query(
+                &client_id,
+                REDIRECT,
+                "openid webid",
+                &challenge,
+                Some(prompt),
+            ),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{prompt}");
+        assert!(reply.location.is_none(), "{prompt}: no redirect, ever");
+    }
+}
+
+#[tokio::test]
+async fn prompt_login_forces_the_login_page_even_with_a_session() {
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    let reply = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid",
+            &challenge,
+            Some("login"),
+        ),
+        Some(&cookie),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let location = reply.location.expect("a redirect to login");
+    assert!(location.starts_with("/login?"), "got {location}");
+    let next = form_urlencoded::parse(location.split_once('?').unwrap().1.as_bytes())
+        .find(|(k, _)| k == "next")
+        .map(|(_, v)| v.into_owned())
+        .expect("a next parameter");
+    // `next` must not carry `prompt=login` back into the request: that
+    // would loop the member through the login page forever (spec 6, H4).
+    assert!(!next.contains("prompt="), "got {next}");
+    // Everything else survives, so the member lands on a plain interactive
+    // authorization.
+    assert!(next.contains("client_id="), "got {next}");
+    assert!(next.contains("code_challenge_method=S256"), "got {next}");
+}
+
+#[tokio::test]
+async fn any_other_prompt_value_is_todays_behaviour() {
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let (_, challenge) = pkce();
+
+    // No session: the login page, with `next`, exactly as without `prompt`.
+    let reply = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid",
+            &challenge,
+            Some("consent"),
+        ),
+        None,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert!(
+        reply.location.as_deref().unwrap().starts_with("/login?"),
+        "got {:?}",
+        reply.location
+    );
+
+    // With a session: the consent screen, as always.
+    let cookie = a_logged_in_member(&harness).await;
+    let reply = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid",
+            &challenge,
+            Some("consent"),
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply.body.contains(r#"<form method="post""#),
+        "the consent screen, not an error"
+    );
+}
+
+#[tokio::test]
+async fn an_interactive_request_still_shows_the_consent_screen_after_a_remembered_consent() {
+    // The remembered-consent table is consulted only by `prompt=none`
+    // (spec 6, H4): skipping the consent screen for interactive
+    // re-authorizations is a product decision recorded as revisitable, not
+    // one this stage makes.
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+    a_code(&harness, &client_id, &challenge, &cookie).await;
+
+    let reply = get(
+        &harness,
+        &authorize_url(&client_id, &challenge),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply.body.contains(r#"<form method="post""#),
+        "an interactive request always shows the consent screen"
+    );
+}
+
+#[tokio::test]
+async fn a_remembered_consent_covers_a_subset_scope_request() {
+    // The spec's own example (spec 6, H4): exact-match scope would refuse a
+    // remembered `openid webid` consent for a bare `webid` request;
+    // coverage is subset matching, both ways.
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (verifier, challenge) = pkce();
+
+    // Remember the wide scope: `authorize_url` asks for all three.
+    a_code(&harness, &client_id, &challenge, &cookie).await;
+
+    let reply = get(
+        &harness,
+        &authorize_query(&client_id, REDIRECT, "webid", &challenge, Some("none")),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let code = reply
+        .redirect_params()
+        .get("code")
+        .cloned()
+        .expect("a covering consent issues silently");
+    let tokens = redeem(&harness, &client_id, &code, &verifier).await;
+    assert_eq!(tokens.status, StatusCode::OK, "token: {}", tokens.body);
+}
+
+#[tokio::test]
+async fn a_request_for_more_than_was_remembered_is_not_covered() {
+    // The other direction of subset matching (spec 6, H4): a superset
+    // request must not be silently granted what was never approved.
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    let allowed = allow(
+        &harness,
+        &authorize_query(&client_id, REDIRECT, "webid", &challenge, None),
+        &cookie,
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::SEE_OTHER, "{}", allowed.body);
+
+    let reply = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid",
+            &challenge,
+            Some("none"),
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let params = reply.redirect_params();
+    assert_eq!(params["error"], "consent_required");
+    assert!(!params.contains_key("code"));
+}
+
+#[tokio::test]
+async fn an_unremembered_redirect_uri_falls_back_to_the_consent_screen_under_prompt_none() {
+    // The `redirect_uris` column is load-bearing security (spec 6, H4): a
+    // request is covered only when its redirect_uri is among the remembered
+    // URIs. Here the client is valid and the URI registered — but the member
+    // allowed a different one, so the silent request is refused with
+    // `consent_required` rather than carrying a code to a URI the member
+    // never saw. The screen the member then sees is the interactive retry's
+    // — the interactive path's exposure, once, not more.
+    let harness = harness().await;
+    let reply = send(
+        &harness,
+        builder("POST", "/oauth/solid/register")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "client_name": "Test App",
+                    "redirect_uris": [REDIRECT, "https://app.example/other"],
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{}", reply.body);
+    let client_id = reply.json()["client_id"].as_str().unwrap().to_string();
+
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    // Allow at the first URI: that is what the consent remembers.
+    let allowed = allow(
+        &harness,
+        &authorize_query(&client_id, REDIRECT, "openid webid", &challenge, None),
+        &cookie,
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::SEE_OTHER, "{}", allowed.body);
+
+    // The silent request at the second: the client is valid, the scope is a
+    // subset, but the member never allowed this URI.
+    let silent = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            "https://app.example/other",
+            "openid webid",
+            &challenge,
+            Some("none"),
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(silent.status, StatusCode::SEE_OTHER, "{}", silent.body);
+    let params = silent.redirect_params();
+    assert_eq!(params["error"], "consent_required");
+    assert!(!params.contains_key("code"));
+
+    // And the client's interactive retry is what shows the screen — once.
+    let retry = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            "https://app.example/other",
+            "openid webid",
+            &challenge,
+            None,
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(retry.status, StatusCode::OK, "{}", retry.body);
+    assert!(
+        retry.body.contains(r#"<form method="post""#),
+        "the interactive retry shows the consent screen"
+    );
+}
+
+/// Serves whatever document it currently holds for a client_id, so a test
+/// can change the document between requests — the reused-or-taken-over
+/// client_id URL, the case the remembered `redirect_uris` column exists for
+/// (spec 6, H4).
+#[derive(Default)]
+struct ChangingDocuments {
+    answers: std::sync::Mutex<
+        std::collections::HashMap<String, brolly_solid::client_documents::ClientIdDocument>,
+    >,
+}
+
+impl ChangingDocuments {
+    fn serve(&self, client_id: &str, turtle: &str) {
+        let document = brolly_solid::client_documents::parse(
+            &url::Url::parse(client_id).unwrap(),
+            "text/turtle",
+            turtle.as_bytes(),
+        )
+        .expect("the test document validates");
+        self.answers
+            .lock()
+            .unwrap()
+            .insert(client_id.to_string(), document);
+    }
+}
+
+impl brolly_server::client_metadata::ClientLookup for ChangingDocuments {
+    type Document = brolly_solid::client_documents::ClientIdDocument;
+    type Invalid = brolly_solid::client_documents::InvalidDocument;
+
+    fn fetch<'a>(
+        &'a self,
+        url: &'a url::Url,
+    ) -> brolly_server::client_metadata::Lookup<'a, Self::Document, Self::Invalid> {
+        let found = self
+            .answers
+            .lock()
+            .unwrap()
+            .get(url.as_str())
+            .cloned()
+            .ok_or(brolly_server::client_metadata::LookupError::Unreachable);
+        Box::pin(std::future::ready(found))
+    }
+}
+
+#[tokio::test]
+async fn a_changed_document_cannot_carry_a_remembered_consent_elsewhere() {
+    // The reason `redirect_uris` is a column (spec 6, H4): a Client ID
+    // Document at a reused or taken-over client_id URL can change its listed
+    // redirect URIs, and without the column a `prompt=none` request would
+    // carry a code silently to a URI the member never saw. With it, the
+    // silent request is refused with `consent_required`, and the changed
+    // document falls back to the consent screen — on the interactive retry,
+    // once: the interactive path's exposure, not more.
+    let documents = std::sync::Arc::new(ChangingDocuments::default());
+    documents.serve(
+        DOCUMENT_ID,
+        &format!(
+            "@prefix oidc: <http://www.w3.org/ns/solid/oidc#>.\n\
+             <> oidc:redirect_uris <{REDIRECT}> ; \
+             oidc:client_name \"Penny\" ."
+        ),
+    );
+    let harness = harness_with(documents.clone()).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    // The member allows Penny — at the URI the document then listed.
+    let allowed = allow(
+        &harness,
+        &authorize_query(DOCUMENT_ID, REDIRECT, "openid webid", &challenge, None),
+        &cookie,
+    )
+    .await;
+    assert_eq!(allowed.status, StatusCode::SEE_OTHER, "{}", allowed.body);
+
+    // The document changes — the takeover.
+    documents.serve(
+        DOCUMENT_ID,
+        "@prefix oidc: <http://www.w3.org/ns/solid/oidc#>. \
+         <> oidc:redirect_uris <https://attacker.example/collect> ; \
+         oidc:client_name \"Penny\" .",
+    );
+
+    // The silent request at the new URI: the document now lists it, the
+    // scope is a subset, the member has a session — but the consent
+    // remembers only the URI they actually allowed.
+    let silent = get(
+        &harness,
+        &authorize_query(
+            DOCUMENT_ID,
+            "https://attacker.example/collect",
+            "openid webid",
+            &challenge,
+            Some("none"),
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(silent.status, StatusCode::SEE_OTHER, "{}", silent.body);
+    let params = silent.redirect_params();
+    assert_eq!(params["error"], "consent_required");
+    assert!(!params.contains_key("code"));
+
+    // And the interactive retry is what shows the screen — the member sees
+    // the request at the new URI before any code is issued.
+    let retry = get(
+        &harness,
+        &authorize_query(
+            DOCUMENT_ID,
+            "https://attacker.example/collect",
+            "openid webid",
+            &challenge,
+            None,
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(retry.status, StatusCode::OK, "{}", retry.body);
+    assert!(
+        retry.body.contains(r#"<form method="post""#),
+        "the interactive retry shows the consent screen"
+    );
+}
+
+#[tokio::test]
+async fn prompt_none_issues_silently_for_a_document_client_too() {
+    // Silent issuance is per client_id string, not per client kind (spec 6,
+    // H4): the consent remembers the `https://` client_id the document was
+    // fetched from, and the grant the code carries is the same string the
+    // token endpoint compares against.
+    let harness = harness_with(std::sync::Arc::new(a_client_id_document())).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (verifier, challenge) = pkce();
+
+    let allowed = allow(&harness, &authorize_url(DOCUMENT_ID, &challenge), &cookie).await;
+    assert_eq!(allowed.status, StatusCode::SEE_OTHER, "{}", allowed.body);
+
+    let reply = get(
+        &harness,
+        &authorize_query(
+            DOCUMENT_ID,
+            REDIRECT,
+            "openid webid offline_access",
+            &challenge,
+            Some("none"),
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+    let params = reply.redirect_params();
+    assert_eq!(
+        params["state"], "opaque-client-state",
+        "state returns with a silent issuance too"
+    );
+    let code = params.get("code").cloned().expect("a silent code");
+
+    let tokens = redeem(&harness, DOCUMENT_ID, &code, &verifier).await;
+    assert_eq!(tokens.status, StatusCode::OK, "token: {}", tokens.body);
 }
 
 // --- the token endpoint -----------------------------------------------------

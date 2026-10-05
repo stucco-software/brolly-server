@@ -321,6 +321,15 @@ async fn deleting_a_user_takes_their_grants_with_them() {
     )
     .await
     .expect("issue code");
+    store::remember_consent(
+        &pool,
+        user,
+        &client_id,
+        "openid webid",
+        "https://app.example/cb",
+    )
+    .await
+    .expect("remember consent");
 
     sqlx::query("DELETE FROM users WHERE id = $1")
         .bind(user)
@@ -336,7 +345,206 @@ async fn deleting_a_user_takes_their_grants_with_them() {
         .fetch_one(&pool)
         .await
         .expect("count refreshes");
+    let consents: (i64,) = sqlx::query_as("SELECT count(*) FROM solid_consents")
+        .fetch_one(&pool)
+        .await
+        .expect("count consents");
 
     assert_eq!(codes.0, 0, "authorization codes must cascade");
     assert_eq!(refreshes.0, 0, "refresh tokens must cascade");
+    assert_eq!(consents.0, 0, "remembered consents must cascade");
+}
+
+// --- remembered consents (spec 6, H4) ---------------------------------------
+
+#[tokio::test]
+async fn an_allow_is_remembered() {
+    let (_db, pool) = fresh().await;
+    let user = a_user(&pool, "alice").await;
+    let client_id = a_client(&pool).await;
+
+    store::remember_consent(
+        &pool,
+        user,
+        &client_id,
+        "openid webid",
+        "https://app.example/cb",
+    )
+    .await
+    .expect("remember");
+
+    let consent = store::remembered_consent(&pool, user, &client_id)
+        .await
+        .expect("lookup")
+        .expect("the consent was remembered");
+    assert_eq!(consent.scope, "openid webid");
+    assert_eq!(
+        consent.redirect_uris,
+        ["https://app.example/cb".to_string()]
+    );
+    assert!(consent.covers("openid webid", "https://app.example/cb"));
+}
+
+#[tokio::test]
+async fn a_document_clients_consent_is_remembered_without_a_registration() {
+    // The table's `client_id` deliberately carries no foreign key (spec 6,
+    // H4): a document client has no row in `solid_clients` — its client_id
+    // is the URL of the document fetched and validated at authorize time.
+    let (_db, pool) = fresh().await;
+    let user = a_user(&pool, "alice").await;
+
+    store::remember_consent(
+        &pool,
+        user,
+        "https://penny.example/id",
+        "openid webid",
+        "https://app.example/cb",
+    )
+    .await
+    .expect("remember");
+
+    assert!(
+        store::remembered_consent(&pool, user, "https://penny.example/id")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "an https:// client_id is remembered without a registration"
+    );
+}
+
+#[tokio::test]
+async fn a_new_grant_widens_the_remembered_scope_and_uris() {
+    // Both widenings are monotonic (spec 6, H4): a new grant replaces the
+    // row with the union — of the scope, and of the redirect URIs.
+    let (_db, pool) = fresh().await;
+    let user = a_user(&pool, "alice").await;
+    let client_id = a_client(&pool).await;
+
+    store::remember_consent(
+        &pool,
+        user,
+        &client_id,
+        "openid webid",
+        "https://app.example/cb",
+    )
+    .await
+    .expect("first");
+    store::remember_consent(
+        &pool,
+        user,
+        &client_id,
+        "offline_access",
+        "https://app.example/other",
+    )
+    .await
+    .expect("second");
+
+    let consent = store::remembered_consent(&pool, user, &client_id)
+        .await
+        .expect("lookup")
+        .expect("remembered");
+    let scope: std::collections::BTreeSet<&str> = consent.scope.split_whitespace().collect();
+    assert_eq!(
+        scope,
+        ["offline_access", "openid", "webid"].into_iter().collect()
+    );
+    assert!(consent.covers("openid webid", "https://app.example/cb"));
+    assert!(
+        consent.covers("webid offline_access", "https://app.example/other"),
+        "both remembered URIs cover, and the union of both scopes"
+    );
+}
+
+#[tokio::test]
+async fn a_narrower_regrant_does_not_shrink_a_remembered_consent() {
+    let (_db, pool) = fresh().await;
+    let user = a_user(&pool, "alice").await;
+    let client_id = a_client(&pool).await;
+
+    store::remember_consent(
+        &pool,
+        user,
+        &client_id,
+        "openid webid offline_access",
+        "https://app.example/cb",
+    )
+    .await
+    .expect("wide");
+    store::remember_consent(&pool, user, &client_id, "openid", "https://app.example/cb")
+        .await
+        .expect("narrow");
+
+    let consent = store::remembered_consent(&pool, user, &client_id)
+        .await
+        .expect("lookup")
+        .expect("remembered");
+    assert!(
+        consent.covers("openid webid offline_access", "https://app.example/cb"),
+        "widening must be monotonic: a narrower re-grant cannot un-approve"
+    );
+}
+
+#[tokio::test]
+async fn coverage_is_subset_matching_not_string_equality() {
+    // Both directions (spec 6, H4): a remembered `openid webid` consent
+    // covers a bare `webid` request — exact matching would refuse it — and a
+    // request for more than was remembered is not covered, so nothing is
+    // silently granted that was never approved. And the redirect_uri must
+    // be among the remembered URIs, whatever the scope.
+    let (_db, pool) = fresh().await;
+    let user = a_user(&pool, "alice").await;
+    let client_id = a_client(&pool).await;
+
+    store::remember_consent(
+        &pool,
+        user,
+        &client_id,
+        "openid webid",
+        "https://app.example/cb",
+    )
+    .await
+    .expect("remember");
+
+    let consent = store::remembered_consent(&pool, user, &client_id)
+        .await
+        .expect("lookup")
+        .expect("remembered");
+    assert!(
+        consent.covers("webid", "https://app.example/cb"),
+        "a subset scope is covered"
+    );
+    assert!(
+        !consent.covers("openid webid offline_access", "https://app.example/cb"),
+        "a request for more than was remembered is not covered"
+    );
+    assert!(
+        !consent.covers("openid webid", "https://attacker.example/collect"),
+        "an unremembered redirect_uri is not covered"
+    );
+}
+
+#[tokio::test]
+async fn one_members_consent_is_not_anothers() {
+    let (_db, pool) = fresh().await;
+    let alice = a_user(&pool, "alice").await;
+    let bob = a_user(&pool, "bob").await;
+    let client_id = a_client(&pool).await;
+
+    store::remember_consent(
+        &pool,
+        alice,
+        &client_id,
+        "openid webid",
+        "https://app.example/cb",
+    )
+    .await
+    .expect("remember");
+
+    assert!(
+        store::remembered_consent(&pool, bob, &client_id)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "a consent is per member, per client"
+    );
 }

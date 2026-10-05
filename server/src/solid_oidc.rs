@@ -13,6 +13,10 @@
 //!   request travels to the decision POST inside a short-lived JWT signed by the
 //!   provider key and bound to the session that was shown the screen. It cannot
 //!   be edited, cannot be replayed by another member, and needs no table.
+//! * **`prompt=none` answers with the flow's own shapes** (spec 6, H4). Its two
+//!   error redirects are the deny path's error redirect — `error`, then
+//!   `state` — and its silent success is the allow path's issuance, code for
+//!   code, so a client cannot tell a silent answer from an interactive one.
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
@@ -214,10 +218,18 @@ pub struct AuthorizeParams {
     code_challenge_method: Option<String>,
     /// Optional pre-registration of the key the token will be bound to.
     dpop_jkt: Option<String>,
+    /// The `prompt` parameter (spec 6, H4): `none` asks for no interaction at
+    /// all, `login` forces the login page. Matched on exact values; any other
+    /// value — or none at all — is today's behaviour.
+    prompt: Option<String>,
 }
 
 /// Rebuild the query string, so the login redirect can send the member back to
-/// exactly the request they arrived with.
+/// exactly the request they arrived with — except `prompt`, deliberately (spec
+/// 6, H4): a preserved `prompt=login` would loop the member through the login
+/// page forever, and `prompt=none` never reaches the login redirect at all
+/// (its no-session answer is an error redirect), so the member always returns
+/// to a plain interactive authorization.
 fn authorize_target(params: &AuthorizeParams) -> String {
     let scope = (!params.scope.is_empty()).then(|| params.scope.clone());
     let mut query = form_urlencoded::Serializer::new(String::new());
@@ -293,6 +305,24 @@ pub async fn authorize(
         return authorize_refusal("A redirect_uri is required.");
     };
 
+    // `prompt`, matched on exact values (spec 6, H4). `none` and `login` are
+    // the only values this provider gives meaning to; any other value — or
+    // none at all — is today's behaviour. A value combining `none` with
+    // anything else is a 400 here, before the client is even looked up and so
+    // before any redirect this handler can produce: OIDC Core §3.1.2.1 forbids
+    // the combination, and honouring the interactive half would quietly break
+    // the no-interaction contract the `none` half asked for.
+    let prompts: Vec<&str> = params
+        .prompt
+        .as_deref()
+        .map(|p| p.split_whitespace().collect())
+        .unwrap_or_default();
+    if prompts.contains(&"none") && prompts.len() > 1 {
+        return authorize_refusal("prompt=none cannot be combined with other prompt values.");
+    }
+    let silent = prompts.as_slice() == ["none"];
+    let fresh_login = prompts.as_slice() == ["login"];
+
     // Three kinds of client_id, three paths (spec 6, H3): `urn:uuid:` is
     // looked up in the table dynamic registration fills, `https://` is
     // fetched and validated as a Client ID Document, and anything else is
@@ -338,13 +368,58 @@ pub async fn authorize(
         return authorize_refusal("code_challenge_method must be S256.");
     }
 
-    let Some(user) = session_user(&state, &jar).await else {
-        // Send them to log in, and back to this exact request afterwards.
-        let next = authorize_target(&params);
-        let query: String = form_urlencoded::Serializer::new(String::new())
-            .append_pair("next", &next)
-            .finish();
-        return Redirect::to(&format!("/login?{query}")).into_response();
+    let session = session_user(&state, &jar).await;
+
+    // `prompt=none` (spec 6, H4): the client asked not to be interacted with,
+    // so both of the flow's failure modes become error redirects it can
+    // handle — never the login page, never the consent screen.
+    if silent {
+        let Some(user) = session else {
+            return error_redirect(redirect_uri, "login_required", params.state.as_deref());
+        };
+        let covered = match store::remembered_consent(&state.pool, user.id, client_id).await {
+            Ok(Some(consent)) => consent.covers(&params.scope, redirect_uri),
+            Ok(None) => false,
+            Err(e) => {
+                tracing::error!(error = %e, "looking up a remembered consent failed");
+                return authorize_refusal("Something went wrong. Try again.");
+            }
+        };
+        if !covered {
+            return error_redirect(redirect_uri, "consent_required", params.state.as_deref());
+        }
+        // Silent success: exactly what a consent-screen allow produces — the
+        // same issuance, the same redirect. The consent needs no re-write:
+        // coverage means the row already holds everything this request
+        // asked for, at a URI that is already remembered.
+        return issue_and_redirect(
+            &state,
+            &user,
+            client_id,
+            redirect_uri,
+            code_challenge,
+            &params.scope,
+            params.nonce.as_deref(),
+            params.dpop_jkt.as_deref(),
+            params.state.as_deref(),
+        )
+        .await;
+    }
+
+    // `prompt=login` forces the login page even with a session (spec 6, H4) —
+    // the one useful thing it does. Otherwise this is today's behaviour: no
+    // session → log in, with `next` bringing the member back to exactly this
+    // request; a session → the consent screen, always.
+    let user = match session {
+        Some(user) if !fresh_login => user,
+        _ => {
+            // Send them to log in, and back to this exact request afterwards.
+            let next = authorize_target(&params);
+            let query: String = form_urlencoded::Serializer::new(String::new())
+                .append_pair("next", &next)
+                .finish();
+            return Redirect::to(&format!("/login?{query}")).into_response();
+        }
     };
 
     let request_token = match sign_consent(&state, &user, &params, code_challenge) {
@@ -408,7 +483,67 @@ fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> String {
     format!("{redirect_uri}{separator}{}", query.finish())
 }
 
+/// Redirect the client to its `redirect_uri` with an OAuth error — the shape
+/// `decide`'s deny path established, and the one `prompt=none`'s two error
+/// answers reuse (spec 6, H4), so an error correlates the same way however
+/// the flow was reached.
+fn error_redirect(redirect_uri: &str, error: &str, state: Option<&str>) -> Response {
+    let mut params: Vec<(&str, &str)> = vec![("error", error)];
+    // The client needs `state` back even on an error, or it cannot
+    // correlate the answer with the request it made.
+    if let Some(s) = state {
+        params.push(("state", s));
+    }
+    Redirect::to(&redirect_with(redirect_uri, &params)).into_response()
+}
+
+/// Issue an authorization code and redirect the client to its `redirect_uri`
+/// with it: the one shape every issuance takes — a consent-screen allow and a
+/// `prompt=none` silent success (spec 6, H4) — so a silent answer is
+/// byte-for-byte what an allow produces.
+#[allow(clippy::too_many_arguments)]
+async fn issue_and_redirect(
+    state: &AppState,
+    user: &User,
+    client_id: &str,
+    redirect_uri: &str,
+    code_challenge: &str,
+    scope: &str,
+    nonce: Option<&str>,
+    dpop_jkt: Option<&str>,
+    state_param: Option<&str>,
+) -> Response {
+    let code = match store::issue_code(
+        &state.pool,
+        client_id,
+        user.id,
+        &webid::webid(&user.username, &state.base_domain),
+        redirect_uri,
+        code_challenge,
+        scope,
+        nonce,
+        dpop_jkt,
+    )
+    .await
+    {
+        Ok(code) => code,
+        Err(e) => {
+            tracing::error!(error = %e, "issuing an authorization code failed");
+            return authorize_refusal("Something went wrong. Try again.");
+        }
+    };
+    let mut redirect: Vec<(&str, &str)> = vec![("code", code.as_str())];
+    if let Some(s) = state_param {
+        redirect.push(("state", s));
+    }
+    Redirect::to(&redirect_with(redirect_uri, &redirect)).into_response()
+}
+
 /// `POST /oauth/solid/authorize` — the member's answer.
+///
+/// An allow remembers the consent (spec 6, H4) before it issues: the
+/// remembering is the member's decision, and it stands even if the code
+/// cannot be issued.
 pub async fn decide(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -441,42 +576,39 @@ pub async fn decide(
     let redirect_uri = str_claim("redirect_uri");
     let state_param = claims["state"].as_str();
 
-    let mut params: Vec<(&str, &str)> = Vec::new();
     if form.decision != "allow" {
-        params.push(("error", "access_denied"));
-        // The client needs `state` back even on a refusal, or it cannot
-        // correlate the answer with the request it made.
-        if let Some(s) = state_param {
-            params.push(("state", s));
-        }
-        return Redirect::to(&redirect_with(&redirect_uri, &params)).into_response();
+        return error_redirect(&redirect_uri, "access_denied", state_param);
     }
 
-    let code = match store::issue_code(
+    // Remember the consent (spec 6, H4): every allow widens the remembered
+    // scope and redirect URIs monotonically. A failure to remember is logged
+    // and survived — the allow stands, and a `prompt=none` request that finds
+    // no covering consent falls back to `consent_required`, which is the safe
+    // predecessor behaviour.
+    if let Err(e) = store::remember_consent(
         &state.pool,
-        &str_claim("client_id"),
         user.id,
-        &webid::webid(&user.username, &state.base_domain),
+        &str_claim("client_id"),
+        &str_claim("scope"),
+        &redirect_uri,
+    )
+    .await
+    {
+        tracing::error!(error = %e, "remembering a consent failed");
+    }
+
+    issue_and_redirect(
+        &state,
+        &user,
+        &str_claim("client_id"),
         &redirect_uri,
         &str_claim("code_challenge"),
         &str_claim("scope"),
         claims["nonce"].as_str(),
         claims["dpop_jkt"].as_str(),
+        state_param,
     )
     .await
-    {
-        Ok(code) => code,
-        Err(e) => {
-            tracing::error!(error = %e, "issuing an authorization code failed");
-            return authorize_refusal("Something went wrong. Try again.");
-        }
-    };
-
-    params.push(("code", &code));
-    if let Some(s) = state_param {
-        params.push(("state", s));
-    }
-    Redirect::to(&redirect_with(&redirect_uri, &params)).into_response()
 }
 
 // --- the token endpoint -----------------------------------------------------
@@ -813,6 +945,7 @@ mod tests {
             code_challenge: Some("chal".into()),
             code_challenge_method: Some("S256".into()),
             dpop_jkt: None,
+            prompt: Some("login".into()),
         };
         let target = authorize_target(&params);
         assert!(target.starts_with("/oauth/solid/authorize?"));
@@ -831,5 +964,11 @@ mod tests {
         }
         // An absent optional parameter must not appear as an empty one.
         assert!(!target.contains("nonce="));
+        // `prompt` is dropped deliberately (spec 6, H4): a preserved
+        // `prompt=login` would loop the member through the login page
+        // forever, and `prompt=none` never reaches the login redirect at
+        // all — its no-session answer is an error redirect — so the member
+        // always returns to a plain interactive authorization.
+        assert!(!target.contains("prompt="));
     }
 }
