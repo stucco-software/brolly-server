@@ -80,6 +80,9 @@ async fn harness() -> Harness {
                     )
                     .expect("the XRPC test client's metadata validates"),
             ),
+            solid_clients: std::sync::Arc::new(
+                brolly_server::client_metadata::StaticClientDocuments::default(),
+            ),
         },
         "server/static",
     );

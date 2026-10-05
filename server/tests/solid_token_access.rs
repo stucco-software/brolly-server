@@ -128,6 +128,9 @@ async fn harness() -> Harness {
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
             clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
+            solid_clients: std::sync::Arc::new(
+                brolly_server::client_metadata::StaticClientDocuments::default(),
+            ),
         },
         "server/static",
     );

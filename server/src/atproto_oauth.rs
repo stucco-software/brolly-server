@@ -129,7 +129,7 @@ fn client_refusal(e: &ClientError) -> Response {
 ///
 /// `LookupError`'s `Display` gives every `Unreachable` the same description,
 /// so this can't be used to map internal hosts (S4).
-fn lookup_refusal(e: &LookupError) -> Response {
+fn lookup_refusal(e: &LookupError<ClientError>) -> Response {
     oauth_error(StatusCode::BAD_REQUEST, "invalid_client", &e.to_string())
 }
 

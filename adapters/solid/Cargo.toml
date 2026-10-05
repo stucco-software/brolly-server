@@ -12,6 +12,9 @@ brolly-store.workspace = true
 brolly-authz.workspace = true
 brolly-identity.workspace = true
 oxigraph = "0.5.9"
+# The loopback redirect rules are URL-structural (scheme, host, port, path),
+# the same reason the ATProto client-metadata rules depend on it.
+url = "2.5.8"
 # The SPARQL algebra oxigraph parses into, so the patch path can classify and
 # allow-list a *parsed* update rather than pattern-match its bytes (spec 5c,
 # H5 and H7). Already in the tree as oxigraph's own parser.

@@ -41,6 +41,9 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
         commits: tokio::sync::broadcast::channel(64).0,
         plc_client: None,
         clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
+        solid_clients: std::sync::Arc::new(
+            brolly_server::client_metadata::StaticClientDocuments::default(),
+        ),
     };
     let router = app(state, "server/static");
     (db, dir, router)

@@ -87,7 +87,23 @@ pub struct AppState {
     /// The network in production (`client_metadata::Fetcher`), a fixed,
     /// validated set in tests (`client_metadata::StaticClients`). A trait
     /// object so tests never need a TLS server to register a client.
-    pub clients: std::sync::Arc<dyn client_metadata::ClientLookup>,
+    pub clients: std::sync::Arc<
+        dyn client_metadata::ClientLookup<
+                Document = brolly_atproto::client_metadata::ClientMetadata,
+                Invalid = brolly_atproto::client_metadata::ClientError,
+            >,
+    >,
+    /// Where Solid-OIDC Client ID Documents come from (spec 6, H3).
+    ///
+    /// The same transport as `clients`, parameterized for RDF: an `https://`
+    /// client_id at `authorize` is fetched and validated here rather than
+    /// looked up in a table. A trait object for the same reason.
+    pub solid_clients: std::sync::Arc<
+        dyn client_metadata::ClientLookup<
+                Document = brolly_solid::client_documents::ClientIdDocument,
+                Invalid = brolly_solid::client_documents::InvalidDocument,
+            >,
+    >,
 }
 
 /// The upstream repository, and the default value of `BROLLY_SOURCE_URL`.

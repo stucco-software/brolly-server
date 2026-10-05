@@ -109,7 +109,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         plc_client,
         // ATProto OAuth clients are identified by a URL serving their
         // metadata. Fetched from public addresses only, validated, cached.
-        clients: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::new()?),
+        clients: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<
+            brolly_atproto::client_metadata::ClientMetadata,
+        >::new()?),
+        // Solid-OIDC clients with a Client ID Document are identified by the
+        // document itself (spec 6, H3): the same hardened transport, asking
+        // for RDF instead of JSON.
+        solid_clients: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<
+            brolly_solid::client_documents::ClientIdDocument,
+        >::new()?),
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

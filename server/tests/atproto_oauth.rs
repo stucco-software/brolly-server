@@ -16,7 +16,7 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
-use brolly_server::client_metadata::{ClientLookup, Lookup, StaticClients};
+use brolly_server::client_metadata::{ClientLookup, Lookup, StaticClientDocuments, StaticClients};
 use brolly_server::{AppState, app};
 use http_body_util::BodyExt;
 use p256::ecdsa::SigningKey;
@@ -62,7 +62,14 @@ async fn harness() -> Harness {
     harness_with(Arc::new(app_example())).await
 }
 
-async fn harness_with(clients: Arc<dyn ClientLookup>) -> Harness {
+async fn harness_with(
+    clients: Arc<
+        dyn ClientLookup<
+                Document = brolly_atproto::client_metadata::ClientMetadata,
+                Invalid = brolly_atproto::client_metadata::ClientError,
+            >,
+    >,
+) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
@@ -94,6 +101,7 @@ async fn harness_with(clients: Arc<dyn ClientLookup>) -> Harness {
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
             clients,
+            solid_clients: std::sync::Arc::new(StaticClientDocuments::default()),
         },
         "server/static",
     );
@@ -280,7 +288,10 @@ struct CountingClients {
 }
 
 impl ClientLookup for CountingClients {
-    fn fetch<'a>(&'a self, url: &'a url::Url) -> Lookup<'a> {
+    type Document = brolly_atproto::client_metadata::ClientMetadata;
+    type Invalid = brolly_atproto::client_metadata::ClientError;
+
+    fn fetch<'a>(&'a self, url: &'a url::Url) -> Lookup<'a, Self::Document, Self::Invalid> {
         self.lookups.fetch_add(1, Ordering::SeqCst);
         self.inner.fetch(url)
     }

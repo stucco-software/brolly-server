@@ -173,6 +173,29 @@ pub const SPACE_PREFERENCES_FILE: &str = "http://www.w3.org/ns/pim/space#prefere
 /// through it — and why it appears nowhere else in provisioning.
 pub const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
 
+// --- Client ID Documents (spec 6, H3) ----------------------------------------
+//
+// The terms a Solid-OIDC Client ID Document is read with. The Solid-OIDC
+// spec (§5.1) defines them only through its normative JSON-LD context,
+// `https://www.w3.org/ns/solid/oidc-context.jsonld`, which maps
+// `redirect_uris` and `client_name` onto this vocabulary. The namespace is
+// **http**, not https — the spec's own note calls that out — and each IRI is
+// pinned byte-for-byte by test below, so a typo is a red build rather than
+// every Client ID Document silently failing to be one.
+
+/// The Solid-OIDC client vocabulary. **http**, not https: the spec's note in
+/// §5.1.1 says the vocabulary uses the http scheme even though the context
+/// document itself must be fetched over https.
+pub const SOLID_OIDC: &str = "http://www.w3.org/ns/solid/oidc#";
+/// The redirect URIs a Client ID Document lists for its client. The JSON-LD
+/// context gives it an `@id`/`@set` container, so each listed URI is a direct
+/// object of this predicate on the client's own IRI — not an RDF collection.
+pub const SOLID_OIDC_REDIRECT_URIS: &str = "http://www.w3.org/ns/solid/oidc#redirect_uris";
+/// The client's name, which the consent screen shows in place of the raw IRI
+/// (spec 6, H3) — the same part of the screen a registered client's
+/// `client_name` fills.
+pub const SOLID_OIDC_CLIENT_NAME: &str = "http://www.w3.org/ns/solid/oidc#client_name";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -280,5 +303,29 @@ mod tests {
             "http://www.w3.org/ns/pim/space#preferencesFile"
         );
         assert_eq!(FOAF_AGENT, "http://xmlns.com/foaf/0.1/Agent");
+    }
+
+    /// Spec 6, H3: these IRIs are what a fetched Client ID Document is read
+    /// with, and no client negotiates to discover a typo — a wrong byte is
+    /// every Solid app failing to log in. Pinned byte-for-byte against the
+    /// Solid-OIDC spec's normative JSON-LD context (its Appendix A), which is
+    /// the only place the vocabulary is defined. Note the **http** scheme:
+    /// the spec's §5.1.1 note says the vocabulary uses http even though the
+    /// context document itself is fetched over https — writing https here
+    /// would refuse every conforming document.
+    #[test]
+    fn the_client_id_document_terms_are_pinned() {
+        assert_eq!(SOLID_OIDC, "http://www.w3.org/ns/solid/oidc#");
+        assert_eq!(
+            SOLID_OIDC_REDIRECT_URIS,
+            "http://www.w3.org/ns/solid/oidc#redirect_uris"
+        );
+        assert_eq!(
+            SOLID_OIDC_CLIENT_NAME,
+            "http://www.w3.org/ns/solid/oidc#client_name"
+        );
+        for term in [SOLID_OIDC_REDIRECT_URIS, SOLID_OIDC_CLIENT_NAME] {
+            assert!(term.starts_with(SOLID_OIDC), "{term}");
+        }
     }
 }

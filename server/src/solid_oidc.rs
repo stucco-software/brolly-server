@@ -24,10 +24,12 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db::User;
 use brolly_identity::oauth::Protocol;
 use brolly_identity::{extract, webid};
+use brolly_solid::client_documents::{ClientIdDocument, allows_redirect};
 use brolly_solid::oidc::{dpop, store, tokens};
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
+use url::Url;
 
 use crate::auth::session_user;
 use crate::{AppState, consent};
@@ -60,6 +62,37 @@ fn oauth_error(status: StatusCode, code: &str, description: &str) -> Response {
 /// attacker an open redirect.
 fn authorize_refusal(message: &str) -> Response {
     (StatusCode::BAD_REQUEST, message.to_string()).into_response()
+}
+
+/// The one answer every unregistered-or-unusable client gets at `authorize`
+/// (spec 6, H3).
+///
+/// One constant, byte-for-byte, for every cause — an unknown `urn:uuid:`, a
+/// `client_id` that is neither kind, a Client ID Document that could not be
+/// fetched, would not parse, or does not list the `redirect_uri` — so the
+/// endpoint cannot be used as an oracle for which client documents exist on
+/// the open web. The registered client's different prose for an unlisted
+/// `redirect_uri` is deliberate: its URIs were fixed at registration, so
+/// there is nothing to probe for.
+const UNREGISTERED: &str = "This application is not registered with this server. \
+     It needs to register before it can ask for access.";
+
+/// The Client ID Document an `https://` client_id names (spec 6, H3): the
+/// fetch branch of `authorize`'s three-way dispatch. `None` for every other
+/// kind — `urn:uuid:` ids are looked up in the table dynamic registration
+/// fills, and anything else is refused without a fetch. Userinfo and
+/// fragments are refused here rather than parsed away: the fetch URL must be
+/// the client_id as sent, because the document's subject has to be it.
+fn client_document_url(client_id: &str) -> Option<Url> {
+    let url = Url::parse(client_id).ok()?;
+    if url.scheme() != "https"
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url)
 }
 
 /// These endpoints are apex-only (ADR 0008). Answering on `alice.brolly.id`
@@ -206,6 +239,41 @@ fn authorize_target(params: &AuthorizeParams) -> String {
     format!("/oauth/solid/authorize?{}", query.finish())
 }
 
+/// Which client is asking, once `authorize` has decided it may ask at all.
+///
+/// The grant remembers the same `client_id` string either way, so the token
+/// endpoint's comparison against it is unchanged (spec 6, H3).
+enum Client {
+    /// Registered through RFC 7591; its redirect URIs were fixed at
+    /// registration.
+    Registered(store::Client),
+    /// Fetched and validated as a Client ID Document (spec 6, H3).
+    Document(ClientIdDocument),
+}
+
+impl Client {
+    /// The name the consent screen shows in place of the raw IRI — the same
+    /// path a registered client's `client_name` already takes (spec 6, H3).
+    fn client_name(&self) -> Option<&str> {
+        match self {
+            Client::Registered(c) => c.client_name.as_deref(),
+            Client::Document(d) => d.client_name(),
+        }
+    }
+
+    /// May this client be sent to `redirect_uri`?
+    ///
+    /// A registered client must have listed the URI at registration. A
+    /// document client must list it in the document — exactly, or as a
+    /// loopback redirect with any port (RFC 8252 §7.3).
+    fn allows_redirect(&self, redirect_uri: &str) -> bool {
+        match self {
+            Client::Registered(c) => c.redirect_uris.iter().any(|u| u == redirect_uri),
+            Client::Document(d) => allows_redirect(d, redirect_uri),
+        }
+    }
+}
+
 /// Who is at the keyboard, from the session cookie.
 /// `GET /oauth/solid/authorize`
 pub async fn authorize(
@@ -225,26 +293,41 @@ pub async fn authorize(
         return authorize_refusal("A redirect_uri is required.");
     };
 
-    let client = match store::find_client(&state.pool, client_id).await {
-        Ok(Some(client)) => client,
-        Ok(None) => {
-            return authorize_refusal(
-                "This application is not registered with this server. \
-                 It needs to register before it can ask for access.",
-            );
+    // Three kinds of client_id, three paths (spec 6, H3): `urn:uuid:` is
+    // looked up in the table dynamic registration fills, `https://` is
+    // fetched and validated as a Client ID Document, and anything else is
+    // refused outright. The document branch's every failure — the fetch, the
+    // parse, the document's own rules — answers with the same words as an
+    // unknown `urn:uuid:`, deliberately, so the endpoint is not an oracle
+    // for which client documents exist on the open web.
+    let client = if let Some(url) = client_document_url(client_id) {
+        match state.solid_clients.fetch(&url).await {
+            Ok(document) => Client::Document(document),
+            Err(_) => return authorize_refusal(UNREGISTERED),
         }
-        Err(e) => {
-            tracing::error!(error = %e, "client lookup failed");
-            return authorize_refusal("Something went wrong. Try again.");
+    } else {
+        match store::find_client(&state.pool, client_id).await {
+            Ok(Some(client)) => Client::Registered(client),
+            Ok(None) => return authorize_refusal(UNREGISTERED),
+            Err(e) => {
+                tracing::error!(error = %e, "client lookup failed");
+                return authorize_refusal("Something went wrong. Try again.");
+            }
         }
     };
-    if !client.redirect_uris.iter().any(|u| u == redirect_uri) {
-        // Never redirect here: an unregistered redirect_uri is precisely the
+    if !client.allows_redirect(redirect_uri) {
+        // Never redirect here: an unlisted redirect_uri is precisely the
         // value an attacker supplies.
-        return authorize_refusal(
-            "This application asked to be sent somewhere it has not registered. \
-             The request has been refused.",
-        );
+        return match client {
+            Client::Registered(_) => authorize_refusal(
+                "This application asked to be sent somewhere it has not registered. \
+                 The request has been refused.",
+            ),
+            // A document client's listed URIs are part of what makes it the
+            // client it claims to be, so their absence is the same refusal
+            // as an unknown one (spec 6, H3).
+            Client::Document(_) => authorize_refusal(UNREGISTERED),
+        };
     }
 
     // PKCE is mandatory and S256 is the only method discovery advertises.
@@ -275,9 +358,9 @@ pub async fn authorize(
     consent::render_consent(
         &state,
         Protocol::SolidOidc,
-        client.client_name.as_deref().unwrap_or("An application"),
+        client.client_name().unwrap_or("An application"),
         &user.username,
-        &client.client_id,
+        client_id,
         &params.scope,
         "/oauth/solid/authorize",
         &request_token,

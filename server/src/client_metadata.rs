@@ -1,8 +1,16 @@
-//! Looking up ATProto OAuth client metadata.
+//! Looking up OAuth client metadata and Client ID Documents over the network.
 //!
-//! The rules live in [`brolly_atproto::client_metadata`]. This module decides
-//! where the metadata comes from: the network in production (`Fetcher`), a
-//! fixed map in integration tests ([`StaticClients`]).
+//! The rules live in [`brolly_atproto::client_metadata`] and
+//! [`brolly_solid::client_documents`]. This module decides where the document
+//! comes from: the network in production ([`Fetcher`]), a fixed map in
+//! integration tests ([`StaticClients`], [`StaticClientDocuments`]).
+//!
+//! The transport — 5 s timeout, 64 KiB cap, no redirects, HTTPS-only, DNS
+//! filtered to public addresses, a cache with distinct ok/error TTLs — is
+//! protocol-agnostic and shared: one [`Fetcher`] per protocol, parameterized
+//! by what the protocol does with the bytes ([`Document`]). ATProto fetches
+//! `application/json`; Solid-OIDC fetches RDF, because our own `/profile`
+//! serves HTML to anything that sounds like a browser (spec 6, H3).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -13,23 +21,24 @@ use std::time::{Duration, Instant};
 use brolly_atproto::client_metadata::{
     ClientError, ClientId, ClientMetadata, loopback_metadata, parse_client_id, validate,
 };
+use brolly_solid::client_documents::{self, ClientIdDocument, InvalidDocument};
 use moka::Expiry;
 use moka::future::Cache;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use url::{Host, Url};
 
-/// Why a client's metadata couldn't be used.
+/// Why a client's document couldn't be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum LookupError {
+pub enum LookupError<I> {
     /// The document was retrieved and broke a rule. Safe to describe.
-    Invalid(ClientError),
+    Invalid(I),
     /// DNS refusal, connection failure, timeout, TLS failure, a non-200 status
     /// or an oversized body. All of them get one description, so PAR can't be
     /// used to map which internal hosts exist or answer (S4).
     Unreachable,
 }
 
-impl std::fmt::Display for LookupError {
+impl<I: std::fmt::Display> std::fmt::Display for LookupError<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LookupError::Invalid(e) => e.fmt(f),
@@ -38,22 +47,25 @@ impl std::fmt::Display for LookupError {
     }
 }
 
-impl std::error::Error for LookupError {}
+impl<I: std::fmt::Display + std::fmt::Debug> std::error::Error for LookupError<I> {}
 
 /// What [`ClientLookup::fetch`] returns: a boxed future, because an `async fn`
 /// in a trait can't be called through `dyn`.
-pub type Lookup<'a> =
-    Pin<Box<dyn Future<Output = Result<ClientMetadata, LookupError>> + Send + 'a>>;
+pub type Lookup<'a, D, I> = Pin<Box<dyn Future<Output = Result<D, LookupError<I>>> + Send + 'a>>;
 
-/// Where client metadata comes from.
+/// Where a protocol's client documents come from.
 ///
-/// `Send + Sync` so it can live in axum state as `Arc<dyn ClientLookup>`.
+/// `Send + Sync` so it can live in axum state as `Arc<dyn ClientLookup<..>>`.
 pub trait ClientLookup: Send + Sync {
-    /// Retrieve and validate the metadata document at `url`.
+    type Document: Clone + Send + Sync;
+    type Invalid: std::error::Error + Clone + Send + Sync + 'static;
+
+    /// Retrieve and validate the document at `url`.
     ///
     /// Only ever called for discoverable clients: PAR goes through
-    /// [`lookup_client`], which answers loopback clients itself.
-    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a>;
+    /// [`lookup_client`], which answers loopback clients itself, and the
+    /// Solid-OIDC authorize branch only consults it for `https://` client ids.
+    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, Self::Document, Self::Invalid>;
 }
 
 /// The metadata for a parsed `client_id`.
@@ -62,12 +74,61 @@ pub trait ClientLookup: Send + Sync {
 /// implementation can override the loopback branch and send a `localhost`
 /// client to the network.
 pub async fn lookup_client(
-    clients: &dyn ClientLookup,
+    clients: &dyn ClientLookup<Document = ClientMetadata, Invalid = ClientError>,
     id: &ClientId,
-) -> Result<ClientMetadata, LookupError> {
+) -> Result<ClientMetadata, LookupError<ClientError>> {
     match id {
         ClientId::Loopback(_) => Ok(loopback_metadata(id)),
         ClientId::Discoverable(url) => clients.fetch(url).await,
+    }
+}
+
+/// What one protocol's fetch does with the bytes it gets back: the `Accept`
+/// header, the content-type check, and the parse (spec 6, H3). Everything
+/// downstream of the bytes — the ATProto fetcher's `application/json` and
+/// JSON parse, the Solid-OIDC fetcher's RDF ask and RDF parse — so that one
+/// hardened transport can serve both.
+pub trait Document: Sized + Clone + Send + Sync + 'static {
+    /// Why a retrieved document broke a rule. Safe to show the caller: it
+    /// names the rule, never anything fetched.
+    type Invalid: std::error::Error + Clone + Send + Sync + 'static;
+
+    /// The `Accept` header: what the protocol's documents are served as. A
+    /// fetch that does not ask for what it wants gets whatever the server
+    /// hands browsers — for our own `/profile`, an HTML page.
+    fn accept() -> &'static str;
+
+    /// The content-type check and the parse, as one: a document served with
+    /// the wrong content type is not that protocol's document, whatever its
+    /// bytes say.
+    fn parse(url: &Url, content_type: &str, body: &[u8]) -> Result<Self, Self::Invalid>;
+}
+
+/// ATProto's half of a fetch: `application/json` metadata, as the ATProto
+/// OAuth spec's `client_id_metadata_document_supported` serves it.
+impl Document for ClientMetadata {
+    type Invalid = ClientError;
+
+    fn accept() -> &'static str {
+        "application/json"
+    }
+
+    fn parse(url: &Url, content_type: &str, body: &[u8]) -> Result<Self, ClientError> {
+        validate(&ClientId::Discoverable(url.clone()), content_type, body)
+    }
+}
+
+/// The Solid-OIDC half of a fetch (spec 6, H3): a Client ID Document is RDF,
+/// asked for as RDF and parsed as RDF.
+impl Document for ClientIdDocument {
+    type Invalid = InvalidDocument;
+
+    fn accept() -> &'static str {
+        client_documents::ACCEPT
+    }
+
+    fn parse(url: &Url, content_type: &str, body: &[u8]) -> Result<Self, InvalidDocument> {
+        client_documents::parse(url, content_type, body)
     }
 }
 
@@ -94,9 +155,53 @@ impl StaticClients {
 }
 
 impl ClientLookup for StaticClients {
-    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a> {
+    type Document = ClientMetadata;
+    type Invalid = ClientError;
+
+    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, ClientMetadata, ClientError> {
         let found = self
             .clients
+            .get(url.as_str())
+            .cloned()
+            .ok_or(LookupError::Unreachable);
+        Box::pin(std::future::ready(found))
+    }
+}
+
+/// A fixed set of Client ID Documents, for integration tests (spec 6, H3).
+///
+/// The same deal as [`StaticClients`]: it skips fetching, not validation, so
+/// a test can't register a document production would refuse. Documents are
+/// Turtle — the form a hand-written one takes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct StaticClientDocuments {
+    documents: HashMap<String, ClientIdDocument>,
+}
+
+impl StaticClientDocuments {
+    /// Register `client_id`, holding `document`.
+    ///
+    /// Only `https://` ids, the only kind the authorize branch fetches (H3):
+    /// a test can't register an id the branch would refuse before looking.
+    pub fn with(mut self, client_id: &str, document: &str) -> Result<Self, InvalidDocument> {
+        if !client_id.starts_with("https://") {
+            return Err(InvalidDocument::NotRdf(client_id.to_string()));
+        }
+        let url =
+            Url::parse(client_id).map_err(|_| InvalidDocument::NotRdf(client_id.to_string()))?;
+        let parsed = client_documents::parse(&url, "text/turtle", document.as_bytes())?;
+        self.documents.insert(client_id.to_owned(), parsed);
+        Ok(self)
+    }
+}
+
+impl ClientLookup for StaticClientDocuments {
+    type Document = ClientIdDocument;
+    type Invalid = InvalidDocument;
+
+    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, ClientIdDocument, InvalidDocument> {
+        let found = self
+            .documents
             .get(url.as_str())
             .cloned()
             .ok_or(LookupError::Unreachable);
@@ -120,11 +225,11 @@ const CAPACITY: u64 = 1_000;
 /// logs. Which instance asked is the one their user just signed in to.
 const FETCH_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
-type Cached = Result<ClientMetadata, LookupError>;
+type Cached<D> = Result<D, LookupError<<D as Document>::Invalid>>;
 
 /// Why one retrieval failed, in the detail the operator's log needs and the
 /// caller must never see.
-enum Failure {
+enum Failure<I> {
     /// Refused without reading a response, or while reading it.
     Refused(&'static str),
     /// Any status other than 200.
@@ -133,10 +238,10 @@ enum Failure {
     /// TLS, timeout, a broken body.
     Http(reqwest::Error),
     /// The document was read and broke a rule.
-    Invalid(ClientError),
+    Invalid(I),
 }
 
-impl std::fmt::Display for Failure {
+impl<I: std::fmt::Display> std::fmt::Display for Failure<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Failure::Refused(why) => f.write_str(why),
@@ -147,11 +252,14 @@ impl std::fmt::Display for Failure {
     }
 }
 
-/// Fetches client metadata over the network, from public addresses only, and
-/// caches the answer.
+/// Fetches a protocol's client documents over the network, from public
+/// addresses only, and caches the answer (spec 6, H3).
 ///
-/// What `main.rs` builds. Every bypass of the address filter is closed where it
-/// happens (S3):
+/// What `main.rs` builds, once per protocol: `Fetcher::<ClientMetadata>` for
+/// ATProto, `Fetcher::<ClientIdDocument>` for Solid-OIDC. The transport is
+/// shared and identical for both; only [`Document`] — the `Accept` header,
+/// the content-type check, the parse — varies. Every bypass of the address
+/// filter is closed where it happens (S3):
 /// - redirects aren't followed, so a public host can't bounce the fetch inward;
 /// - proxies are off, so an environment proxy can't resolve names the filter
 ///   never sees;
@@ -162,31 +270,33 @@ impl std::fmt::Display for Failure {
 ///
 /// It never calls `ClientBuilder::resolve` or `resolve_to_addrs`: reqwest
 /// applies those overrides on top of the custom resolver.
-pub struct Fetcher {
+pub struct Fetcher<D: Document> {
     http: reqwest::Client,
-    cache: Cache<String, Cached>,
+    cache: Cache<String, Cached<D>>,
     allow_loopback: bool,
+    _document: std::marker::PhantomData<D>,
 }
 
-impl Fetcher {
+impl<D: Document> Fetcher<D> {
     pub fn new() -> Result<Self, reqwest::Error> {
         Self::build(false, false, OK_TTL, ERR_TTL)
     }
 
-    /// For this module's unit tests, which fetch from `http://127.0.0.1:PORT`
-    /// and need cache lifetimes in milliseconds.
+    /// For tests that fetch from `http://127.0.0.1:PORT` — this module's unit
+    /// tests, and the integration tests that fetch from a server served on a
+    /// real loopback port — which also need cache lifetimes in milliseconds.
     ///
     /// `allow_loopback` lets loopback IP literals through and stops
     /// [`PublicOnly`] dropping loopback addresses. `allow_http` lifts
-    /// https-only.
-    #[cfg(test)]
+    /// https-only. Production builds `new`, which allows neither. Like `new`,
+    /// building the client can fail, so the caller — a test — expects.
     pub fn for_tests(
         allow_loopback: bool,
         allow_http: bool,
         ok_ttl: Duration,
         err_ttl: Duration,
-    ) -> Self {
-        Self::build(allow_loopback, allow_http, ok_ttl, err_ttl).unwrap()
+    ) -> Result<Self, reqwest::Error> {
+        Self::build(allow_loopback, allow_http, ok_ttl, err_ttl)
     }
 
     fn build(
@@ -217,6 +327,7 @@ impl Fetcher {
             http,
             cache,
             allow_loopback,
+            _document: std::marker::PhantomData,
         })
     }
 
@@ -232,10 +343,10 @@ impl Fetcher {
 
     /// One retrieval, as the cache stores it. The only place a failure is
     /// logged, so each is logged once, and a cached failure not again.
-    async fn retrieve(&self, url: &Url) -> Cached {
+    async fn retrieve(&self, url: &Url) -> Cached<D> {
         self.request(url).await.map_err(|failure| {
             // The caller gets one description; the operator gets the detail.
-            tracing::info!(client_id = %url, error = %failure, "client metadata lookup failed");
+            tracing::info!(client_id = %url, error = %failure, "client document lookup failed");
             match failure {
                 Failure::Invalid(e) => LookupError::Invalid(e),
                 Failure::Refused(_) | Failure::Status(_) | Failure::Http(_) => {
@@ -245,14 +356,17 @@ impl Fetcher {
         })
     }
 
-    async fn request(&self, url: &Url) -> Result<ClientMetadata, Failure> {
+    async fn request(&self, url: &Url) -> Result<D, Failure<D::Invalid>> {
         if !self.host_allowed(url) {
             return Err(Failure::Refused("the host is an IP address"));
         }
         let mut response = self
             .http
             .get(url.as_str())
-            .header(reqwest::header::ACCEPT, "application/json")
+            // What varies with the protocol, and everything else is shared:
+            // the Accept is why an RDF fetch gets RDF and an ATProto fetch
+            // gets JSON from the same server (spec 6, H3).
+            .header(reqwest::header::ACCEPT, D::accept())
             .send()
             .await
             .map_err(Failure::Http)?;
@@ -274,13 +388,15 @@ impl Fetcher {
             body.extend_from_slice(&chunk);
         }
 
-        validate(&ClientId::Discoverable(url.clone()), &content_type, &body)
-            .map_err(Failure::Invalid)
+        D::parse(url, &content_type, &body).map_err(Failure::Invalid)
     }
 }
 
-impl ClientLookup for Fetcher {
-    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a> {
+impl<D: Document> ClientLookup for Fetcher<D> {
+    type Document = D;
+    type Invalid = D::Invalid;
+
+    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, D, D::Invalid> {
         // get_with also collapses concurrent lookups of one client into a
         // single fetch.
         Box::pin(async move {
@@ -297,8 +413,13 @@ struct Lifetimes {
     err: Duration,
 }
 
-impl Expiry<String, Cached> for Lifetimes {
-    fn expire_after_create(&self, _key: &String, value: &Cached, _at: Instant) -> Option<Duration> {
+impl<D: Document> Expiry<String, Cached<D>> for Lifetimes {
+    fn expire_after_create(
+        &self,
+        _key: &String,
+        value: &Cached<D>,
+        _at: Instant,
+    ) -> Option<Duration> {
         Some(if value.is_ok() { self.ok } else { self.err })
     }
 }
@@ -438,7 +559,10 @@ mod tests {
     }
 
     impl ClientLookup for Counting {
-        fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a> {
+        type Document = ClientMetadata;
+        type Invalid = ClientError;
+
+        fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, ClientMetadata, ClientError> {
             self.lookups.fetch_add(1, Ordering::SeqCst);
             self.inner.fetch(url)
         }
@@ -501,8 +625,62 @@ mod tests {
     #[test]
     fn every_unreachable_client_is_described_the_same_way() {
         assert_eq!(
-            LookupError::Unreachable.to_string(),
+            LookupError::<ClientError>::Unreachable.to_string(),
             "client metadata could not be retrieved"
+        );
+    }
+
+    #[test]
+    fn static_client_documents_hold_only_what_parse_accepts() {
+        // The stub validates, so it cannot hold what production would refuse:
+        // not a non-https id, not a non-document, not unparseable Turtle.
+        let valid = "@prefix oidc: <http://www.w3.org/ns/solid/oidc#>. \
+                     <https://app.example/id> oidc:redirect_uris <https://app.example/cb> .";
+        assert!(
+            StaticClientDocuments::default()
+                .with("https://app.example/id", valid)
+                .is_ok()
+        );
+        assert!(matches!(
+            StaticClientDocuments::default().with("http://app.example/id", valid),
+            Err(InvalidDocument::NotRdf(_))
+        ));
+        assert!(matches!(
+            StaticClientDocuments::default().with("https://app.example/id", "not turtle"),
+            Err(InvalidDocument::Unparseable(_))
+        ));
+        // Parses, but the triples are about some other node: not the
+        // client's own document.
+        assert_eq!(
+            StaticClientDocuments::default().with(
+                "https://app.example/id",
+                "@prefix oidc: <http://www.w3.org/ns/solid/oidc#>. \
+                 <https://elsewhere/> oidc:redirect_uris <https://app.example/cb> .",
+            ),
+            Err(InvalidDocument::NotAClientDocument)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_registered_document_is_found_and_an_unknown_one_is_unreachable() {
+        let documents = StaticClientDocuments::default()
+            .with(
+                "https://app.example/id",
+                "@prefix oidc: <http://www.w3.org/ns/solid/oidc#>. \
+                 <> oidc:redirect_uris <https://app.example/cb> .",
+            )
+            .unwrap();
+
+        let found = documents
+            .fetch(&Url::parse("https://app.example/id").unwrap())
+            .await
+            .unwrap();
+        assert_eq!(found.client_id(), "https://app.example/id");
+
+        let unknown = Url::parse("https://unknown.example/id").unwrap();
+        assert_eq!(
+            documents.fetch(&unknown).await,
+            Err(LookupError::Unreachable)
         );
     }
 }
@@ -564,8 +742,17 @@ mod fetch_tests {
         )
     }
 
-    fn local_fetcher() -> Fetcher {
-        Fetcher::for_tests(true, true, MINUTE, MINUTE)
+    fn local_fetcher() -> Fetcher<ClientMetadata> {
+        Fetcher::for_tests(true, true, MINUTE, MINUTE).unwrap()
+    }
+
+    /// A Client ID Document in Turtle, about the client at `url`.
+    fn solid_document(url: &str) -> String {
+        format!(
+            "@prefix oidc: <http://www.w3.org/ns/solid/oidc#>.\n<{url}> \
+             oidc:redirect_uris <https://app.example/cb> ; \
+             oidc:client_name \"Penny\" ."
+        )
     }
 
     #[tokio::test]
@@ -724,7 +911,9 @@ mod fetch_tests {
             )
         })
         .await;
-        let fetcher = Fetcher::for_tests(true, true, MINUTE, Duration::from_millis(50));
+        let fetcher =
+            Fetcher::<ClientMetadata>::for_tests(true, true, MINUTE, Duration::from_millis(50))
+                .unwrap();
 
         assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
         assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
@@ -751,7 +940,7 @@ mod fetch_tests {
             )
         })
         .await;
-        let fetcher = Fetcher::for_tests(false, true, MINUTE, MINUTE);
+        let fetcher = Fetcher::<ClientMetadata>::for_tests(false, true, MINUTE, MINUTE).unwrap();
         assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
         assert_eq!(hits.load(Ordering::SeqCst), 0, "refused before connecting");
     }
@@ -771,7 +960,7 @@ mod fetch_tests {
         let mut by_name = ip_url.clone();
         by_name.set_host(Some("localhost")).unwrap();
 
-        let fetcher = Fetcher::for_tests(false, true, MINUTE, MINUTE);
+        let fetcher = Fetcher::<ClientMetadata>::for_tests(false, true, MINUTE, MINUTE).unwrap();
         assert_eq!(fetcher.fetch(&by_name).await, Err(LookupError::Unreachable));
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -792,7 +981,7 @@ mod fetch_tests {
             )
         })
         .await;
-        let fetcher = Fetcher::for_tests(true, false, MINUTE, MINUTE);
+        let fetcher = Fetcher::<ClientMetadata>::for_tests(true, false, MINUTE, MINUTE).unwrap();
         assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
@@ -812,7 +1001,7 @@ mod fetch_tests {
             )
         })
         .await;
-        let fetcher = Fetcher::new().unwrap();
+        let fetcher = Fetcher::<ClientMetadata>::new().unwrap();
 
         // http://127.0.0.1:PORT: refused as an IP literal, before connecting.
         assert!(matches!(
@@ -874,6 +1063,181 @@ mod fetch_tests {
         let seen = seen.lock().unwrap().clone();
         assert_eq!(seen.as_deref(), Some(FETCH_USER_AGENT));
         assert!(FETCH_USER_AGENT.starts_with("brolly-server/"));
+    }
+
+    // --- Solid-OIDC Client ID Documents (spec 6, H3) ------------------------------
+    //
+    // The transport above is shared with the ATProto fetcher and tested once:
+    // what these pin is the half that varies — the RDF ask, the content-type
+    // check, the RDF parse — and that the shared rules really are shared.
+
+    /// A local fetcher of Client ID Documents.
+    fn solid_fetcher() -> Fetcher<ClientIdDocument> {
+        Fetcher::for_tests(true, true, MINUTE, MINUTE).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_client_id_document_is_asked_for_as_rdf_and_parsed_as_rdf() {
+        // The trap the RDF ask exists for: this server, like our own
+        // `/profile`, serves HTML to anything that sounds like a browser and
+        // Turtle to a caller that asks for it. A fetcher that does not ask
+        // for RDF gets the page and must be refused by the content-type
+        // check; a fetcher that asks gets the document.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            let hits = hits.clone();
+            let body = solid_document(&url);
+            Router::new().route(
+                "/client-metadata.json",
+                get(move |headers: axum::http::HeaderMap| {
+                    let hits = hits.clone();
+                    let body = body.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let accept = headers
+                            .get(header::ACCEPT)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default();
+                        let browser = accept
+                            .split(',')
+                            .map(|part| part.split(';').next().unwrap_or("").trim())
+                            .any(|media| media == "text/html");
+                        if browser {
+                            (
+                                [(header::CONTENT_TYPE, "text/html")],
+                                "<html>A page, not a document</html>".to_string(),
+                            )
+                        } else {
+                            ([(header::CONTENT_TYPE, "text/turtle")], body.clone())
+                        }
+                    }
+                }),
+            )
+        })
+        .await;
+
+        let document = solid_fetcher().fetch(&url).await.unwrap();
+        assert_eq!(document.client_id(), url.as_str());
+        assert_eq!(document.client_name(), Some("Penny"));
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_page_served_to_browsers_is_not_a_client_id_document() {
+        // The second half of the trap: even if HTML arrives — a server that
+        // serves it whatever the ask — the content-type check refuses it
+        // before any parse. The page's contents are irrelevant; a real page
+        // is what a browser-sounding Accept on our own `/profile` gets.
+        let url = serve(|_| {
+            answering(
+                StatusCode::OK,
+                "text/html",
+                "<html>A page, not a document</html>".to_string(),
+                &Arc::new(AtomicUsize::new(0)),
+            )
+        })
+        .await;
+        assert!(matches!(
+            solid_fetcher().fetch(&url).await,
+            Err(LookupError::Invalid(InvalidDocument::NotRdf(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_client_id_document_redirect_is_not_followed() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|url| {
+            answering(StatusCode::OK, "text/turtle", solid_document(&url), &hits).route(
+                "/moved.json",
+                get(|| async {
+                    (
+                        StatusCode::FOUND,
+                        [(header::LOCATION, "/client-metadata.json")],
+                    )
+                }),
+            )
+        })
+        .await;
+        let moved = url.join("/moved.json").unwrap();
+
+        assert_eq!(
+            solid_fetcher().fetch(&moved).await,
+            Err(LookupError::Unreachable)
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "the redirect target was never fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_id_document_fetch_is_https_only_from_public_addresses() {
+        // `Fetcher::<ClientIdDocument>::new` is what main.rs builds: the
+        // parameterization changed nothing about the transport rules.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url =
+            serve(|url| answering(StatusCode::OK, "text/turtle", solid_document(&url), &hits))
+                .await;
+        let fetcher = Fetcher::<ClientIdDocument>::new().unwrap();
+
+        // Plain http: refused by https_only, before any connection.
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+        // An IP-literal host: refused before the resolver, https or not.
+        let mut https_loopback = url.clone();
+        https_loopback.set_scheme("https").unwrap();
+        assert_eq!(
+            fetcher.fetch(&https_loopback).await,
+            Err(LookupError::Unreachable)
+        );
+        // A name with no public address: refused by the resolver filter.
+        let mut by_name = url.clone();
+        by_name.set_host(Some("localhost")).unwrap();
+        assert_eq!(fetcher.fetch(&by_name).await, Err(LookupError::Unreachable));
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the server");
+    }
+
+    #[tokio::test]
+    async fn a_client_id_document_is_fetched_and_cached() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url =
+            serve(|url| answering(StatusCode::OK, "text/turtle", solid_document(&url), &hits))
+                .await;
+        let fetcher = solid_fetcher();
+
+        let first = fetcher.fetch(&url).await.unwrap();
+        let second = fetcher.fetch(&url).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a fetched document is reused, not re-fetched"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_client_id_document_fetch_is_not_re_hammered() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|_| {
+            answering(
+                StatusCode::NOT_FOUND,
+                "text/plain",
+                "gone".to_string(),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher =
+            Fetcher::<ClientIdDocument>::for_tests(true, true, MINUTE, Duration::from_millis(50))
+                .unwrap();
+
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+        assert_eq!(fetcher.fetch(&url).await, Err(LookupError::Unreachable));
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "a failure is cached for its shorter lifetime, not re-hammered"
+        );
     }
 
     // --- PublicOnly -----------------------------------------------------------------

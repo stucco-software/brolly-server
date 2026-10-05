@@ -27,7 +27,14 @@ struct Harness {
     router: axum::Router,
 }
 
-async fn harness() -> Harness {
+async fn harness_with(
+    solid_clients: std::sync::Arc<
+        dyn brolly_server::client_metadata::ClientLookup<
+                Document = brolly_solid::client_documents::ClientIdDocument,
+                Invalid = brolly_solid::client_documents::InvalidDocument,
+            >,
+    >,
+) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -54,6 +61,9 @@ async fn harness() -> Harness {
         commits: tokio::sync::broadcast::channel(64).0,
         plc_client: None,
         clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
+        // Where Client ID Documents come from (spec 6, H3): a fixed,
+        // validated set here, as the ATProto side's `StaticClients` does.
+        solid_clients,
     };
     let router = app(state, "server/static");
     Harness {
@@ -61,6 +71,13 @@ async fn harness() -> Harness {
         _dir: dir,
         router,
     }
+}
+
+async fn harness() -> Harness {
+    harness_with(std::sync::Arc::new(
+        brolly_server::client_metadata::StaticClientDocuments::default(),
+    ))
+    .await
 }
 
 struct Reply {
@@ -566,6 +583,305 @@ async fn consent_names_the_app_and_the_member() {
     assert!(
         reply.body.contains(r#"<form method="post""#),
         "consent must work without JavaScript (§4.2)"
+    );
+}
+
+// --- Client ID Documents (spec 6, H3) ---------------------------------------
+
+/// The `https://` client_id of the tests below, and the Turtle document it
+/// names — registered in the harness's `StaticClientDocuments`, which
+/// validates it exactly as the fetch path would.
+const DOCUMENT_ID: &str = "https://penny.example/id";
+
+fn a_client_id_document() -> brolly_server::client_metadata::StaticClientDocuments {
+    brolly_server::client_metadata::StaticClientDocuments::default()
+        .with(
+            DOCUMENT_ID,
+            &format!(
+                "@prefix oidc: <http://www.w3.org/ns/solid/oidc#>.\n\
+                 <> oidc:redirect_uris <{REDIRECT}> ; \
+                 oidc:client_name \"Penny\" ."
+            ),
+        )
+        .expect("the test document validates")
+}
+
+#[tokio::test]
+async fn a_client_id_document_authorizes_and_reaches_the_token_endpoint() {
+    // The real flow, end to end, for the third kind of client (spec 6, H3):
+    // fetched (here, from the validated stub), validated, consented, redeemed
+    // — with the grant remembering the `https://` client_id string, so the
+    // token endpoint's comparison is the unchanged one.
+    let harness = harness_with(std::sync::Arc::new(a_client_id_document())).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (verifier, challenge) = pkce();
+    let code = a_code(&harness, DOCUMENT_ID, &challenge, &cookie).await;
+
+    let key = client_key();
+    let url = format!("https://{BASE}/oauth/solid/token");
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "authorization_code")
+        .append_pair("code", &code)
+        .append_pair("redirect_uri", REDIRECT)
+        .append_pair("client_id", DOCUMENT_ID)
+        .append_pair("code_verifier", &verifier)
+        .finish();
+
+    let reply = send(
+        &harness,
+        builder("POST", "/oauth/solid/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("DPoP", dpop_proof(&key, "POST", &url, None))
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "token: {}", reply.body);
+    assert!(reply.json().get("access_token").is_some());
+}
+
+#[tokio::test]
+async fn the_consent_screen_names_a_document_client_by_its_client_name() {
+    // The document's `client_name`, in place of the raw IRI — the same part
+    // of the screen a registered client's name fills (spec 6, H3). The IRI is
+    // still shown as the requester; the name is what the member reads.
+    let harness = harness_with(std::sync::Arc::new(a_client_id_document())).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    let reply = get(
+        &harness,
+        &authorize_url(DOCUMENT_ID, &challenge),
+        Some(&cookie),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    assert!(
+        reply.body.contains("Penny"),
+        "the document's name must be shown"
+    );
+    assert!(
+        reply.body.contains(DOCUMENT_ID),
+        "and the client_id it was fetched from"
+    );
+}
+
+#[tokio::test]
+async fn a_document_clients_unlisted_redirect_uri_is_refused() {
+    // The open-redirect case for the third kind of client: the document
+    // lists one URI, the request names another.
+    let harness = harness_with(std::sync::Arc::new(a_client_id_document())).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    let query: String = form_urlencoded::Serializer::new(String::new())
+        .append_pair("response_type", "code")
+        .append_pair("client_id", DOCUMENT_ID)
+        .append_pair("redirect_uri", "https://attacker.example/collect")
+        .append_pair("scope", "openid webid")
+        .append_pair("code_challenge", &challenge)
+        .append_pair("code_challenge_method", "S256")
+        .finish();
+    let reply = get(
+        &harness,
+        &format!("/oauth/solid/authorize?{query}"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.location.is_none());
+}
+
+/// Serves one canned answer per client_id — the refusals the validating
+/// `StaticClientDocuments` cannot hold, which is the point (spec 6, H3).
+struct BrokenDocuments {
+    answers: std::collections::HashMap<
+        String,
+        Result<
+            brolly_solid::client_documents::ClientIdDocument,
+            brolly_server::client_metadata::LookupError<
+                brolly_solid::client_documents::InvalidDocument,
+            >,
+        >,
+    >,
+}
+
+impl brolly_server::client_metadata::ClientLookup for BrokenDocuments {
+    type Document = brolly_solid::client_documents::ClientIdDocument;
+    type Invalid = brolly_solid::client_documents::InvalidDocument;
+
+    fn fetch<'a>(
+        &'a self,
+        url: &'a url::Url,
+    ) -> brolly_server::client_metadata::Lookup<'a, Self::Document, Self::Invalid> {
+        let answer = self.answers.get(url.as_str()).cloned().unwrap_or(Err(
+            brolly_server::client_metadata::LookupError::Unreachable,
+        ));
+        Box::pin(std::future::ready(answer))
+    }
+}
+
+#[tokio::test]
+async fn every_unusable_client_answer_is_identical() {
+    // The load-bearing property (spec 6, H3): an unknown `urn:uuid:`, a
+    // client_id that is neither kind, a document that could not be fetched,
+    // one that would not parse, one that is not a client at all, and one that
+    // does not list the redirect_uri — byte-for-byte the same 400, before
+    // any redirect, so the endpoint is not an oracle for which client
+    // documents exist on the open web.
+    use brolly_server::client_metadata::LookupError;
+    use brolly_solid::client_documents::InvalidDocument;
+
+    let mut answers = BrokenDocuments {
+        answers: std::collections::HashMap::new(),
+    };
+    // A fetched-but-broken document, for every way a document can be broken.
+    answers.answers.insert(
+        "https://unparseable.example/id".to_string(),
+        Err(LookupError::Invalid(InvalidDocument::Unparseable(
+            "parse error".to_string(),
+        ))),
+    );
+    answers.answers.insert(
+        "https://mistyped.example/id".to_string(),
+        Err(LookupError::Invalid(InvalidDocument::NotAClientDocument)),
+    );
+    answers.answers.insert(
+        "https://wrong-content-type.example/id".to_string(),
+        Err(LookupError::Invalid(InvalidDocument::NotRdf(
+            "text/html".to_string(),
+        ))),
+    );
+    let harness = harness_with(std::sync::Arc::new(answers)).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_, challenge) = pkce();
+
+    let mut refusals: Vec<(String, Reply)> = Vec::new();
+    for client_id in [
+        "urn:uuid:00000000-0000-0000-0000-000000000000", // unknown in the table
+        "did:key:z6Mk",                                  // neither kind
+        "http://app.example/id",                         // not https: no fetch
+        "https://unfetched.example/id",                  // the stub has nothing
+        "https://unparseable.example/id",
+        "https://mistyped.example/id",
+        "https://wrong-content-type.example/id",
+    ] {
+        let reply = get(
+            &harness,
+            &authorize_url(client_id, &challenge),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{client_id}");
+        assert!(reply.location.is_none(), "{client_id}: no redirect, ever");
+        refusals.push((client_id.to_string(), reply));
+    }
+
+    // And a document that does not list the redirect_uri: the same answer
+    // again, from the same constant.
+    let unlisting = brolly_server::client_metadata::StaticClientDocuments::default()
+        .with(
+            "https://unlisting.example/id",
+            "@prefix oidc: <http://www.w3.org/ns/solid/oidc#>. \
+             <> oidc:redirect_uris <https://unlisting.example/other> .",
+        )
+        .unwrap();
+    let harness = harness_with(std::sync::Arc::new(unlisting)).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let reply = get(
+        &harness,
+        &authorize_url("https://unlisting.example/id", &challenge),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert!(reply.location.is_none());
+    refusals.push(("https://unlisting.example/id".to_string(), reply));
+
+    let (_, first) = &refusals[0];
+    for (client_id, reply) in &refusals[1..] {
+        assert_eq!(
+            reply.body, first.body,
+            "{client_id} must be indistinguishable from an unknown client"
+        );
+    }
+}
+
+/// Serve the router on a real port, as `xrpc.rs` does for its websocket
+/// tests: the fetcher is real HTTP, and `oneshot` is not.
+async fn serve(router: axum::Router) -> std::net::SocketAddr {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, router).await;
+    });
+    addr
+}
+
+#[tokio::test]
+async fn our_own_profile_is_not_a_client_id_document() {
+    // The trap, against our own server (spec 6, H3): `/profile` serves HTML
+    // to anything that sounds like a browser and RDF to a caller that asks
+    // for it. The fetch must ask for RDF — and get it — and the profile that
+    // comes back must still be refused as a document: not a content-type
+    // refusal, not a transport failure, but a profile not being a client.
+    //
+    // The base domain and the username are chosen so that the member's
+    // subdomain *is* the loopback IP the router is served on — `127.0.0.1`
+    // reads back as user `127` of a server based at `0.0.1` — because a real
+    // fetch cannot set its own Host header.
+    let db = brolly_test_support::postgres().await;
+    db::MIGRATOR.run(&db.pool).await.expect("migrations");
+    let dir = tempfile::tempdir().expect("tempdir");
+    let key = brolly_solid::oidc::store::load_or_create_key(&db.pool)
+        .await
+        .expect("provider key");
+    let state = AppState {
+        pool: db.pool.clone(),
+        base_domain: "0.0.1".to_string(),
+        instance_name: "0.0.1".to_string(),
+        instance_description: "A private community server.".to_string(),
+        source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
+        terms_url: None,
+        privacy_url: None,
+        stores: std::sync::Arc::new(
+            brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),
+        ),
+        provider_key: std::sync::Arc::new(key),
+        instance_actor: std::sync::Arc::new(
+            brolly_identity::instance::load_or_create(&db.pool, brolly_activitypub::keys::generate)
+                .await
+                .expect("instance actor"),
+        ),
+        commits: tokio::sync::broadcast::channel(64).0,
+        plc_client: None,
+        clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
+        solid_clients: std::sync::Arc::new(
+            brolly_server::client_metadata::StaticClientDocuments::default(),
+        ),
+    };
+    db::create_user(&db.pool, "127", None, "a-long-password", "member")
+        .await
+        .expect("the 127.0.0.1 member");
+    let router = app(state, "server/static");
+    let addr = serve(router).await;
+
+    use brolly_server::client_metadata::{ClientLookup, LookupError};
+    use brolly_solid::client_documents::InvalidDocument;
+    let fetcher = brolly_server::client_metadata::Fetcher::<
+        brolly_solid::client_documents::ClientIdDocument,
+    >::for_tests(
+        true,
+        true,
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(60),
+    )
+    .expect("the test fetcher builds");
+    let profile = url::Url::parse(&format!("http://{addr}/profile")).unwrap();
+    assert_eq!(
+        fetcher.fetch(&profile).await,
+        Err(LookupError::Invalid(InvalidDocument::NotAClientDocument))
     );
 }
 
