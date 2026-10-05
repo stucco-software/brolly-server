@@ -814,6 +814,45 @@ fn a_binary_records_its_blob_and_removing_it_deletes_the_bytes_after_commit() {
 }
 
 #[test]
+fn referenced_blob_digests_name_every_binary_and_only_what_exists() {
+    // The graph side of ADR 0013's orphan diff (spec 4, H7): every digest a
+    // record names, and nothing a removed resource left behind. Two resources
+    // sharing one content name it once — the diff walks records, not files.
+    let (_dir, stores) = manager(60);
+    let pod = provisioned(&stores);
+    let shared = blob(&pod, b"shared bytes");
+    let sole = blob(&pod, b"sole bytes");
+    pod.write(|w| {
+        w.put(&at("one.png"), Content::Binary(shared.clone()))?;
+        w.put(&at("two.png"), Content::Binary(shared.clone()))?;
+        w.put(&at("kept.png"), Content::Binary(sole.clone()))
+    })
+    .unwrap();
+
+    let mut named = pod.referenced_blob_digests().unwrap();
+    named.sort();
+    let mut expected = vec![shared.digest.clone(), sole.digest.clone()];
+    expected.sort();
+    assert_eq!(
+        named, expected,
+        "each named digest once, both resources' records read"
+    );
+
+    // The removed resource's digest leaves the set; the content shared with a
+    // surviving resource stays, because another record still names it.
+    pod.write(|w| {
+        w.remove(&at("one.png"))?;
+        w.remove(&at("kept.png"))
+    })
+    .unwrap();
+    assert_eq!(
+        pod.referenced_blob_digests().unwrap(),
+        vec![shared.digest],
+        "a released digest is gone; a still-referenced one stays"
+    );
+}
+
+#[test]
 fn a_binary_put_refuses_bytes_that_are_not_there() {
     let (_dir, stores) = manager(60);
     let pod = provisioned(&stores);

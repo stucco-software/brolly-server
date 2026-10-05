@@ -20,6 +20,7 @@ USAGE:
     brolly-admin promote <username>
     brolly-admin demote <username>
     brolly-admin plc-retry [--dry-run]
+    brolly-admin blob-sweep [--apply]
     brolly-admin whoami <username>
 
 COMMANDS:
@@ -28,14 +29,19 @@ COMMANDS:
                  creates an admin, which is how an instance is handed over
                  without also handing over the database password.
     promote      Make a member an admin.
-    demote       Make an admin an ordinary member. Refuses the last one.
+    demote      Make an admin an ordinary member. Refuses the last one.
     plc-retry    Submit PLC operations the directory has not accepted yet.
                  Safe to re-run — already-submitted operations are skipped.
+    blob-sweep   Report every pod blob no resource record names, and remove
+                 it with --apply (ADR 0013's promised orphan sweep; spec 4,
+                 H7). Read-only without it. Runs with the server STOPPED:
+                 a running server holds the stores' locks.
     whoami       Print what a member's identity resolves to.
 
 ENVIRONMENT:
     DATABASE_URL          required
     BROLLY_BASE_DOMAIN    defaults to brolly.test
+    BROLLY_DATA_DIR       blob-sweep only; defaults to data, as the server does
 ";
 
 #[tokio::main]
@@ -83,6 +89,7 @@ async fn main() -> ExitCode {
         "promote" => set_role(&pool, &args, "admin").await,
         "demote" => set_role(&pool, &args, "member").await,
         "plc-retry" => plc_retry(&pool, &args).await,
+        "blob-sweep" => blob_sweep(&pool, &args).await,
         "whoami" => whoami(&pool, &base_domain, &args).await,
         other => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
@@ -276,6 +283,108 @@ async fn plc_retry(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
 
     if failed > 0 {
         eprintln!("{failed} of {} failed", pending.len());
+        return ExitCode::FAILURE;
+    }
+    ExitCode::SUCCESS
+}
+
+/// ADR 0013's promised orphan sweep, delivered as an operator verb (spec 4,
+/// H7): for every member, the pod's `blobs/` directory walked against every
+/// digest the metadata graph names. Unreferenced bytes are reported; with
+/// `--apply` they are removed.
+///
+/// Read-only by default, because the diff can be wrong in exactly one way
+/// that matters — run against a live server it would report blobs the server
+/// is a commit away from referencing — and it cannot even open the stores
+/// then: RocksDB lets one process open a directory once, so a running server
+/// makes this fail on the instance store before a single pod is reached. Run
+/// it with the server stopped.
+///
+/// `blobs/` only, never the pod directory as a whole: the pod also holds
+/// `repo/`, the ATProto repo's CAR blocks, referenced by repo history and not
+/// by the resource metadata graph — a whole-pod diff would delete every repo
+/// block.
+async fn blob_sweep(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
+    let apply = args.iter().any(|a| a == "--apply");
+    let data_dir = std::env::var("BROLLY_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+
+    let users = match brolly_identity::db::list_users(pool).await {
+        Ok(users) => users,
+        Err(e) => {
+            eprintln!("could not list members: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // The server's own budget numbers: the walk holds one pod at a time, and
+    // the LRU keeps a handful open rather than all of them.
+    let stores = match brolly_store::StoreManager::open(&data_dir, 4, 60) {
+        Ok(stores) => stores,
+        Err(e) => {
+            eprintln!("could not open the stores under {data_dir}: {e}");
+            eprintln!("is the server running? it holds the stores' locks; stop it first");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut failed = 0usize;
+    let mut found = 0usize;
+    let mut bytes = 0u64;
+    for user in users {
+        // No pod directory, nothing to sweep — and opening would create one,
+        // which a read-only report has no business doing.
+        if !stores.pod_exists(user.id) {
+            continue;
+        }
+        // One pod at a time: open it, read the digests its records name, walk
+        // `blobs/` against them. A pod that fails to open or read is reported
+        // and skipped — the other pods' reports are still worth having.
+        let orphans = match (|| {
+            let pod = stores.pod(user.id)?;
+            let referenced = pod.referenced_blob_digests()?;
+            stores.blobs(user.id)?.orphans(&referenced)
+        })() {
+            Ok(orphans) => orphans,
+            Err(e) => {
+                eprintln!("{}: could not sweep the pod: {e}", user.username);
+                failed += 1;
+                continue;
+            }
+        };
+        for orphan in orphans {
+            if apply {
+                match stores.blobs(user.id).and_then(|b| b.remove(&orphan.digest)) {
+                    Ok(()) => println!(
+                        "{}\t{}\t{}\tremoved",
+                        user.username, orphan.digest, orphan.bytes
+                    ),
+                    Err(e) => {
+                        eprintln!(
+                            "{}: {} could not be removed: {e}",
+                            user.username, orphan.digest
+                        );
+                        failed += 1;
+                        continue;
+                    }
+                }
+            } else {
+                println!("{}\t{}\t{}", user.username, orphan.digest, orphan.bytes);
+            }
+            found += 1;
+            bytes += orphan.bytes;
+        }
+    }
+
+    eprintln!(
+        "{found} orphaned blob(s), {bytes} byte(s){}",
+        if apply {
+            ", removed"
+        } else {
+            "; re-run with --apply to remove"
+        }
+    );
+    if failed > 0 {
+        eprintln!("{failed} pod(s) could not be swept");
         return ExitCode::FAILURE;
     }
     ExitCode::SUCCESS

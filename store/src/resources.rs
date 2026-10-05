@@ -293,9 +293,24 @@ impl Pod {
     pub(crate) fn open(dir: &Path) -> Result<Self, StoreError> {
         let rdf = dir.join("rdf");
         std::fs::create_dir_all(&rdf)?;
+        let blobs = BlobStore::open(dir.join("blobs"))?;
+        // The temp sweep (spec 4, H7): a crashed `put` leaves a `.tmp-*` file,
+        // never a partial at a digest path (H1), so this is hygiene and not
+        // recovery — which is why a failure is logged rather than fatal. A
+        // pod that refused to open over an undeletable temp would cost more
+        // than the disk the temp wastes.
+        match blobs.sweep_temp(crate::blobs::TEMP_MAX_AGE) {
+            Ok(swept) if swept > 0 => {
+                tracing::info!(swept, "swept stale blob temp files")
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "the blob temp sweep failed; stale temps remain")
+            }
+        }
         Ok(Self {
             store: Store::open(&rdf)?,
-            blobs: BlobStore::open(dir.join("blobs"))?,
+            blobs,
             write_lock: Mutex::new(()),
         })
     }
@@ -392,6 +407,28 @@ impl Pod {
     #[cfg(feature = "test-fixtures")]
     pub fn raw_store(&self) -> &Store {
         &self.store
+    }
+
+    /// Every blob digest any resource's record names (spec 4, H7), sorted and
+    /// deduplicated: the graph side of ADR 0013's orphan diff. The disk side
+    /// is [`BlobStore::orphans`]; the operator verb that joins them is
+    /// `brolly-admin blob-sweep`.
+    pub fn referenced_blob_digests(&self) -> Result<Vec<String>, StoreError> {
+        let read = self.read_store();
+        let mut digests = Vec::new();
+        for quad in read.quads_for_pattern(
+            None,
+            Some(iri(vocab::BROLLY_BLOB_DIGEST).as_ref()),
+            None,
+            Some(metadata_graph().as_ref()),
+        ) {
+            if let Term::Literal(value) = &quad?.object {
+                digests.push(value.value().to_owned());
+            }
+        }
+        digests.sort();
+        digests.dedup();
+        Ok(digests)
     }
 }
 
@@ -1141,6 +1178,13 @@ fn normalise_modified(stored: &str) -> String {
 /// the timestamp in the high 48 bits.
 fn new_version(ms: i64) -> String {
     ulid(u64::try_from(ms).unwrap_or(0), rand::random())
+}
+
+/// A fresh ULID, for names that must be unique per attempt: H1's blob temps
+/// (spec 4). Not `new_version` — a version is tied to its resource's
+/// `modified`; a temp name is tied to nothing but the clock.
+pub(crate) fn fresh_ulid() -> String {
+    ulid(u64::try_from(now_ms()).unwrap_or(0), rand::random())
 }
 
 fn ulid(ms: u64, randomness: [u8; 10]) -> String {
