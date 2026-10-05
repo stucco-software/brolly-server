@@ -484,6 +484,14 @@ fn media_json(id: &str, url: &str, media_type: &str, description: Option<&str>) 
     })
 }
 
+/// The 413 for a multipart read that failed because the body limit was
+/// exceeded (spec 4, H3) — axum's own status and text for it, via
+/// `MultipartError`. `None` for every other read failure, which keep the
+/// handler's existing shapes below.
+fn over_limit(e: &axum::extract::multipart::MultipartError) -> Option<Response> {
+    (e.status() == StatusCode::PAYLOAD_TOO_LARGE).then(|| error(e.status(), &e.body_text()))
+}
+
 /// `POST /api/v1/media` and `/api/v2/media`
 pub async fn upload_media(
     State(state): State<AppState>,
@@ -503,19 +511,44 @@ pub async fn upload_media(
     let mut bytes: Option<Vec<u8>> = None;
     let mut media_type = String::new();
     let mut description: Option<String> = None;
-
-    while let Ok(Some(field)) = multipart.next_field().await {
+    // The body limit (spec 4, H3) can fail at either multipart read — a
+    // field's headers or its bytes — and a read that fails on it is axum's own
+    // 413, caught here so it doesn't fall through to "File can't be blank"
+    // below, which would answer a question the client didn't ask. Every other
+    // read failure keeps the old shape: the loop ends, the 422 takes it.
+    let mut refused: Option<Response> = None;
+    loop {
+        let field = match multipart.next_field().await {
+            Ok(Some(field)) => field,
+            Ok(None) => break,
+            Err(e) => {
+                refused = over_limit(&e);
+                break;
+            }
+        };
         match field.name().unwrap_or_default() {
             "file" => {
                 media_type = field
                     .content_type()
                     .unwrap_or("application/octet-stream")
                     .to_string();
-                bytes = field.bytes().await.ok().map(|b| b.to_vec());
+                match field.bytes().await {
+                    Ok(b) => bytes = Some(b.to_vec()),
+                    Err(e) => match over_limit(&e) {
+                        Some(refusal) => {
+                            refused = Some(refusal);
+                            break;
+                        }
+                        None => bytes = None,
+                    },
+                }
             }
             "description" => description = field.text().await.ok(),
             _ => {}
         }
+    }
+    if let Some(refused) = refused {
+        return refused;
     }
 
     let Some(bytes) = bytes.filter(|b| !b.is_empty()) else {
@@ -542,10 +575,11 @@ pub async fn upload_media(
     // upload doesn't queue behind it on disk I/O. Then the resource and its alt
     // text commit in one write, so a client never reads back an upload without
     // the description it was sent with. The multipart awaits are all behind
-    // us, so nothing here holds the lock across one.
-    let store_upload = || -> Result<(), StoreError> {
-        let body = brolly_solid::ldp::prepare(blobs.as_ref(), &bytes, &media_type)
-            .map_err(|e| StoreError::Backend(e.to_string()))?;
+    // us, so nothing here holds the lock across one. `prepare` is the same
+    // choke point Solid PUTs pass through, so the allow-list (spec 4, H2) is
+    // enforced for this route by the one check, not a second one here.
+    let store_upload = || -> Result<(), brolly_solid::ldp::LdpError> {
+        let body = brolly_solid::ldp::prepare(blobs.as_ref(), &bytes, &media_type)?;
         pod.write(|w| {
             // Not an HTTP precondition: this upload is a Mastodon call, not an
             // LDP one.
@@ -567,14 +601,22 @@ pub async fn upload_media(
             }
             Ok(())
         })
+        .map_err(brolly_solid::ldp::LdpError::from)
     };
     // Identical bytes, released by a delete between the two steps above: write
     // them again and retry, once (spec 5a, R12).
     let stored = match store_upload() {
-        Err(StoreError::BlobMissing) => store_upload(),
+        Err(brolly_solid::ldp::LdpError::BlobMissing) => store_upload(),
         other => other,
     };
     if let Err(e) = stored {
+        // The allow-list refusal is the client's to fix, not ours to log: the
+        // 415's body is the error's own Display, which carries the list (spec
+        // 4, H2) — the same answer the LDP surface gives, in this API's own
+        // error shape.
+        if let e @ brolly_solid::ldp::LdpError::ContentTypeNotAllowed(_) = &e {
+            return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, &e.to_string());
+        }
         tracing::error!(error = %e, "media upload failed");
         return error(StatusCode::INTERNAL_SERVER_ERROR, "Upload failed");
     }
@@ -1100,7 +1142,16 @@ pub async fn unmatched() -> Response {
 }
 
 /// Mount the Client API.
-pub fn routes() -> Router<AppState> {
+///
+/// `max_upload_bytes` is the one upload limit (spec 4, H3), threaded from
+/// `AppState` at composition so the enforced number and the advertised one
+/// come from the same place. It wraps the media routes only: the rest of the
+/// API takes form fields and JSON an order of magnitude smaller.
+pub fn routes(max_upload_bytes: usize) -> Router<AppState> {
+    // H3 (spec 4): axum's own 413 answers an over-limit upload. The limit is
+    // bytes-on-the-wire, so a multipart file at exactly the limit costs its
+    // framing too — accepted, per the spec, rather than fudged.
+    let upload = post(upload_media).layer(axum::extract::DefaultBodyLimit::max(max_upload_bytes));
     let mut router = Router::new()
         .route("/api/v1/instance", get(instance_v1))
         .route("/api/v2/instance", get(instance_v2))
@@ -1114,8 +1165,8 @@ pub fn routes() -> Router<AppState> {
         .route("/api/v1/timelines/public", get(public_timeline))
         .route("/api/v1/statuses/{id}", get(status))
         .route("/api/v1/statuses", post(create_status))
-        .route("/api/v1/media", post(upload_media))
-        .route("/api/v2/media", post(upload_media))
+        .route("/api/v1/media", upload.clone())
+        .route("/api/v2/media", upload)
         .route("/api/v1/media/{id}", get(get_media).put(update_media))
         .route(
             "/api/v1/accounts/update_credentials",

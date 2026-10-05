@@ -652,6 +652,13 @@ pub(crate) fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Res
             "this resource takes an RDF body",
         )
             .into_response(),
+        // 415 with the list in the body (spec 4, H2): the type is syntactically
+        // fine, this server just doesn't store it as media, and the body is
+        // the error's own Display so the list has one source. Produced after
+        // the WAC check, so only a caller who may write learns the list.
+        error @ LdpError::ContentTypeNotAllowed(_) => {
+            (StatusCode::UNSUPPORTED_MEDIA_TYPE, error.to_string()).into_response()
+        }
         // 422, not 415 or 409 (spec 5c, H8): the request is well-formed and
         // the media type is one this server stores, just not over a resource
         // of the other kind, and no other request is in the way. The body is

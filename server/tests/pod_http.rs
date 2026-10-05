@@ -59,6 +59,15 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    // The advertised default (spec 4, H3): most of these tests don't care
+    // about the limit, and the ones that do want the real number or a small
+    // one, not a silently different harness.
+    harness_with(brolly_domain::media::MAX_UPLOAD_BYTES).await
+}
+
+/// The harness with an overridden upload limit, for the tests that pin the
+/// limit's behaviour (spec 4, H3) without putting megabytes on the wire.
+async fn harness_with(max_upload_bytes: usize) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
@@ -107,6 +116,7 @@ async fn harness() -> Harness {
             source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
             terms_url: None,
             privacy_url: None,
+            max_upload_bytes,
             stores: std::sync::Arc::clone(&stores),
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)
@@ -664,6 +674,150 @@ async fn rdf_xml_is_refused_over_http_rather_than_stored_as_a_blob() {
         )
         .await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+}
+
+#[tokio::test]
+async fn an_off_list_content_type_is_a_415_whose_body_lists_the_allowed_ones() {
+    // H2 (spec 4): the exact defect this closes — a member PUTs `text/html`
+    // with their own credentials and the bytes come back served as `text/html`
+    // from the member's own origin, which is stored XSS. The 415's body
+    // carries the list, because a client that gets a bare 415 has nothing to
+    // act on.
+    let h = harness().await;
+    let (status, body, _) = h
+        .send("PUT", "/~/page.html", Some(("text/html", "<html>")), true)
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert!(
+        body.contains("text/html"),
+        "must name what was sent: {body}"
+    );
+    for allowed in ["image/png", "application/pdf", "application/zip"] {
+        assert!(body.contains(allowed), "must list {allowed}: {body}");
+    }
+
+    // Nothing was recorded, and nothing is servable.
+    let (status, _, _) = h.send("GET", "/~/page.html", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn an_svg_is_refused_like_any_other_off_list_type() {
+    // The one absence that is a decision rather than an omission (spec 4,
+    // H2): SVG is script, and a member-hosted SVG on the member's origin is
+    // stored XSS with the pod's cookies in scope. This test exists so that
+    // reopening the question means deleting it.
+    let h = harness().await;
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/icon.svg",
+            Some(("image/svg+xml", "<svg onload=alert(1) />")),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
+    assert!(body.contains("image/svg+xml"), "{body}");
+}
+
+#[tokio::test]
+async fn a_content_type_with_parameters_is_matched_by_its_bare_type() {
+    // H2 (spec 4): parameters are stripped before the list is consulted —
+    // `image/png; charset=utf-8` is `image/png`. A list that matched on the
+    // raw header value would refuse every parameterised upload a real client
+    // sends.
+    let h = harness().await;
+    let (status, _, _) = h
+        .send(
+            "PUT",
+            "/~/avatar.png",
+            Some(("image/png; charset=utf-8", "PNG-BYTES")),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // And the recorded type is the bare one, so that is what a read serves.
+    let (_, _, headers) = h.send("GET", "/~/avatar.png", None, true).await;
+    assert_eq!(headers[header::CONTENT_TYPE], "image/png");
+}
+
+#[tokio::test]
+async fn an_upload_over_the_limit_is_axums_own_413() {
+    // H3 (spec 4): the limit is enforced by `DefaultBodyLimit`, so the 413 is
+    // axum's own — a small limit here proves the wiring, which is the same
+    // wiring that carries the advertised 10 MiB.
+    let h = harness_with(64).await;
+    let (status, _, _) = h
+        .send(
+            "PUT",
+            "/~/big.bin",
+            Some(("application/octet-stream", &"x".repeat(65))),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+
+    // The boundary is inclusive: at exactly the limit, and not one byte over,
+    // the PUT stands.
+    let (status, _, _) = h
+        .send(
+            "PUT",
+            "/~/exact.bin",
+            Some(("application/octet-stream", &"x".repeat(64))),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn a_body_between_axums_default_and_the_advertised_limit_is_accepted() {
+    // H3 (spec 4): axum's own default body limit is 2 MiB, so this proves the
+    // pod routes carry the advertised 10 MiB rather than the framework's
+    // default — the “advertises a limit it does not enforce” bug, inverted.
+    let h = harness().await;
+    let bytes = vec![b'x'; 3 * 1024 * 1024];
+    let request = Request::builder()
+        .method("PUT")
+        .uri("/~/big.pdf")
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, format!("brolly_session={}", h.session))
+        .header(header::CONTENT_TYPE, "application/pdf")
+        .body(Body::from(bytes))
+        .unwrap();
+    let response = h.router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn every_response_carries_nosniff() {
+    // H4 (spec 4): one layer at composition, so the header is on every
+    // response — the binary read where it is load-bearing, the profile and a
+    // 404 where it is redundant, and `/health`, which is not a pod route at
+    // all. The redundant cases are the point: per-route application is how
+    // the header ends up missing on the one route that matters.
+    let h = harness().await;
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+
+    // (path, expected status): the binary read where the header is
+    // load-bearing, the profile and `/health` where it is redundant but must
+    // still be there, and a 404 — a refusal is a response too.
+    for (path, expected) in [
+        ("/~/paper.pdf", StatusCode::OK),
+        ("/profile", StatusCode::OK),
+        ("/health", StatusCode::OK),
+        ("/~/nothing-here", StatusCode::NOT_FOUND),
+    ] {
+        let (status, _, headers) = h.send("GET", path, None, true).await;
+        assert_eq!(status, expected, "{path}");
+        assert_eq!(
+            headers[header::X_CONTENT_TYPE_OPTIONS],
+            "nosniff",
+            "{path}: the layer must be app-wide, not per-route"
+        );
+    }
 }
 
 // --- the settings resources (spec 6, H2) --------------------------------------

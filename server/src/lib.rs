@@ -53,6 +53,12 @@ pub struct AppState {
     pub source_url: String,
     pub terms_url: Option<String>,
     pub privacy_url: Option<String>,
+    /// The one upload limit (spec 4, H3): the `DefaultBodyLimit` on the pod
+    /// and media routes. Instance state rather than a constant at the route,
+    /// because `BROLLY_MAX_UPLOAD_BYTES` overrides it — read once in `main`,
+    /// before the state is built, and threaded here. Defaults to the same
+    /// constant the Mastodon instance configuration advertises.
+    pub max_upload_bytes: usize,
     pub stores: std::sync::Arc<brolly_store::StoreManager>,
     /// The Solid-OIDC provider's signing key, loaded once at startup.
     ///
@@ -275,6 +281,30 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
     response
 }
 
+/// `X-Content-Type-Options: nosniff` on every response (spec 4, H4).
+///
+/// A browser that follows the header will not second-guess a response's
+/// `Content-Type`, so a binary served with the type the server recorded — the
+/// allow-list's decision, not the uploader's — is the type it is rendered as.
+/// The header is harmless where it is redundant and load-bearing where a type
+/// could be second-guessed, and one layer at composition is how it stays on
+/// every response: per-route application is how it ends up missing on the one
+/// route that matters.
+///
+/// No CSP header in this stage: the allow-list (H2) excludes the scriptable
+/// types, and a CSP layered on client-typed storage is a bandage on a hole H2
+/// already closed. Reopened if SVG is ever admitted.
+async fn nosniff(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    // Inserted, not appended: nothing else writes this header, so there is no
+    // value to preserve, and a duplicate would be a spec violation either way.
+    response.headers_mut().insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    response
+}
+
 /// Build the application router.
 ///
 /// Adapters contribute their own routers here. Nothing else in the workspace
@@ -397,8 +427,10 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .route("/oauth/revoke", post(mastodon_oauth::revoke))
         // The Client API. Everything under /api/ answers JSON, including its
         // 404s — the predecessor let unmatched paths fall through to the LDP
-        // router and hand clients RDF they cannot parse.
-        .merge(mastodon_api::routes())
+        // router and hand clients RDF they cannot parse. Its upload routes
+        // carry the one upload limit (spec 4, H3), threaded from the state so
+        // the enforced number and the advertised one come from one place.
+        .merge(mastodon_api::routes(state.max_upload_bytes))
         // XRPC on the apex, with the repo named by parameter — the shape a PDS
         // has and the endpoint the PLC document advertises.
         .merge(xrpc::routes())
@@ -406,6 +438,9 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .merge(oauth)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.
+        // The upload limit (spec 4, H3) is the method router's own layer, so
+        // it bounds every body these routes take — RDF included — without
+        // touching any other route's.
         .route(
             "/~/{*path}",
             get(pod::get)
@@ -413,7 +448,8 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
                 .post(pod::post)
                 .patch(pod::patch)
                 .delete(pod::delete)
-                .options(pod::options),
+                .options(pod::options)
+                .layer(axum::extract::DefaultBodyLimit::max(state.max_upload_bytes)),
         )
         // The storage root. The wildcard above doesn't match an empty
         // remainder, so the root needs every method of its own. That includes
@@ -426,11 +462,17 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
                 .post(pod::post_root)
                 .patch(pod::patch_root)
                 .delete(pod::delete_root)
-                .options(pod::options_root),
+                .options(pod::options_root)
+                .layer(axum::extract::DefaultBodyLimit::max(state.max_upload_bytes)),
         )
         .nest_service("/static", ServeDir::new(static_dir))
         // Default-deny on subdomains. No LDP fallback (ADR 0010).
         .fallback(pod::subdomain_fallback)
+        // `nosniff` on every response (spec 4, H4). One layer here, not per
+        // route: per-route application is how the header ends up missing on
+        // the one route that matters, and the cost of the redundant cases is
+        // zero.
+        .layer(axum::middleware::from_fn(nosniff))
         // Outermost, so it covers the OAuth sub-router and the fallback too —
         // a 404 that a browser cannot read is a 404 nobody can debug.
         .layer(axum::middleware::from_fn(cors))

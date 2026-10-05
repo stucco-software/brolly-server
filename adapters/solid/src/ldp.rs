@@ -29,6 +29,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use brolly_authz::{AccessMode, authorize, effective_acl};
+use brolly_domain::media;
 use brolly_domain::syntax::{self, ReadFormat, SyntaxError};
 use brolly_domain::vocab;
 use brolly_identity::Subject;
@@ -116,6 +117,14 @@ pub enum LdpError {
         recorded: Kind,
         incoming: String,
     },
+    /// A binary whose content type is not on the server's media allow-list
+    /// (415, spec 4, H2). Not [`LdpError::Syntax`] and not [`LdpError::NotRdf`]:
+    /// the type is syntactically fine, this server just doesn't store it as
+    /// media. Carries the parameter-stripped incoming type; the body names it
+    /// and lists the allowed ones, so a client can tell what would have been
+    /// accepted. Produced after the WAC check, so only a caller who may write
+    /// learns what the server stores.
+    ContentTypeNotAllowed(String),
 }
 
 /// The LDP class a recorded kind is served as, for a refusal's body.
@@ -164,6 +173,12 @@ impl std::fmt::Display for LdpError {
                 "a PUT cannot change a resource's kind: this one is recorded as \
                  {} and the body is {incoming}; delete it first to store the other kind",
                 kind_name(*recorded)
+            ),
+            LdpError::ContentTypeNotAllowed(media_type) => write!(
+                f,
+                "this server stores media by allow-list, and {media_type} is not \
+                 on it; the types it stores are: {}",
+                media::ALLOWED_MEDIA_TYPES.join(", ")
             ),
         }
     }
@@ -643,7 +658,11 @@ impl Body {
 /// disk I/O. Content addressing makes this idempotent. RDF/XML is refused
 /// rather than stored as a blob (ADR 0007): storing it defers the parse rather
 /// than avoiding it, and the two live `quick-xml` advisories are reachable
-/// either way.
+/// either way. A binary is stored only if its content type is on the media
+/// allow-list (spec 4, H2), checked **before** its bytes reach the disk: a
+/// refusal that wrote first would leave an orphan for the sweep. Parameters
+/// are stripped first (`syntax::media_type_of`): `image/png; charset=utf-8`
+/// is `image/png`.
 pub fn prepare(
     blobs: Option<&BlobStore>,
     body: &[u8],
@@ -656,9 +675,17 @@ pub fn prepare(
             format: syntax::read_format(content_type)?,
         });
     }
+    // The one choke point every protocol's binary passes through (spec 4,
+    // H2): Solid PUT/POST and Mastodon's `upload_media` all land here, so the
+    // list is enforced once for all of them. `image/svg+xml` is not an
+    // omission — see `media::ALLOWED_MEDIA_TYPES`.
+    let media_type = syntax::media_type_of(content_type);
+    if !media::is_allowed_media_type(media_type) {
+        return Err(LdpError::ContentTypeNotAllowed(media_type.to_string()));
+    }
     Ok(Body::Binary(BlobMeta {
         digest: blob_store(blobs)?.put(body)?,
-        media_type: syntax::media_type_of(content_type).to_string(),
+        media_type: media_type.to_string(),
         byte_size: u64::try_from(body.len()).unwrap_or(u64::MAX),
     }))
 }

@@ -75,6 +75,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base_domain =
         std::env::var("BROLLY_BASE_DOMAIN").unwrap_or_else(|_| "brolly.test".to_string());
 
+    // The one upload limit (spec 4, H3): read here, with the rest of the env
+    // config, before the state is built — the router's `DefaultBodyLimit` is
+    // wired from it at composition. Defaults to the same constant the
+    // instance configuration advertises, so an operator who sets nothing gets
+    // a limit that matches the advertisement.
+    let max_upload_bytes = std::env::var("BROLLY_MAX_UPLOAD_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(brolly_domain::media::MAX_UPLOAD_BYTES);
+
     let state = brolly_server::AppState {
         pool,
         base_domain: base_domain.clone(),
@@ -96,6 +106,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         privacy_url: std::env::var("BROLLY_PRIVACY_URL")
             .ok()
             .filter(|s| !s.is_empty()),
+        max_upload_bytes,
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),
         instance_actor: std::sync::Arc::new(instance_actor),

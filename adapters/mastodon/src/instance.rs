@@ -69,10 +69,17 @@ fn configuration() -> Value {
             "characters_reserved_per_url": 23,
         },
         "media_attachments": {
+            // A subset of the server's media allow-list (spec 4, H2), pinned by
+            // a test below: what a client offers in the composer is what we
+            // both advertise and store. The allow-list itself is wider — audio,
+            // video, PDFs — because a Solid client can PUT any of it.
             "supported_mime_types": [
                 "image/jpeg", "image/png", "image/gif", "image/webp",
             ],
-            "image_size_limit": 10 * 1024 * 1024,
+            // The enforced limit, not a promise about it (spec 4, H3): the
+            // pod and media routes carry a `DefaultBodyLimit` of this same
+            // constant, and the test below fails if the two drift apart.
+            "image_size_limit": brolly_domain::media::MAX_UPLOAD_BYTES,
             "image_matrix_limit": 16_777_216,
             // Video is not transcoded, so it is not advertised.
             "video_size_limit": 0,
@@ -168,6 +175,36 @@ mod tests {
             config["statuses"]["max_media_attachments"],
             MAX_MEDIA_ATTACHMENTS
         );
+        // H3 (spec 4): the advertised image size limit is the same constant the
+        // pod and media routes enforce. Before this, the number here was a
+        // promise nothing kept.
+        assert_eq!(
+            config["media_attachments"]["image_size_limit"],
+            brolly_domain::media::MAX_UPLOAD_BYTES
+        );
+    }
+
+    #[test]
+    fn the_advertised_supported_types_are_a_subset_of_what_the_server_stores() {
+        // H2 (spec 4): every type the instance advertises is one the server
+        // stores, so a client that offers the composer's formats never hits a
+        // 415 it was told nothing about. A subset, not equality: the
+        // allow-list is the Solid surface's too, and it is wider.
+        let config = configuration();
+        let advertised = config["media_attachments"]["supported_mime_types"]
+            .as_array()
+            .expect("a list");
+        assert!(
+            !advertised.is_empty(),
+            "an empty advertisement hides the composer"
+        );
+        for media_type in advertised {
+            let media_type = media_type.as_str().expect("a string");
+            assert!(
+                brolly_domain::media::is_allowed_media_type(media_type),
+                "{media_type} is advertised but not stored"
+            );
+        }
     }
 
     #[test]

@@ -42,6 +42,7 @@ async fn harness() -> Harness {
             source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
             terms_url: None,
             privacy_url: None,
+            max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
             stores: std::sync::Arc::clone(&stores),
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)

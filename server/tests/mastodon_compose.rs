@@ -31,6 +31,14 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    // The advertised default (spec 4, H3), for the tests that don't care; the
+    // limit tests want the real number or a small one.
+    harness_with(brolly_domain::media::MAX_UPLOAD_BYTES).await
+}
+
+/// The harness with an overridden upload limit, for the tests that pin the
+/// limit's behaviour (spec 4, H3) without putting megabytes in a multipart.
+async fn harness_with(max_upload_bytes: usize) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
@@ -44,6 +52,7 @@ async fn harness() -> Harness {
             source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
             terms_url: None,
             privacy_url: None,
+            max_upload_bytes,
             stores: std::sync::Arc::clone(&stores),
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)
@@ -435,6 +444,83 @@ async fn an_upload_reads_back_from_metadata_with_its_alt_text() {
     let got = get_media(&h, &token, &later).await;
     assert_eq!(got.json()["type"], "image");
     assert_eq!(got.json()["description"], "added later");
+}
+
+/// Upload a file of `content_type`, raw: the `upload` helper above pins
+/// `image/png` and asserts success, which is what every other test wants —
+/// the refusal tests need their own type and no success assertion.
+async fn upload_typed(h: &Harness, token: &str, content_type: &str, file: &str) -> Reply {
+    let boundary = "----brollytest";
+    let body = format!(
+        "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; \
+         filename=\"a.file\"\r\nContent-Type: {content_type}\r\n\r\n{file}\r\n--{boundary}--\r\n"
+    );
+    send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/media")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn an_off_list_upload_is_a_415_whose_body_lists_the_allowed_ones() {
+    // H2 (spec 4), through the Mastodon surface: `upload_media` goes through
+    // the same `ldp::prepare` choke point as a Solid PUT, so the one list
+    // governs both — and the 415 is this API's own error shape, with the list
+    // in it, not a 500 from a stringified error.
+    let h = harness().await;
+    let (_, token) = a_member(&h, "alice").await;
+
+    let reply = upload_typed(&h, &token, "text/html", "<html>alert(1)</html>").await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "{}",
+        reply.body
+    );
+    let error = reply.json()["error"].as_str().unwrap().to_string();
+    assert!(
+        error.contains("text/html"),
+        "must name what was sent: {error}"
+    );
+    assert!(
+        error.contains("image/png"),
+        "must list the allowed types: {error}"
+    );
+}
+
+#[tokio::test]
+async fn an_upload_over_the_limit_is_axums_own_413_framing_counts() {
+    // H3 (spec 4): the limit is bytes-on-the-wire, so a file that fits on its
+    // own can still 413 because its multipart framing counts too. Accepted
+    // per the spec — no fudge factor. A small limit here proves the wiring;
+    // the advertised 10 MiB is the same wiring with the real number.
+    let h = harness_with(150).await;
+    let (_, token) = a_member(&h, "alice").await;
+
+    // The file's 64 bytes fit the 150-byte limit; the multipart framing
+    // around them (~130 more) does not.
+    let reply = upload_typed(&h, &token, "image/png", &"x".repeat(64)).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "{}",
+        reply.body
+    );
+
+    // Well under, framing included, it stands.
+    let reply = upload_typed(&h, &token, "image/png", &"x".repeat(8)).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
 }
 
 #[tokio::test]

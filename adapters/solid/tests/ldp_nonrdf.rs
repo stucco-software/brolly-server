@@ -375,6 +375,90 @@ fn rdf_xml_is_still_refused_rather_than_stored_as_a_blob() {
     );
 }
 
+/// H2 (spec 4): a binary is stored only if its content type is on the list,
+/// and the refusal carries the list. `text/html` is the type this exists for:
+/// before the list, a member PUT it with their own credentials and it came
+/// back served from their own origin — stored XSS.
+#[test]
+fn an_off_list_binary_is_refused_with_the_list_and_leaves_no_bytes_behind() {
+    let pod = pod();
+    let err = ldp::put(
+        &pod.store,
+        Some(&pod.blobs),
+        BASE,
+        "/~/page.html",
+        &alice(),
+        b"<html>alert(1)</html>",
+        "text/html",
+        ROOT,
+    )
+    .unwrap_err();
+
+    let LdpError::ContentTypeNotAllowed(media_type) = &err else {
+        panic!("got {err:?}");
+    };
+    assert_eq!(media_type, "text/html");
+    let said = err.to_string();
+    assert!(said.contains("text/html"), "{said}");
+    for allowed in ["image/png", "application/pdf", "application/zip"] {
+        assert!(said.contains(allowed), "must list {allowed}: {said}");
+    }
+
+    // Nothing was recorded, and — because the check precedes the blob write —
+    // nothing was written for the sweep to find.
+    assert!(meta(&pod.store, &format!("{ROOT}page.html")).is_none());
+    assert!(pod.blobs.orphans(&[]).unwrap().is_empty());
+}
+
+/// The one absence that is a decision rather than an omission (spec 4, H2):
+/// SVG is script, and a member-hosted SVG on the member's origin is stored
+/// XSS. When SVG is wanted it wants its own serving rules, and that is a
+/// recorded decision to reopen — this test is what reopening has to delete.
+#[test]
+fn an_svg_is_refused_like_any_other_off_list_type() {
+    let pod = pod();
+    let err = ldp::put(
+        &pod.store,
+        Some(&pod.blobs),
+        BASE,
+        "/~/icon.svg",
+        &alice(),
+        b"<svg onload=alert(1) />",
+        "image/svg+xml",
+        ROOT,
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, LdpError::ContentTypeNotAllowed(ref t) if t == "image/svg+xml"),
+        "got {err:?}"
+    );
+}
+
+/// H2 (spec 4): parameters are stripped before the list is consulted, and the
+/// recorded type is the bare one. A list that matched on the raw header value
+/// would refuse every parameterised upload a real client sends.
+#[test]
+fn a_parameterised_content_type_is_matched_and_recorded_by_its_bare_type() {
+    let pod = pod();
+    ldp::put(
+        &pod.store,
+        Some(&pod.blobs),
+        BASE,
+        "/~/avatar.png",
+        &alice(),
+        PNG,
+        "image/png; charset=utf-8",
+        ROOT,
+    )
+    .unwrap();
+
+    let blob = meta(&pod.store, &format!("{ROOT}avatar.png"))
+        .unwrap()
+        .blob
+        .unwrap();
+    assert_eq!(blob.media_type, "image/png");
+}
+
 #[test]
 fn turtle_still_goes_to_the_graph_and_not_the_blob_store() {
     let pod = pod();

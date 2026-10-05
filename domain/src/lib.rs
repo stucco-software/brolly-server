@@ -20,6 +20,7 @@
 pub mod canonical;
 pub mod faithful;
 pub mod iri;
+pub mod media;
 pub mod nsid;
 pub mod ports;
 pub mod syntax;
