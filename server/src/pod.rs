@@ -18,12 +18,13 @@ use brolly_identity::routing::{SubdomainRoute, subdomain_route};
 use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
 use brolly_solid::conditional::{self, Preconditions};
 use brolly_solid::ldp::{self, Description, LdpError, LdpOutcome};
-use brolly_solid::oidc::tokens;
+use brolly_solid::oidc::{keys, tokens};
 use brolly_solid::patch;
 use brolly_solid::storage;
 use brolly_solid::storage_description;
 use brolly_store::resources::{Kind, Pod};
 use std::sync::Arc;
+use url::Url;
 
 use crate::AppState;
 
@@ -176,8 +177,9 @@ impl Caller {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
     /// The token: a header we couldn't parse, or a token that is unknown,
-    /// expired, revoked, or carries a WebID this instance doesn't host.
-    /// RFC 6750 §3.1's `invalid_token`.
+    /// expired, revoked, or carries a WebID this instance doesn't host — or a
+    /// foreign issuer's token the remote path refused, for any of its causes
+    /// (spec 6, H5). RFC 6750 §3.1's `invalid_token`.
     Token,
     /// The proof: not signed by the token's key, the wrong `htm` or `htu`,
     /// outside the freshness window, or a replayed `jti`. RFC 9449 §7.1's
@@ -314,6 +316,26 @@ pub(crate) async fn subject_for(
             // proof so it can't be sent again.
             let proof = (!proof.is_empty()).then_some(proof);
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            // The issuer split (spec 6, H5): a token whose `iss` names another
+            // Solid-OIDC issuer takes the remote path — its key is not ours,
+            // so there is nothing here to verify it with until the issuer's
+            // own discovery document and key set have been fetched. Our own
+            // tokens — and a malformed or `iss`-less one — stay on today's
+            // path, unchanged.
+            if let Some(iss) =
+                tokens::foreign_issuer(&token, &format!("https://{}", state.base_domain))
+            {
+                return remote_solid_subject(
+                    state,
+                    &iss,
+                    &token,
+                    proof.as_deref(),
+                    method.as_str(),
+                    url,
+                    now,
+                )
+                .await;
+            }
             let claims = match tokens::verify_access(
                 &state.provider_key,
                 &token,
@@ -385,9 +407,9 @@ pub(crate) async fn subject_for(
 /// The WebID in the token decides who is calling, not the subdomain being
 /// visited: an app holding Bob's token is Bob wherever it reads.
 ///
-/// A token we minted whose WebID this instance doesn't host, or whose member
-/// is gone, resolves to nobody, so it is the token that is wrong. Accepting
-/// other issuers is stage 6. A failure to look the member up is ours (H2).
+/// The fast path, for tokens our own issuer minted: the WebID must be one
+/// this instance hosts and an active member. A foreign issuer's tokens take
+/// [`remote_solid_subject`]. A failure to look the member up is ours (H2).
 async fn solid_subject(state: &AppState, claims: tokens::AccessClaims) -> Result<Subject, Refused> {
     let Some(username) = webid::local_username(&claims.webid, &state.base_domain) else {
         return Err(Refused::Token);
@@ -408,6 +430,171 @@ async fn solid_subject(state: &AppState, claims: tokens::AccessClaims) -> Result
         Scope::parse(&claims.scope),
         Via::SolidDpop,
     ))
+}
+
+// --- the remote path (spec 6, H5) ---------------------------------------------
+//
+// A token another Solid-OIDC issuer signed: verified against that issuer's
+// own key set, and trusted for the WebID it names only once the WebID's own
+// document says the issuer may speak for it. Without the binding, anyone who
+// can serve HTTPS can publish a discovery document and a key set, and every
+// ACL grant to any WebID becomes redeemable by whoever stands up an endpoint.
+
+/// The `iss` claim as an HTTPS origin (spec 6, H5): scheme, host, optional
+/// port, and no path, query, fragment, or userinfo.
+///
+/// The ecosystem's issuers are origins, and the two discovery conventions —
+/// OIDC's append, RFC 8414's insert-between-host-and-path — disagree on where
+/// the well-known goes for a path-bearing issuer, so a path-bearing `iss` is a
+/// malformed token rather than a fetch to guess at.
+fn issuer_origin(iss: &str) -> Option<Url> {
+    let url = Url::parse(iss).ok()?;
+    if url.scheme() != "https"
+        || url.path() != "/"
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || !url.username().is_empty()
+        || url.password().is_some()
+    {
+        return None;
+    }
+    Some(url)
+}
+
+/// The same mapping the fast path gives a token error (spec 6, H5): a JWT
+/// failure is the token's, the rest say the proof was not good enough for it.
+fn remote_refusal(error: tokens::TokenError) -> Refused {
+    match error {
+        tokens::TokenError::Jwt(_) => Refused::Token,
+        _ => Refused::Proof,
+    }
+}
+
+/// The remote half of the Solid branch (spec 6, H5): a token another
+/// Solid-OIDC issuer signed.
+///
+/// Every failure on the path is the same answer — 401 `invalid_token` —
+/// without distinguishing a fetch failure from a bad signature from an
+/// unbound WebID, because the resource server is not an oracle for which
+/// foreign issuers are up or which WebIDs exist. The one exception is the
+/// proof, which runs exactly as it does on the fast path: a failure there is
+/// `invalid_dpop_proof`, so a client with a good token signs a fresh proof
+/// instead of refreshing.
+///
+/// A token naming a *local* WebID is refused by the binding, full stop: our
+/// profiles publish exactly one `solid:oidcIssuer` — this instance's apex —
+/// and H1 makes that triple server-authoritative, so no foreign issuer can
+/// ever be authoritative for a WebID this instance hosts. There is no local
+/// special case to preserve the member's activity check — the binding already
+/// closes that gate, and WAC, the only thing the pod surface consults, never
+/// wanted the local user anyway.
+async fn remote_solid_subject(
+    state: &AppState,
+    iss: &str,
+    token: &str,
+    proof: Option<&str>,
+    method: &str,
+    url: &str,
+    now: i64,
+) -> Result<Caller, Refused> {
+    // 1. The issuer must be an HTTPS origin, before any fetch (H5).
+    let Some(origin) = issuer_origin(iss) else {
+        tracing::debug!(iss, "a foreign issuer is not an HTTPS origin");
+        return Err(Refused::Token);
+    };
+
+    // 2. The issuer's discovery document, cached per issuer (H5). Its
+    //    `issuer` must be the `iss` claim — discovery cannot be used to
+    //    launder one issuer for another.
+    let Ok(well_known) = origin.join(".well-known/openid-configuration") else {
+        tracing::debug!(iss, "the well-known URL would not build");
+        return Err(Refused::Token);
+    };
+    let discovery = match state.issuer_discovery.fetch(&well_known).await {
+        Ok(discovery) if discovery.issuer == iss => discovery,
+        _ => {
+            tracing::debug!(iss, "a foreign issuer's discovery did not name it");
+            return Err(Refused::Token);
+        }
+    };
+
+    // 3. The issuer's key set, fetched from the `jwks_uri` the discovery
+    //    document names, same transport rules, cached per issuer (H5).
+    let Ok(jwks_uri) = Url::parse(&discovery.jwks_uri) else {
+        tracing::debug!(iss, "a foreign issuer's jwks_uri is not a URL");
+        return Err(Refused::Token);
+    };
+    let verify = |jwks: &tokens::RemoteJwks| {
+        tokens::verify_remote_access(jwks, token, proof, method, url, now)
+    };
+    let unspent = match state.issuer_jwks.fetch(&jwks_uri).await {
+        // 4 and 5. The signature — ES256 only, the key chosen by the token's
+        //          `kid` — `aud`, `exp`, and the required `cnf.jkt`, then the
+        //          proof, which runs exactly as today.
+        Ok(jwks) => match verify(&jwks) {
+            Ok(unspent) => unspent,
+            // An unknown `kid` is what a rotation looks like from the
+            // outside: exactly one re-fetch, then refuse (H5).
+            Err(tokens::TokenError::Jwt(keys::JwtError::UnknownKey(_))) => {
+                match state.issuer_jwks.refetch(&jwks_uri).await {
+                    Ok(fresh) => verify(&fresh).map_err(|e| {
+                        tracing::debug!(error = %e, "a foreign access token was rejected");
+                        remote_refusal(e)
+                    })?,
+                    Err(_) => {
+                        tracing::debug!(iss, "a foreign issuer's key set could not be re-fetched");
+                        return Err(Refused::Token);
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "a foreign access token was rejected");
+                return Err(remote_refusal(e));
+            }
+        },
+        Err(_) => {
+            tracing::debug!(iss, "a foreign issuer's key set could not be fetched");
+            return Err(Refused::Token);
+        }
+    };
+
+    // The jti spend, exactly as the fast path spends it — before the gates
+    // that follow, as it does there: a captured proof cannot be retried until
+    // one attempt works (RFC 9449).
+    let claims = match unspent.spend(&state.pool, now).await {
+        Ok(claims) => claims,
+        Err(DpopError::Storage(e)) => {
+            tracing::error!(error = %e, "recording a DPoP proof failed");
+            return Err(Refused::Unavailable);
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Solid access token proof refused");
+            return Err(Refused::Proof);
+        }
+    };
+
+    // 6. Bind the WebID to the issuer (H5): dereference the token's `webid`
+    //    and require the `iss` among the document's `solid:oidcIssuer`
+    //    values — the WebID's own assertion, read from the WebID.
+    let bound = match Url::parse(&claims.webid) {
+        Ok(webid) => match state.webid_documents.fetch(&webid).await {
+            Ok(document) => document.names(iss),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    if !bound {
+        tracing::debug!(iss, "a WebID does not name this issuer");
+        return Err(Refused::Token);
+    }
+
+    // 7. The remote subject (H5): the WebID as the authenticated agent, and
+    //    no local user — the shape `Subject::remote` exists for.
+    Ok(Caller::verified(Subject::remote(
+        claims.webid,
+        Scope::parse(&claims.scope),
+        Via::SolidDpop,
+    )))
 }
 
 /// Turn a refusal from `ldp` into a response.

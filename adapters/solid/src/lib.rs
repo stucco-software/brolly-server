@@ -17,5 +17,6 @@ pub mod patch;
 pub mod profile;
 pub mod storage;
 pub mod storage_description;
+pub mod webid_documents;
 
 pub use ldp::{LdpError, LdpOutcome};

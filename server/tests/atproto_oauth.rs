@@ -16,7 +16,9 @@ use axum::http::{Request, StatusCode, header};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
-use brolly_server::client_metadata::{ClientLookup, Lookup, StaticClientDocuments, StaticClients};
+use brolly_server::client_metadata::{
+    ClientLookup, Lookup, StaticClientDocuments, StaticClients, StaticDocuments,
+};
 use brolly_server::{AppState, app};
 use http_body_util::BodyExt;
 use p256::ecdsa::SigningKey;
@@ -102,6 +104,12 @@ async fn harness_with(
             plc_client: None,
             clients,
             solid_clients: std::sync::Arc::new(StaticClientDocuments::default()),
+            // The remote path's lookups (spec 6, H5): empty here, as a fetch
+            // that finds nothing would be — these tests never leave the
+            // instance.
+            issuer_discovery: std::sync::Arc::new(StaticDocuments::default()),
+            issuer_jwks: std::sync::Arc::new(StaticDocuments::default()),
+            webid_documents: std::sync::Arc::new(StaticDocuments::default()),
         },
         "server/static",
     );

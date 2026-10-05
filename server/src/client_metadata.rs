@@ -10,7 +10,10 @@
 //! protocol-agnostic and shared: one [`Fetcher`] per protocol, parameterized
 //! by what the protocol does with the bytes ([`Document`]). ATProto fetches
 //! `application/json`; Solid-OIDC fetches RDF, because our own `/profile`
-//! serves HTML to anything that sounds like a browser (spec 6, H3).
+//! serves HTML to anything that sounds like a browser (spec 6, H3). The
+//! remote path's three documents (spec 6, H5) ride the same transport: a
+//! foreign issuer's discovery document and key set as JSON, a remote WebID's
+//! profile document as RDF.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -22,6 +25,8 @@ use brolly_atproto::client_metadata::{
     ClientError, ClientId, ClientMetadata, loopback_metadata, parse_client_id, validate,
 };
 use brolly_solid::client_documents::{self, ClientIdDocument, InvalidDocument};
+use brolly_solid::oidc::tokens::{InvalidDiscovery, InvalidJwks, RemoteDiscovery, RemoteJwks};
+use brolly_solid::webid_documents::{self, InvalidWebIdDocument, WebIdDocument};
 use moka::Expiry;
 use moka::future::Cache;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -66,6 +71,18 @@ pub trait ClientLookup: Send + Sync {
     /// [`lookup_client`], which answers loopback clients itself, and the
     /// Solid-OIDC authorize branch only consults it for `https://` client ids.
     fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, Self::Document, Self::Invalid>;
+
+    /// A fetch that must not be answered from a cache (spec 6, H5).
+    ///
+    /// Key rotation: a foreign issuer can rotate a new key into its set
+    /// between our cached copy and a token that names it, and an unknown
+    /// `kid` re-fetches the set exactly once before refusing — so a rotation
+    /// must not wait out the cache's lifetime. The default is [`fetch`]
+    /// itself, so a stub that counts fetches counts a re-fetch too; the
+    /// production [`Fetcher`] drops its cached answer first.
+    fn refetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, Self::Document, Self::Invalid> {
+        self.fetch(url)
+    }
 }
 
 /// The metadata for a parsed `client_id`.
@@ -129,6 +146,53 @@ impl Document for ClientIdDocument {
 
     fn parse(url: &Url, content_type: &str, body: &[u8]) -> Result<Self, InvalidDocument> {
         client_documents::parse(url, content_type, body)
+    }
+}
+
+// --- the remote path's documents (spec 6, H5) -----------------------------------
+//
+// Three more protocols over the one transport: a foreign issuer's discovery
+// document and key set, asked for as JSON like the ATProto side's client
+// metadata, and a remote WebID's profile document, asked for as RDF like a
+// Client ID Document.
+
+/// A foreign issuer's discovery document (spec 6, H5).
+impl Document for RemoteDiscovery {
+    type Invalid = InvalidDiscovery;
+
+    fn accept() -> &'static str {
+        "application/json"
+    }
+
+    fn parse(_url: &Url, content_type: &str, body: &[u8]) -> Result<Self, InvalidDiscovery> {
+        RemoteDiscovery::parse(content_type, body)
+    }
+}
+
+/// A foreign issuer's key set (spec 6, H5).
+impl Document for RemoteJwks {
+    type Invalid = InvalidJwks;
+
+    fn accept() -> &'static str {
+        "application/json"
+    }
+
+    fn parse(_url: &Url, content_type: &str, body: &[u8]) -> Result<Self, InvalidJwks> {
+        RemoteJwks::parse(content_type, body)
+    }
+}
+
+/// A remote WebID's profile document (spec 6, H5): RDF again, so the ask a
+/// Client ID Document makes is the ask this one makes.
+impl Document for WebIdDocument {
+    type Invalid = InvalidWebIdDocument;
+
+    fn accept() -> &'static str {
+        client_documents::ACCEPT
+    }
+
+    fn parse(url: &Url, content_type: &str, body: &[u8]) -> Result<Self, InvalidWebIdDocument> {
+        webid_documents::parse(url, content_type, body)
     }
 }
 
@@ -200,6 +264,52 @@ impl ClientLookup for StaticClientDocuments {
     type Invalid = InvalidDocument;
 
     fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, ClientIdDocument, InvalidDocument> {
+        let found = self
+            .documents
+            .get(url.as_str())
+            .cloned()
+            .ok_or(LookupError::Unreachable);
+        Box::pin(std::future::ready(found))
+    }
+}
+
+/// A fixed set of one of the remote path's documents, for integration tests
+/// (spec 6, H5).
+///
+/// The same deal as [`StaticClients`] and [`StaticClientDocuments`]: it skips
+/// fetching, not validation — the documents it holds were parsed by the
+/// production `parse` when the test built them. A URL it doesn't hold is
+/// `Unreachable`, as a fetch that finds nothing would be. The remote-path
+/// tests that count fetches or change an answer mid-rotation write their own
+/// stubs, as the client-document tests do.
+#[derive(Debug)]
+pub struct StaticDocuments<D: Document> {
+    documents: HashMap<String, D>,
+}
+
+// Manual, because the derive would demand `D: Default` — an empty map is
+// default whatever the documents are.
+impl<D: Document> Default for StaticDocuments<D> {
+    fn default() -> Self {
+        Self {
+            documents: HashMap::new(),
+        }
+    }
+}
+
+impl<D: Document> StaticDocuments<D> {
+    /// Hold `document`, answered for `url`.
+    pub fn with(mut self, url: &str, document: D) -> Self {
+        self.documents.insert(url.to_owned(), document);
+        self
+    }
+}
+
+impl<D: Document> ClientLookup for StaticDocuments<D> {
+    type Document = D;
+    type Invalid = D::Invalid;
+
+    fn fetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, D, D::Invalid> {
         let found = self
             .documents
             .get(url.as_str())
@@ -400,6 +510,19 @@ impl<D: Document> ClientLookup for Fetcher<D> {
         // get_with also collapses concurrent lookups of one client into a
         // single fetch.
         Box::pin(async move {
+            self.cache
+                .get_with(url.as_str().to_owned(), self.retrieve(url))
+                .await
+        })
+    }
+
+    fn refetch<'a>(&'a self, url: &'a Url) -> Lookup<'a, D, D::Invalid> {
+        // Rotation (spec 6, H5): the cached answer is dropped first, so the
+        // one re-fetch an unknown `kid` forces reads the wire and not the
+        // cache — and what it finds is cached, so the next request does not
+        // repeat the round trip.
+        Box::pin(async move {
+            self.cache.invalidate(url.as_str()).await;
             self.cache
                 .get_with(url.as_str().to_owned(), self.retrieve(url))
                 .await
@@ -1238,6 +1361,218 @@ mod fetch_tests {
             1,
             "a failure is cached for its shorter lifetime, not re-hammered"
         );
+    }
+
+    // --- the remote path's documents (spec 6, H5) ------------------------------
+    //
+    // The transport above is shared and tested once, per protocol; what these
+    // pin is the half that varies — the JSON ask for the issuer's two
+    // documents, the RDF ask for the WebID's — and the one rule that is new
+    // to the remote path: `refetch` drops the cached answer, because a key
+    // rotation must not wait out a cache lifetime.
+
+    /// A discovery document for an issuer at `issuer`.
+    fn discovery_body(issuer: &str) -> String {
+        serde_json::json!({
+            "issuer": issuer,
+            "jwks_uri": format!("{issuer}/jwks"),
+        })
+        .to_string()
+    }
+
+    /// A key set carrying one ES256 key, `kid` naming it.
+    fn jwks_body(kid: &str) -> String {
+        let key = p256::ecdsa::SigningKey::from_slice(&[13u8; 32]).unwrap();
+        let sec1 = key.verifying_key().to_sec1_bytes();
+        use base64::Engine;
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        serde_json::json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-256", "alg": "ES256", "kid": kid,
+                "x": b64.encode(&sec1[1..33]),
+                "y": b64.encode(&sec1[33..65]),
+            }]
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn a_discovery_document_is_fetched_as_json_and_cached() {
+        // Once per issuer (H5): the second lookup is a cache hit.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|_| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                discovery_body("https://idp.example"),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher = Fetcher::<RemoteDiscovery>::for_tests(true, true, MINUTE, MINUTE).unwrap();
+
+        let first = fetcher.fetch(&url).await.unwrap();
+        assert_eq!(first.issuer, "https://idp.example");
+        assert_eq!(first.jwks_uri, "https://idp.example/jwks");
+        let second = fetcher.fetch(&url).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "cached per issuer");
+    }
+
+    #[tokio::test]
+    async fn a_discovery_document_is_json_only() {
+        let url = serve(|_| {
+            answering(
+                StatusCode::OK,
+                "text/html",
+                "<html>A page, not a discovery document</html>".to_string(),
+                &Arc::new(AtomicUsize::new(0)),
+            )
+        })
+        .await;
+        assert!(matches!(
+            Fetcher::<RemoteDiscovery>::for_tests(true, true, MINUTE, MINUTE)
+                .unwrap()
+                .fetch(&url)
+                .await,
+            Err(LookupError::Invalid(InvalidDiscovery::NotJson(_)))
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_key_set_is_fetched_parsed_and_cached() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|_| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                jwks_body("idp-1"),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher = Fetcher::<RemoteJwks>::for_tests(true, true, MINUTE, MINUTE).unwrap();
+
+        let first = fetcher.fetch(&url).await.unwrap();
+        assert!(first.key_for("idp-1").is_some(), "the parse kept the key");
+        assert!(
+            fetcher
+                .fetch(&url)
+                .await
+                .unwrap()
+                .key_for("idp-1")
+                .is_some()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "cached per issuer");
+    }
+
+    #[tokio::test]
+    async fn a_refetch_drops_the_cached_answer() {
+        // The rotation plumbing (H5): `refetch` reads the wire, not the cache
+        // — and what it finds replaces the cached answer.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|_| {
+            answering(
+                StatusCode::OK,
+                "application/json",
+                jwks_body("idp-1"),
+                &hits,
+            )
+        })
+        .await;
+        let fetcher = Fetcher::<RemoteJwks>::for_tests(true, true, MINUTE, MINUTE).unwrap();
+
+        let cached = fetcher.fetch(&url).await.unwrap();
+        let fresh = fetcher.refetch(&url).await.unwrap();
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "the re-fetch read the wire");
+        let after = fetcher.fetch(&url).await.unwrap();
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            2,
+            "and what it found was cached"
+        );
+        assert!(fresh.key_for("idp-1").is_some());
+        assert!(cached.key_for("idp-1").is_some());
+        assert!(after.key_for("idp-1").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_webid_document_is_asked_for_as_rdf_parsed_and_cached() {
+        // The trap the RDF ask exists for, again: this server, like our own
+        // `/profile`, serves HTML to anything that sounds like a browser and
+        // Turtle to a caller that asks for it. The WebID's fragment is in the
+        // fetch URL and never reaches the wire — the request that arrives is
+        // for `/profile` — which is what lets the parse anchor the
+        // `solid:oidcIssuer` triples on the WebID's exact IRI.
+        let hits = Arc::new(AtomicUsize::new(0));
+        let url = serve(|_| {
+            let hits = hits.clone();
+            Router::new().route(
+                "/profile",
+                get(move |headers: axum::http::HeaderMap| {
+                    let hits = hits.clone();
+                    async move {
+                        hits.fetch_add(1, Ordering::SeqCst);
+                        let accept = headers
+                            .get(header::ACCEPT)
+                            .and_then(|v| v.to_str().ok())
+                            .unwrap_or_default();
+                        let browser = accept
+                            .split(',')
+                            .map(|part| part.split(';').next().unwrap_or("").trim())
+                            .any(|media| media == "text/html");
+                        if browser {
+                            (
+                                [(header::CONTENT_TYPE, "text/html")],
+                                "<html>A page, not a profile</html>".to_string(),
+                            )
+                        } else {
+                            (
+                                [(header::CONTENT_TYPE, "text/turtle")],
+                                "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n\
+                                 <#me> solid:oidcIssuer <https://idp.example> ."
+                                    .to_string(),
+                            )
+                        }
+                    }
+                }),
+            )
+        })
+        .await;
+        // The WebID, fragment and all: the cache key is per WebID, and the
+        // wire sees only the path.
+        let webid = url.join("/profile#me").unwrap();
+        let fetcher = Fetcher::<WebIdDocument>::for_tests(true, true, MINUTE, MINUTE).unwrap();
+
+        let first = fetcher.fetch(&webid).await.unwrap();
+        assert!(first.names("https://idp.example"));
+        let second = fetcher.fetch(&webid).await.unwrap();
+        assert_eq!(first, second);
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the fragment never hit the wire, and the document is cached per WebID"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_served_to_browsers_is_not_a_webid_document() {
+        let url = serve(|_| {
+            answering(
+                StatusCode::OK,
+                "text/html",
+                "<html>A page, not a profile</html>".to_string(),
+                &Arc::new(AtomicUsize::new(0)),
+            )
+        })
+        .await;
+        assert!(matches!(
+            Fetcher::<WebIdDocument>::for_tests(true, true, MINUTE, MINUTE)
+                .unwrap()
+                .fetch(&url)
+                .await,
+            Err(LookupError::Invalid(InvalidWebIdDocument::NotRdf(_)))
+        ));
     }
 
     // --- PublicOnly -----------------------------------------------------------------

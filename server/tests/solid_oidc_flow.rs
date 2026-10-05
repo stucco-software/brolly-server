@@ -64,6 +64,16 @@ async fn harness_with(
         // Where Client ID Documents come from (spec 6, H3): a fixed,
         // validated set here, as the ATProto side's `StaticClients` does.
         solid_clients,
+        // The remote path's lookups (spec 6, H5): empty, as a fetch that
+        // finds nothing would be — this suite's requests never take the
+        // remote path.
+        issuer_discovery: std::sync::Arc::new(
+            brolly_server::client_metadata::StaticDocuments::default(),
+        ),
+        issuer_jwks: std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
+        webid_documents: std::sync::Arc::new(
+            brolly_server::client_metadata::StaticDocuments::default(),
+        ),
     };
     let router = app(state, "server/static");
     Harness {
@@ -920,6 +930,13 @@ async fn our_own_profile_is_not_a_client_id_document() {
         clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
         solid_clients: std::sync::Arc::new(
             brolly_server::client_metadata::StaticClientDocuments::default(),
+        ),
+        issuer_discovery: std::sync::Arc::new(
+            brolly_server::client_metadata::StaticDocuments::default(),
+        ),
+        issuer_jwks: std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
+        webid_documents: std::sync::Arc::new(
+            brolly_server::client_metadata::StaticDocuments::default(),
         ),
     };
     db::create_user(&db.pool, "127", None, "a-long-password", "member")

@@ -118,6 +118,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         solid_clients: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<
             brolly_solid::client_documents::ClientIdDocument,
         >::new()?),
+        // A foreign Solid-OIDC issuer's discovery document and key set
+        // (spec 6, H5): the same transport again, asking for JSON, cached
+        // per issuer — the remote path a token whose `iss` is not ours takes.
+        issuer_discovery: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<
+            brolly_solid::oidc::tokens::RemoteDiscovery,
+        >::new()?),
+        issuer_jwks: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<
+            brolly_solid::oidc::tokens::RemoteJwks,
+        >::new()?),
+        // A remote WebID's profile document (spec 6, H5): the dereference
+        // the issuer binding reads, asking for RDF like the Client ID
+        // Document fetch, cached per WebID.
+        webid_documents: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<
+            brolly_solid::webid_documents::WebIdDocument,
+        >::new()?),
     };
 
     let addr = SocketAddr::from(([0, 0, 0, 0], port));

@@ -44,6 +44,16 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
         solid_clients: std::sync::Arc::new(
             brolly_server::client_metadata::StaticClientDocuments::default(),
         ),
+        // The remote path's lookups (spec 6, H5): empty here, as a fetch
+        // that finds nothing would be — these tests never leave the
+        // instance.
+        issuer_discovery: std::sync::Arc::new(
+            brolly_server::client_metadata::StaticDocuments::default(),
+        ),
+        issuer_jwks: std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
+        webid_documents: std::sync::Arc::new(
+            brolly_server::client_metadata::StaticDocuments::default(),
+        ),
     };
     let router = app(state, "server/static");
     (db, dir, router)

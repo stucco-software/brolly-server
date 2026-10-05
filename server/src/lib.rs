@@ -104,6 +104,36 @@ pub struct AppState {
                 Invalid = brolly_solid::client_documents::InvalidDocument,
             >,
     >,
+    /// Where a foreign Solid-OIDC issuer's discovery document comes from
+    /// (spec 6, H5).
+    ///
+    /// The same transport again, parameterized for JSON: a token whose `iss`
+    /// names another issuer takes the remote path, which fetches that
+    /// issuer's discovery document here, cached per issuer. A trait object
+    /// for the same reason as `clients`.
+    pub issuer_discovery: std::sync::Arc<
+        dyn client_metadata::ClientLookup<
+                Document = brolly_solid::oidc::tokens::RemoteDiscovery,
+                Invalid = brolly_solid::oidc::tokens::InvalidDiscovery,
+            >,
+    >,
+    /// Where a foreign issuer's key set comes from (spec 6, H5) — fetched
+    /// from the `jwks_uri` its discovery document names, with the one
+    /// cache-bypassing re-fetch a key rotation forces.
+    pub issuer_jwks: std::sync::Arc<
+        dyn client_metadata::ClientLookup<
+                Document = brolly_solid::oidc::tokens::RemoteJwks,
+                Invalid = brolly_solid::oidc::tokens::InvalidJwks,
+            >,
+    >,
+    /// Where a remote WebID's profile document comes from (spec 6, H5) —
+    /// the dereference the issuer binding reads, cached per WebID.
+    pub webid_documents: std::sync::Arc<
+        dyn client_metadata::ClientLookup<
+                Document = brolly_solid::webid_documents::WebIdDocument,
+                Invalid = brolly_solid::webid_documents::InvalidWebIdDocument,
+            >,
+    >,
 }
 
 /// The upstream repository, and the default value of `BROLLY_SOURCE_URL`.

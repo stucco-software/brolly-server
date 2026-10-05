@@ -149,7 +149,9 @@ fn coordinates(key: &VerifyingKey) -> (String, String) {
     (B64.encode(&sec1[1..33]), B64.encode(&sec1[33..65]))
 }
 
-fn verify_with(
+/// Verify a token against one key, which the header's `kid` must name (H5:
+/// the remote path calls this with the key a foreign issuer's set carries).
+pub(crate) fn verify_with(
     key: &VerifyingKey,
     expected_kid: &str,
     token: &str,

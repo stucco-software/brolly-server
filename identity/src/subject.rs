@@ -95,6 +95,25 @@ impl Subject {
         }
     }
 
+    /// A verified remote caller: a WebID with no account on this instance
+    /// (spec 6, H5 — a token from another Solid-OIDC issuer, bound to its
+    /// WebID by the WebID's own `solid:oidcIssuer`).
+    ///
+    /// `user_id: None` and `did: None` — the shape `user_id`'s doc comment
+    /// describes — because there is no local account to name: WAC, the only
+    /// thing the pod surface consults, matches the WebID, and resolving a
+    /// local user instead would be a special case shaped like a bypass of the
+    /// issuer binding.
+    pub fn remote(webid: String, scope: Scope, via: Via) -> Self {
+        Self {
+            user_id: None,
+            did: None,
+            webid: Some(webid),
+            scope,
+            via,
+        }
+    }
+
     /// Nobody: no credential was presented, or the one that was did not
     /// resolve to a person.
     ///
@@ -170,6 +189,24 @@ mod tests {
         assert_eq!(nobody.user_id, None);
         assert_eq!(nobody.did, None);
         assert!(nobody.scope.as_slice().is_empty(), "no scope is granted");
+    }
+
+    #[test]
+    fn a_remote_caller_is_no_local_user_and_still_an_authenticated_agent() {
+        // The shape `user_id: None` was designed for (spec 6, H5): a foreign
+        // issuer's token verifies to a WebID this instance does not host, and
+        // nothing else. A `user_id` here would be a local account the binding
+        // never established.
+        let webid = "https://bob.example.org/profile#me".to_string();
+        let subject = Subject::remote(webid.clone(), Scope::parse("webid"), Via::SolidDpop);
+        assert_eq!(subject.user_id, None);
+        assert_eq!(subject.did, None);
+        assert_eq!(subject.webid.as_deref(), Some(webid.as_str()));
+        assert_eq!(
+            subject.agent(),
+            brolly_authz::Agent::Authenticated(webid),
+            "the WebID is what WAC matches"
+        );
     }
 
     #[test]
