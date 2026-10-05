@@ -4865,3 +4865,177 @@ async fn a_meta_takes_rdf_only() {
         .await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{text}");
 }
+
+// --- read access follows the publication (spec 4, H5, ADR 0017) -----------------
+
+/// Plant a composer medium in the pod directly — `upload_media`'s own shape —
+/// so the publish path is exercised over HTTP without the OAuth machinery
+/// these tests don't otherwise need. Setup through the pod, not through the
+/// code under test.
+async fn a_medium(h: &Harness) -> String {
+    let id = brolly_mastodon::status_id::mint_note_id();
+    let iri = format!("{BASE}/~/media/{id}");
+    let digest = h.stores.blobs(h.user).unwrap().put(b"PNG-BYTES").unwrap();
+    h.stores
+        .pod(h.user)
+        .unwrap()
+        .write(|w| {
+            w.put(
+                &iri,
+                Content::Binary(brolly_store::resources::BlobMeta {
+                    digest,
+                    media_type: "image/png".into(),
+                    byte_size: 9,
+                }),
+            )
+        })
+        .unwrap();
+    format!("/~/media/{id}")
+}
+
+/// Publish a bare note through the outbox as the harness member, attaching
+/// `media` and addressed to `to`.
+async fn publish(h: &Harness, to: serde_json::Value, media: &str) {
+    let note = serde_json::json!({
+        "type": "Note",
+        "content": "hello",
+        "to": to,
+        "cc": [],
+        "attachment": [{"type": "Document", "mediaType": "image/png", "url": format!("{BASE}{media}")}]
+    });
+    let request = Request::builder()
+        .method("POST")
+        .uri("/outbox")
+        .header(header::HOST, HOST)
+        .header(header::COOKIE, format!("brolly_session={}", h.session))
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(note.to_string()))
+        .unwrap();
+    let (status, text, _) = run(h.router.clone(), request).await;
+    assert_eq!(status, StatusCode::CREATED, "publish: {text}");
+}
+
+/// Another member's session, for the cross-member reads.
+async fn a_stranger(h: &Harness, username: &str) -> String {
+    let user = db::create_user(
+        &h._db.pool,
+        username,
+        None,
+        "correct-horse-battery",
+        "member",
+    )
+    .await
+    .unwrap();
+    db::create_session(&h._db.pool, user.id, time::Duration::hours(1), None)
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_public_posts_media_is_readable_by_anonymous_callers() {
+    // The flip this chunk makes: a published medium reads 200 for its
+    // audience, where every binary was owner-only before. The note too — the
+    // same grants, the same ACL.
+    let h = harness().await;
+    let media = a_medium(&h).await;
+    publish(
+        &h,
+        serde_json::json!(["https://www.w3.org/ns/activitystreams#Public"]),
+        &media,
+    )
+    .await;
+
+    let (status, body, _) = h.send("GET", &media, None, false).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "PNG-BYTES", "the bytes must come back");
+}
+
+#[tokio::test]
+async fn a_followers_only_posts_media_reads_for_the_follower_alone() {
+    // The private row: the compose-time snapshot reads, and nobody else —
+    // not a stranger, not an anonymous caller.
+    let h = harness().await;
+    let media = a_medium(&h).await;
+
+    // Bob follows alice; carol doesn't.
+    let bob = db::create_user(&h._db.pool, "bob", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let carol = a_stranger(&h, "carol").await;
+    let bob_session = db::create_session(&h._db.pool, bob.id, time::Duration::hours(1), None)
+        .await
+        .unwrap();
+    h.stores
+        .pod(h.user)
+        .unwrap()
+        .write(|w| {
+            brolly_activitypub::follows::record(
+                w,
+                &brolly_identity::webid::actor("bob", "brolly.test"),
+                &brolly_identity::webid::actor("alice", "brolly.test"),
+            )
+        })
+        .unwrap();
+
+    publish(
+        &h,
+        serde_json::json!(["https://alice.brolly.test/followers"]),
+        &media,
+    )
+    .await;
+
+    let request = conditional_request("GET", &media, None, Some(&bob_session), &[]);
+    let (status, _, _) = run(h.router.clone(), request).await;
+    assert_eq!(status, StatusCode::OK, "the follower at compose time reads");
+
+    // 403 for the stranger (authenticated, unauthorized) and 401 for the
+    // anonymous caller, per stage 5b's H1 table.
+    let request = conditional_request("GET", &media, None, Some(&carol), &[]);
+    let (status, body, _) = run(h.router.clone(), request).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a stranger reads a followers-only medium: {body}"
+    );
+    let (status, body, _) = h.send("GET", &media, None, false).await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "an anonymous caller reads a followers-only medium: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_followers_only_medium_stays_unreadable_by_a_follower_gained_later() {
+    // The snapshot is the model: carol follows *after* the post, and the post
+    // predates her.
+    let h = harness().await;
+    let media = a_medium(&h).await;
+    publish(
+        &h,
+        serde_json::json!(["https://alice.brolly.test/followers"]),
+        &media,
+    )
+    .await;
+
+    let carol = a_stranger(&h, "carol").await;
+    h.stores
+        .pod(h.user)
+        .unwrap()
+        .write(|w| {
+            brolly_activitypub::follows::record(
+                w,
+                &brolly_identity::webid::actor("carol", "brolly.test"),
+                &brolly_identity::webid::actor("alice", "brolly.test"),
+            )
+        })
+        .unwrap();
+
+    let request = conditional_request("GET", &media, None, Some(&carol), &[]);
+    let (status, _, _) = run(h.router.clone(), request).await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a follower gained later reads a post that predates them"
+    );
+}

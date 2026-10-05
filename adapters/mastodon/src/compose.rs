@@ -13,6 +13,101 @@ use serde_json::{Value, json};
 /// The AS2 public collection.
 pub const PUBLIC: &str = "https://www.w3.org/ns/activitystreams#Public";
 
+/// One read grant a note's audience maps to, by the table in spec 4, H5.
+///
+/// The audience is what the note is addressed to, so the grants are a
+/// function of the addressing — the same `to`/`cc` every publication path
+/// carries, not a field only the Mastodon form has.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum ReadGrant {
+    /// `acl:agentClass foaf:Agent` — the `public` and `unlisted` rows, which
+    /// share a grant because unlisted is a discoverability question, not an
+    /// access one: timelines decide what to list, and Mastodon serves
+    /// unlisted statuses anonymously, so we do too.
+    Public,
+    /// `acl:agent <iri>` — a named reader: a follower from the compose-time
+    /// snapshot (the `private` row) or an addressed recipient (the `direct`
+    /// row).
+    Agent(String),
+}
+
+/// The read grants a note's audience maps to (spec 4, H5's table).
+///
+/// `followers` is the author's followers collection IRI — the `private` row —
+/// and `snapshot` the local followers' WebIDs at compose time. The snapshot is
+/// the model: a follower gained later never reads a post that predates them,
+/// which is Mastodon's own behaviour for delivered content and simple to
+/// reason about. Every other addressee is the `direct` row, resolved by
+/// `webid_of` when it names a local actor — the WebID its holder actually
+/// authenticates as — and named as addressed otherwise, remote recipients
+/// included: federation being off changes nothing here (ADR 0016's switch
+/// flipping later finds the grants already the right shape).
+///
+/// An audience that addresses nobody — a direct post with no recipients,
+/// mention parsing being unbuilt — yields no grants, and the note is the
+/// author's alone. That is the safe side to fail to.
+pub fn read_grants(
+    note: &Value,
+    followers: &str,
+    snapshot: &[String],
+    webid_of: impl Fn(&str) -> Option<String>,
+) -> Vec<ReadGrant> {
+    let mut grants = Vec::new();
+    for entry in addressed(note, "to")
+        .into_iter()
+        .chain(addressed(note, "cc"))
+    {
+        if entry == PUBLIC {
+            grants.push(ReadGrant::Public);
+        } else if entry == followers {
+            grants.extend(snapshot.iter().cloned().map(ReadGrant::Agent));
+        } else {
+            grants.push(ReadGrant::Agent(webid_of(&entry).unwrap_or(entry)));
+        }
+    }
+    grants.sort();
+    grants.dedup();
+    grants
+}
+
+/// One `to`/`cc` field's addressees — an array, or a single string. A
+/// hand-composed note is under no obligation to use the array form the
+/// composer writes.
+fn addressed(note: &Value, field: &str) -> Vec<String> {
+    match note.get(field) {
+        Some(Value::String(s)) => vec![s.clone()],
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The media resources the composer minted for this note (spec 4, H5).
+///
+/// The composer's minting ground is `{base}/~/media/{id}` with a minted id —
+/// exactly what `upload_media` mints. The id check is what separates the
+/// post's media from the member's: a binary the member PUT themselves, even
+/// one PUT at `/~/media/dog.png`, has no minted id, so it is the member's and
+/// not the post's — it keeps its own access and it survives the post's
+/// deletion.
+pub fn minted_media(note: &Value, base: &str) -> Vec<String> {
+    let ground = format!("{base}/~/media/");
+    note["attachment"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|attachment| attachment["url"].as_str())
+        .filter(|url| {
+            url.strip_prefix(&ground)
+                .is_some_and(crate::status_id::is_note_id)
+        })
+        .map(str::to_string)
+        .collect()
+}
+
 /// One attachment, already resolved from a media id to something addressable.
 #[derive(Debug, Clone)]
 pub struct Attachment {
@@ -370,5 +465,103 @@ mod tests {
         let note = note(&composition, ACTOR, FOLLOWERS, "2026-08-26T12:00:00Z");
         assert_eq!(note["to"], json!([]));
         assert_eq!(note["cc"], json!([]));
+    }
+
+    // --- read grants (spec 4, H5) --------------------------------------------
+
+    const BOB: &str = "https://bob.brolly.test/profile#me";
+
+    fn resolve_nothing(_: &str) -> Option<String> {
+        None
+    }
+
+    #[test]
+    fn public_and_unlisted_grant_the_public_class() {
+        // One row of the table each: unlisted is a discoverability question,
+        // not an access one, so its grant is the public one.
+        for (to, cc) in [
+            (vec![PUBLIC.to_string()], vec![FOLLOWERS.to_string()]),
+            (vec![FOLLOWERS.to_string()], vec![PUBLIC.to_string()]),
+        ] {
+            let note = json!({"to": to, "cc": cc});
+            assert_eq!(
+                read_grants(&note, FOLLOWERS, &[], resolve_nothing),
+                vec![ReadGrant::Public]
+            );
+        }
+    }
+
+    #[test]
+    fn a_followers_audience_grants_the_snapshot_and_only_the_snapshot() {
+        // The snapshot is the model: who follows at compose time reads, and
+        // nobody else — not even a follower gained later, which is the grant
+        // a live lookup would quietly become.
+        let note = json!({"to": [FOLLOWERS]});
+        assert_eq!(
+            read_grants(&note, FOLLOWERS, &[BOB.into()], resolve_nothing),
+            vec![ReadGrant::Agent(BOB.into())]
+        );
+    }
+
+    #[test]
+    fn a_direct_audience_grants_each_addressee_local_or_remote() {
+        // A local actor is granted as the WebID its holder authenticates as;
+        // a remote one is named exactly as addressed.
+        let local = "https://bob.brolly.test/actor";
+        let remote = "https://elsewhere.example/actor";
+        let note = json!({"to": [local], "cc": [remote]});
+        assert_eq!(
+            read_grants(&note, FOLLOWERS, &[], |actor: &str| (actor == local)
+                .then(|| BOB.to_string())),
+            vec![
+                ReadGrant::Agent(BOB.into()),
+                ReadGrant::Agent(remote.into())
+            ]
+        );
+    }
+
+    #[test]
+    fn an_audience_that_addresses_nobody_grants_nobody() {
+        // A direct post with no recipients is the author's alone. Failing
+        // open here would publish something the client asked to keep private.
+        let note = json!({"to": [], "cc": []});
+        assert!(read_grants(&note, FOLLOWERS, &[BOB.into()], resolve_nothing).is_empty());
+    }
+
+    #[test]
+    fn a_single_string_audience_is_still_an_audience() {
+        // A hand-composed note may address a string rather than an array.
+        let note = json!({"to": PUBLIC});
+        assert_eq!(
+            read_grants(&note, FOLLOWERS, &[], resolve_nothing),
+            vec![ReadGrant::Public]
+        );
+    }
+
+    // --- the composer's media (spec 4, H5) ------------------------------------
+
+    #[test]
+    fn a_minted_medium_is_the_posts() {
+        // A minted id is a ULID — `upload_media`'s own shape.
+        let id = crate::status_id::mint_note_id();
+        let note = json!({"attachment": [
+            {"type": "Document", "url": format!("https://alice.brolly.test/~/media/{id}")}
+        ]});
+        assert_eq!(
+            minted_media(&note, "https://alice.brolly.test"),
+            vec![format!("https://alice.brolly.test/~/media/{id}")]
+        );
+    }
+
+    #[test]
+    fn a_binary_the_member_put_themselves_is_not_the_posts() {
+        // Not a minted id, not the composer's — even under the composer's
+        // minting ground, and certainly not elsewhere in the pod.
+        let note = json!({"attachment": [
+            {"type": "Document", "url": "https://alice.brolly.test/~/media/dog.png"},
+            {"type": "Document", "url": "https://alice.brolly.test/~/photos/dog.png"},
+            {"type": "Document", "url": "https://elsewhere.example/cat.png"}
+        ]});
+        assert!(minted_media(&note, "https://alice.brolly.test").is_empty());
     }
 }

@@ -935,6 +935,84 @@ pub async fn create_status(
     }
 }
 
+/// `DELETE /api/v1/statuses/{id}`
+///
+/// Drives the outbox's `Delete` path, so the note, its activity, its outbox
+/// entry, the public index row, and the media the composer minted for the
+/// post all go in the one write `outbox::deliver` makes (spec 4, H5). Media
+/// deleted with the status is Mastodon's own semantics, and it is what keeps
+/// a public post's media from quietly outliving it.
+///
+/// The Mastodon delete surface did not exist before spec 4 — H5 cites this
+/// route, and citing a route is building it: without it the spec's
+/// "deleting the status removes those resources" has no caller.
+pub async fn delete_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    let Some((user, grant)) = authenticated(&state, &headers).await else {
+        return unauthorized();
+    };
+    if !oauth::has_scope(&grant.scopes, "write:statuses") {
+        return error(StatusCode::FORBIDDEN, "This action requires write scope");
+    }
+
+    let Some((note_id, owner)) = status_id::decode(&id) else {
+        return not_found();
+    };
+    // Mastodon's semantics, as above: someone else's status is not found, not
+    // forbidden — a 403 would confirm it exists.
+    if owner != user.id {
+        return not_found();
+    }
+
+    let iri = status_id::note_iri(&note_id, &user.username, &state.base_domain);
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return error(StatusCode::INTERNAL_SERVER_ERROR, "Pod unavailable");
+    };
+    // Read before the deletion: the Delete is addressed where the publication
+    // went, and the response is the deleted status the client is about to
+    // remove from its UI. A status that isn't there is a 404, not a 200 that
+    // deleted nothing.
+    let Some(note) = brolly_store::collection::read_record(&pod.read_store(), &iri) else {
+        return not_found();
+    };
+
+    let base = format!("https://{}.{}", user.username, state.base_domain);
+    let actor = webid::actor(&user.username, &state.base_domain);
+    let activity = json!({
+        "type": "Delete",
+        "id": format!("{base}/~/activities/{}", uuid::Uuid::new_v4()),
+        "actor": actor,
+        "to": note.get("to").cloned().unwrap_or_else(|| json!([])),
+        "cc": note.get("cc").cloned().unwrap_or_else(|| json!([])),
+        "object": iri,
+    });
+
+    match crate::outbox::deliver(&state, &user, &actor, &activity).await {
+        Ok(()) => {}
+        Err(crate::outbox::DeliverError::Refused(refusal)) => {
+            return error(StatusCode::BAD_REQUEST, refusal.describe());
+        }
+        Err(crate::outbox::DeliverError::Failed) => {
+            return error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Something went wrong. Try again.",
+            );
+        }
+    }
+
+    let author = author_for(&state, &user).await;
+    match translate::try_status(&note, &author, &state.base_domain) {
+        Some(status) => (StatusCode::OK, Json(status)).into_response(),
+        None => error(StatusCode::INTERNAL_SERVER_ERROR, "Could not render status"),
+    }
+}
+
 // --- profile flags and follow requests ---------------------------------------------
 
 #[derive(Deserialize, Default)]
@@ -1163,7 +1241,7 @@ pub fn routes(max_upload_bytes: usize) -> Router<AppState> {
         .route("/api/v1/accounts/{id}", get(account))
         .route("/api/v1/timelines/home", get(home_timeline))
         .route("/api/v1/timelines/public", get(public_timeline))
-        .route("/api/v1/statuses/{id}", get(status))
+        .route("/api/v1/statuses/{id}", get(status).delete(delete_status))
         .route("/api/v1/statuses", post(create_status))
         .route("/api/v1/media", upload.clone())
         .route("/api/v2/media", upload)

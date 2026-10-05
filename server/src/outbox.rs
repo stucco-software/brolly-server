@@ -17,9 +17,12 @@ use axum::response::{IntoResponse, Response};
 use axum_extra::extract::CookieJar;
 use brolly_activitypub::follows;
 use brolly_activitypub::processor::{self, ProcessError};
+use brolly_domain::vocab;
 use brolly_identity::db::{self, User};
 use brolly_identity::{extract, webid};
-use brolly_store::resources::PodRead;
+use brolly_store::StoreError;
+use brolly_store::resources::{Content, PodRead, PodWrite};
+use oxigraph_model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
 use serde_json::{Value, json};
 
 use crate::AppState;
@@ -282,18 +285,38 @@ pub async fn deliver(
     // so a failure can't leave a post the outbox doesn't list. A Delete removes
     // rather than stores, in the same single write.
     //
+    // That one write is also where read access follows the publication
+    // (spec 4, H5, ADR 0017): a Create writes the audience + author ACLs for
+    // the note, the activity, and the composer's media, and a Delete takes
+    // the media with the post. Access that lagged the publication by a
+    // transaction would be a privacy bug — a public post with owner-only
+    // media is the quiet version, and so is a deleted post whose public
+    // media outlive it.
+    //
     // `Pod::write` is synchronous, so this write is closed before the recipient
     // loop's first `.await`, and no member's delivery waits on the author's
     // lock.
     let deleting = activity["type"] == "Delete";
     let stored = author_pod.write(|w| {
         if deleting {
+            // The note goes first, read from this transaction before the
+            // removal takes it: its attachments name the media the composer
+            // minted, which go with the post.
+            let media = media_of(&*w, activity, &base);
             processor::process_member(w, &author_inbox, &author_outbox, activity, &received)
-                .map_err(rollback)
+                .map_err(rollback)?;
+            for medium in media {
+                // `remove` takes the medium's `.acl` and `.meta` with it (spec
+                // 5d, H5) and releases its blob. A no-op on one already gone,
+                // so a Delete that reaches the same medium twice doesn't fail.
+                w.remove(&medium)?;
+            }
+            Ok(())
         } else {
             brolly_activitypub::inbox::deliver(w, &author_outbox, activity, &received)
                 .map(|_| ())
-                .map_err(rollback)
+                .map_err(rollback)?;
+            grant_access(w, activity, &author.username, &state.base_domain)
         }
     });
     if let Err(e) = stored {
@@ -338,8 +361,176 @@ pub async fn deliver(
 /// The `StoreError` that makes `Pod::write` roll back, keeping the failure's
 /// message for the log. A delivery failure isn't a storage error, but the
 /// closure has to return one to abort.
-fn rollback(e: impl std::fmt::Display) -> brolly_store::StoreError {
-    brolly_store::StoreError::Backend(e.to_string())
+fn rollback(e: impl std::fmt::Display) -> StoreError {
+    StoreError::Backend(e.to_string())
+}
+
+// --- read access follows the publication (spec 4, H5, ADR 0017) -------------
+
+/// The WAC namespace.
+const ACL: &str = "http://www.w3.org/ns/auth/acl#";
+
+fn iri(s: &str) -> NamedNode {
+    NamedNode::new_unchecked(s)
+}
+
+fn triple(graph: &str, subject: &str, predicate: &str, object: &str) -> Quad {
+    Quad::new(
+        NamedOrBlankNode::NamedNode(iri(subject)),
+        iri(predicate),
+        Term::NamedNode(iri(object)),
+        GraphName::NamedNode(iri(graph)),
+    )
+}
+
+/// Write the audience + author ACLs for everything a publication mints (spec
+/// 4, H5), inside the same write that stored it.
+///
+/// Only a `Create` publishes: its embedded object is the note, and the minted
+/// resources are the note, the activity, and each medium the composer minted
+/// for it. A `Follow` or a `Like` is stored here too, but it is not a
+/// publication — it has no audience to map, and its access stays today's
+/// owner-only.
+///
+/// A medium the member linked from their own Solid data is deliberately not
+/// granted: the composer minted the post's media, not the member's, and the
+/// server deciding to publish a member's private resource because it was
+/// named in a note is a privacy decision the server must not make (H6's
+/// avatar reasoning, one surface over). The member shares it with an `.acl`
+/// if they want it read.
+fn grant_access(
+    w: &mut PodWrite<'_>,
+    activity: &Value,
+    username: &str,
+    base_domain: &str,
+) -> Result<(), StoreError> {
+    if activity["type"] != "Create"
+        || !activity
+            .get("object")
+            .is_some_and(|object| object.is_object())
+    {
+        return Ok(());
+    }
+    let note = &activity["object"];
+
+    let base = format!("https://{username}.{base_domain}");
+    let actor = webid::actor(username, base_domain);
+    let author = webid::webid(username, base_domain);
+    let followers = webid::followers(username, base_domain);
+    // The snapshot is taken in the same write that stores the post, so the
+    // grants and the note can never disagree about who followed whom at
+    // compose time — the snapshot is the model (spec 4, H5).
+    let snapshot = local_follower_webids(w, &actor, base_domain);
+    let grants =
+        brolly_mastodon::compose::read_grants(note, &followers, &snapshot, |addressed: &str| {
+            webid_of(addressed, base_domain)
+        });
+
+    let mut minted = vec![
+        activity["id"].as_str().unwrap_or_default().to_string(),
+        note["id"].as_str().unwrap_or_default().to_string(),
+    ];
+    minted.extend(brolly_mastodon::compose::minted_media(note, &base));
+    for resource in minted {
+        write_acl(w, &resource, &author, &grants)?;
+    }
+    Ok(())
+}
+
+/// Write the ACL for one minted resource (spec 4, H5).
+///
+/// The author's own grant is on every one of these, and it has to be: the
+/// closest ACL governs to the exclusion of every ancestor's (`authz::wac`
+/// resolves the most specific existing ACL and reads only it), so an
+/// audience-only ACL would leave the author — not being among their own
+/// followers — holding nothing at all on their own followers-only note, with
+/// no `Control` to fix it with. The same shape the root ACL provisions
+/// (`provision.rs`), minus `acl:default`: attachments are *beside* their
+/// note, not inside it, and default-inheritance is for subtrees, not
+/// siblings.
+///
+/// An ordinary auxiliary beside the resource, so the member can tighten or
+/// loosen it afterwards under stage 0's `Control` rule: the composer's grant
+/// is a default, not a leash.
+fn write_acl(
+    w: &mut PodWrite<'_>,
+    resource: &str,
+    author: &str,
+    grants: &[brolly_mastodon::compose::ReadGrant],
+) -> Result<(), StoreError> {
+    let acl = format!("{resource}.acl");
+    let owner = format!("{acl}#owner");
+    let mut quads = vec![
+        triple(&acl, &owner, &format!("{ACL}accessTo"), resource),
+        triple(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        triple(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        triple(
+            &acl,
+            &owner,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Control"),
+        ),
+        triple(&acl, &owner, &format!("{ACL}agent"), author),
+    ];
+    for (i, grant) in grants.iter().enumerate() {
+        let auth = format!("{acl}#read-{i}");
+        quads.push(triple(&acl, &auth, &format!("{ACL}accessTo"), resource));
+        quads.push(triple(
+            &acl,
+            &auth,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Read"),
+        ));
+        match grant {
+            brolly_mastodon::compose::ReadGrant::Public => quads.push(triple(
+                &acl,
+                &auth,
+                &format!("{ACL}agentClass"),
+                vocab::FOAF_AGENT,
+            )),
+            brolly_mastodon::compose::ReadGrant::Agent(webid) => {
+                quads.push(triple(&acl, &auth, &format!("{ACL}agent"), webid))
+            }
+        }
+    }
+    w.put(&acl, Content::Auxiliary(&quads)).map(|_| ())
+}
+
+/// The author's local followers' WebIDs, snapshotted against the store in the
+/// compose write (spec 4, H5).
+///
+/// Local only: a remote follower cannot authenticate here while federation is
+/// off, and when ADR 0016's switch flips, the named grants it would need are a
+/// deliberate reopening — not a grant to invent now for agents that cannot
+/// present them.
+fn local_follower_webids(store: &impl PodRead, actor: &str, base_domain: &str) -> Vec<String> {
+    follows::followers(store, actor)
+        .iter()
+        .filter_map(|follower| webid_of(follower, base_domain))
+        .collect()
+}
+
+/// A local actor IRI's WebID — the identity its holder actually authenticates
+/// as on the pod surface. `None` for anything else: a remote IRI is named as
+/// it was addressed, and a resource IRI is not a person.
+fn webid_of(actor: &str, base_domain: &str) -> Option<String> {
+    let url = url::Url::parse(actor).ok()?;
+    let username = extract::subdomain_user(url.host_str()?, base_domain)?;
+    (url.path() == "/actor").then(|| webid::webid(&username, base_domain))
+}
+
+/// The composer's media for the note a `Delete` names, read from the store in
+/// the same write that removes the note (spec 4, H5): deleting a status
+/// deletes its media — Mastodon's own semantics, and the only thing that
+/// keeps public media from quietly outliving their post. A medium the member
+/// linked from their own Solid data is not the post's and survives (recorded,
+/// accepted, in ADR 0017).
+fn media_of(store: &impl PodRead, activity: &Value, base: &str) -> Vec<String> {
+    activity["object"]
+        .as_str()
+        .and_then(|target| brolly_store::collection::read_record(store, target))
+        .map(|note| brolly_mastodon::compose::minted_media(&note, base))
+        .unwrap_or_default()
 }
 
 /// Which inboxes this activity is for.

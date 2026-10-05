@@ -19,6 +19,7 @@ use brolly_server::{AppState, app};
 use brolly_store::resources::{Kind, PodRead};
 use http_body_util::BodyExt;
 use oxigraph::model::{GraphNameRef, NamedNodeRef};
+use serde_json::json;
 use tower::ServiceExt;
 
 const BASE: &str = "brolly.test";
@@ -782,4 +783,592 @@ async fn posting_requires_a_token_at_all() {
     )
     .await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+}
+
+// --- read access follows the publication (spec 4, H5, ADR 0017) ----------------------
+
+const ACL: &str = "http://www.w3.org/ns/auth/acl#";
+const FOAF_AGENT: &str = "http://xmlns.com/foaf/0.1/Agent";
+
+/// A session cookie, for the outbox path: `POST /outbox` authenticates as the
+/// member, not as an OAuth client.
+async fn a_session(h: &Harness, user: uuid::Uuid) -> String {
+    db::create_session(&h.db.pool, user, time::Duration::hours(1), None)
+        .await
+        .unwrap()
+}
+
+/// Publish a bare note through the outbox, addressed to `to`/`cc`.
+async fn publish_outbox(
+    h: &Harness,
+    session: &str,
+    to: serde_json::Value,
+    cc: serde_json::Value,
+    attachments: serde_json::Value,
+) -> (String, String) {
+    let mut note = json!({
+        "type": "Note",
+        "content": "hello",
+        "to": to,
+        "cc": cc,
+    });
+    if !attachments.is_null() {
+        note["attachment"] = attachments;
+    }
+    let reply = send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/outbox")
+            .header(header::HOST, "alice.brolly.test")
+            .header(header::COOKIE, format!("brolly_session={session}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(note.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED, "publish: {}", reply.body);
+    let activity = serde_json::from_str::<serde_json::Value>(&reply.body).unwrap();
+    (
+        activity["id"].as_str().unwrap().to_string(),
+        activity["object"]["id"].as_str().unwrap().to_string(),
+    )
+}
+
+/// Every quad in the ACL at `resource.acl`.
+fn acl_quads(h: &Harness, user: uuid::Uuid, resource: &str) -> Vec<oxigraph::model::Quad> {
+    let pod = h.stores.pod(user).unwrap();
+    let acl = format!("{resource}.acl");
+    pod.read_store()
+        .quads_for_pattern(
+            None,
+            None,
+            None,
+            Some(GraphNameRef::NamedNode(
+                oxigraph::model::NamedNode::new_unchecked(&acl).as_ref(),
+            )),
+        )
+        .filter_map(Result::ok)
+        .collect()
+}
+
+/// Does the ACL at `resource.acl` carry this subject-predicate-object triple?
+fn acl_grants(
+    h: &Harness,
+    user: uuid::Uuid,
+    resource: &str,
+    subject: &str,
+    predicate: &str,
+    object: &str,
+) -> bool {
+    acl_quads(h, user, resource).iter().any(|q| {
+        q.subject.to_string() == format!("<{subject}>")
+            && q.predicate.to_string() == format!("<{predicate}>")
+            && q.object.to_string() == format!("<{object}>")
+    })
+}
+
+/// The author's Read/Write/Control grant is on every composer-written ACL
+/// (spec 4, H5): the closest ACL governs to the exclusion of ancestors, so an
+/// audience-only ACL would lock the author out of their own note with no
+/// Control to fix it with.
+fn assert_author_grant(h: &Harness, user: uuid::Uuid, resource: &str) {
+    let author = "https://alice.brolly.test/profile#me";
+    let owner = format!("{resource}.acl#owner");
+    for mode in ["Read", "Write", "Control"] {
+        assert!(
+            acl_grants(
+                h,
+                user,
+                resource,
+                &owner,
+                &format!("{ACL}mode"),
+                &format!("{ACL}{mode}"),
+            ),
+            "{resource}.acl lacks the author's {mode}"
+        );
+    }
+    assert!(
+        acl_grants(h, user, resource, &owner, &format!("{ACL}agent"), author),
+        "{resource}.acl does not name the author"
+    );
+    assert!(
+        acl_grants(
+            h,
+            user,
+            resource,
+            &owner,
+            &format!("{ACL}accessTo"),
+            resource,
+        ),
+        "{resource}.acl's owner grant does not scope to the resource"
+    );
+}
+
+#[tokio::test]
+async fn a_public_post_grants_the_public_class_and_the_author() {
+    // The first row of the table (spec 4, H5): public → foaf:Agent, Read — on
+    // the note, the activity, and each medium.
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+    let media_id = upload(&h, &token, None).await;
+    let local_id = media_id.split_at(26).0.to_string();
+    let media_iri = format!("https://alice.brolly.test/~/media/{local_id}");
+
+    let created = post_form(
+        &h,
+        "/api/v1/statuses",
+        &format!("status=look&media_ids[]={media_id}&visibility=public"),
+        &token,
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "body: {}", created.body);
+    let note_id = created.json()["id"]
+        .as_str()
+        .unwrap()
+        .split_at(26)
+        .0
+        .to_string();
+    let note_iri = format!("https://alice.brolly.test/~/notes/{note_id}");
+
+    // The activity's id is minted server-side; the activities container holds
+    // exactly this publication.
+    let pod = h.stores.pod(alice).unwrap();
+    let activity_iri = pod
+        .write(|w| w.members("https://alice.brolly.test/~/activities/"))
+        .unwrap()
+        .pop()
+        .expect("the publication minted an activity");
+
+    for resource in [&note_iri, &activity_iri, &media_iri] {
+        assert!(
+            acl_quads(&h, alice, resource).iter().any(|q| {
+                q.predicate.to_string() == format!("<{ACL}agentClass>")
+                    && q.object.to_string() == format!("<{FOAF_AGENT}>")
+            }),
+            "{resource}.acl does not grant foaf:Agent"
+        );
+        assert_author_grant(&h, alice, resource);
+    }
+}
+
+#[tokio::test]
+async fn an_unlisted_post_reads_like_a_public_one() {
+    // Unlisted is a discoverability question, not an access one: the grant is
+    // the public one.
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+
+    let created = post_form(
+        &h,
+        "/api/v1/statuses",
+        "status=look&visibility=unlisted",
+        &token,
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "body: {}", created.body);
+    let note_id = created.json()["id"]
+        .as_str()
+        .unwrap()
+        .split_at(26)
+        .0
+        .to_string();
+    let note_iri = format!("https://alice.brolly.test/~/notes/{note_id}");
+
+    assert!(
+        acl_quads(&h, alice, &note_iri).iter().any(|q| {
+            q.predicate.to_string() == format!("<{ACL}agentClass>")
+                && q.object.to_string() == format!("<{FOAF_AGENT}>")
+        }),
+        "an unlisted note's ACL does not grant foaf:Agent"
+    );
+    assert_author_grant(&h, alice, &note_iri);
+}
+
+#[tokio::test]
+async fn a_followers_only_post_grants_the_followers_snapshot_not_strangers() {
+    // The third row: one grant per local follower's WebID, snapshotted at
+    // compose time. Bob follows; Carol doesn't; a remote follower isn't
+    // granted — an agent that cannot authenticate here cannot present it.
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+    a_member(&h, "bob").await;
+    a_member(&h, "carol").await;
+
+    let alice_pod = h.stores.pod(alice).unwrap();
+    alice_pod
+        .write(|w| {
+            brolly_activitypub::follows::record(
+                w,
+                &brolly_identity::webid::actor("bob", BASE),
+                &brolly_identity::webid::actor("alice", BASE),
+            )?;
+            brolly_activitypub::follows::record(
+                w,
+                "https://elsewhere.example/actor",
+                &brolly_identity::webid::actor("alice", BASE),
+            )
+        })
+        .unwrap();
+
+    let created = post_form(
+        &h,
+        "/api/v1/statuses",
+        "status=hello followers&visibility=private",
+        &token,
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "body: {}", created.body);
+    let note_id = created.json()["id"]
+        .as_str()
+        .unwrap()
+        .split_at(26)
+        .0
+        .to_string();
+    let note_iri = format!("https://alice.brolly.test/~/notes/{note_id}");
+
+    let quads = acl_quads(&h, alice, &note_iri);
+    let bob_webid = "https://bob.brolly.test/profile#me";
+    assert!(
+        quads.iter().any(|q| {
+            q.predicate.to_string() == format!("<{ACL}agent>")
+                && q.object.to_string() == format!("<{bob_webid}>")
+        }),
+        "the follower at compose time is not granted"
+    );
+    for (who, label) in [
+        ("https://carol.brolly.test/profile#me", "a stranger"),
+        ("https://elsewhere.example/actor", "a remote follower"),
+    ] {
+        assert!(
+            !quads
+                .iter()
+                .any(|q| q.object.to_string() == format!("<{who}>")),
+            "{label} is granted on a followers-only post"
+        );
+    }
+    assert!(
+        !quads
+            .iter()
+            .any(|q| q.predicate.to_string() == format!("<{ACL}agentClass>")),
+        "a followers-only post is not world-readable"
+    );
+    assert_author_grant(&h, alice, &note_iri);
+}
+
+#[tokio::test]
+async fn a_direct_post_to_a_remote_webid_names_it_in_the_acl() {
+    // The fourth row, through the outbox: a remote recipient is named exactly
+    // as addressed, federation off — when the switch flips (ADR 0016), the
+    // grants are already the right shape.
+    let h = harness().await;
+    let (alice, _) = a_member(&h, "alice").await;
+    let session = a_session(&h, alice).await;
+
+    let remote = "https://elsewhere.example/actor";
+    let (_, note_iri) = publish_outbox(
+        &h,
+        &session,
+        json!([remote]),
+        json!([]),
+        serde_json::Value::Null,
+    )
+    .await;
+
+    let quads = acl_quads(&h, alice, &note_iri);
+    assert!(
+        quads.iter().any(|q| {
+            q.predicate.to_string() == format!("<{ACL}agent>")
+                && q.object.to_string() == format!("<{remote}>")
+        }),
+        "the remote recipient is not named in the ACL"
+    );
+    assert_author_grant(&h, alice, &note_iri);
+}
+
+#[tokio::test]
+async fn a_direct_post_with_no_recipients_grants_only_the_author() {
+    // The Mastodon composer's direct row addresses nobody (mention parsing is
+    // not built), and an audience that addresses nobody grants nobody: the
+    // note is the author's alone.
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+
+    let created = post_form(
+        &h,
+        "/api/v1/statuses",
+        "status=psst&visibility=direct",
+        &token,
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "body: {}", created.body);
+    let note_id = created.json()["id"]
+        .as_str()
+        .unwrap()
+        .split_at(26)
+        .0
+        .to_string();
+    let note_iri = format!("https://alice.brolly.test/~/notes/{note_id}");
+
+    // No grant on the note except the author's own: an audience that
+    // addresses nobody grants nobody.
+    let quads = acl_quads(&h, alice, &note_iri);
+    let owner = format!("{note_iri}.acl#owner");
+    assert!(
+        !quads.iter().any(|q| {
+            (q.predicate.to_string() == format!("<{ACL}agent>")
+                || q.predicate.to_string() == format!("<{ACL}agentClass>"))
+                && q.subject.to_string() != format!("<{owner}>")
+        }),
+        "a direct post with no recipients granted somebody: {quads:?}"
+    );
+    assert_author_grant(&h, alice, &note_iri);
+}
+
+// --- deleting a status deletes its media (spec 4, H5) --------------------------------
+
+#[tokio::test]
+async fn deleting_a_status_removes_its_media_and_their_auxiliaries() {
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+    let media_id = upload(&h, &token, Some("a small dog")).await;
+    let local_id = media_id.split_at(26).0.to_string();
+    let media_iri = format!("https://alice.brolly.test/~/media/{local_id}");
+
+    let created = post_form(
+        &h,
+        "/api/v1/statuses",
+        &format!("status=look&media_ids[]={media_id}"),
+        &token,
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "body: {}", created.body);
+    let status_id = created.json()["id"].as_str().unwrap().to_string();
+
+    // The medium, its ACL, and its .meta are all there before the delete —
+    // without this the test passes for any reason the delete removes
+    // nothing.
+    let pod = h.stores.pod(alice).unwrap();
+    let before = pod
+        .read(|r| {
+            Ok((
+                r.meta(&media_iri)?.is_some(),
+                r.meta(&format!("{media_iri}.acl"))?.is_some(),
+                r.meta(&format!("{media_iri}.meta"))?.is_some(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(before, (true, true, true), "setup: the media must exist");
+
+    let deleted = send(
+        &h,
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/statuses/{status_id}"))
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::OK, "body: {}", deleted.body);
+
+    let after = pod
+        .read(|r| {
+            Ok((
+                r.meta(&media_iri)?.is_some(),
+                r.meta(&format!("{media_iri}.acl"))?.is_some(),
+                r.meta(&format!("{media_iri}.meta"))?.is_some(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(
+        after,
+        (false, false, false),
+        "the medium or one of its auxiliaries outlived the post"
+    );
+
+    // And the status itself is gone, both surfaces.
+    let fetched = send(
+        &h,
+        Request::builder()
+            .uri(format!("/api/v1/statuses/{status_id}"))
+            .header(header::HOST, BASE)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(fetched.status, StatusCode::NOT_FOUND);
+    let media = get_media(&h, &token, &media_id).await;
+    assert_eq!(media.status, StatusCode::NOT_FOUND, "body: {}", media.body);
+}
+
+#[tokio::test]
+async fn a_binary_the_member_put_themselves_survives_the_delete() {
+    // The composer minted the post's media; a member's own binary linked from
+    // a hand-composed note is the member's (ADR 0017). It survives the post.
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+    let session = a_session(&h, alice).await;
+
+    let media_id = upload(&h, &token, None).await;
+    let local_id = media_id.split_at(26).0.to_string();
+    let minted = format!("https://alice.brolly.test/~/media/{local_id}");
+
+    // The member's own binary, PUT into their pod directly — setup through
+    // the pod, not through the code under test, in the acl_control.rs
+    // tradition.
+    let own = "https://alice.brolly.test/~/photos/dog.png";
+    let pod = h.stores.pod(alice).unwrap();
+    let digest = h.stores.blobs(alice).unwrap().put(b"PNG-BYTES").unwrap();
+    pod.write(|w| {
+        w.put(
+            own,
+            brolly_store::resources::Content::Binary(brolly_store::resources::BlobMeta {
+                digest,
+                media_type: "image/png".into(),
+                byte_size: 9,
+            }),
+        )?;
+        // A `.meta` of the member's own, so its survival is asserted too,
+        // not just the binary's.
+        let meta = format!("{own}.meta");
+        let quads = [oxigraph::model::Quad::new(
+            oxigraph::model::NamedOrBlankNode::NamedNode(
+                oxigraph::model::NamedNode::new_unchecked(own),
+            ),
+            oxigraph::model::NamedNode::new_unchecked("https://brolly.id/ns#altText"),
+            oxigraph::model::Term::Literal(oxigraph::model::Literal::new_simple_literal("my dog")),
+            oxigraph::model::GraphName::NamedNode(oxigraph::model::NamedNode::new_unchecked(&meta)),
+        )];
+        w.put(&meta, brolly_store::resources::Content::Auxiliary(&quads))
+    })
+    .unwrap();
+
+    let attachments = json!([
+        {"type": "Document", "mediaType": "image/png", "url": minted},
+        {"type": "Document", "mediaType": "image/png", "url": own},
+    ]);
+    let (activity_iri, note_iri) = publish_outbox(
+        &h,
+        &session,
+        json!(["https://www.w3.org/ns/activitystreams#Public"]),
+        json!([]),
+        attachments,
+    )
+    .await;
+    // A minted medium linked from a hand-composed note is still the post's.
+    assert_author_grant(&h, alice, &minted);
+
+    // The outbox-minted note id, as a Mastodon status id: the note id is the
+    // status id's first half (ADR 0015).
+    let note_id = note_iri.rsplit('/').next().unwrap().to_string();
+    let status_id = brolly_mastodon::status_id::encode(&note_id, alice).unwrap();
+
+    let deleted = send(
+        &h,
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/statuses/{status_id}"))
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::OK, "body: {}", deleted.body);
+
+    let survives = pod
+        .read(|r| {
+            Ok((
+                r.meta(own)?.is_some(),
+                r.meta(&format!("{own}.meta"))?.is_some(),
+                r.meta(&minted)?.is_some(),
+                r.meta(&note_iri)?.is_some(),
+                r.meta(&activity_iri)?.is_some(),
+            ))
+        })
+        .unwrap();
+    assert_eq!(
+        survives,
+        (true, true, false, false, false),
+        "the member's own binary went with the post, or the post's resources survived it"
+    );
+}
+
+#[tokio::test]
+async fn deleting_someone_elses_status_is_not_found() {
+    // Mastodon's semantics: a 403 would confirm it exists.
+    let h = harness().await;
+    let (_, alice) = a_member(&h, "alice").await;
+    let (_, mallory) = a_member(&h, "mallory").await;
+
+    let created = post_form(&h, "/api/v1/statuses", "status=hello", &alice).await;
+    let status_id = created.json()["id"].as_str().unwrap().to_string();
+
+    let deleted = send(
+        &h,
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/api/v1/statuses/{status_id}"))
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {mallory}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn deleting_an_unknown_status_is_not_found() {
+    let h = harness().await;
+    let (_, token) = a_member(&h, "alice").await;
+
+    let deleted = send(
+        &h,
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/statuses/not-a-real-id")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn deleting_requires_a_write_scope() {
+    let h = harness().await;
+    let user = db::create_user(&h.db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let app = brolly_mastodon::oauth::register_app(
+        &h.db.pool,
+        "Reader",
+        &["https://app.example/cb".into()],
+        "read",
+        None,
+    )
+    .await
+    .unwrap();
+    let token =
+        brolly_mastodon::oauth::issue_token(&h.db.pool, &app.app.client_id, user.id, "read")
+            .await
+            .unwrap();
+
+    let deleted = send(
+        &h,
+        Request::builder()
+            .method("DELETE")
+            .uri("/api/v1/statuses/whatever")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(deleted.status, StatusCode::FORBIDDEN);
 }

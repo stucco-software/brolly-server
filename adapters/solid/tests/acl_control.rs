@@ -700,3 +700,152 @@ fn an_empty_acl_governs_and_grants_nothing() {
         Err(LdpError::Denied)
     ));
 }
+
+// --- read access follows the publication (spec 4, H5, ADR 0017) -----------------
+
+/// The composer's ACL shape, exactly as `outbox::write_acl` writes it: the
+/// author (Read, Write, Control) plus one audience grant. Written here in the
+/// test rather than published through the composer, which lives a crate over
+/// in the server — what this file pins is the WAC-level behaviour the shape
+/// depends on.
+fn composer_acl(resource: &str, author: &str, audience: &[Quad]) -> Vec<Quad> {
+    let acl = format!("{resource}.acl");
+    let owner = format!("{acl}#owner");
+    let mut quads = vec![
+        t(&acl, &owner, &format!("{ACL}accessTo"), resource),
+        t(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&acl, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        t(
+            &acl,
+            &owner,
+            &format!("{ACL}mode"),
+            &format!("{ACL}Control"),
+        ),
+        t(&acl, &owner, &format!("{ACL}agent"), author),
+    ];
+    quads.extend_from_slice(audience);
+    quads
+}
+
+/// The audience grant of a public post: `foaf:Agent`, Read.
+fn public_audience(resource: &str) -> Vec<Quad> {
+    let acl = format!("{resource}.acl");
+    let auth = format!("{acl}#read-0");
+    vec![
+        t(&acl, &auth, &format!("{ACL}accessTo"), resource),
+        t(&acl, &auth, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(
+            &acl,
+            &auth,
+            &format!("{ACL}agentClass"),
+            "http://xmlns.com/foaf/0.1/Agent",
+        ),
+    ]
+}
+
+#[test]
+fn a_composer_shaped_acl_governs_the_resource_alone() {
+    // The exclusion fact the author grant rides on: once the resource has its
+    // own ACL, it alone decides, and the ancestor's broader default does not
+    // reach through. Bob holds Read and Write on everything under /~/shared/
+    // by `acl:default`; the medium inside with its own ACL grants him nothing,
+    // and his write on it is denied.
+    let (_m, _d, store) = shared_pod();
+    let medium = format!("{ROOT}shared/medium");
+    store
+        .write(|w| {
+            w.put(&medium, Content::Rdf(&[]))?;
+            let acl = composer_acl(&medium, ALICE, &[]);
+            w.put(&format!("{medium}.acl"), Content::Auxiliary(&acl))
+        })
+        .unwrap();
+
+    assert!(
+        !ldp::granted_modes(&store.read_store(), BASE, "/~/shared/medium", &bob())
+            .contains(&AccessMode::Write),
+        "the container's default reached through the medium's own ACL"
+    );
+    assert!(matches!(
+        ldp::put(
+            &store,
+            None,
+            BASE,
+            "/~/shared/medium",
+            &bob(),
+            NOTE,
+            "text/turtle",
+            ROOT,
+        ),
+        Err(LdpError::Denied)
+    ));
+    // The author, meanwhile, holds everything the ACL names — Read, Write,
+    // and Control, which is the mode the member fixes access with.
+    let granted = ldp::granted_modes(&store.read_store(), BASE, "/~/shared/medium", &alice());
+    for mode in [AccessMode::Read, AccessMode::Write, AccessMode::Control] {
+        assert!(granted.contains(&mode), "the author lacks {mode:?}");
+    }
+}
+
+#[test]
+fn an_audience_only_acl_locks_the_author_out() {
+    // The hole the author grant closes: an ACL with the audience's grant and
+    // no author grant leaves the author — who holds Read, Write and Control
+    // on the whole pod through the root's `acl:default` — with nothing on
+    // their own resource. The audience reads; the author cannot even fix the
+    // ACL, because Control went with the exclusion.
+    let (_m, _d, store) = pod();
+    let medium = format!("{ROOT}medium");
+    store
+        .write(|w| {
+            w.put(&medium, Content::Rdf(&[]))?;
+            let acl = public_audience(&medium);
+            w.put(&format!("{medium}.acl"), Content::Auxiliary(&acl))
+        })
+        .unwrap();
+
+    // The audience reads, anonymously even.
+    assert!(
+        ldp::granted_modes(
+            &store.read_store(),
+            BASE,
+            "/~/medium",
+            &Subject::anonymous()
+        )
+        .contains(&AccessMode::Read),
+        "the public audience does not read"
+    );
+    // The author: Read as one foaf:Agent among many, and nothing else — not
+    // Write, not Control.
+    let granted = ldp::granted_modes(&store.read_store(), BASE, "/~/medium", &alice());
+    assert_eq!(
+        granted,
+        vec![AccessMode::Read],
+        "the author kept more than Read"
+    );
+    assert!(matches!(
+        ldp::put(
+            &store,
+            None,
+            BASE,
+            "/~/medium",
+            &alice(),
+            NOTE,
+            "text/turtle",
+            ROOT,
+        ),
+        Err(LdpError::Denied)
+    ));
+    assert!(matches!(
+        ldp::put(
+            &store,
+            None,
+            BASE,
+            "/~/medium.acl",
+            &alice(),
+            b"",
+            "text/turtle",
+            ROOT,
+        ),
+        Err(LdpError::Denied)
+    ));
+}
