@@ -230,6 +230,38 @@ async fn the_actor_name_comes_from_the_pod() {
 }
 
 #[tokio::test]
+async fn the_actor_icon_comes_from_the_pod() {
+    // H6 (spec 4): the depiction triple on the WebID is the one avatar
+    // mechanism, and the actor document is one of the surfaces that renders
+    // it — the same projection as the name, one field over. The IRI is
+    // emitted with no access check: a pointer, not bytes, and public read on
+    // the target is the member's `.acl` call, not the actor's.
+    let h = harness().await;
+    let bare = get(&h, ALICE_HOST, "/actor", Some(AS2)).await.json();
+    assert!(bare.get("icon").is_none(), "no triple, no icon");
+
+    let pod = h.stores.pod(h.alice).unwrap();
+    let target = "https://alice.brolly.test/~/media/01J5ZP7WQC5V1TQ3M8BRFNV8HA";
+    pod.write(|w| {
+        w.insert(&[oxigraph::model::Quad::new(
+            oxigraph::model::NamedOrBlankNode::NamedNode(
+                oxigraph::model::NamedNode::new_unchecked("https://alice.brolly.test/profile#me"),
+            ),
+            oxigraph::model::NamedNode::new_unchecked(brolly_domain::vocab::FOAF_DEPICTION),
+            oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new_unchecked(target)),
+            oxigraph::model::GraphName::NamedNode(oxigraph::model::NamedNode::new_unchecked(
+                "https://alice.brolly.test/profile",
+            )),
+        )])
+    })
+    .unwrap();
+
+    let actor = get(&h, ALICE_HOST, "/actor", Some(AS2)).await.json();
+    assert_eq!(actor["icon"]["type"], "Image");
+    assert_eq!(actor["icon"]["url"], target);
+}
+
+#[tokio::test]
 async fn an_unknown_member_has_no_actor() {
     let h = harness().await;
     let reply = get(&h, "nobody.brolly.test", "/actor", Some(AS2)).await;

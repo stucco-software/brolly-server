@@ -380,6 +380,17 @@ textarea { width: 100%; }
 /* --- member dashboard --------------------------------------------------- */
 .dashboard { max-width: var(--grid-max-width); }
 
+/* The WebID profile page's depiction (spec 4, H6): a face beside the name,
+   bounded whatever the member uploaded — the reset's `max-width: 100%` alone
+   would let a 4000px photograph push the page around. */
+.dashboard > .depiction {
+  inline-size: var(--sp-3);
+  block-size: var(--sp-3);
+  border-radius: var(--radius);
+  margin-block-end: var(--sp--1);
+  object-fit: cover;
+}
+
 /* A hairline under the whole strip, so the current tab's heavy rule is the
    thing that reads — the same weight brolly.id gives its other underlines. */
 .dashboard-tabs {

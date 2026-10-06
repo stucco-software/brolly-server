@@ -1171,6 +1171,145 @@ async fn the_members_own_triples_are_still_there() {
     assert!(body.contains("oidcIssuer"), "got: {body}");
 }
 
+// --- the WebID profile document: the depiction (spec 4, H6) -------------------
+
+/// Write `<me> foaf:depiction <target>` into the profile graph, the way a
+/// member's Solid client would with a `PATCH` on `/profile`. The write side of
+/// the avatar mechanism is stage 6's and already built; the page under test
+/// here is the read.
+fn depict(h: &Harness, target: &str) {
+    let pod = h.stores.pod(h.user).unwrap();
+    pod.write(|w| {
+        w.insert(&[t(
+            &format!("{BASE}/profile"),
+            &format!("{BASE}/profile#me"),
+            brolly_domain::vocab::FOAF_DEPICTION,
+            target,
+        )])
+    })
+    .unwrap();
+}
+
+/// A caller who can read the target sees the depiction; a caller who cannot
+/// sees the page without it. H6 (spec 4): the page is the one surface that
+/// embeds the bytes' fetch in a page it serves, so it is the one surface that
+/// checks — the JSON surfaces emit the IRI unchecked, because a pointer leaks
+/// a path, not bytes.
+#[tokio::test]
+async fn the_profile_page_renders_the_depiction_only_to_a_caller_who_can_read_it() {
+    let h = harness().await;
+    // A private binary: PUT as the owner, granted to nobody — the root's
+    // `acl:default` is the only ACL that reaches it.
+    h.send(
+        "PUT",
+        "/~/photos/me.png",
+        Some(("image/png", "PNG-BYTES")),
+        true,
+    )
+    .await;
+    let target = format!("{ROOT}photos/me.png");
+    depict(&h, &target);
+
+    // The owner: the page renders the depiction.
+    let (status, body, _) = run(
+        h.router.clone(),
+        conditional_request(
+            "GET",
+            "/profile",
+            None,
+            Some(&h.session),
+            &[(header::ACCEPT.as_str(), "text/html")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+    assert!(
+        body.contains(&target),
+        "the owner's page lost the depiction: {body}"
+    );
+
+    // Anonymous: the page renders, the depiction does not.
+    let (status, body, _) = run(
+        h.router.clone(),
+        conditional_request(
+            "GET",
+            "/profile",
+            None,
+            None,
+            &[(header::ACCEPT.as_str(), "text/html")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "the page itself is public: {body}");
+    assert!(
+        !body.contains(&target),
+        "the depiction leaked to anonymous: {body}"
+    );
+    assert!(
+        !body.contains("<img"),
+        "an anonymous page renders no image at all: {body}"
+    );
+}
+
+/// The other half of H6's rule: a depiction the *world* can read renders for
+/// an anonymous caller. The public target is a public post's medium — the
+/// composer's ACL (spec 4, H5), chunk 3's substrate — rather than a
+/// hand-built grant, so the page is tested against the access the rest of the
+/// server actually produces.
+#[tokio::test]
+async fn the_profile_page_renders_a_public_depiction_to_anonymous_callers() {
+    let h = harness().await;
+    // A medium at the composer's minting ground: PUT the binary there, then
+    // publish a public note that carries it, and the composer grants the
+    // world Read on it in the same write as the publication.
+    let local = brolly_mastodon::status_id::new_note_id(1_724_000_000_000, [7; 10]);
+    h.send(
+        "PUT",
+        &format!("/~/media/{local}"),
+        Some(("image/png", "PNG-BYTES")),
+        true,
+    )
+    .await;
+    let note = serde_json::json!({
+        "type": "Note",
+        "content": "hello",
+        "to": ["https://www.w3.org/ns/activitystreams#Public"],
+        "attachment": [{"type": "Document", "mediaType": "image/png", "url": format!("{ROOT}media/{local}")}],
+    });
+    let (status, _, _) = run(
+        h.router.clone(),
+        conditional_request(
+            "POST",
+            "/outbox",
+            Some(("application/json", &note.to_string())),
+            Some(&h.session),
+            &[],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "the publication failed");
+
+    let target = format!("{ROOT}media/{local}");
+    depict(&h, &target);
+
+    let (status, body, _) = run(
+        h.router.clone(),
+        conditional_request(
+            "GET",
+            "/profile",
+            None,
+            None,
+            &[(header::ACCEPT.as_str(), "text/html")],
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got: {body}");
+    assert!(
+        body.contains(&target),
+        "a world-readable depiction did not render for anonymous: {body}"
+    );
+}
+
 // --- the WebID profile document: writing (spec 6, H1) -------------------------
 
 /// The profile graph's IRIs, for the write tests.

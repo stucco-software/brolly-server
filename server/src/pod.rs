@@ -150,7 +150,12 @@ pub(crate) struct Caller {
 impl Caller {
     /// Nobody in particular. WAC decides whether that is enough, so a public
     /// resource is readable without a credential.
-    fn anonymous() -> Caller {
+    ///
+    /// `pub(crate)` because the profile page degrades an unverifiable caller
+    /// to it for its depiction check (spec 4, H6): the page itself is public
+    /// and stays public, so a credential that does not verify is checked as
+    /// the anonymous caller it effectively is rather than failing the page.
+    pub(crate) fn anonymous() -> Caller {
         Caller {
             subject: Subject::anonymous(),
             authenticated: false,

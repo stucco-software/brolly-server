@@ -381,6 +381,7 @@ mod tests {
                 bot: false,
                 discoverable: true,
                 created_at: String::new(),
+                avatar: None,
             };
             let status = crate::translate::status(&note, &author, "brolly.test");
             assert_eq!(

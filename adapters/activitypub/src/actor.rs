@@ -57,12 +57,20 @@ pub struct Flags {
 /// Every collection is on the member's own host. An `inbox` on the apex would
 /// route their private delivery to the shared inbox, where the instance
 /// processor — not the member's — would handle it.
+///
+/// `icon` is the member's `foaf:depiction` target (spec 4, H6), emitted with
+/// no access check: a pointer, not bytes, and the fetch of it answers to the
+/// target's own ACL. An `Image` object because that is the shape every
+/// ActivityPub client reads an icon out of; the IRI is in `url`, and no
+/// `mediaType` is invented — the profile triple does not carry one, and
+/// guessing would be a lie the client renders.
 pub fn person(
     username: &str,
     base_domain: &str,
     public_key_pem: &str,
     name: &str,
     summary: &str,
+    icon: Option<&str>,
     flags: Flags,
 ) -> Value {
     use brolly_identity::webid;
@@ -99,6 +107,12 @@ pub fn person(
     }
     if !summary.trim().is_empty() {
         document["summary"] = json!(summary);
+    }
+    // Absent for the same reason as the name: a client that finds no `icon`
+    // renders its own placeholder, where an empty one renders as a broken
+    // image.
+    if let Some(icon) = icon {
+        document["icon"] = json!({"type": "Image", "url": icon});
     }
     document
 }
@@ -218,7 +232,7 @@ mod tests {
 
     #[test]
     fn a_persons_collections_are_all_on_their_own_host() {
-        let actor = person("alice", BASE, PEM, "", "", Flags::default());
+        let actor = person("alice", BASE, PEM, "", "", None, Flags::default());
         for field in ["id", "inbox", "outbox", "followers", "following"] {
             let value = actor[field].as_str().expect(field);
             assert!(
@@ -230,7 +244,7 @@ mod tests {
 
     #[test]
     fn the_shared_inbox_is_the_instances_and_the_personal_one_is_not() {
-        let actor = person("alice", BASE, PEM, "", "", Flags::default());
+        let actor = person("alice", BASE, PEM, "", "", None, Flags::default());
         assert_eq!(actor["inbox"], "https://alice.brolly.id/inbox");
         assert_eq!(
             actor["endpoints"]["sharedInbox"], "https://brolly.id/inbox",
@@ -242,7 +256,7 @@ mod tests {
     fn an_empty_name_is_omitted_rather_than_blank() {
         // `"name": ""` renders as an empty display name; a missing one falls
         // back to the username.
-        let actor = person("alice", BASE, PEM, "", "", Flags::default());
+        let actor = person("alice", BASE, PEM, "", "", None, Flags::default());
         assert!(actor.get("name").is_none());
         assert!(actor.get("summary").is_none());
 
@@ -252,6 +266,7 @@ mod tests {
             PEM,
             "Alice Example",
             "Hello",
+            None,
             Flags::default(),
         );
         assert_eq!(named["name"], "Alice Example");
@@ -259,8 +274,34 @@ mod tests {
     }
 
     #[test]
+    fn the_icon_is_the_depiction_iri_and_absent_without_one() {
+        // H6 (spec 4): the actor's icon is the member's `foaf:depiction`
+        // target, and absent without one — a missing `icon` renders the
+        // client's own placeholder, where an empty one renders a broken
+        // image. An `Image` object because that is the shape every
+        // ActivityPub client reads an icon out of.
+        let bare = person("alice", BASE, PEM, "", "", None, Flags::default());
+        assert!(bare.get("icon").is_none());
+
+        let depicted = person(
+            "alice",
+            BASE,
+            PEM,
+            "",
+            "",
+            Some("https://alice.brolly.id/~/media/01J5ZP7WQC5V1TQ3M8BRFNV8HA"),
+            Flags::default(),
+        );
+        assert_eq!(depicted["icon"]["type"], "Image");
+        assert_eq!(
+            depicted["icon"]["url"],
+            "https://alice.brolly.id/~/media/01J5ZP7WQC5V1TQ3M8BRFNV8HA"
+        );
+    }
+
+    #[test]
     fn the_security_context_is_present_so_the_key_survives_processing() {
-        let actor = person("alice", BASE, PEM, "", "", Flags::default());
+        let actor = person("alice", BASE, PEM, "", "", None, Flags::default());
         let context = actor["@context"].to_string();
         assert!(context.contains("activitystreams"));
         assert!(
@@ -271,7 +312,7 @@ mod tests {
 
     #[test]
     fn the_key_id_is_the_actor_with_a_main_key_fragment() {
-        let actor = person("alice", BASE, PEM, "", "", Flags::default());
+        let actor = person("alice", BASE, PEM, "", "", None, Flags::default());
         assert_eq!(
             actor["publicKey"]["id"],
             "https://alice.brolly.id/actor#main-key"
@@ -289,6 +330,7 @@ mod tests {
             PEM,
             "",
             "",
+            None,
             Flags {
                 locked: true,
                 ..Default::default()
@@ -305,6 +347,7 @@ mod tests {
             PEM,
             "",
             "",
+            None,
             Flags {
                 bot: true,
                 ..Default::default()

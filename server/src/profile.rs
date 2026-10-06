@@ -23,6 +23,7 @@ use askama::Template;
 use axum::extract::State;
 use axum::http::{HeaderMap, Method, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use brolly_authz::AccessMode;
 use brolly_domain::syntax;
 use brolly_identity::db::User;
 use brolly_identity::{extract, routing, webid};
@@ -130,13 +131,21 @@ struct ProfileDocument<'a> {
     issuer: &'a str,
     display_name: &'a str,
     bio: &'a str,
+    /// The `foaf:depiction` target (spec 4, H6), already filtered to what the
+    /// requesting caller can read — `None` renders nothing, and the template
+    /// has no say in the decision.
+    depiction: Option<&'a str>,
 }
 
 /// `GET /profile` on a member subdomain.
 ///
 /// Apex has no profile — the instance's own identity is an actor, not a person
 /// — so it 404s there rather than inventing one.
-pub async fn profile_document(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn profile_document(
+    State(state): State<AppState>,
+    method: Method,
+    headers: HeaderMap,
+) -> Response {
     let (user, pod, id) = match member(&state, &headers).await {
         Ok(member) => member,
         Err(response) => return response,
@@ -148,7 +157,7 @@ pub async fn profile_document(State(state): State<AppState>, headers: HeaderMap)
 
     let accept = headers.get(header::ACCEPT).and_then(|h| h.to_str().ok());
     if wants_html(accept) {
-        return html(&state, &user, &id, &issuer, &pod);
+        return html(&state, &user, &id, &issuer, &pod, &headers, &method).await;
     }
 
     let quads = graph::document(
@@ -270,14 +279,44 @@ pub async fn patch_document(
     }
 }
 
-fn html(
+/// The profile page (HTML), with the depiction rendered only for a caller who
+/// can read its target (spec 4, H6).
+///
+/// This is the one surface that embeds the bytes' fetch in a page it serves,
+/// so it is the one surface that checks: the JSON surfaces emit the IRI with
+/// no access check at all, because a pointer leaks a path, not bytes — and
+/// the RDF branch of this same URL serves the member's triples, depiction
+/// included, to whoever asks. The page still does not serve the bytes itself;
+/// the browser's own fetch of the `img` is the pod's `GET`, WAC and all. The
+/// check is the page declining to point at what its caller cannot have.
+async fn html(
     state: &AppState,
     user: &User,
     id: &Identity,
     issuer: &str,
     pod: &brolly_store::resources::Pod,
+    headers: &HeaderMap,
+    method: &Method,
 ) -> Response {
-    let profile = brolly_solid::profile::read(&pod.read_store(), &id.webid, &id.document);
+    let read = pod.read_store();
+    let profile = brolly_solid::profile::read(&read, &id.webid, &id.document);
+
+    // H6: "public read on the depiction target is the member's call", so the
+    // caller is resolved for the check alone — the page is public and stays
+    // public. A credential that does not verify degrades to the anonymous
+    // caller rather than failing the page: the RDF branch serves anyone, the
+    // credential here only ever *adds* the depiction, and anonymous renders
+    // only what the world can read. The bytes are not at stake either way;
+    // their fetch is the pod's own `GET`.
+    let caller = crate::pod::subject_for(state, headers, method, &id.document)
+        .await
+        .unwrap_or_else(|refused| {
+            tracing::debug!(?refused, "the profile page's caller did not verify");
+            crate::pod::Caller::anonymous()
+        });
+    let depiction = brolly_solid::profile::depiction(&read, &id.webid, &id.document)
+        .filter(|target| reads_target(pod, &id.storage_root, target, &caller.subject));
+
     render(&ProfileDocument {
         chrome: state.chrome(),
         username: &user.username,
@@ -286,7 +325,37 @@ fn html(
         issuer,
         display_name: &profile.display_name,
         bio: &profile.bio,
+        depiction: depiction.as_deref(),
     })
+}
+
+/// H6 (spec 4): can `subject` read `target`, as this pod's own `GET` of the
+/// target would decide?
+///
+/// The same evaluation the pod surface takes — `ldp::granted_modes` walks the
+/// target's ACL chain inside one read snapshot, so the page and a direct fetch
+/// of the target can never disagree about who reads what. The target must be
+/// in this pod's storage: `foaf:depiction` points at "any pod binary", and a
+/// target elsewhere — another member's pod, a remote IRI, a protocol route on
+/// this host — is not this pod's to evaluate. Unevaluable does not render,
+/// which is the same answer the browser's fetch of it would get from the
+/// default-deny; a member who wants a cross-pod avatar publishes it with the
+/// target's own `.acl`, on the pod that holds it.
+fn reads_target(
+    pod: &brolly_store::resources::Pod,
+    storage_root: &str,
+    target: &str,
+    subject: &brolly_identity::Subject,
+) -> bool {
+    let Some(rest) = target.strip_prefix(storage_root) else {
+        return false;
+    };
+    let base = storage_root.strip_suffix("/~/").unwrap_or(storage_root);
+    let path = format!("/~/{rest}");
+    pod.read(|r| {
+        Ok(brolly_solid::ldp::granted_modes(r, base, &path, subject).contains(&AccessMode::Read))
+    })
+    .unwrap_or(false)
 }
 
 fn not_found() -> Response {

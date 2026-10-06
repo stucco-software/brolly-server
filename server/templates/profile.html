@@ -21,6 +21,9 @@
   <main id="main" class="shell-main">
     <div class="wrap">
       <div class="dashboard">
+        {# H6 (spec 4): the depiction, already filtered to what this caller can
+           read — the handler decides, the template only renders. #}
+        {% if let Some(depiction) = depiction %}<img class="depiction" src="{{ depiction }}" alt="{{ username }}">{% endif %}
         <h1>{% if display_name.is_empty() %}@{{ username }}{% else %}{{ display_name }}{% endif %}</h1>
 
         {% if !bio.is_empty() %}<p class="lede">{{ bio }}</p>{% endif %}

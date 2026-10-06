@@ -36,6 +36,7 @@ fn author() -> Author {
         bot: false,
         discoverable: true,
         created_at: "2026-01-01T00:00:00Z".into(),
+        avatar: None,
     }
 }
 
@@ -277,6 +278,29 @@ fn an_account_carries_the_flags_that_change_client_behaviour() {
     );
     assert_eq!(account["bot"], true);
     assert_eq!(account["discoverable"], false);
+}
+
+#[test]
+fn the_avatar_is_the_depiction_iri_and_null_without_one() {
+    // H6 (spec 4): `avatar`/`avatar_static` carry the `foaf:depiction` target
+    // when the profile holds one, null when it doesn't. Emitted with no access
+    // check: the IRI is a pointer, not bytes, and which pointers are public is
+    // the member's `.acl` call to make — a private upload is a valid avatar
+    // for a private audience, and the projection deciding otherwise is the
+    // privacy decision the spec says the server must not make.
+    let account = translate::account(&author(), BASE);
+    assert!(account["avatar"].is_null(), "no triple, no avatar");
+    assert!(account["avatar_static"].is_null());
+
+    let mut author = author();
+    author.avatar = Some("https://alice.brolly.test/~/media/01J5ZP7WQC5V1TQ3M8BRFNV8HA".into());
+    let account = translate::account(&author, BASE);
+    assert_eq!(
+        account["avatar"],
+        "https://alice.brolly.test/~/media/01J5ZP7WQC5V1TQ3M8BRFNV8HA"
+    );
+    // The same IRI, not a second copy: we serve originals.
+    assert_eq!(account["avatar_static"], account["avatar"]);
 }
 
 #[test]

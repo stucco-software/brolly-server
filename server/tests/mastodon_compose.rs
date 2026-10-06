@@ -1372,3 +1372,153 @@ async fn deleting_requires_a_write_scope() {
     .await;
     assert_eq!(deleted.status, StatusCode::FORBIDDEN);
 }
+
+// --- the avatar is a depiction (spec 4, H6) -----------------------------------
+
+/// Write `<me> foaf:depiction <target>` into the profile graph, the way a
+/// member's Solid client would with a `PATCH` on `/profile` — the write side
+/// of the avatar mechanism, which is stage 6's and already built; these tests
+/// are the reads.
+fn depict(h: &Harness, user: uuid::Uuid, target: &str) {
+    let pod = h.stores.pod(user).unwrap();
+    pod.write(|w| {
+        w.insert(&[oxigraph::model::Quad::new(
+            oxigraph::model::NamedOrBlankNode::NamedNode(
+                oxigraph::model::NamedNode::new_unchecked("https://alice.brolly.test/profile#me"),
+            ),
+            oxigraph::model::NamedNode::new_unchecked(brolly_domain::vocab::FOAF_DEPICTION),
+            oxigraph::model::Term::NamedNode(oxigraph::model::NamedNode::new_unchecked(target)),
+            oxigraph::model::GraphName::NamedNode(oxigraph::model::NamedNode::new_unchecked(
+                "https://alice.brolly.test/profile",
+            )),
+        )])
+    })
+    .unwrap();
+}
+
+#[tokio::test]
+async fn the_account_jsons_avatar_is_the_depiction_iri() {
+    // H6 (spec 4): the account JSON resolves the depiction triple and emits
+    // the target IRI — with no access check. The target here is a *private*
+    // upload, never posted, so the only ACL on it is the author's own: a
+    // private avatar is a valid avatar for a private audience, and the JSON
+    // saying otherwise would be the server guessing privacy on the member's
+    // behalf. The bytes stay WAC-guarded at their own address; the JSON leaks
+    // a path, not bytes.
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+
+    let account = send(
+        &h,
+        Request::builder()
+            .uri("/api/v1/accounts/verify_credentials")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(account.status, StatusCode::OK, "body: {}", account.body);
+    assert!(account.json()["avatar"].is_null(), "no triple, no avatar");
+    assert!(account.json()["avatar_static"].is_null());
+
+    let media_id = upload(&h, &token, None).await;
+    let local_id = media_id.split_at(26).0.to_string();
+    let target = format!("https://alice.brolly.test/~/media/{local_id}");
+    depict(&h, alice, &target);
+
+    let account = send(
+        &h,
+        Request::builder()
+            .uri("/api/v1/accounts/verify_credentials")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(account.status, StatusCode::OK, "body: {}", account.body);
+    assert_eq!(account.json()["avatar"], target);
+    // The same IRI, not a second copy: we serve originals.
+    assert_eq!(account.json()["avatar_static"], target);
+}
+
+#[tokio::test]
+async fn writing_the_depiction_triple_grants_nothing_on_the_target() {
+    // H6 (spec 4): "no auto-grant on writing the triple". Public read on the
+    // depiction target is the member's call, made with an `.acl` — the server
+    // guessing which uploads are meant to be public is the privacy decision it
+    // must not make. So the write leaves the target's access exactly as it
+    // found it: a private upload stays owner-only (anonymous bytes still
+    // 401), and a public post's medium keeps the composer's grant — nothing
+    // added, nothing widened.
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+
+    // A private upload: never posted, so nothing but the author's root grant.
+    let private_id = upload(&h, &token, None).await;
+    let private_iri = format!(
+        "https://alice.brolly.test/~/media/{}",
+        private_id.split_at(26).0
+    );
+
+    // A public post's medium: the composer grants the world Read (spec 4, H5).
+    let public_id = upload(&h, &token, None).await;
+    let public_iri = format!(
+        "https://alice.brolly.test/~/media/{}",
+        public_id.split_at(26).0
+    );
+    let created = post_form(
+        &h,
+        "/api/v1/statuses",
+        &format!("status=look&media_ids[]={public_id}&visibility=public"),
+        &token,
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "body: {}", created.body);
+
+    let before = |resource: &str| -> std::collections::BTreeSet<String> {
+        acl_quads(&h, alice, resource)
+            .iter()
+            .map(|q| q.to_string())
+            .collect()
+    };
+    let private_before = before(&private_iri);
+    let public_before = before(&public_iri);
+    assert!(
+        public_before.iter().any(|q| q.contains("agentClass")),
+        "the public medium must start out public, or the test proves nothing"
+    );
+
+    // The member's call: point the profile at the private upload.
+    depict(&h, alice, &private_iri);
+
+    assert_eq!(
+        before(&private_iri),
+        private_before,
+        "writing the triple changed the private target's ACL"
+    );
+    assert_eq!(
+        before(&public_iri),
+        public_before,
+        "writing the triple changed the public target's ACL"
+    );
+
+    // And at the surface that matters: the private avatar's bytes are still
+    // the author's alone.
+    let fetched = send(
+        &h,
+        Request::builder()
+            .uri(format!("/~/media/{}", private_id.split_at(26).0))
+            .header(header::HOST, "alice.brolly.test")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        fetched.status,
+        StatusCode::UNAUTHORIZED,
+        "the private avatar's bytes were granted to the world: {}",
+        fetched.body
+    );
+}

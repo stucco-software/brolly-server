@@ -29,6 +29,13 @@ pub struct Author {
     pub bot: bool,
     pub discoverable: bool,
     pub created_at: String,
+    /// The member's `foaf:depiction` target, when the profile carries one
+    /// (spec 4, H6). Emitted as-is, with no access check: the IRI is a
+    /// pointer, not bytes, and the fetch of it answers to the target's own
+    /// ACL — public read on the avatar is the member's `.acl` call to make,
+    /// and this projection making it for them is the privacy decision the
+    /// spec says the server must not make.
+    pub avatar: Option<String>,
 }
 
 /// Every spelling of the public collection that can arrive on the wire.
@@ -163,8 +170,13 @@ pub fn account(author: &Author, base_domain: &str) -> Value {
         "note": author.bio,
         "url": format!("https://{username}.{base_domain}/"),
         "uri": brolly_identity::webid::actor(username, base_domain),
-        "avatar": Value::Null,
-        "avatar_static": Value::Null,
+        // H6 (spec 4): the depiction target, null without one. The same IRI
+        // twice because we serve originals — the same reasoning as
+        // `preview_url`: there is no derived copy to point `avatar_static`
+        // at, and a null one shows a broken image where a missing one falls
+        // back.
+        "avatar": author.avatar.clone(),
+        "avatar_static": author.avatar.clone(),
         "header": Value::Null,
         "header_static": Value::Null,
         "locked": author.locked,

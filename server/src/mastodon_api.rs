@@ -84,13 +84,20 @@ async fn authenticated(state: &AppState, headers: &HeaderMap) -> Option<(User, G
 
 /// Build the `Author` the translation layer needs.
 async fn author_for(state: &AppState, user: &User) -> translate::Author {
-    let profile = match state.stores.pod(user.id) {
-        Ok(pod) => brolly_solid::profile::read(
-            &pod.read_store(),
-            &webid::webid(&user.username, &state.base_domain),
-            &webid::profile_document(&user.username, &state.base_domain),
-        ),
-        Err(_) => brolly_solid::profile::Profile::blank(),
+    // The depiction is read beside the profile's own fields (spec 4, H6): it
+    // is member data the profile form does not own, so it never rides in
+    // `Profile` — and the one read of the pod covers both.
+    let (profile, depiction) = match state.stores.pod(user.id) {
+        Ok(pod) => {
+            let read = pod.read_store();
+            let webid = webid::webid(&user.username, &state.base_domain);
+            let document = webid::profile_document(&user.username, &state.base_domain);
+            (
+                brolly_solid::profile::read(&read, &webid, &document),
+                brolly_solid::profile::depiction(&read, &webid, &document),
+            )
+        }
+        Err(_) => (brolly_solid::profile::Profile::blank(), None),
     };
     translate::Author {
         user_id: user.id,
@@ -104,6 +111,9 @@ async fn author_for(state: &AppState, user: &User) -> translate::Author {
         bot: profile.bot,
         discoverable: profile.discoverable,
         created_at: String::new(),
+        // H6: emitted with no access check — the IRI is a pointer, not bytes,
+        // and the bytes stay WAC-guarded at their own address.
+        avatar: depiction,
     }
 }
 

@@ -98,16 +98,23 @@ async fn member_actor(state: &AppState, username: &str) -> Response {
     };
 
     // Name and summary are projected from the pod (D8) — the actor document is
-    // a view of the WebID's triples, never a second copy of them.
-    let profile = match state.stores.pod(user.id) {
-        Ok(pod) => brolly_solid::profile::read(
-            &pod.read_store(),
-            &webid::webid(&user.username, &state.base_domain),
-            &webid::profile_document(&user.username, &state.base_domain),
-        ),
+    // a view of the WebID's triples, never a second copy of them. The icon is
+    // the same projection one protocol over (spec 4, H6): the depiction
+    // target, read beside the profile's own fields because the form does not
+    // own it, emitted with no access check — a pointer, not bytes.
+    let (profile, depiction) = match state.stores.pod(user.id) {
+        Ok(pod) => {
+            let read = pod.read_store();
+            let webid = webid::webid(&user.username, &state.base_domain);
+            let document = webid::profile_document(&user.username, &state.base_domain);
+            (
+                brolly_solid::profile::read(&read, &webid, &document),
+                brolly_solid::profile::depiction(&read, &webid, &document),
+            )
+        }
         Err(e) => {
             tracing::warn!(error = %e, user = %user.id, "pod unavailable; serving actor without profile");
-            brolly_solid::profile::Profile::blank()
+            (brolly_solid::profile::Profile::blank(), None)
         }
     };
 
@@ -119,6 +126,7 @@ async fn member_actor(state: &AppState, username: &str) -> Response {
             &keys.public_key_pem,
             &profile.display_name,
             &profile.bio,
+            depiction.as_deref(),
             actor::Flags {
                 locked: profile.locked,
                 bot: profile.bot,

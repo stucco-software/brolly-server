@@ -62,6 +62,38 @@ pub fn read(store: &impl PodRead, webid: &str, document: &str) -> Profile {
     }
 }
 
+/// The member's `foaf:depiction` target, if the profile carries one (spec 4,
+/// H6).
+///
+/// A read beside [`read`] rather than a field on [`Profile`], and that is
+/// H6's own constraint made structural: the depiction is member data, "the
+/// profile projection does not derive or filter it", and `write` replaces
+/// exactly the predicates the struct owns. A depiction field would either put
+/// the member's triple under the form's writer — every read-modify-write
+/// through the dashboard and `update_credentials` would then re-seat it — or
+/// make the struct a shape its own writer doesn't write. Off the struct, no
+/// round-trip through `Profile` can drop it, and the reads that want it ask
+/// for it by name.
+///
+/// The object must be an IRI: a depiction is a pointer at a pod binary, and a
+/// literal there is not one. `None` rather than a guess — the same refusal as
+/// [`flag`] making no assumption about a value it cannot read.
+pub fn depiction(store: &impl PodRead, webid: &str, document: &str) -> Option<String> {
+    let graph = iri(document);
+    store
+        .quads_for_pattern(
+            Some((&NamedOrBlankNode::NamedNode(iri(webid))).into()),
+            Some(iri(vocab::FOAF_DEPICTION).as_ref()),
+            None,
+            Some(GraphNameRef::NamedNode(graph.as_ref())),
+        )
+        .filter_map(Result::ok)
+        .find_map(|q| match q.object {
+            Term::NamedNode(node) => Some(node.as_str().to_string()),
+            _ => None,
+        })
+}
+
 /// Read a boolean flag, distinguishing "absent" from "false".
 ///
 /// The distinction matters: `discoverable` defaults true when absent, so
