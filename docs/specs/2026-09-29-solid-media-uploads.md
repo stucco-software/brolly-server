@@ -4,11 +4,14 @@
 <!-- The spec names files this stage creates, so not every path it cites
      resolves until it's implemented. -->
 
-**Status:** Draft (2026-09-29), revised after one adversarial review against
-the Solid Protocol, WAC, LDP, ADR 0013, RFC 9110, and the code it cites —
-every claim in the Problem was checked against the tree. Stage 5a and 5b
-were each revised through three passes before approval; this one awaits a
-second.
+**Status:** Implemented, 2026-10-06, in four commits: `fd73f5e` (atomic
+writes and sweeps), `0d430e3` (the media gate), `353f323` (publication
+access and ADR 0017), `8b58883` (the depiction). Drafted 2026-09-29 and
+revised after one adversarial review against the Solid Protocol, WAC, LDP,
+ADR 0013, RFC 9110, and the code it cites — every claim in the Problem was
+checked against the tree. Stage 5a and 5b were each revised through three
+passes before approval; this one was implemented after its first, and the
+close's re-read of every H against the landed tree was its second.
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 4 —
 **re-scoped 2026-09-29 to the Solid half only.** Every upload is one pod
 resource over ADR 0013's store; this stage makes uploads safe (atomic,
@@ -315,7 +318,7 @@ for the public type index, caught here before it was built.
 **Tests whose expectations change:** every binary-PUT test using an
 off-list type moves onto the list or asserts the new 415 (the existing
 `application/pdf` fixtures stay valid — pdf is on the list); the owner-only
-media assertions (`pod_http.rs:601-618`) gain the published-media cases
+media assertions (`pod_http.rs:631-648`) gain the published-media cases
 that now read 200 for the right audiences; the anon-401 binary test keeps
 its 401 for *unpublished* media. `mastodon_compose.rs` gains
 visibility→grant coverage, including "direct to a remote WebID names it in
