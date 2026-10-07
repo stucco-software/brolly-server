@@ -201,10 +201,11 @@ async fn a_member(h: &Harness, username: &str) -> (uuid::Uuid, String) {
 
     let key = brolly_atproto::keys::SigningKey::from_bytes(&private).unwrap();
     let blocks = brolly_atproto::blocks::PodBlocks::new(h.stores.repo_blocks(user.id).unwrap());
-    let root = brolly_atproto::repo::create(blocks, &format!("did:web:{username}.{BASE}"), &key)
-        .await
-        .unwrap();
-    brolly_atproto::state::create(&h.db.pool, user.id, &root.to_string())
+    let (root, genesis_rev) =
+        brolly_atproto::repo::create(blocks, &format!("did:web:{username}.{BASE}"), &key)
+            .await
+            .unwrap();
+    brolly_atproto::state::create(&h.db.pool, user.id, &root.to_string(), &genesis_rev)
         .await
         .unwrap();
 
@@ -865,7 +866,11 @@ async fn the_announcement_chains_to_the_previous_commit() {
         Some(events[0].commit_cid.as_str()),
         "the second commit must name the first"
     );
-    assert!(events[1].rev > events[0].rev, "revisions must advance");
+    // The revs are TIDs, and TID text orders like TID numbers (1, A).
+    assert!(
+        events[1].rev.as_str() > events[0].rev.as_str(),
+        "revisions must advance"
+    );
 }
 
 #[tokio::test]

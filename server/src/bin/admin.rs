@@ -428,7 +428,7 @@ async fn whoami(pool: &sqlx::PgPool, base_domain: &str, args: &[String]) -> Exit
     );
 
     match brolly_atproto::state::load(pool, user.id).await {
-        Ok(Some(state)) => println!("repo       {} (rev {})", state.root_cid, state.rev),
+        Ok(Some(state)) => println!("repo       {} (rev {})", state.root_cid, state.rev.as_str()),
         Ok(None) => println!("repo       (none)"),
         Err(e) => eprintln!("repo       lookup failed: {e}"),
     }

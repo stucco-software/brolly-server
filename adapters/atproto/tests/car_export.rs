@@ -49,7 +49,7 @@ async fn a_repo_with_two_lexicons(
     user: uuid::Uuid,
 ) -> (SigningKey, atrium_repo::Cid) {
     let key = SigningKey::generate();
-    let mut root = repo::create(blocks(manager, user), DID, &key)
+    let (mut root, mut rev) = repo::create(blocks(manager, user), DID, &key)
         .await
         .expect("create");
 
@@ -69,11 +69,19 @@ async fn a_repo_with_two_lexicons(
             }),
         ),
     ] {
-        let (_, next) =
-            repo::put_record(blocks(manager, user), root, &key, collection, rkey, &record)
-                .await
-                .expect("put");
+        let (_, next, minted) = repo::put_record(
+            blocks(manager, user),
+            root,
+            &key,
+            collection,
+            rkey,
+            &record,
+            &rev,
+        )
+        .await
+        .expect("put");
         root = next;
+        rev = minted;
     }
 
     (key, root)
@@ -181,7 +189,7 @@ async fn an_export_of_an_empty_repo_is_still_a_valid_archive() {
     // A member who has never posted must still be able to export.
     let (_dir, manager, user) = fixture();
     let key = SigningKey::generate();
-    let root = repo::create(blocks(&manager, user), DID, &key)
+    let (root, _rev) = repo::create(blocks(&manager, user), DID, &key)
         .await
         .expect("create");
 

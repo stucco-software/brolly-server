@@ -10,13 +10,14 @@
 //! CID is persisted by the caller, because atrium holds a repo open but does
 //! not decide where the pointer to it lives.
 
-use atrium_api::types::string::Did;
+use atrium_api::types::string::{Did, Tid};
 use atrium_repo::{Cid, Repository};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::blocks::PodBlocks;
 use crate::keys::SigningKey;
+use crate::tid;
 
 #[derive(Debug)]
 pub enum RepoError {
@@ -74,9 +75,15 @@ fn did_for(did: &str) -> Result<Did, RepoError> {
 
 /// Create a member's repo and sign its genesis commit.
 ///
-/// Returns the root CID, which the caller persists — that pointer is what makes
-/// the repo findable again, and atrium does not decide where it lives.
-pub async fn create(blocks: PodBlocks, did: &str, key: &SigningKey) -> Result<Cid, RepoError> {
+/// Returns the root CID and the genesis commit's own rev, which the caller
+/// persists together — that pointer is what makes the repo findable again,
+/// and atrium does not decide where it lives. The rev travels with it so the
+/// stored rev is the commit's own from the first row (1, A).
+pub async fn create(
+    blocks: PodBlocks,
+    did: &str,
+    key: &SigningKey,
+) -> Result<(Cid, Tid), RepoError> {
     let builder = Repository::create(blocks, did_for(did)?).await?;
 
     // atrium hands out the bytes and takes back a signature; the private key
@@ -87,10 +94,17 @@ pub async fn create(blocks: PodBlocks, did: &str, key: &SigningKey) -> Result<Ci
         .map_err(|e| RepoError::Signing(e.to_string()))?;
 
     let repo = builder.finalize(signature).await?;
-    Ok(repo.root())
+    Ok((repo.root(), repo.commit().rev()))
 }
 
-/// Write a record, returning `(record CID, new root CID)`.
+/// Write a record, returning `(record CID, new root CID, the commit's rev)`.
+///
+/// The rev is minted to clear `head_rev` — the stored head's — so a retry in
+/// the same millisecond or a clock that stepped backwards still mints forward
+/// (1, A); monotonicity itself is enforced where the head moves (1, C). It is
+/// set on the commit before signing and read back from the signed commit
+/// afterwards, so the rev that is stored and emitted is the commit's own —
+/// one source of truth, not a counter beside it.
 pub async fn put_record<T: Serialize>(
     blocks: PodBlocks,
     root: Cid,
@@ -98,7 +112,8 @@ pub async fn put_record<T: Serialize>(
     collection: &str,
     rkey: &str,
     record: &T,
-) -> Result<(Cid, Cid), RepoError> {
+    head_rev: &Tid,
+) -> Result<(Cid, Cid, Tid), RepoError> {
     let path = record_path(collection, rkey)?;
     let mut repo = Repository::open(blocks, root).await?;
 
@@ -106,7 +121,8 @@ pub async fn put_record<T: Serialize>(
     // have never seen writes exactly like one we have. That is the same
     // property the faithful layer gives the pod side (D7) — no mapping table
     // is a precondition for ingesting the network, not a convenience.
-    let (commit, record_cid) = repo.add_raw(&path, record).await?;
+    let (mut commit, record_cid) = repo.add_raw(&path, record).await?;
+    commit.rev(tid::mint_after(head_rev));
 
     let payload = commit.bytes();
     let signature = key
@@ -114,7 +130,7 @@ pub async fn put_record<T: Serialize>(
         .map_err(|e| RepoError::Signing(e.to_string()))?;
     let new_root = commit.finalize(signature).await?;
 
-    Ok((record_cid, new_root))
+    Ok((record_cid, new_root, repo.commit().rev()))
 }
 
 /// Read a record back.
@@ -129,23 +145,30 @@ pub async fn get_record<T: DeserializeOwned>(
     Ok(repo.get_raw(&path).await?)
 }
 
-/// Remove a record, returning the new root.
+/// Remove a record, returning `(new root CID, the commit's rev)`.
+///
+/// The rev is minted and read back exactly as `put_record` does — one code
+/// path, one source of truth (1, A).
 pub async fn delete_record(
     blocks: PodBlocks,
     root: Cid,
     key: &SigningKey,
     collection: &str,
     rkey: &str,
-) -> Result<Cid, RepoError> {
+    head_rev: &Tid,
+) -> Result<(Cid, Tid), RepoError> {
     let path = record_path(collection, rkey)?;
     let mut repo = Repository::open(blocks, root).await?;
-    let commit = repo.delete_raw(&path).await?;
+    let mut commit = repo.delete_raw(&path).await?;
+    commit.rev(tid::mint_after(head_rev));
 
     let payload = commit.bytes();
     let signature = key
         .sign(&payload)
         .map_err(|e| RepoError::Signing(e.to_string()))?;
-    Ok(commit.finalize(signature).await?)
+    let new_root = commit.finalize(signature).await?;
+
+    Ok((new_root, repo.commit().rev()))
 }
 
 /// Export the repo as a CARv1 archive.
@@ -291,7 +314,7 @@ mod tests {
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
 
-        let root = create(blocks(&manager, user), DID, &key)
+        let (root, _rev) = create(blocks(&manager, user), DID, &key)
             .await
             .expect("create");
         assert!(
@@ -304,20 +327,21 @@ mod tests {
     async fn a_record_written_reads_back_identically() {
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
-        let root = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
         let record = json!({
             "$type": "app.bsky.feed.post",
             "text": "hello atproto",
             "createdAt": "2026-08-26T12:00:00Z",
         });
-        let (_, new_root) = put_record(
+        let (_, new_root, _) = put_record(
             blocks(&manager, user),
             root,
             &key,
             "app.bsky.feed.post",
             "3kaaaaaaaaaaa",
             &record,
+            &genesis,
         )
         .await
         .expect("put");
@@ -339,20 +363,89 @@ mod tests {
         // produced a commit nobody can observe.
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
-        let root = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
-        let (_, new_root) = put_record(
+        let (_, new_root, _) = put_record(
             blocks(&manager, user),
             root,
             &key,
             "app.bsky.feed.post",
             "3kaaaaaaaaaaa",
             &json!({"$type": "app.bsky.feed.post", "text": "one"}),
+            &genesis,
         )
         .await
         .unwrap();
 
         assert_ne!(root, new_root);
+    }
+
+    #[tokio::test]
+    async fn the_stored_rev_is_the_signed_commits_own() {
+        // One source of truth: the rev a write returns is the one the commit
+        // block itself carries, and it clears the head it was minted past
+        // (1, A). A counter invented beside the commits is the divergence this
+        // replaces.
+        let (_dir, manager, user) = fixture();
+        let key = SigningKey::generate();
+        let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
+
+        let (_, new_root, rev) = put_record(
+            blocks(&manager, user),
+            root,
+            &key,
+            "app.bsky.feed.post",
+            "3kaaaaaaaaaaa",
+            &json!({"$type": "app.bsky.feed.post", "text": "one"}),
+            &genesis,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            rev.as_str() > genesis.as_str(),
+            "the commit's rev did not clear the head's: {} -> {}",
+            genesis.as_str(),
+            rev.as_str()
+        );
+
+        // Read back through atrium, from the root alone: the commit block
+        // must carry that same rev.
+        let repo = Repository::open(blocks(&manager, user), new_root)
+            .await
+            .unwrap();
+        assert_eq!(repo.commit().rev(), rev);
+    }
+
+    #[tokio::test]
+    async fn the_rev_mints_forward_across_writes() {
+        // Chained writes, each minted past the previous commit's rev: strictly
+        // increasing, the property the head's `rev <` guard enforces (1, C).
+        let (_dir, manager, user) = fixture();
+        let key = SigningKey::generate();
+        let (mut root, mut rev) = create(blocks(&manager, user), DID, &key).await.unwrap();
+
+        for (n, rkey) in ["3kaaaaaaaaaaa", "3kbbbbbbbbbbb"].iter().enumerate() {
+            let (_, next, minted) = put_record(
+                blocks(&manager, user),
+                root,
+                &key,
+                "app.bsky.feed.post",
+                rkey,
+                &json!({"$type": "app.bsky.feed.post", "text": format!("post {n}")}),
+                &rev,
+            )
+            .await
+            .unwrap();
+            assert!(
+                minted.as_str() > rev.as_str(),
+                "a remint did not clear the previous rev: {} -> {}",
+                rev.as_str(),
+                minted.as_str()
+            );
+            root = next;
+            rev = minted;
+        }
     }
 
     #[tokio::test]
@@ -362,20 +455,21 @@ mod tests {
         // case — it is the same call.
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
-        let root = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
         let record = json!({
             "$type": "site.standard.doc",
             "text": "a wholly unrelated lexicon",
             "nested": {"depth": 2, "list": [1, 2, 3]},
         });
-        let (_, new_root) = put_record(
+        let (_, new_root, _) = put_record(
             blocks(&manager, user),
             root,
             &key,
             "site.standard.doc",
             "3kbbbbbbbbbbb",
             &record,
+            &genesis,
         )
         .await
         .expect("an unmapped lexicon must write");
@@ -395,20 +489,22 @@ mod tests {
     async fn two_records_coexist_and_both_read_back() {
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
-        let mut root = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let (mut root, mut rev) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
         for (n, rkey) in ["3kaaaaaaaaaaa", "3kbbbbbbbbbbb"].iter().enumerate() {
-            let (_, next) = put_record(
+            let (_, next, minted) = put_record(
                 blocks(&manager, user),
                 root,
                 &key,
                 "app.bsky.feed.post",
                 rkey,
                 &json!({"$type": "app.bsky.feed.post", "text": format!("post {n}")}),
+                &rev,
             )
             .await
             .unwrap();
             root = next;
+            rev = minted;
         }
 
         for (n, rkey) in ["3kaaaaaaaaaaa", "3kbbbbbbbbbbb"].iter().enumerate() {
@@ -424,25 +520,27 @@ mod tests {
     async fn a_deleted_record_is_gone_and_the_root_moves() {
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
-        let root = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
-        let (_, with_record) = put_record(
+        let (_, with_record, with_rev) = put_record(
             blocks(&manager, user),
             root,
             &key,
             "app.bsky.feed.post",
             "3kaaaaaaaaaaa",
             &json!({"$type": "app.bsky.feed.post", "text": "delete me"}),
+            &genesis,
         )
         .await
         .unwrap();
 
-        let after = delete_record(
+        let (after, _) = delete_record(
             blocks(&manager, user),
             with_record,
             &key,
             "app.bsky.feed.post",
             "3kaaaaaaaaaaa",
+            &with_rev,
         )
         .await
         .expect("delete");
@@ -463,7 +561,7 @@ mod tests {
     async fn a_missing_record_is_none_rather_than_an_error() {
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
-        let root = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let (root, _) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
         let read: Option<serde_json::Value> = get_record(
             blocks(&manager, user),
@@ -482,14 +580,15 @@ mod tests {
         // the CID and the blocks, the repo is fully recoverable.
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
-        let root = create(blocks(&manager, user), DID, &key).await.unwrap();
-        let (_, root) = put_record(
+        let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let (_, root, _) = put_record(
             blocks(&manager, user),
             root,
             &key,
             "app.bsky.feed.post",
             "3kaaaaaaaaaaa",
             &json!({"$type": "app.bsky.feed.post", "text": "durable"}),
+            &genesis,
         )
         .await
         .unwrap();

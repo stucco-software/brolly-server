@@ -7,6 +7,7 @@
 //! error anyone notices.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use atrium_api::types::string::Tid;
 use brolly_atproto::firehose::{self, Action};
 use brolly_identity::db::MIGRATOR;
 use sqlx::PgPool;
@@ -20,7 +21,7 @@ async fn fresh() -> (brolly_test_support::TestDb, PgPool) {
     (db, pool)
 }
 
-async fn commit(pool: &PgPool, did: &str, n: i64) -> firehose::CommitEvent {
+async fn commit(pool: &PgPool, did: &str, n: i64, rev: &Tid) -> firehose::CommitEvent {
     firehose::record(
         pool,
         did,
@@ -28,13 +29,31 @@ async fn commit(pool: &PgPool, did: &str, n: i64) -> firehose::CommitEvent {
         (n > 1)
             .then(|| format!("bafyreicommit{}", n - 1))
             .as_deref(),
-        n,
+        rev,
         Action::Create,
         &format!("app.bsky.feed.post/3k{n}"),
         Some(&format!("bafyreirecord{n}")),
     )
     .await
     .expect("record")
+}
+
+/// A chain of mints, one per row, so each repo's revs stay strictly
+/// increasing the way real commits' do (1, A).
+struct Revs {
+    current: Tid,
+}
+
+impl Revs {
+    fn new() -> Self {
+        Revs {
+            current: Tid::new("3kaaaaaaaaaaa".into()).expect("a valid TID"),
+        }
+    }
+    fn next(&mut self) -> Tid {
+        self.current = brolly_atproto::tid::mint_after(&self.current);
+        self.current.clone()
+    }
 }
 
 #[tokio::test]
@@ -44,20 +63,46 @@ async fn the_cursor_increases_across_the_whole_instance() {
     // other.
     let (_db, pool) = fresh().await;
 
-    let first = commit(&pool, DID, 1).await;
-    let other = commit(&pool, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", 1).await;
-    let third = commit(&pool, DID, 2).await;
+    let mut alice = Revs::new();
+    let mut bob = Revs::new();
+    let first = commit(&pool, DID, 1, &alice.next()).await;
+    let other = commit(&pool, "did:plc:bbbbbbbbbbbbbbbbbbbbbbbb", 1, &bob.next()).await;
+    let third = commit(&pool, DID, 2, &alice.next()).await;
 
     assert!(first.seq < other.seq, "sequence must span repos");
     assert!(other.seq < third.seq);
 }
 
 #[tokio::test]
+async fn a_repo_events_revs_increase_per_repo() {
+    // A rev is a TID and it is per-repo: a consumer orders a repo's events by
+    // it without reasoning about the global sequence (1, A).
+    let (_db, pool) = fresh().await;
+    let mut revs = Revs::new();
+    let mut previous = revs.next();
+    for n in 1..=3 {
+        commit(&pool, DID, n, &previous).await;
+        previous = revs.next();
+    }
+
+    let events = firehose::since(&pool, None, 10).await.unwrap();
+    for pair in events.windows(2) {
+        assert!(
+            pair[1].rev.as_str() > pair[0].rev.as_str(),
+            "a repo's revs must increase: {} -> {}",
+            pair[0].rev.as_str(),
+            pair[1].rev.as_str()
+        );
+    }
+}
+
+#[tokio::test]
 async fn a_consumer_resumes_from_its_cursor_without_a_gap_or_a_duplicate() {
     // The whole point of the log outliving the connection.
     let (_db, pool) = fresh().await;
+    let mut revs = Revs::new();
     for n in 1..=5 {
-        commit(&pool, DID, n).await;
+        commit(&pool, DID, n, &revs.next()).await;
     }
 
     let first_page = firehose::since(&pool, None, 2).await.unwrap();
@@ -86,8 +131,9 @@ async fn a_consumer_resumes_from_its_cursor_without_a_gap_or_a_duplicate() {
 #[tokio::test]
 async fn a_fresh_consumer_receives_everything() {
     let (_db, pool) = fresh().await;
+    let mut revs = Revs::new();
     for n in 1..=3 {
-        commit(&pool, DID, n).await;
+        commit(&pool, DID, n, &revs.next()).await;
     }
     assert_eq!(firehose::since(&pool, None, 100).await.unwrap().len(), 3);
 }
@@ -95,7 +141,8 @@ async fn a_fresh_consumer_receives_everything() {
 #[tokio::test]
 async fn a_consumer_at_the_head_receives_nothing_until_something_happens() {
     let (_db, pool) = fresh().await;
-    commit(&pool, DID, 1).await;
+    let mut revs = Revs::new();
+    commit(&pool, DID, 1, &revs.next()).await;
 
     let head = firehose::head(&pool).await.unwrap().expect("a head");
     assert!(
@@ -105,10 +152,11 @@ async fn a_consumer_at_the_head_receives_nothing_until_something_happens() {
             .is_empty()
     );
 
-    commit(&pool, DID, 2).await;
+    let second = revs.next();
+    commit(&pool, DID, 2, &second).await;
     let next = firehose::since(&pool, Some(head), 100).await.unwrap();
     assert_eq!(next.len(), 1);
-    assert_eq!(next[0].rev, 2);
+    assert_eq!(next[0].rev, second);
 }
 
 #[tokio::test]
@@ -122,8 +170,9 @@ async fn events_arrive_in_sequence_order() {
     // Out-of-order delivery would make `prev` unverifiable on the consumer's
     // side: it would see a commit before the one it follows.
     let (_db, pool) = fresh().await;
+    let mut revs = Revs::new();
     for n in 1..=5 {
-        commit(&pool, DID, n).await;
+        commit(&pool, DID, n, &revs.next()).await;
     }
 
     let events = firehose::since(&pool, None, 100).await.unwrap();
@@ -138,7 +187,8 @@ async fn an_event_carries_pointers_rather_than_records() {
     // D5 at the firehose: a consumer that wants the record fetches it. Inlining
     // would make this a second copy of every write.
     let (_db, pool) = fresh().await;
-    let event = commit(&pool, DID, 1).await;
+    let mut revs = Revs::new();
+    let event = commit(&pool, DID, 1, &revs.next()).await;
 
     assert_eq!(event.did, DID);
     assert!(event.commit_cid.starts_with("bafy"));
@@ -168,7 +218,7 @@ async fn a_delete_carries_no_record_cid() {
         DID,
         "bafyreicommit1",
         None,
-        1,
+        &Tid::new("3kaaaaaaaaaaa".into()).unwrap(),
         Action::Delete,
         "app.bsky.feed.post/3k1",
         None,
@@ -187,6 +237,7 @@ async fn a_delete_carries_no_record_cid() {
 #[tokio::test]
 async fn every_action_survives_the_round_trip() {
     let (_db, pool) = fresh().await;
+    let mut revs = Revs::new();
     for (n, action) in [Action::Create, Action::Update, Action::Delete]
         .into_iter()
         .enumerate()
@@ -196,7 +247,7 @@ async fn every_action_survives_the_round_trip() {
             DID,
             &format!("bafyreicommit{n}"),
             None,
-            n as i64,
+            &revs.next(),
             action,
             "app.bsky.feed.post/3k1",
             None,

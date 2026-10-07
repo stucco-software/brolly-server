@@ -158,15 +158,17 @@ pub async fn atproto_identity(
         .await?;
 
     // The repository, with a genesis commit signed by the key just stored.
+    // The genesis commit's own rev is persisted with the root, so the stored
+    // rev is the commit's from the first row (1, A).
     let blocks = PodBlocks::new(
         stores
             .repo_blocks(user_id)
             .map_err(|e| DbError::Hash(format!("opening repo blocks: {e}")))?,
     );
-    let root = repo::create(blocks, &did, &signing)
+    let (root, genesis_rev) = repo::create(blocks, &did, &signing)
         .await
         .map_err(|e| DbError::Hash(format!("genesis commit: {e}")))?;
-    state::create(pool, user_id, &root.to_string()).await?;
+    state::create(pool, user_id, &root.to_string(), &genesis_rev).await?;
 
     // Best effort, and explicitly so.
     let plc_registered = match plc_client {

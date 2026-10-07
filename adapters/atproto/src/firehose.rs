@@ -16,6 +16,7 @@
 //! the firehose a second copy of every write, which is the thing D5 exists to
 //! prevent.
 
+use atrium_api::types::string::Tid;
 use brolly_identity::db::DbError;
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
@@ -48,9 +49,10 @@ pub struct CommitEvent {
     pub did: String,
     pub commit_cid: String,
     pub prev_cid: Option<String>,
-    /// Per-repo revision, so ordering within one repo needs no reasoning about
-    /// the global sequence.
-    pub rev: i64,
+    /// Per-repo revision — the commit's own TID, the same rev the head holds
+    /// and the frame emits (1, A) — so ordering within one repo needs no
+    /// reasoning about the global sequence.
+    pub rev: Tid,
     pub action: Action,
     /// `collection/rkey`.
     pub path: String,
@@ -65,7 +67,7 @@ pub async fn record(
     did: &str,
     commit_cid: &str,
     prev_cid: Option<&str>,
-    rev: i64,
+    rev: &Tid,
     action: Action,
     path: &str,
     record_cid: Option<&str>,
@@ -78,7 +80,7 @@ pub async fn record(
     .bind(did)
     .bind(commit_cid)
     .bind(prev_cid)
-    .bind(rev)
+    .bind(rev.as_str())
     .bind(action.as_str())
     .bind(path)
     .bind(record_cid)
@@ -90,7 +92,7 @@ pub async fn record(
         did: did.to_string(),
         commit_cid: commit_cid.to_string(),
         prev_cid: prev_cid.map(str::to_string),
-        rev,
+        rev: rev.clone(),
         action,
         path: path.to_string(),
         record_cid: record_cid.map(str::to_string),
@@ -103,7 +105,7 @@ type EventRow = (
     String,
     String,
     Option<String>,
-    i64,
+    String,
     String,
     String,
     Option<String>,
@@ -128,25 +130,36 @@ pub async fn since(
     .fetch_all(pool)
     .await?;
 
-    Ok(rows
+    let events: Result<Vec<CommitEvent>, DbError> = rows
         .into_iter()
         .map(
-            |(seq, did, commit_cid, prev_cid, rev, action, path, record_cid)| CommitEvent {
-                seq,
-                did,
-                commit_cid,
-                prev_cid,
-                rev,
-                action: match action.as_str() {
-                    "create" => Action::Create,
-                    "update" => Action::Update,
-                    _ => Action::Delete,
-                },
-                path,
-                record_cid,
+            |(seq, did, commit_cid, prev_cid, rev, action, path, record_cid)| {
+                // The log only ever holds revs written from `Tid`s; a row
+                // that does not parse is corruption, reported as a decode
+                // fault rather than guessed around.
+                let rev = Tid::new(rev).map_err(|e| {
+                    DbError::Sql(sqlx::Error::Decode(
+                        format!("a logged rev is not a TID: {e}").into(),
+                    ))
+                })?;
+                Ok(CommitEvent {
+                    seq,
+                    did,
+                    commit_cid,
+                    prev_cid,
+                    rev,
+                    action: match action.as_str() {
+                        "create" => Action::Create,
+                        "update" => Action::Update,
+                        _ => Action::Delete,
+                    },
+                    path,
+                    record_cid,
+                })
             },
         )
-        .collect())
+        .collect();
+    events
 }
 
 /// The newest cursor, for a consumer that wants only what happens next.
@@ -172,7 +185,7 @@ pub fn frame(event: &CommitEvent) -> Result<Vec<u8>, String> {
         "repo": event.did,
         "commit": event.commit_cid,
         "prev": event.prev_cid,
-        "rev": event.rev.to_string(),
+        "rev": event.rev.as_str(),
         "since": event.prev_cid,
         "ops": [{
             "action": event.action.as_str(),
@@ -201,7 +214,7 @@ mod tests {
             did: "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".into(),
             commit_cid: "bafyreicommit".into(),
             prev_cid: Some("bafyreiprev".into()),
-            rev: 7,
+            rev: Tid::new("3kaaaaaaaaaaa".into()).expect("a valid TID"),
             action: Action::Create,
             path: "app.bsky.feed.post/3kaaa".into(),
             record_cid: Some("bafyreirecord".into()),
@@ -241,5 +254,17 @@ mod tests {
         assert_eq!(Action::Create.as_str(), "create");
         assert_eq!(Action::Update.as_str(), "update");
         assert_eq!(Action::Delete.as_str(), "delete");
+    }
+
+    #[test]
+    fn a_frame_carries_the_rev_as_the_tids_own_text() {
+        // Every ATProtocol consumer parses `rev` as a 13-character TID; an
+        // integer there is a parse failure on their side, not a spelling (1, A).
+        let bytes = frame(&an_event()).expect("frame");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(
+            text.contains("3kaaaaaaaaaaa"),
+            "the frame did not carry the rev as TID text"
+        );
     }
 }

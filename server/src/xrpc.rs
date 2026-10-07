@@ -19,6 +19,7 @@ use axum::{Json, body::Bytes};
 use axum_extra::extract::CookieJar;
 use brolly_atproto::blocks::PodBlocks;
 use brolly_atproto::keys::SigningKey;
+use brolly_atproto::tid::Tid;
 use brolly_atproto::{ingest, repo, state};
 use brolly_identity::db::{self, User};
 use brolly_identity::{extract, webid};
@@ -46,6 +47,22 @@ fn auth_required() -> Response {
         StatusCode::UNAUTHORIZED,
         "AuthenticationRequired",
         "this method requires authentication",
+    )
+}
+
+/// A write whose compare-and-set lost the head (1, C).
+///
+/// Another write landed first, or this commit's rev did not clear the stored
+/// one. The server-side retry that makes this invisible to clients — and the
+/// `InvalidSwap` answer for the swap endpoints — is chunk 2 of the stage;
+/// until then the conflict is surfaced as an explicit error rather than the
+/// old behaviour, which overwrote the head and silently orphaned the other
+/// write's signed commit.
+fn write_conflict() -> Response {
+    xrpc_error(
+        StatusCode::CONFLICT,
+        "ConcurrentWrite",
+        "the repository moved while this write was in flight",
     )
 }
 
@@ -195,6 +212,9 @@ struct RepoHandle {
     user: User,
     blocks_for: std::sync::Arc<brolly_store::StoreManager>,
     root: atrium_repo::Cid,
+    /// The head's current rev — the floor the new commit's rev must clear,
+    /// and half of what the compare-and-set checks (1, C).
+    rev: Tid,
 }
 
 impl RepoHandle {
@@ -239,6 +259,7 @@ async fn open_repo(state: &AppState, user: User) -> Result<RepoHandle, Response>
         user,
         blocks_for: std::sync::Arc::clone(&state.stores),
         root,
+        rev: current.rev,
     })
 }
 
@@ -464,22 +485,34 @@ pub async fn create_record(
     let Some(blocks) = handle.blocks() else {
         return storage_unavailable();
     };
-    let (record_cid, new_root) = match repo::put_record(
+    let (record_cid, new_root, rev) = match repo::put_record(
         blocks,
         handle.root,
         &key,
         &input.collection,
         &rkey,
         &record,
+        &handle.rev,
     )
     .await
     {
-        Ok(pair) => pair,
+        Ok(triple) => triple,
         Err(e) => return invalid_request(&e.to_string()),
     };
 
-    let rev = match state::advance(&state.pool, user.id, &new_root.to_string()).await {
+    // Compare-and-set: the head moves only from the root this write read, and
+    // only forward in rev (1, C).
+    let rev = match state::advance(
+        &state.pool,
+        user.id,
+        &handle.root.to_string(),
+        &new_root.to_string(),
+        &rev,
+    )
+    .await
+    {
         Ok(rev) => rev,
+        Err(state::AdvanceError::Conflict) => return write_conflict(),
         Err(e) => {
             tracing::error!(error = %e, "advancing the repo failed after a write");
             return xrpc_error(
@@ -495,7 +528,7 @@ pub async fn create_record(
         &did_of(&user, &state),
         &new_root.to_string(),
         Some(&handle.root.to_string()),
-        rev,
+        &rev,
         brolly_atproto::firehose::Action::Create,
         &format!("{}/{rkey}", input.collection),
         Some(&record_cid.to_string()),
@@ -563,33 +596,45 @@ pub async fn delete_record(
     let Some(blocks) = handle.blocks() else {
         return storage_unavailable();
     };
-    let new_root = match repo::delete_record(
+    let (new_root, rev) = match repo::delete_record(
         blocks,
         handle.root,
         &key,
         &input.collection,
         &input.rkey,
+        &handle.rev,
     )
     .await
     {
-        Ok(root) => root,
+        Ok(pair) => pair,
         Err(e) => return invalid_request(&e.to_string()),
     };
 
-    match state::advance(&state.pool, user.id, &new_root.to_string()).await {
+    match state::advance(
+        &state.pool,
+        user.id,
+        &handle.root.to_string(),
+        &new_root.to_string(),
+        &rev,
+    )
+    .await
+    {
         Ok(rev) => {
             announce(
                 &state,
                 &did_of(&user, &state),
                 &new_root.to_string(),
                 Some(&handle.root.to_string()),
-                rev,
+                &rev,
                 brolly_atproto::firehose::Action::Delete,
                 &format!("{}/{}", input.collection, input.rkey),
                 None,
             )
             .await;
         }
+        // Surfaced rather than logged: swallowing a conflict here would
+        // answer 200 for a delete whose head was taken by another write (1, C).
+        Err(state::AdvanceError::Conflict) => return write_conflict(),
         Err(e) => tracing::error!(error = %e, "advancing the repo failed after a delete"),
     }
 
@@ -627,7 +672,7 @@ async fn announce(
     did: &str,
     commit_cid: &str,
     prev_cid: Option<&str>,
-    rev: i64,
+    rev: &Tid,
     action: brolly_atproto::firehose::Action,
     path: &str,
     record_cid: Option<&str>,
