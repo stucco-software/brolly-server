@@ -20,6 +20,15 @@ atrium-crypto = "0.1.3"
 atrium-identity = "0.1.9"
 atrium-repo = "0.1.8"
 atrium-xrpc = "0.12.4"
+# The record value as it is stored: DAG-CBOR with CID links. The same copy
+# atrium-api and serde_ipld_dagcbor already link, named directly because a
+# `$blob` ref has to be built as an `Ipld::Link` and no crate re-exports the
+# type (1, H).
+ipld-core = "0.4"
+# The commit envelope's `sig` field is a CBOR byte string, and atrium's own
+# schema serializes it with `serde_bytes` — the same copy atrium-repo links,
+# named so the envelope's bytes cannot drift from its (1, B).
+serde_bytes = "0.11"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 # client_id and redirect_uri checks are URL-structural (host kind, port,

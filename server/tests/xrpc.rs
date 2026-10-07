@@ -507,6 +507,669 @@ async fn a_deleted_record_is_gone_from_the_repo() {
     assert_eq!(fetched.status, StatusCode::NOT_FOUND);
 }
 
+// --- the write path is the lexicon's (1, B) ------------------------------------
+
+#[tokio::test]
+async fn create_record_on_an_occupied_path_refuses_invalid_swap() {
+    // `createRecord` creates; a second create at the same path is the
+    // lexicon's `InvalidSwap`, not a silent replace (1, B).
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let body = json!({
+        "collection": "app.bsky.feed.post",
+        "rkey": "3kaaaaaaaaaaa",
+        "record": {"$type": "app.bsky.feed.post", "text": "first"},
+    });
+    let first = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        body.clone(),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+
+    let second = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "second"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(second.status, StatusCode::BAD_REQUEST, "{}", second.text());
+    assert_eq!(second.json()["error"], "InvalidSwap");
+
+    // The refusal announced nothing and replaced nothing.
+    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1);
+    let fetched = get(
+        &h,
+        &format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.feed.post&rkey=3kaaaaaaaaaaa"
+        ),
+    )
+    .await;
+    assert_eq!(fetched.json()["value"]["text"], "first");
+}
+
+#[tokio::test]
+async fn a_rkey_less_create_mints_a_tid_rkey() {
+    // The reference PDS mints TID rkeys; the mint_note_id placeholder this
+    // replaced produced rkeys no ATProtocol consumer treats as TIDs (1, B).
+    let h = harness().await;
+    let (user_id, cookie) = a_member(&h, "alice").await;
+
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "record": {"$type": "app.bsky.feed.post", "text": "minted"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    let uri = created.json()["uri"].as_str().unwrap().to_string();
+    let rkey = uri.rsplit('/').next().unwrap().to_string();
+    assert_eq!(rkey.len(), 13, "a TID rkey is 13 base32 characters: {rkey}");
+    assert!(
+        brolly_atproto::tid::Tid::new(rkey.clone()).is_ok(),
+        "the minted rkey must be a TID: {rkey}"
+    );
+    let _ = user_id;
+}
+
+#[tokio::test]
+async fn put_record_creates_and_replaces() {
+    // `putRecord` is upsert: the same call creates the record and then
+    // replaces it, and the log says which happened (1, B).
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let body = |text: &str| {
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": text},
+        })
+    };
+
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.putRecord",
+        body("created"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+    let cid = created.json()["cid"].as_str().unwrap().to_string();
+
+    let replaced = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.putRecord",
+        body("replaced"),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(replaced.status, StatusCode::OK, "{}", replaced.text());
+    assert_ne!(
+        replaced.json()["cid"].as_str().unwrap(),
+        cid.as_str(),
+        "a replace must write a new record"
+    );
+
+    let fetched = get(
+        &h,
+        &format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.feed.post&rkey=3kaaaaaaaaaaa"
+        ),
+    )
+    .await;
+    assert_eq!(fetched.json()["value"]["text"], "replaced");
+
+    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0].ops[0].action,
+        brolly_atproto::firehose::Action::Create
+    );
+    assert_eq!(
+        events[1].ops[0].action,
+        brolly_atproto::firehose::Action::Update
+    );
+    assert_eq!(
+        events[1].ops[0].prev_cid.as_deref(),
+        events[0].ops[0].record_cid.as_deref(),
+        "the update's prev is the record it replaced (1, D)"
+    );
+}
+
+#[tokio::test]
+async fn a_stale_swap_record_refuses_invalid_swap() {
+    // The client named the exact record; a mismatch is the answer, not a
+    // retry and not a silent overwrite (1, C).
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "first"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    let swapped = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.putRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "swapped"},
+            "swapRecord": "bafyreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        swapped.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        swapped.text()
+    );
+    assert_eq!(swapped.json()["error"], "InvalidSwap");
+
+    // `swapRecord: null` on an occupied path is the same answer.
+    let null_swap = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.putRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "swapped"},
+            "swapRecord": null,
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(null_swap.status, StatusCode::BAD_REQUEST);
+    assert_eq!(null_swap.json()["error"], "InvalidSwap");
+}
+
+#[tokio::test]
+async fn a_stale_swap_commit_refuses_invalid_swap() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    let swapped = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.putRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "swapped"},
+            "swapCommit": "bafyreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        swapped.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        swapped.text()
+    );
+    assert_eq!(swapped.json()["error"], "InvalidSwap");
+}
+
+#[tokio::test]
+async fn the_swap_routes_write_against_the_exact_head_and_record() {
+    // `swapRecord` and `swapCommit` are the compare-and-set C needs, as
+    // routes a synced client can call with everything it knows (1, B).
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "first"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+    let record_cid = created.json()["cid"].as_str().unwrap().to_string();
+    let commit_cid = created.json()["commit"]["cid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Both exact: the write lands.
+    let swapped = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.swapRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "second"},
+            "swapRecord": record_cid,
+            "swapCommit": commit_cid,
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(swapped.status, StatusCode::OK, "{}", swapped.text());
+
+    // A stale record CID: refused, no retry.
+    let stale_record = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.swapRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "third"},
+            "swapRecord": record_cid,
+            "swapCommit": swapped.json()["commit"]["cid"].as_str().unwrap(),
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(stale_record.status, StatusCode::BAD_REQUEST);
+    assert_eq!(stale_record.json()["error"], "InvalidSwap");
+
+    // swapCommit alone, against the exact head.
+    let head = swapped.json()["commit"]["cid"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let committed = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.swapCommit",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "third"},
+            "commitCid": head,
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(committed.status, StatusCode::OK, "{}", committed.text());
+
+    // And against a head that has moved.
+    let stale_head = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.swapCommit",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "fourth"},
+            "commitCid": head,
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(stale_head.status, StatusCode::BAD_REQUEST);
+    assert_eq!(stale_head.json()["error"], "InvalidSwap");
+
+    // Both swap parameters are required on the swapRecord route.
+    let missing = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.swapRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "fifth"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(missing.status, StatusCode::BAD_REQUEST);
+    assert_eq!(missing.json()["error"], "InvalidRequest");
+}
+
+#[tokio::test]
+async fn apply_writes_applies_a_batch_as_one_commit() {
+    // One commit — one MST revision, one signature — and one event with one
+    // op per write (1, B).
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    let applied = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({
+            "writes": [
+                {"$type": "com.atproto.repo.applyWrites#create",
+                 "collection": "app.bsky.feed.post",
+                 "rkey": "3kaaaaaaaaaaa",
+                 "value": {"$type": "app.bsky.feed.post", "text": "a"}},
+                {"$type": "com.atproto.repo.applyWrites#create",
+                 "collection": "app.bsky.feed.post",
+                 "value": {"$type": "app.bsky.feed.post", "text": "b"}},
+                {"$type": "com.atproto.repo.applyWrites#update",
+                 "collection": "app.bsky.feed.post",
+                 "rkey": "3kaaaaaaaaaaa",
+                 "value": {"$type": "app.bsky.feed.post", "text": "a2"}},
+            ],
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(applied.status, StatusCode::OK, "{}", applied.text());
+    assert_eq!(
+        applied.json()["results"].as_array().unwrap().len(),
+        3,
+        "one result per write"
+    );
+
+    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(events.len(), 1, "a batch is one event");
+    assert_eq!(events[0].ops.len(), 3, "one op per write");
+    let actions: Vec<_> = events[0].ops.iter().map(|op| op.action).collect();
+    assert_eq!(
+        actions,
+        vec![
+            brolly_atproto::firehose::Action::Create,
+            brolly_atproto::firehose::Action::Create,
+            brolly_atproto::firehose::Action::Update,
+        ]
+    );
+    assert_eq!(
+        events[0].ops[2].prev_cid, events[0].ops[0].record_cid,
+        "the update's prev is the record this same batch wrote (1, D)"
+    );
+
+    // The whole batch reads back under one commit — the minted rkey from
+    // the results, the fixed ones by name.
+    let minted = applied.json()["results"][1]["uri"]
+        .as_str()
+        .unwrap()
+        .rsplit('/')
+        .next()
+        .unwrap()
+        .to_string();
+    for (rkey, text) in [("3kaaaaaaaaaaa", "a2"), (minted.as_str(), "b")] {
+        let fetched = get(
+            &h,
+            &format!(
+                "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.feed.post&rkey={rkey}"
+            ),
+        )
+        .await;
+        assert_eq!(fetched.status, StatusCode::OK, "{rkey}");
+        assert_eq!(fetched.json()["value"]["text"], text);
+    }
+}
+
+#[tokio::test]
+async fn an_invalid_op_refuses_the_whole_batch() {
+    // A batch is atomic: one invalid op — here, a create on a path another
+    // op in the same batch just took — refuses everything, unsigned (1, B).
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    let refused = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({
+            "writes": [
+                {"$type": "com.atproto.repo.applyWrites#create",
+                 "collection": "app.bsky.feed.post",
+                 "rkey": "3kaaaaaaaaaaa",
+                 "value": {"$type": "app.bsky.feed.post", "text": "would land"}},
+                {"$type": "com.atproto.repo.applyWrites#create",
+                 "collection": "app.bsky.feed.post",
+                 "rkey": "3kaaaaaaaaaaa",
+                 "value": {"$type": "app.bsky.feed.post", "text": "collision"}},
+            ],
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        refused.text()
+    );
+    assert_eq!(refused.json()["error"], "InvalidSwap");
+
+    // Nothing landed and nothing was announced.
+    assert!(
+        brolly_atproto::firehose::since(&h.db.pool, None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused batch must not be announced"
+    );
+    let fetched = get(
+        &h,
+        &format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.feed.post&rkey=3kaaaaaaaaaaa"
+        ),
+    )
+    .await;
+    assert_eq!(fetched.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_batch_over_two_hundred_writes_is_refused() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    let writes: Vec<serde_json::Value> = (0..201)
+        .map(|n| {
+            json!({
+                "$type": "com.atproto.repo.applyWrites#create",
+                "collection": "app.bsky.feed.post",
+                "rkey": format!("3kb{n:010}"),
+                "value": {"$type": "app.bsky.feed.post", "text": "too many"},
+            })
+        })
+        .collect();
+
+    let refused = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.applyWrites",
+        json!({"writes": writes}),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{}",
+        refused.text()
+    );
+    assert_eq!(refused.json()["error"], "InvalidRequest");
+    assert!(
+        brolly_atproto::firehose::since(&h.db.pool, None, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a refused batch must not be announced"
+    );
+}
+
+#[tokio::test]
+async fn a_record_over_a_megabyte_is_refused() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    let refused = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "x".repeat(1_000_001)},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "{}",
+        refused.text()
+    );
+    assert_eq!(refused.json()["error"], "PayloadTooLarge");
+    assert!(
+        brolly_atproto::firehose::since(&h.db.pool, None, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn two_concurrent_put_records_both_land() {
+    // The spec's lost-update race, with the retry: two writes from the same
+    // root, and both succeed — one of them by re-applying against the head
+    // the other moved. The head's history stays linear — `since`/`prevData`
+    // chain with no orphan — and no event is missing (1, C).
+    let h = harness().await;
+    let (user_id, cookie) = a_member(&h, "alice").await;
+
+    let put = |rkey: &'static str, text: &'static str| {
+        post_json(
+            &h,
+            "/xrpc/com.atproto.repo.putRecord",
+            json!({
+                "collection": "app.bsky.feed.post",
+                "rkey": rkey,
+                "record": {"$type": "app.bsky.feed.post", "text": text},
+            }),
+            Some(&cookie),
+        )
+    };
+    let (a, b) = tokio::join!(
+        put("3kaaaaaaaaaaa", "from a"),
+        put("3kbbbbbbbbbbb", "from b")
+    );
+    assert_eq!(a.status, StatusCode::OK, "a: {}", a.text());
+    assert_eq!(b.status, StatusCode::OK, "b: {}", b.text());
+
+    // Both records landed.
+    for (rkey, text) in [("3kaaaaaaaaaaa", "from a"), ("3kbbbbbbbbbbb", "from b")] {
+        let fetched = get(
+            &h,
+            &format!(
+                "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.feed.post&rkey={rkey}"
+            ),
+        )
+        .await;
+        assert_eq!(fetched.status, StatusCode::OK, "{rkey}");
+        assert_eq!(fetched.json()["value"]["text"], text);
+    }
+
+    // Both events landed, in order, and the chain between them is linear.
+    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        2,
+        "no event may go missing: {} events",
+        events.len()
+    );
+    assert_eq!(events[0].ops.len(), 1);
+    assert_eq!(events[1].ops.len(), 1);
+    assert_eq!(
+        events[1].prev_cid.as_deref(),
+        Some(events[0].commit_cid.as_str()),
+        "the second commit must name the first — no orphan between them"
+    );
+    assert_eq!(
+        events[1].since_rev.as_ref(),
+        Some(&events[0].rev),
+        "since must chain to the previous commit's rev (1, C)"
+    );
+
+    // prevData chains to the previous commit's MST root, read back through
+    // atrium from the first event's commit alone.
+    let blocks = brolly_atproto::blocks::PodBlocks::new(h.stores.repo_blocks(user_id).unwrap());
+    let first = atrium_repo::Repository::open(blocks, events[0].commit_cid.parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        events[1].prev_data.as_deref(),
+        Some(first.commit().data().to_string().as_str()),
+        "prevData must be the first commit's MST root (1, C)"
+    );
+
+    // And the head is exactly the second event's commit — no third state.
+    let head = brolly_atproto::state::load(&h.db.pool, user_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.root_cid, events[1].commit_cid);
+}
+
+#[tokio::test]
+async fn a_blob_ref_round_trips_through_the_handler() {
+    // H at the endpoint: a `$blob` ref lands as a CID link in the record's
+    // block — asserted against the block itself in the repo tests — and the
+    // record reads back as the JSON that named it (1, H).
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {
+                "$type": "app.bsky.feed.post",
+                "text": "with an image",
+                "image": {
+                    "$type": "blob",
+                    "ref": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
+                    "mimeType": "image/png",
+                    "size": 1234,
+                },
+            },
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    let fetched = get(
+        &h,
+        &format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.feed.post&rkey=3kaaaaaaaaaaa"
+        ),
+    )
+    .await;
+    assert_eq!(fetched.status, StatusCode::OK, "{}", fetched.text());
+    assert_eq!(
+        fetched.json()["value"]["image"]["ref"],
+        "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
+        "a blob ref must read back as the CID string that named it"
+    );
+    assert_eq!(fetched.json()["value"]["image"]["mimeType"], "image/png");
+}
+
 // --- DPoP-bound callers ------------------------------------------------------------
 
 // Chunk 5 (B) makes PAR look these up in the harness's `StaticClients`. It must
@@ -797,9 +1460,21 @@ async fn a_write_is_announced_on_the_firehose() {
         .await
         .expect("firehose");
     assert_eq!(events.len(), 1, "the write was not announced");
-    assert_eq!(events[0].action, brolly_atproto::firehose::Action::Create);
-    assert_eq!(events[0].path, "app.bsky.feed.post/3kaaaaaaaaaaa");
+    assert_eq!(
+        events[0].ops.len(),
+        1,
+        "a single write is one event with one op"
+    );
+    assert_eq!(
+        events[0].ops[0].action,
+        brolly_atproto::firehose::Action::Create
+    );
+    assert_eq!(events[0].ops[0].path, "app.bsky.feed.post/3kaaaaaaaaaaa");
     assert!(events[0].commit_cid.starts_with("bafy"));
+    assert!(
+        events[0].ops[0].record_cid.is_some(),
+        "a create announces the record it wrote"
+    );
 }
 
 #[tokio::test]
@@ -829,10 +1504,17 @@ async fn a_delete_is_announced_too() {
         .await
         .unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[1].action, brolly_atproto::firehose::Action::Delete);
     assert_eq!(
-        events[1].record_cid, None,
+        events[1].ops[0].action,
+        brolly_atproto::firehose::Action::Delete
+    );
+    assert_eq!(
+        events[1].ops[0].record_cid, None,
         "a delete announces no record CID"
+    );
+    assert!(
+        events[1].ops[0].prev_cid.is_some(),
+        "a delete announces the record it removed (1, D)"
     );
 }
 
@@ -841,7 +1523,7 @@ async fn the_announcement_chains_to_the_previous_commit() {
     // A consumer verifies `prev` against what it already has; an event that
     // does not name its predecessor cannot be checked.
     let h = harness().await;
-    let (_, cookie) = a_member(&h, "alice").await;
+    let (user_id, cookie) = a_member(&h, "alice").await;
 
     for n in 1..=2 {
         post_json(
@@ -870,6 +1552,24 @@ async fn the_announcement_chains_to_the_previous_commit() {
     assert!(
         events[1].rev.as_str() > events[0].rev.as_str(),
         "revisions must advance"
+    );
+    // And the chain a syncing consumer actually walks: `since` names the
+    // rev the commit is based on, `prevData` the MST root it replaced —
+    // the previous commit's `data` field, read back here through atrium
+    // from the previous commit alone (1, A).
+    let blocks = brolly_atproto::blocks::PodBlocks::new(h.stores.repo_blocks(user_id).unwrap());
+    let previous = atrium_repo::Repository::open(blocks, events[0].commit_cid.parse().unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        events[1].since_rev.as_ref(),
+        Some(&events[0].rev),
+        "since must name the previous commit's own rev"
+    );
+    assert_eq!(
+        events[1].prev_data.as_deref(),
+        Some(previous.commit().data().to_string().as_str()),
+        "prevData must be the previous commit's MST root"
     );
 }
 

@@ -15,6 +15,13 @@
 //! that wants the records fetches them. Putting record bodies here would make
 //! the firehose a second copy of every write, which is the thing D5 exists to
 //! prevent.
+//!
+//! One event carries **one commit and all of its ops** (1, B): the event row is
+//! the commit — its CIDs, its rev, the rev and MST root it follows — and the
+//! ops live beside it, one row per write, in the order the batch applied them.
+//! The per-op `prev` — the record CID an update replaced or a delete removed —
+//! is captured by the write path while the old MST is open, because chunk 3's
+//! frames emit it and it cannot be reconstructed afterwards (1, D).
 
 use atrium_api::types::string::Tid;
 use brolly_identity::db::DbError;
@@ -40,6 +47,50 @@ impl Action {
     }
 }
 
+/// One op of a commit, as the write hands it to the log (1, B).
+#[derive(Debug, Clone)]
+pub struct NewOp {
+    pub action: Action,
+    /// `collection/rkey`.
+    pub path: String,
+    /// The written record's CID; absent for a delete.
+    pub record_cid: Option<String>,
+    /// The record CID this op replaced or removed; undefined for a create
+    /// (1, D).
+    pub prev_cid: Option<String>,
+}
+
+/// A commit to record on the log: one commit, `n` ops (1, B).
+#[derive(Debug, Clone)]
+pub struct NewCommit<'a> {
+    pub did: &'a str,
+    pub commit_cid: &'a str,
+    /// The commit this one follows — the head it was applied to.
+    pub prev_cid: Option<&'a str>,
+    /// The commit's own rev.
+    pub rev: &'a Tid,
+    /// The rev this commit is based on — the previous commit's own rev, null
+    /// on a repo's first commit (1, A).
+    pub since_rev: Option<&'a Tid>,
+    /// The previous MST root — the previous commit's `data` field, which is
+    /// `prevData` on the wire and what MST inversion needs (1, A).
+    pub prev_data: Option<&'a str>,
+    pub ops: Vec<NewOp>,
+}
+
+/// One op of a commit event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Op {
+    pub action: Action,
+    /// `collection/rkey`.
+    pub path: String,
+    /// Absent for a delete.
+    pub record_cid: Option<String>,
+    /// The record CID this op replaced or removed; undefined for a create
+    /// (1, D).
+    pub prev_cid: Option<String>,
+}
+
 /// One commit event.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommitEvent {
@@ -53,49 +104,71 @@ pub struct CommitEvent {
     /// and the frame emits (1, A) — so ordering within one repo needs no
     /// reasoning about the global sequence.
     pub rev: Tid,
-    pub action: Action,
-    /// `collection/rkey`.
-    pub path: String,
-    /// Absent for a delete.
-    pub record_cid: Option<String>,
+    /// The rev this commit is based on (1, A).
+    pub since_rev: Option<Tid>,
+    /// The previous MST root (1, A).
+    pub prev_data: Option<String>,
+    /// One op per write the commit applied, in order (1, B).
+    pub ops: Vec<Op>,
 }
 
 /// Record a commit and return the event, cursor included.
-#[allow(clippy::too_many_arguments)]
-pub async fn record(
-    pool: &PgPool,
-    did: &str,
-    commit_cid: &str,
-    prev_cid: Option<&str>,
-    rev: &Tid,
-    action: Action,
-    path: &str,
-    record_cid: Option<&str>,
-) -> Result<CommitEvent, DbError> {
+///
+/// The event row and its op rows land in one transaction: a commit whose ops
+/// were half-logged is not a commit a consumer can invert (1, B).
+pub async fn record(pool: &PgPool, commit: &NewCommit<'_>) -> Result<CommitEvent, DbError> {
+    let mut tx = pool.begin().await?;
+
     let (seq,): (i64,) = sqlx::query_as(
         "INSERT INTO atproto_firehose
-           (did, commit_cid, prev_cid, rev, action, path, record_cid)
-         VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING seq",
+           (did, commit_cid, prev_cid, rev, since_rev, prev_data)
+         VALUES ($1, $2, $3, $4, $5, $6) RETURNING seq",
     )
-    .bind(did)
-    .bind(commit_cid)
-    .bind(prev_cid)
-    .bind(rev.as_str())
-    .bind(action.as_str())
-    .bind(path)
-    .bind(record_cid)
-    .fetch_one(pool)
+    .bind(commit.did)
+    .bind(commit.commit_cid)
+    .bind(commit.prev_cid)
+    .bind(commit.rev.as_str())
+    .bind(commit.since_rev.map(|rev| rev.as_str()))
+    .bind(commit.prev_data)
+    .fetch_one(&mut *tx)
     .await?;
+
+    for (position, op) in commit.ops.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO atproto_firehose_ops
+               (seq, position, action, path, record_cid, prev_cid)
+             VALUES ($1, $2, $3, $4, $5, $6)",
+        )
+        .bind(seq)
+        .bind(position as i32)
+        .bind(op.action.as_str())
+        .bind(&op.path)
+        .bind(&op.record_cid)
+        .bind(&op.prev_cid)
+        .execute(&mut *tx)
+        .await?;
+    }
+
+    tx.commit().await?;
 
     Ok(CommitEvent {
         seq,
-        did: did.to_string(),
-        commit_cid: commit_cid.to_string(),
-        prev_cid: prev_cid.map(str::to_string),
-        rev: rev.clone(),
-        action,
-        path: path.to_string(),
-        record_cid: record_cid.map(str::to_string),
+        did: commit.did.to_string(),
+        commit_cid: commit.commit_cid.to_string(),
+        prev_cid: commit.prev_cid.map(str::to_string),
+        rev: commit.rev.clone(),
+        since_rev: commit.since_rev.cloned(),
+        prev_data: commit.prev_data.map(str::to_string),
+        ops: commit
+            .ops
+            .iter()
+            .map(|op| Op {
+                action: op.action,
+                path: op.path.clone(),
+                record_cid: op.record_cid.clone(),
+                prev_cid: op.prev_cid.clone(),
+            })
+            .collect(),
     })
 }
 
@@ -106,10 +179,12 @@ type EventRow = (
     String,
     Option<String>,
     String,
-    String,
-    String,
+    Option<String>,
     Option<String>,
 );
+
+/// An op row of the event log.
+type OpRow = (i64, i32, String, String, Option<String>, Option<String>);
 
 /// Events after `cursor`, oldest first.
 ///
@@ -122,7 +197,7 @@ pub async fn since(
     limit: i64,
 ) -> Result<Vec<CommitEvent>, DbError> {
     let rows: Vec<EventRow> = sqlx::query_as(
-        "SELECT seq, did, commit_cid, prev_cid, rev, action, path, record_cid
+        "SELECT seq, did, commit_cid, prev_cid, rev, since_rev, prev_data
              FROM atproto_firehose WHERE seq > $1 ORDER BY seq LIMIT $2",
     )
     .bind(cursor.unwrap_or(0))
@@ -130,36 +205,64 @@ pub async fn since(
     .fetch_all(pool)
     .await?;
 
-    let events: Result<Vec<CommitEvent>, DbError> = rows
-        .into_iter()
-        .map(
-            |(seq, did, commit_cid, prev_cid, rev, action, path, record_cid)| {
-                // The log only ever holds revs written from `Tid`s; a row
-                // that does not parse is corruption, reported as a decode
-                // fault rather than guessed around.
-                let rev = Tid::new(rev).map_err(|e| {
-                    DbError::Sql(sqlx::Error::Decode(
-                        format!("a logged rev is not a TID: {e}").into(),
-                    ))
-                })?;
-                Ok(CommitEvent {
-                    seq,
-                    did,
-                    commit_cid,
-                    prev_cid,
-                    rev,
-                    action: match action.as_str() {
-                        "create" => Action::Create,
-                        "update" => Action::Update,
-                        _ => Action::Delete,
-                    },
-                    path,
-                    record_cid,
-                })
-            },
-        )
-        .collect();
-    events
+    let mut events = Vec::with_capacity(rows.len());
+    for (seq, did, commit_cid, prev_cid, rev, since_rev, prev_data) in rows {
+        // The log only ever holds revs written from `Tid`s; a row that does
+        // not parse is corruption, reported as a decode fault rather than
+        // guessed around.
+        let rev = parse_rev(rev)?;
+        let since_rev = since_rev.map(parse_rev).transpose()?;
+        let ops = ops_for(pool, seq).await?;
+        events.push(CommitEvent {
+            seq,
+            did,
+            commit_cid,
+            prev_cid,
+            rev,
+            since_rev,
+            prev_data,
+            ops,
+        });
+    }
+    Ok(events)
+}
+
+/// A stored rev, parsed.
+///
+/// The column only ever holds revs written from `Tid`s, so a row that does not
+/// parse is corruption — reported as a decode fault rather than guessed around.
+fn parse_rev(text: String) -> Result<Tid, DbError> {
+    Tid::new(text).map_err(|e| {
+        DbError::Sql(sqlx::Error::Decode(
+            format!("a logged rev is not a TID: {e}").into(),
+        ))
+    })
+}
+
+/// One commit's ops, in the order the batch applied them.
+async fn ops_for(pool: &PgPool, seq: i64) -> Result<Vec<Op>, DbError> {
+    let rows: Vec<OpRow> = sqlx::query_as(
+        "SELECT seq, position, action, path, record_cid, prev_cid
+             FROM atproto_firehose_ops WHERE seq = $1 ORDER BY position",
+    )
+    .bind(seq)
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|(_seq, _position, action, path, record_cid, prev_cid)| {
+            Ok(Op {
+                action: match action.as_str() {
+                    "create" => Action::Create,
+                    "update" => Action::Update,
+                    _ => Action::Delete,
+                },
+                path,
+                record_cid,
+                prev_cid,
+            })
+        })
+        .collect()
 }
 
 /// The newest cursor, for a consumer that wants only what happens next.
@@ -178,6 +281,11 @@ pub async fn head(pool: &PgPool) -> Result<Option<i64>, DbError> {
 /// message type, then the body. Emitting the header separately is not cosmetic:
 /// a consumer dispatches on it before it has parsed the body, and one that
 /// cannot find it treats the whole frame as unknown and drops it.
+///
+/// The body is still JSON here; chunk 3 rebuilds it on IPLD, where a CID can be
+/// a link. What this chunk carries is the shape chunk 3 needs to reach: every
+/// op of the commit, each with its `prev`, `since` as the previous rev, and
+/// `prevData` as the previous MST root (1, B, 1, D).
 pub fn frame(event: &CommitEvent) -> Result<Vec<u8>, String> {
     let header = serde_json::json!({"op": 1, "t": "#commit"});
     let body = serde_json::json!({
@@ -186,12 +294,14 @@ pub fn frame(event: &CommitEvent) -> Result<Vec<u8>, String> {
         "commit": event.commit_cid,
         "prev": event.prev_cid,
         "rev": event.rev.as_str(),
-        "since": event.prev_cid,
-        "ops": [{
-            "action": event.action.as_str(),
-            "path": event.path,
-            "cid": event.record_cid,
-        }],
+        "since": event.since_rev.as_ref().map(|rev| rev.as_str()),
+        "prevData": event.prev_data,
+        "ops": event.ops.iter().map(|op| serde_json::json!({
+            "action": op.action.as_str(),
+            "path": op.path,
+            "cid": op.record_cid,
+            "prev": op.prev_cid,
+        })).collect::<Vec<_>>(),
         // We do not carry blocks inline; a consumer fetches what it wants.
         "blocks": Vec::<u8>::new(),
         "tooBig": false,
@@ -215,9 +325,14 @@ mod tests {
             commit_cid: "bafyreicommit".into(),
             prev_cid: Some("bafyreiprev".into()),
             rev: Tid::new("3kaaaaaaaaaaa".into()).expect("a valid TID"),
-            action: Action::Create,
-            path: "app.bsky.feed.post/3kaaa".into(),
-            record_cid: Some("bafyreirecord".into()),
+            since_rev: Some(Tid::new("3jzzzzzzzzzzz".into()).expect("a valid TID")),
+            prev_data: Some("bafyreiprevdata".into()),
+            ops: vec![Op {
+                action: Action::Create,
+                path: "app.bsky.feed.post/3kaaa".into(),
+                record_cid: Some("bafyreirecord".into()),
+                prev_cid: None,
+            }],
         }
     }
 
@@ -266,5 +381,26 @@ mod tests {
             text.contains("3kaaaaaaaaaaa"),
             "the frame did not carry the rev as TID text"
         );
+    }
+
+    #[test]
+    fn a_frame_carries_every_op_of_the_commit() {
+        // One event, n ops — a batch that arrived as one commit leaves as one
+        // event, or a consumer replays the wrong history (1, B).
+        let mut event = an_event();
+        event.ops.push(Op {
+            action: Action::Update,
+            path: "app.bsky.feed.post/3kbbb".into(),
+            record_cid: Some("bafyreirecord2".into()),
+            prev_cid: Some("bafyreirecord1".into()),
+        });
+        let bytes = frame(&event).expect("frame");
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(text.contains("3kbbb"), "the second op is missing");
+        assert!(
+            text.contains("bafyreirecord1"),
+            "the update's prev is missing"
+        );
+        assert!(text.contains("bafyreiprevdata"), "prevData is missing");
     }
 }

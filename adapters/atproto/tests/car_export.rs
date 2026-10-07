@@ -19,7 +19,7 @@
 
 use brolly_atproto::blocks::PodBlocks;
 use brolly_atproto::keys::SigningKey;
-use brolly_atproto::repo;
+use brolly_atproto::repo::{self, PlannedWrite, RecordSwap};
 use serde_json::json;
 
 const DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -69,19 +69,17 @@ async fn a_repo_with_two_lexicons(
             }),
         ),
     ] {
-        let (_, next, minted) = repo::put_record(
+        let applied = repo::apply(
             blocks(manager, user),
             root,
             &key,
-            collection,
-            rkey,
-            &record,
+            vec![PlannedWrite::put(collection, rkey, &record, RecordSwap::Any).unwrap()],
             &rev,
         )
         .await
         .expect("put");
-        root = next;
-        rev = minted;
+        root = applied.commit;
+        rev = applied.rev;
     }
 
     (key, root)

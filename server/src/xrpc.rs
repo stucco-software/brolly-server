@@ -50,14 +50,23 @@ fn auth_required() -> Response {
     )
 }
 
-/// A write whose compare-and-set lost the head (1, C).
+/// The lexicon's own error for a write whose compare-and-set did not hold
+/// (1, C) — the shape `putRecord`/`applyWrites` define in atrium-api's
+/// generated types: `error: "InvalidSwap"` with a message.
+fn invalid_swap(message: &str) -> Response {
+    xrpc_error(StatusCode::BAD_REQUEST, "InvalidSwap", message)
+}
+
+/// A write the spec's size limits refuse (1, B).
+fn payload_too_large(message: &str) -> Response {
+    xrpc_error(StatusCode::PAYLOAD_TOO_LARGE, "PayloadTooLarge", message)
+}
+
+/// A write whose compare-and-set lost the head after every retry (1, C).
 ///
-/// Another write landed first, or this commit's rev did not clear the stored
-/// one. The server-side retry that makes this invisible to clients — and the
-/// `InvalidSwap` answer for the swap endpoints — is chunk 2 of the stage;
-/// until then the conflict is surfaced as an explicit error rather than the
-/// old behaviour, which overwrote the head and silently orphaned the other
-/// write's signed commit.
+/// The server-side retry makes this invisible to clients in the ordinary
+/// race; what reaches here is a write that kept losing for three attempts
+/// straight, which is contention a client should see rather have swallowed.
 fn write_conflict() -> Response {
     xrpc_error(
         StatusCode::CONFLICT,
@@ -310,7 +319,7 @@ pub async fn get_record(
     let Some(blocks) = handle.blocks() else {
         return storage_unavailable();
     };
-    match repo::get_record::<Value>(blocks, handle.root, &query.collection, &query.rkey).await {
+    match repo::get_record(blocks, handle.root, &query.collection, &query.rkey).await {
         Ok(Some(value)) => Json(json!({
             "uri": ingest::at_uri(
                 &did_of(&handle.user, &state),
@@ -420,21 +429,248 @@ pub async fn get_repo(
 
 // --- writes -------------------------------------------------------------------
 
+/// How many attempts a plain write gets before its conflict is surfaced (1, C).
+const WRITE_ATTEMPTS: usize = 3;
+
+/// What a write named as the head it must land against (1, C).
+#[derive(Debug, Clone)]
+enum HeadSwap {
+    /// A plain write: the client named no prior state, so the server retries
+    /// the whole write when the head moves first — optimistic concurrency,
+    /// the reference PDS's own behaviour, and the difference between two tabs
+    /// writing at once and a spurious failure in bsky.app.
+    Plain,
+    /// A swap write: the head must be exactly this commit. No retry, ever —
+    /// the client bought exactly that answer.
+    AtCommit(String),
+}
+
+/// A write as it landed: the applied batch and the head it replaced, which
+/// is everything the announcement and the response need.
+struct Landed {
+    applied: brolly_atproto::repo::Applied,
+    /// The commit CID the head held before this write moved it.
+    prev_cid: String,
+}
+
+/// Perform a write against the head: open, apply, compare-and-set — and for
+/// a plain write, do it all again from the new head when the head moved
+/// first (1, C).
+///
+/// A retry re-signs against a root the client never saw, but the client
+/// never *named* a root — it asked for a write, and got the commit that
+/// landed. A swap write never retries: the client named the exact prior
+/// state, and the mismatch is the answer `InvalidSwap`.
+async fn perform_write(
+    state: &AppState,
+    user: &User,
+    writes: Vec<brolly_atproto::repo::PlannedWrite>,
+    head: HeadSwap,
+) -> Result<Landed, Response> {
+    for attempt in 0..WRITE_ATTEMPTS {
+        let handle = match open_repo(state, user.clone()).await {
+            Ok(handle) => handle,
+            Err(response) => return Err(response),
+        };
+        if let HeadSwap::AtCommit(expected) = &head
+            && handle.root.to_string() != *expected
+        {
+            return Err(invalid_swap(
+                "swapCommit did not match the current repo commit",
+            ));
+        }
+
+        let key = match signing_key(state, user).await {
+            Ok(key) => key,
+            Err(response) => return Err(response),
+        };
+        let Some(blocks) = handle.blocks() else {
+            return Err(storage_unavailable());
+        };
+        let applied = match brolly_atproto::repo::apply(
+            blocks,
+            handle.root,
+            &key,
+            writes.clone(),
+            &handle.rev,
+        )
+        .await
+        {
+            Ok(applied) => applied,
+            Err(e) => return Err(write_refused(e)),
+        };
+
+        // Compare-and-set: the head moves only from the root this write read,
+        // and only forward in rev (1, C).
+        match state::advance(
+            &state.pool,
+            user.id,
+            &handle.root.to_string(),
+            &applied.commit.to_string(),
+            &applied.rev,
+        )
+        .await
+        {
+            Ok(_) => {
+                return Ok(Landed {
+                    applied,
+                    prev_cid: handle.root.to_string(),
+                });
+            }
+            Err(state::AdvanceError::Conflict) => {
+                if matches!(head, HeadSwap::Plain) && attempt + 1 < WRITE_ATTEMPTS {
+                    // Re-read the head, re-apply the ops to the new root,
+                    // re-sign — minted past the new head's rev (1, C).
+                    continue;
+                }
+                return Err(if matches!(head, HeadSwap::Plain) {
+                    write_conflict()
+                } else {
+                    invalid_swap("swapCommit did not match the current repo commit")
+                });
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "advancing the repo failed after a write");
+                return Err(xrpc_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "the record was written but the repo pointer did not move",
+                ));
+            }
+        }
+    }
+    Err(write_conflict())
+}
+
+/// A refused write, as the lexicon spells the refusal (1, B).
+fn write_refused(e: brolly_atproto::repo::RepoError) -> Response {
+    match e {
+        brolly_atproto::repo::RepoError::InvalidSwap(_) => invalid_swap(&e.to_string()),
+        brolly_atproto::repo::RepoError::TooLarge(_) => payload_too_large(&e.to_string()),
+        brolly_atproto::repo::RepoError::Signing(m) => {
+            tracing::error!(error = %m, "signing a commit failed");
+            xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "the commit could not be signed",
+            )
+        }
+        _ => invalid_request(&e.to_string()),
+    }
+}
+
+/// Record a commit on the firehose and hand it to attached consumers.
+///
+/// The durable write comes first and the broadcast second, deliberately: a
+/// consumer that misses the broadcast resumes from the log, but an event that
+/// was broadcast and never logged is invisible to anyone who reconnects.
+///
+/// A failure here does not fail the write. The record is already committed to
+/// the repo, and refusing a successful write because its announcement failed
+/// would be the worse outcome — the log is repairable, a rejected write the
+/// client believes failed is not.
+async fn announce(state: &AppState, did: &str, landed: &Landed) {
+    let applied = &landed.applied;
+    let commit = brolly_atproto::firehose::NewCommit {
+        did,
+        commit_cid: &applied.commit.to_string(),
+        prev_cid: Some(&landed.prev_cid),
+        rev: &applied.rev,
+        since_rev: Some(&applied.since_rev),
+        prev_data: Some(&applied.prev_data.to_string()),
+        ops: applied
+            .ops
+            .iter()
+            .map(|op| brolly_atproto::firehose::NewOp {
+                action: op.action,
+                path: op.path.clone(),
+                record_cid: op.record_cid.as_ref().map(atrium_repo::Cid::to_string),
+                prev_cid: op.prev_cid.as_ref().map(atrium_repo::Cid::to_string),
+            })
+            .collect(),
+    };
+    match brolly_atproto::firehose::record(&state.pool, &commit).await {
+        Ok(event) => {
+            // `send` fails only when nobody is listening, which is normal.
+            let _ = state.commits.send(event);
+        }
+        Err(e) => tracing::error!(error = %e, "recording a firehose event failed"),
+    }
+}
+
+/// And into the pod, faithfully, so the other protocols can see it (D7).
+///
+/// One op per non-delete write, paired with the record the caller asked for;
+/// a delete leaves the pod copy alone, exactly as the single delete always
+/// has. Best effort and explicitly so — the repo is the source of truth the
+/// network syncs, and a pod hiccup must not fail a landed write.
+async fn ingest_written(
+    state: &AppState,
+    user: &User,
+    ops: &[brolly_atproto::repo::AppliedOp],
+    records: &[Value],
+) {
+    let Ok(pod) = state.stores.pod(user.id) else {
+        tracing::error!(user = %user.id, "the pod is unavailable after a repo write");
+        return;
+    };
+    let did = did_of(user, state);
+    let webid = webid::webid(&user.username, &state.base_domain);
+    let document = webid::profile_document(&user.username, &state.base_domain);
+    for (op, record) in ops.iter().zip(records) {
+        if op.action == brolly_atproto::firehose::Action::Delete {
+            continue;
+        }
+        let Some((collection, rkey)) = op.path.split_once('/') else {
+            continue;
+        };
+        let uri = ingest::at_uri(&did, collection, rkey);
+        if let Err(e) = pod
+            .write(|w| Ok(ingest::ingest(w, record, &uri, &webid, &document)))
+            .map_err(ingest::IngestError::from)
+            .flatten()
+        {
+            tracing::error!(error = %e, "faithful ingest failed after a repo write");
+        }
+    }
+}
+
+/// The write endpoints' shared answer: auth, the target check, and then the
+/// write itself — landed, announced, and ingested.
+async fn commit_write(
+    state: &AppState,
+    user: &User,
+    writes: Vec<brolly_atproto::repo::PlannedWrite>,
+    head: HeadSwap,
+    records: Vec<Value>,
+) -> Result<Landed, Response> {
+    let landed = perform_write(state, user, writes, head).await?;
+    announce(state, &did_of(user, state), &landed).await;
+    ingest_written(state, user, &landed.applied.ops, &records).await;
+    Ok(landed)
+}
+
 #[derive(Deserialize)]
-pub struct WriteRecord {
+#[serde(rename_all = "camelCase")]
+struct CreateRecord {
     repo: Option<String>,
     collection: String,
     rkey: Option<String>,
     record: Value,
+    swap_commit: Option<String>,
 }
 
-/// `com.atproto.repo.createRecord` and `putRecord`.
+/// `com.atproto.repo.createRecord`.
+///
+/// Creates, never replaces: an occupied path is `InvalidSwap` before
+/// anything is signed. The rkey is minted as a TID when the caller supplies
+/// none; a supplied one is validated against the lexicon's grammar (1, B).
 ///
 /// Writes land in **both** places, and that is the point: the repo is what the
 /// network syncs, and the pod is what every other protocol reads (D7's faithful
 /// layer). A record in one and not the other is a member whose data exists for
 /// some readers and not others.
-pub async fn create_record(
+async fn create_record(
     State(state): State<AppState>,
     headers: HeaderMap,
     jar: CookieJar,
@@ -446,12 +682,9 @@ pub async fn create_record(
     let Some(user) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
-    let Ok(input) = serde_json::from_slice::<WriteRecord>(&body) else {
+    let Ok(input) = serde_json::from_slice::<CreateRecord>(&body) else {
         return invalid_request("body must be a JSON object with collection and record");
     };
-
-    // Writing to someone else's repo is not a permissions question to answer
-    // later; it is refused here.
     if let Some(target) = input.repo.as_deref()
         && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
     {
@@ -469,97 +702,453 @@ pub async fn create_record(
         record["$type"] = json!(input.collection);
     }
 
-    let rkey = input
-        .rkey
-        .unwrap_or_else(brolly_mastodon::status_id::mint_note_id);
-
-    let handle = match open_repo(&state, user.clone()).await {
-        Ok(handle) => handle,
-        Err(response) => return response,
-    };
-    let key = match signing_key(&state, &user).await {
-        Ok(key) => key,
-        Err(response) => return response,
-    };
-
-    let Some(blocks) = handle.blocks() else {
-        return storage_unavailable();
-    };
-    let (record_cid, new_root, rev) = match repo::put_record(
-        blocks,
-        handle.root,
-        &key,
+    let write = match brolly_atproto::repo::PlannedWrite::create(
         &input.collection,
-        &rkey,
+        input.rkey.as_deref(),
         &record,
-        &handle.rev,
-    )
-    .await
-    {
-        Ok(triple) => triple,
-        Err(e) => return invalid_request(&e.to_string()),
+    ) {
+        Ok(write) => write,
+        Err(e) => return write_refused(e),
+    };
+    let head = match input.swap_commit {
+        // A swap write never retries (1, C).
+        Some(cid) => HeadSwap::AtCommit(cid),
+        None => HeadSwap::Plain,
     };
 
-    // Compare-and-set: the head moves only from the root this write read, and
-    // only forward in rev (1, C).
-    let rev = match state::advance(
-        &state.pool,
-        user.id,
-        &handle.root.to_string(),
-        &new_root.to_string(),
-        &rev,
-    )
-    .await
-    {
-        Ok(rev) => rev,
-        Err(state::AdvanceError::Conflict) => return write_conflict(),
-        Err(e) => {
-            tracing::error!(error = %e, "advancing the repo failed after a write");
-            return xrpc_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "InternalServerError",
-                "the record was written but the repo pointer did not move",
-            );
-        }
+    let landed = match commit_write(&state, &user, vec![write], head, vec![record]).await {
+        Ok(landed) => landed,
+        Err(response) => return response,
     };
+    write_response(&state, &user, &landed)
+}
 
-    announce(
-        &state,
-        &did_of(&user, &state),
-        &new_root.to_string(),
-        Some(&handle.root.to_string()),
-        &rev,
-        brolly_atproto::firehose::Action::Create,
-        &format!("{}/{rkey}", input.collection),
-        Some(&record_cid.to_string()),
-    )
-    .await;
+/// The create/put answer: the lexicon's `uri`, `cid`, and the commit that
+/// landed the write.
+fn write_response(state: &AppState, user: &User, landed: &Landed) -> Response {
+    let applied = &landed.applied;
+    let Some(op) = applied.ops.first() else {
+        return xrpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "the write landed without an op",
+        );
+    };
+    let Some((collection, rkey)) = op.path.split_once('/') else {
+        return xrpc_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "InternalServerError",
+            "the write landed without a path",
+        );
+    };
+    Json(json!({
+        "uri": ingest::at_uri(&did_of(user, state), collection, rkey),
+        "cid": op.record_cid.map(|cid| cid.to_string()),
+        "commit": {
+            "cid": applied.commit.to_string(),
+            "rev": applied.rev.as_str(),
+        },
+    }))
+    .into_response()
+}
 
-    // And into the pod, faithfully, so the other protocols can see it.
-    let uri = ingest::at_uri(&did_of(&user, &state), &input.collection, &rkey);
-    let webid = webid::webid(&user.username, &state.base_domain);
-    let document = webid::profile_document(&user.username, &state.base_domain);
-    if let Ok(pod) = state.stores.pod(user.id)
-        && let Err(e) = pod
-            .write(|w| Ok(ingest::ingest(w, &record, &uri, &webid, &document)))
-            .map_err(ingest::IngestError::from)
-            .flatten()
-    {
-        tracing::error!(error = %e, "faithful ingest failed after a repo write");
-    }
-
-    Json(json!({"uri": uri, "cid": record_cid.to_string()})).into_response()
+/// A nullable-and-optional field, kept distinguishable (1, B).
+///
+/// `putRecord`'s `swapRecord` is deliberately both: absent means no
+/// requirement, `null` means "must not exist", a CID means "must be at
+/// exactly this". Plain `Option<Option<T>>` collapses the first two — serde
+/// maps `null` straight to the outer `None` — so the field is deserialized
+/// with the inner option preserved and defaulted only when absent.
+fn double_option<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer).map(Some)
 }
 
 #[derive(Deserialize)]
-pub struct DeleteRecord {
+#[serde(rename_all = "camelCase")]
+struct PutRecord {
+    repo: Option<String>,
+    collection: String,
+    rkey: String,
+    record: Value,
+    /// Nullable *and* optional, deliberately (1, B).
+    #[serde(default, deserialize_with = "double_option")]
+    swap_record: Option<Option<String>>,
+    swap_commit: Option<String>,
+}
+
+/// `com.atproto.repo.putRecord`: upsert, as the lexicon defines it — absent
+/// creates, present replaces — with compare-and-set on both the record and
+/// the head when the client names either (1, B).
+async fn put_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    body: Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    let Some(user) = caller(&state, &headers, &jar).await else {
+        return auth_required();
+    };
+    let Ok(input) = serde_json::from_slice::<PutRecord>(&body) else {
+        return invalid_request("body must be a JSON object with collection, rkey and record");
+    };
+    if let Some(target) = input.repo.as_deref()
+        && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
+    {
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "you can only write to your own repository",
+        );
+    }
+
+    let mut record = input.record;
+    if record.get("$type").is_none() {
+        record["$type"] = json!(input.collection);
+    }
+
+    let swap = match brolly_atproto::repo::RecordSwap::parse(
+        input.swap_record.as_ref().map(|swap| swap.as_deref()),
+    ) {
+        Ok(swap) => swap,
+        Err(e) => return write_refused(e),
+    };
+    let write = match brolly_atproto::repo::PlannedWrite::put(
+        &input.collection,
+        &input.rkey,
+        &record,
+        swap,
+    ) {
+        Ok(write) => write,
+        Err(e) => return write_refused(e),
+    };
+    let head = match input.swap_commit {
+        Some(cid) => HeadSwap::AtCommit(cid),
+        None => HeadSwap::Plain,
+    };
+
+    let landed = match commit_write(&state, &user, vec![write], head, vec![record]).await {
+        Ok(landed) => landed,
+        Err(response) => return response,
+    };
+    write_response(&state, &user, &landed)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapRecord {
+    repo: Option<String>,
+    collection: String,
+    rkey: String,
+    record: Value,
+    /// Required, and may be `null`: `null` is "must not exist", a CID is
+    /// "must be at exactly this" (1, B).
+    #[serde(default, deserialize_with = "double_option")]
+    swap_record: Option<Option<String>>,
+    /// Required: the head must be exactly this commit (1, B).
+    swap_commit: Option<String>,
+}
+
+/// `com.atproto.repo.swapRecord` — brolly's strict route over the same
+/// compare-and-set `putRecord` expresses with optional parameters (1, B).
+///
+/// Both swap parameters are required here, because a client that has synced
+/// the repo knows both — the record it read and the commit it read it at —
+/// and a route that demands them cannot be sent half a compare-and-set by
+/// mistake. No retry, ever; every refusal is `InvalidSwap`.
+async fn swap_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    body: Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    let Some(user) = caller(&state, &headers, &jar).await else {
+        return auth_required();
+    };
+    let Ok(input) = serde_json::from_slice::<SwapRecord>(&body) else {
+        return invalid_request(
+            "body must be a JSON object with collection, rkey, record, swapRecord and swapCommit",
+        );
+    };
+    let (Some(swap_record), Some(swap_commit)) = (input.swap_record, input.swap_commit) else {
+        return invalid_request("both swapRecord and swapCommit are required");
+    };
+    if let Some(target) = input.repo.as_deref()
+        && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
+    {
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "you can only write to your own repository",
+        );
+    }
+
+    let mut record = input.record;
+    if record.get("$type").is_none() {
+        record["$type"] = json!(input.collection);
+    }
+
+    let swap = match brolly_atproto::repo::RecordSwap::parse(Some(swap_record.as_deref())) {
+        Ok(swap) => swap,
+        Err(e) => return write_refused(e),
+    };
+    let write = match brolly_atproto::repo::PlannedWrite::put(
+        &input.collection,
+        &input.rkey,
+        &record,
+        swap,
+    ) {
+        Ok(write) => write,
+        Err(e) => return write_refused(e),
+    };
+
+    let landed = match commit_write(
+        &state,
+        &user,
+        vec![write],
+        HeadSwap::AtCommit(swap_commit),
+        vec![record],
+    )
+    .await
+    {
+        Ok(landed) => landed,
+        Err(response) => return response,
+    };
+    write_response(&state, &user, &landed)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SwapCommit {
+    repo: Option<String>,
+    collection: String,
+    rkey: String,
+    record: Value,
+    /// Required: the head must be exactly this commit (1, B).
+    commit_cid: String,
+}
+
+/// `com.atproto.repo.swapCommit` — a write against the head *only if* the
+/// head is exactly that commit (1, B).
+///
+/// This is the compare-and-set C's retry half needs to be reachable by a
+/// client that has synced the repo: it names the commit it read, and if the
+/// head has moved, `InvalidSwap` is the whole answer. No retry, ever.
+async fn swap_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    body: Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    let Some(user) = caller(&state, &headers, &jar).await else {
+        return auth_required();
+    };
+    let Ok(input) = serde_json::from_slice::<SwapCommit>(&body) else {
+        return invalid_request(
+            "body must be a JSON object with collection, rkey, record and commitCid",
+        );
+    };
+    if let Some(target) = input.repo.as_deref()
+        && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
+    {
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "you can only write to your own repository",
+        );
+    }
+
+    let mut record = input.record;
+    if record.get("$type").is_none() {
+        record["$type"] = json!(input.collection);
+    }
+
+    let write = match brolly_atproto::repo::PlannedWrite::put(
+        &input.collection,
+        &input.rkey,
+        &record,
+        brolly_atproto::repo::RecordSwap::Any,
+    ) {
+        Ok(write) => write,
+        Err(e) => return write_refused(e),
+    };
+
+    let landed = match commit_write(
+        &state,
+        &user,
+        vec![write],
+        HeadSwap::AtCommit(input.commit_cid),
+        vec![record],
+    )
+    .await
+    {
+        Ok(landed) => landed,
+        Err(response) => return response,
+    };
+    write_response(&state, &user, &landed)
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "$type", rename_all = "camelCase")]
+enum ApplyWrite {
+    #[serde(rename = "com.atproto.repo.applyWrites#create")]
+    Create {
+        collection: String,
+        rkey: Option<String>,
+        value: Value,
+    },
+    #[serde(rename = "com.atproto.repo.applyWrites#update")]
+    Update {
+        collection: String,
+        rkey: String,
+        value: Value,
+    },
+    #[serde(rename = "com.atproto.repo.applyWrites#delete")]
+    Delete { collection: String, rkey: String },
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ApplyWrites {
+    repo: Option<String>,
+    writes: Vec<ApplyWrite>,
+    swap_commit: Option<String>,
+}
+
+/// `com.atproto.repo.applyWrites`: a batch applied in **one commit** — one MST
+/// revision, one signature, one event with one op per write (1, B).
+///
+/// Atomic: any invalid op refuses the whole batch before anything is signed.
+async fn apply_writes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    body: Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    let Some(user) = caller(&state, &headers, &jar).await else {
+        return auth_required();
+    };
+    let Ok(input) = serde_json::from_slice::<ApplyWrites>(&body) else {
+        return invalid_request("body must be a JSON object with a non-empty writes array");
+    };
+    if let Some(target) = input.repo.as_deref()
+        && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
+    {
+        return xrpc_error(
+            StatusCode::FORBIDDEN,
+            "Forbidden",
+            "you can only write to your own repository",
+        );
+    }
+    if input.writes.is_empty() {
+        return invalid_request("writes must not be empty");
+    }
+    if input.writes.len() > brolly_atproto::repo::MAX_BATCH_OPS {
+        return invalid_request(&format!(
+            "a batch is capped at {} writes",
+            brolly_atproto::repo::MAX_BATCH_OPS
+        ));
+    }
+
+    // The plan and the records, in the order the batch applies them. A value
+    // without a `$type` is given its collection's, exactly as a single write
+    // is.
+    let mut writes = Vec::with_capacity(input.writes.len());
+    let mut records = Vec::with_capacity(input.writes.len());
+    for write in &input.writes {
+        let planned = match write {
+            ApplyWrite::Create {
+                collection,
+                rkey,
+                value,
+            } => {
+                let mut record = value.clone();
+                if record.get("$type").is_none() {
+                    record["$type"] = json!(collection);
+                }
+                records.push(record.clone());
+                brolly_atproto::repo::PlannedWrite::create(collection, rkey.as_deref(), &record)
+            }
+            ApplyWrite::Update {
+                collection,
+                rkey,
+                value,
+            } => {
+                let mut record = value.clone();
+                if record.get("$type").is_none() {
+                    record["$type"] = json!(collection);
+                }
+                records.push(record.clone());
+                brolly_atproto::repo::PlannedWrite::update(collection, rkey, &record)
+            }
+            ApplyWrite::Delete { collection, rkey } => {
+                records.push(Value::Null);
+                brolly_atproto::repo::PlannedWrite::delete(collection, rkey)
+            }
+        };
+        match planned {
+            Ok(planned) => writes.push(planned),
+            Err(e) => return write_refused(e),
+        }
+    }
+    let head = match input.swap_commit {
+        Some(cid) => HeadSwap::AtCommit(cid),
+        None => HeadSwap::Plain,
+    };
+
+    let landed = match commit_write(&state, &user, writes, head, records).await {
+        Ok(landed) => landed,
+        Err(response) => return response,
+    };
+
+    // One result per write, in order: the uri and cid it landed at.
+    let did = did_of(&user, &state);
+    let results: Vec<Value> = landed
+        .applied
+        .ops
+        .iter()
+        .map(|op| match op.path.split_once('/') {
+            Some((collection, rkey)) => json!({
+                "uri": ingest::at_uri(&did, collection, rkey),
+                "cid": op.record_cid.map(|cid| cid.to_string()),
+            }),
+            None => json!({}),
+        })
+        .collect();
+    Json(json!({
+        "commit": {
+            "cid": landed.applied.commit.to_string(),
+            "rev": landed.applied.rev.as_str(),
+        },
+        "results": results,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DeleteRecord {
     repo: Option<String>,
     collection: String,
     rkey: String,
 }
 
 /// `com.atproto.repo.deleteRecord`
-pub async fn delete_record(
+async fn delete_record(
     State(state): State<AppState>,
     headers: HeaderMap,
     jar: CookieJar,
@@ -584,61 +1173,17 @@ pub async fn delete_record(
         );
     }
 
-    let handle = match open_repo(&state, user.clone()).await {
-        Ok(handle) => handle,
-        Err(response) => return response,
-    };
-    let key = match signing_key(&state, &user).await {
-        Ok(key) => key,
-        Err(response) => return response,
+    let write = match brolly_atproto::repo::PlannedWrite::delete(&input.collection, &input.rkey) {
+        Ok(write) => write,
+        Err(e) => return write_refused(e),
     };
 
-    let Some(blocks) = handle.blocks() else {
-        return storage_unavailable();
-    };
-    let (new_root, rev) = match repo::delete_record(
-        blocks,
-        handle.root,
-        &key,
-        &input.collection,
-        &input.rkey,
-        &handle.rev,
-    )
-    .await
-    {
-        Ok(pair) => pair,
-        Err(e) => return invalid_request(&e.to_string()),
-    };
-
-    match state::advance(
-        &state.pool,
-        user.id,
-        &handle.root.to_string(),
-        &new_root.to_string(),
-        &rev,
-    )
-    .await
-    {
-        Ok(rev) => {
-            announce(
-                &state,
-                &did_of(&user, &state),
-                &new_root.to_string(),
-                Some(&handle.root.to_string()),
-                &rev,
-                brolly_atproto::firehose::Action::Delete,
-                &format!("{}/{}", input.collection, input.rkey),
-                None,
-            )
-            .await;
-        }
-        // Surfaced rather than logged: swallowing a conflict here would
-        // answer 200 for a delete whose head was taken by another write (1, C).
-        Err(state::AdvanceError::Conflict) => return write_conflict(),
-        Err(e) => tracing::error!(error = %e, "advancing the repo failed after a delete"),
+    // A plain write: no swap was named, so the head's movement is retried
+    // through rather than answered (1, C).
+    match commit_write(&state, &user, vec![write], HeadSwap::Plain, Vec::new()).await {
+        Ok(_) => Json(json!({})).into_response(),
+        Err(response) => response,
     }
-
-    Json(json!({})).into_response()
 }
 
 /// `com.atproto.server.describeServer`
@@ -654,47 +1199,6 @@ pub async fn describe_server(State(state): State<AppState>, headers: HeaderMap) 
         "links": {},
     }))
     .into_response()
-}
-
-/// Record a commit on the firehose and hand it to attached consumers.
-///
-/// The durable write comes first and the broadcast second, deliberately: a
-/// consumer that misses the broadcast resumes from the log, but an event that
-/// was broadcast and never logged is invisible to anyone who reconnects.
-///
-/// A failure here does not fail the write. The record is already committed to
-/// the repo, and refusing a successful write because its announcement failed
-/// would be the worse outcome — the log is repairable, a rejected write the
-/// client believes failed is not.
-#[allow(clippy::too_many_arguments)]
-async fn announce(
-    state: &AppState,
-    did: &str,
-    commit_cid: &str,
-    prev_cid: Option<&str>,
-    rev: &Tid,
-    action: brolly_atproto::firehose::Action,
-    path: &str,
-    record_cid: Option<&str>,
-) {
-    match brolly_atproto::firehose::record(
-        &state.pool,
-        did,
-        commit_cid,
-        prev_cid,
-        rev,
-        action,
-        path,
-        record_cid,
-    )
-    .await
-    {
-        Ok(event) => {
-            // `send` fails only when nobody is listening, which is normal.
-            let _ = state.commits.send(event);
-        }
-        Err(e) => tracing::error!(error = %e, "recording a firehose event failed"),
-    }
 }
 
 // --- firehose ---------------------------------------------------------------------
@@ -819,8 +1323,11 @@ pub fn routes() -> Router<AppState> {
             get(describe_server),
         )
         .route("/xrpc/com.atproto.repo.createRecord", post(create_record))
-        .route("/xrpc/com.atproto.repo.putRecord", post(create_record))
+        .route("/xrpc/com.atproto.repo.putRecord", post(put_record))
         .route("/xrpc/com.atproto.repo.deleteRecord", post(delete_record))
+        .route("/xrpc/com.atproto.repo.applyWrites", post(apply_writes))
+        .route("/xrpc/com.atproto.repo.swapRecord", post(swap_record))
+        .route("/xrpc/com.atproto.repo.swapCommit", post(swap_commit))
         // Last, and a wildcard: literal segments match first.
         .route(
             "/xrpc/{nsid}",
