@@ -436,8 +436,6 @@ dependencies = [
 [[package]]
 name = "atrium-repo"
 version = "0.1.8"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "db6727246cd65a5614ef7a5e1ddc17fac1a0da971863422d43146441529e6a36"
 dependencies = [
  "async-stream",
  "atrium-api",

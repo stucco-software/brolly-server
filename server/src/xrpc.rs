@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, body::Bytes};
 use axum_extra::extract::CookieJar;
 use brolly_atproto::blocks::PodBlocks;
+use brolly_atproto::firehose::CommitEvent;
 use brolly_atproto::keys::SigningKey;
 use brolly_atproto::tid::Tid;
 use brolly_atproto::{ingest, repo, state};
@@ -1240,6 +1241,66 @@ pub async fn subscribe_repos(
     ws.on_upgrade(move |socket| stream_commits(state, query.cursor, socket))
 }
 
+/// A commit event as a wire frame: the CAR diff slice built at emission time
+/// from the log's pointers plus the member's blocks (1, D, D5), then the
+/// frame around it.
+///
+/// `None` is a skip, not an empty frame. A member whose blocks cannot be
+/// reached — deleted, disabled, or with storage that will not open — cannot
+/// have a diff built, and emitting the event with empty blocks would pretend
+/// a diff no consumer could invert. The event is skipped with an error log;
+/// the cursor moves past it, and a consumer that wants that repo's history
+/// resyncs it by other means. (The *reason* a member's events stop being
+/// frameable is chunk 4's `#account` event, not this function's silence.)
+///
+/// The member is resolved through the same resolver every other repo read
+/// uses — `did:plc` from the table, `did:web` structurally — with its
+/// `is_active` filter: the firehose is an unauthenticated read path, and this
+/// is the moderation stance that path already takes everywhere else.
+async fn frame_commit(state: &AppState, event: &CommitEvent) -> Option<Vec<u8>> {
+    let Some(user) = resolve_repo(state, &event.did).await else {
+        tracing::error!(
+            did = %event.did,
+            seq = event.seq,
+            "the member behind a logged commit cannot be resolved; skipping its event"
+        );
+        return None;
+    };
+    let Ok(blobs) = state.stores.repo_blocks(user.id) else {
+        tracing::error!(
+            did = %event.did,
+            seq = event.seq,
+            "the member's repo blocks cannot be opened; skipping its event"
+        );
+        return None;
+    };
+    let mut blocks = PodBlocks::new(blobs);
+    let car = match repo::event_diff_car(&mut blocks, event).await {
+        Ok(car) => car,
+        Err(e) => {
+            tracing::error!(
+                did = %event.did,
+                seq = event.seq,
+                error = %e,
+                "the CAR diff slice for a logged commit cannot be built; skipping its event"
+            );
+            return None;
+        }
+    };
+    match brolly_atproto::firehose::frame(event, &car) {
+        Ok(frame) => Some(frame),
+        Err(e) => {
+            tracing::error!(
+                did = %event.did,
+                seq = event.seq,
+                error = %e,
+                "framing a logged commit failed; skipping its event"
+            );
+            None
+        }
+    }
+}
+
 async fn stream_commits(
     state: AppState,
     cursor: Option<i64>,
@@ -1265,8 +1326,10 @@ async fn stream_commits(
             break;
         }
         for event in &events {
-            let Ok(frame) = firehose::frame(event) else {
-                tracing::error!(seq = event.seq, "could not frame a commit event");
+            // A frame is built at emission time, from the log's pointers plus
+            // the member's blocks (D5) — an event that cannot be built is
+            // skipped loudly rather than emitted hollow (1, D).
+            let Some(frame) = frame_commit(&state, event).await else {
                 continue;
             };
             if socket.send(Message::Binary(frame.into())).await.is_err() {
@@ -1287,7 +1350,7 @@ async fn stream_commits(
             // draining the table and attaching to the channel.
             continue;
         }
-        let Ok(frame) = firehose::frame(&event) else {
+        let Some(frame) = frame_commit(&state, &event).await else {
             continue;
         };
         if socket.send(Message::Binary(frame.into())).await.is_err() {

@@ -46,6 +46,13 @@ tracing = "0.1"
 [profile.dev.package."*"]
 debug = false
 
+# atrium-repo 0.1.8's `split_subtree` silently drops a parent node's entries
+# when the level below splits with one side empty, losing records from the
+# tree (a delete/re-add round trip makes every key on that side unfindable).\n# Vendored with that one fix until an upstream release carries it; the patch
+# is marked in vendor/atrium-repo/src/mst.rs.
+[patch.crates-io]
+atrium-repo = { path = "vendor/atrium-repo" }
+
 [workspace.lints.clippy]
 # Deny, not warn. Warn was not enough last time — see learnings §2.10.
 unwrap_used  = "deny"

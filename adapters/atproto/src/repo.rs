@@ -24,7 +24,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use atrium_api::types::string::{Did, Nsid, RecordKey, Tid};
-use atrium_repo::blockstore::{AsyncBlockStoreRead, AsyncBlockStoreWrite, DiffBlockStore};
+use atrium_repo::blockstore::{AsyncBlockStoreRead, AsyncBlockStoreWrite};
 use atrium_repo::{Cid, Repository};
 use ipld_core::ipld::Ipld;
 use serde::Deserialize;
@@ -33,7 +33,7 @@ use serde_json::Value;
 use sha2::Digest;
 
 use crate::blocks::PodBlocks;
-use crate::firehose::Action;
+use crate::firehose::{Action, CommitEvent};
 use crate::keys::SigningKey;
 use crate::tid;
 
@@ -46,7 +46,9 @@ pub const MAX_BATCH_OPS: usize = 200;
 /// A commit whose CAR diff slice would exceed this many bytes is refused at
 /// the write rather than emitted with `tooBig` — the Sync spec deprecates
 /// `tooBig` ("producers should always set it to `false`"), so the limit has to
-/// bite somewhere, and the write is where (1, B).
+/// bite somewhere, and the write is where (1, B). The check measures the
+/// exact slice [`diff_car`] builds — the same bytes the firehose emits — so a
+/// commit that passes it is a commit whose frame fits, by construction.
 pub const MAX_DIFF_BYTES: usize = 2_000_000;
 
 #[derive(Debug)]
@@ -151,6 +153,71 @@ async fn read_commit(blocks: &mut PodBlocks, root: Cid) -> Result<SignedCommit, 
         .map_err(|e| RepoError::Repo(e.to_string()))?;
     serde_ipld_dagcbor::from_slice::<SignedCommit>(&bytes)
         .map_err(|e| RepoError::Repo(format!("the commit block does not parse: {e}")))
+}
+
+// --- the MST node walk -----------------------------------------------------------
+
+/// An MST node, mirrored field for field from atrium's private node schema
+/// (l/e/p/k/v/t) — the same move the commit envelope makes (1, B). The node
+/// set of a revision cannot be taken from `Tree::export`, which yields node
+/// CIDs and record CIDs undifferentiated, so the nodes are walked directly
+/// (1, D). `p`, `k` and `v` are parsed but unused: they must be carried to
+/// deserialize the entries at all, and a mirror that dropped them would not
+/// be the schema it claims to mirror.
+#[derive(Deserialize)]
+struct MstNode {
+    #[serde(rename = "l")]
+    left: Option<Cid>,
+    #[serde(rename = "e")]
+    entries: Vec<MstEntry>,
+}
+
+#[derive(Deserialize)]
+struct MstEntry {
+    #[serde(rename = "p")]
+    _prefix_len: usize,
+    #[serde(rename = "k", with = "serde_bytes")]
+    _key_suffix: Vec<u8>,
+    #[serde(rename = "v")]
+    _value: Cid,
+    #[serde(rename = "t")]
+    tree: Option<Cid>,
+}
+
+/// Every MST node CID reachable from `root`, in walk order (1, D).
+///
+/// The walk is iterative rather than recursive — an MST's depth is bounded by
+/// its keys' layers, but a mirror that recursed would trade that bound for a
+/// stack — and a `seen` set makes a malformed cycle a skip rather than a hang.
+/// A block that does not parse as a node is corruption, reported rather than
+/// guessed around.
+async fn node_cids<S: AsyncBlockStoreRead>(
+    store: &mut S,
+    root: Cid,
+    out: &mut Vec<Cid>,
+) -> Result<(), RepoError> {
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(cid) = stack.pop() {
+        if !seen.insert(cid) {
+            continue;
+        }
+        let bytes = store.read_block(cid).await?;
+        let node: MstNode = serde_ipld_dagcbor::from_slice(&bytes)
+            .map_err(|e| RepoError::Repo(format!("an MST node block does not parse: {e}")))?;
+        out.push(cid);
+        // The `l` field is real: a node whose first entry is a subtree stores
+        // it there, so a walk that skipped it would miss half a tree.
+        if let Some(left) = node.left {
+            stack.push(left);
+        }
+        for entry in &node.entries {
+            if let Some(tree) = entry.tree {
+                stack.push(tree);
+            }
+        }
+    }
+    Ok(())
 }
 
 // --- records as they are stored -------------------------------------------------
@@ -496,14 +563,12 @@ pub async fn apply(
         record_blocks.push(bytes);
     }
 
-    let mut store = DiffBlockStore::wrap(blocks);
-
     // Validate the whole batch against the old tree, simulating the writes in
     // order so a batch that touches one path twice is judged on the state the
     // first touch leaves (1, B).
     let mut simulated: BTreeMap<String, Option<Cid>> = BTreeMap::new();
     {
-        let mut tree = atrium_repo::mst::Tree::open(&mut store, old_commit.data);
+        let mut tree = atrium_repo::mst::Tree::open(&mut blocks, old_commit.data);
         for write in &writes {
             let path = write.path()?;
             let current = match simulated.get(&path) {
@@ -530,7 +595,7 @@ pub async fn apply(
         let path = write.path()?;
         let record_cid = match write.record.as_ref() {
             Some(_) => {
-                let cid = store
+                let cid = blocks
                     .write_block(
                         atrium_repo::blockstore::DAG_CBOR,
                         atrium_repo::blockstore::SHA2_256,
@@ -541,7 +606,7 @@ pub async fn apply(
             }
             None => None,
         };
-        let mut tree = atrium_repo::mst::Tree::open(&mut store, mst_root);
+        let mut tree = atrium_repo::mst::Tree::open(&mut blocks, mst_root);
         // The state the path is in right now — the real tree, so an op on a
         // path an earlier op in this batch touched sees that op's record.
         let current = tree.get(&path).await?;
@@ -613,52 +678,27 @@ pub async fn apply(
     let signed_bytes = serde_ipld_dagcbor::to_vec(&signed)
         .map_err(|e| RepoError::Repo(format!("the commit cannot be encoded: {e}")))?;
 
-    // The CAR diff slice this commit implies, sized at the write: every block
-    // the write stored (the new MST nodes and the new record values), the
-    // contextual path blocks of the old tree each op needs for inversion, and
-    // the commit block itself (1, B). Chunk 3 emits the slice this measures.
-    let commit_cid = Cid::new_v1(
-        atrium_repo::blockstore::DAG_CBOR,
-        atrium_repo::Multihash::wrap(
-            atrium_repo::blockstore::SHA2_256,
-            &sha2::Sha256::digest(&signed_bytes),
-        )
-        .map_err(|e| RepoError::Repo(format!("hashing the commit: {e}")))?,
-    );
-    let mut diff = car_frame_size(&commit_cid, &signed_bytes);
-    let mut counted: HashSet<Cid> = HashSet::new();
-    // Every block the write stored: the new MST nodes and the new record
-    // values. Collected first — the differencing store lends its blocks out
-    // only while it is not being read.
-    let written: Vec<Cid> = store.blocks().collect();
-    for cid in written {
-        if counted.insert(cid) {
-            let bytes = store.read_block(cid).await?;
-            diff += car_frame_size(&cid, &bytes);
-        }
-    }
-    for op in &ops {
-        // The contextual chain to this op's key in the old tree, collected
-        // before the store is read back, because the tree holds it while
-        // open.
-        let path_cids = {
-            let mut tree = atrium_repo::mst::Tree::open(&mut store, old_commit.data);
-            tree.extract_path(&op.path).await?.collect::<Vec<_>>()
-        };
-        for cid in path_cids {
-            if counted.insert(cid) {
-                let bytes = store.read_block(cid).await?;
-                diff += car_frame_size(&cid, &bytes);
-            }
-        }
-    }
-    if diff > MAX_DIFF_BYTES {
+    // The exact CAR diff slice this commit implies — the same bytes the
+    // firehose emits (1, D) — sized here because `tooBig` is deprecated and
+    // cannot absorb an oversized slice, so the limit has to bite at the write
+    // (1, B). One slice, built by one function, measured at the write and
+    // framed at the emission: the emitted bytes are the measured bytes.
+    let diff_ops: Vec<DiffOp<'_>> = ops
+        .iter()
+        .map(|op| DiffOp {
+            path: &op.path,
+            record_cid: op.record_cid,
+        })
+        .collect();
+    let car = diff_car(&mut blocks, &signed_bytes, Some(old_commit.data), &diff_ops).await?;
+    if car.len() > MAX_DIFF_BYTES {
         return Err(RepoError::TooLarge(format!(
-            "the commit's CAR diff slice would be {diff} bytes, over the {MAX_DIFF_BYTES}-byte limit"
+            "the commit's CAR diff slice would be {} bytes, over the {MAX_DIFF_BYTES}-byte limit",
+            car.len()
         )));
     }
 
-    let written = store
+    let written = blocks
         .write_block(
             atrium_repo::blockstore::DAG_CBOR,
             atrium_repo::blockstore::SHA2_256,
@@ -710,20 +750,7 @@ fn invalid_swap(path: &str, why: &str) -> RepoError {
     RepoError::InvalidSwap(format!("swapRecord did not hold for {path}: {why}"))
 }
 
-/// The space one block occupies in a CAR: a varint length, the CID bytes, the
-/// data (1, B).
-fn car_frame_size(cid: &Cid, bytes: &[u8]) -> usize {
-    let cid_len = cid.to_bytes().len();
-    let body = cid_len + bytes.len();
-    let mut varint = 1;
-    let mut rest = body >> 7;
-    while rest > 0 {
-        varint += 1;
-        rest >>= 7;
-    }
-    varint + body
-}
-
+/// Whether one write may proceed against the state its path is in (1, B).
 /// Create a member's repo and sign its genesis commit.
 ///
 /// Returns the root CID and the genesis commit's own rev, which the caller
@@ -882,6 +909,179 @@ impl tokio::io::AsyncSeek for SharedBuffer {
         use std::io::Seek;
         std::task::Poll::Ready(self.with(|cursor| cursor.stream_position()))
     }
+}
+
+// --- the CAR diff slice ------------------------------------------------------------
+
+/// One op's place in a CAR diff slice: the path it touched, and the new record
+/// value it wrote — none for a delete, whose old value never rides the slice
+/// (1, D).
+#[derive(Debug, Clone)]
+pub struct DiffOp<'a> {
+    /// `collection/rkey`.
+    pub path: &'a str,
+    /// The written record's CID; absent for a delete.
+    pub record_cid: Option<Cid>,
+}
+
+/// The CAR diff slice a commit implies, per the Repository spec's definition
+/// (1, D):
+///
+/// - the new commit block, first, and the CAR's only root;
+/// - every MST node of the new revision that did not exist in the previous
+///   one;
+/// - the contextual MST nodes operation inversion needs — the previous
+///   tree's path to each op's key, adjacent in key order, which is what lets
+///   a consumer re-add or remove a *pointer* without the old record bytes;
+/// - the created/updated records' new values — never a deleted record's old
+///   value.
+///
+/// Built with the same atrium CAR writer `export_car` uses (D14) — the frame
+/// is exactly the kind of structural detail that is easy to get subtly wrong
+/// and impossible to notice locally.
+///
+/// This is the one slice both the write-time limit and the firehose use
+/// (1, B): the limit measures these bytes at the write, and the frame carries
+/// them at the emission, so the emitted slice is the measured slice by
+/// construction rather than by coincidence.
+///
+/// `commit_bytes` is the signed commit block — passed rather than read, so
+/// the write can size its slice *before* the block is stored and a refusal
+/// leaves nothing behind. `prev_data` is the previous MST root; `None` on a
+/// repo's first commit, where there is no previous revision to diff against
+/// and every node of the new one is new.
+pub async fn diff_car<S: AsyncBlockStoreRead>(
+    store: &mut S,
+    commit_bytes: &[u8],
+    prev_data: Option<Cid>,
+    ops: &[DiffOp<'_>],
+) -> Result<Vec<u8>, RepoError> {
+    use atrium_repo::blockstore::CarStore;
+
+    let commit_cid = Cid::new_v1(
+        atrium_repo::blockstore::DAG_CBOR,
+        atrium_repo::Multihash::wrap(
+            atrium_repo::blockstore::SHA2_256,
+            &sha2::Sha256::digest(commit_bytes),
+        )
+        .map_err(|e| RepoError::Repo(format!("hashing the commit: {e}")))?,
+    );
+    let signed: SignedCommit = serde_ipld_dagcbor::from_slice(commit_bytes)
+        .map_err(|e| RepoError::Repo(format!("the commit block does not parse: {e}")))?;
+
+    // The node sets of both revisions: a node of the new tree that the old one
+    // did not have was created by this commit, and the rest of the new tree is
+    // context only where an op's inversion needs it.
+    let mut old_nodes = Vec::new();
+    if let Some(prev) = prev_data {
+        node_cids(store, prev, &mut old_nodes).await?;
+    }
+    let old_set: HashSet<Cid> = old_nodes.iter().copied().collect();
+    let mut new_nodes = Vec::new();
+    node_cids(store, signed.data, &mut new_nodes).await?;
+
+    // `CarStore` keeps its storage private, so the buffer is shared rather
+    // than recovered afterwards — the same arrangement as `export_car`.
+    let buffer = SharedBuffer::default();
+    let mut car = CarStore::create_with_roots(buffer.clone(), [commit_cid])
+        .await
+        .map_err(|e| RepoError::Repo(e.to_string()))?;
+
+    // The commit block first, and the CAR's only root (1, D).
+    car.write_block(
+        atrium_repo::blockstore::DAG_CBOR,
+        atrium_repo::blockstore::SHA2_256,
+        commit_bytes,
+    )
+    .await?;
+
+    // Every MST node of the new revision the previous one did not have. The
+    // CAR writer skips duplicates by content address, so ordering across the
+    // three groups below cannot double-file a block.
+    for cid in new_nodes {
+        if !old_set.contains(&cid) {
+            let bytes = store.read_block(cid).await?;
+            car.write_block(
+                atrium_repo::blockstore::DAG_CBOR,
+                atrium_repo::blockstore::SHA2_256,
+                &bytes,
+            )
+            .await?;
+        }
+    }
+
+    // The contextual chains: the previous tree's path to each op's key — the
+    // nodes adjacent in key order that a reversed op walks. `extract_path`'s
+    // found-case also returns the record's own CID at the end of its chain;
+    // filtering to the old node set keeps the nodes and drops that leaf, which
+    // is how a deleted record's old value stays out of the slice (1, D).
+    if let Some(prev) = prev_data {
+        for op in ops {
+            let chain = {
+                let mut tree = atrium_repo::mst::Tree::open(&mut *store, prev);
+                tree.extract_path(op.path).await?.collect::<Vec<_>>()
+            };
+            for cid in chain {
+                if old_set.contains(&cid) {
+                    let bytes = store.read_block(cid).await?;
+                    car.write_block(
+                        atrium_repo::blockstore::DAG_CBOR,
+                        atrium_repo::blockstore::SHA2_256,
+                        &bytes,
+                    )
+                    .await?;
+                }
+            }
+        }
+    }
+
+    // The created/updated records' new values. A delete's old value never
+    // rides the slice: inversion re-adds its pointer, and the contextual
+    // nodes above are what make that enough (1, D).
+    for op in ops {
+        if let Some(record) = op.record_cid {
+            let bytes = store.read_block(record).await?;
+            car.write_block(
+                atrium_repo::blockstore::DAG_CBOR,
+                atrium_repo::blockstore::SHA2_256,
+                &bytes,
+            )
+            .await?;
+        }
+    }
+
+    Ok(buffer.take())
+}
+
+/// The CAR diff slice for a logged commit event, built from the member's
+/// blocks at emission time (1, D, D5).
+///
+/// The log holds pointers — the commit CID, the previous MST root, the ops —
+/// and never blocks; the blocks are content-addressed and never pruned, so
+/// the slice a write implied is reconstructible from the event row plus the
+/// member's store whenever a consumer asks for it.
+pub async fn event_diff_car(
+    blocks: &mut PodBlocks,
+    event: &CommitEvent,
+) -> Result<Vec<u8>, RepoError> {
+    let parse = |cid: &str| -> Result<Cid, RepoError> {
+        cid.parse()
+            .map_err(|e| RepoError::Repo(format!("a logged CID does not parse ({cid}): {e}")))
+    };
+
+    let commit_bytes = blocks.read_block(parse(&event.commit_cid)?).await?;
+    let prev_data = match &event.prev_data {
+        Some(prev) => Some(parse(prev)?),
+        None => None,
+    };
+    let mut ops = Vec::with_capacity(event.ops.len());
+    for op in &event.ops {
+        ops.push(DiffOp {
+            path: &op.path,
+            record_cid: op.record_cid.as_deref().map(parse).transpose()?,
+        });
+    }
+    diff_car(blocks, &commit_bytes, prev_data, &ops).await
 }
 
 /// Every CID reachable from the root — the block set a CAR export carries.
