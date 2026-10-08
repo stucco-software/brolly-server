@@ -279,10 +279,12 @@ the head.
 ### E. The other events
 
 The `atproto_firehose` table grows a `kind` column (`commit`, `identity`,
-`account`) and the commit-specific columns (`commit_cid`, `prev_cid`,
-`action`, `path`, `record_cid`) become nullable — an `#identity` event
-carries none of them. New columns: `handle` (`#identity`), `active`/
-`status` (`#account`), `since_rev` and `prev_data` (D).
+`account`); the commit-specific columns on the event row (`commit_cid`,
+`rev`) become nullable, and a non-commit row carries none of the commit
+columns — a CHECK, not a promise. (`prev_cid`, `since_rev` and `prev_data`
+were nullable already; `action`, `path` and `record_cid` live on the op
+rows, where they stay required — an op row exists only where a commit
+does.) New columns: `handle` (`#identity`), `active`/`status` (`#account`).
 
 - **`#identity`** is emitted when a member's identity changes — handle
   rename, key rotation. DID and the new handle on the wire; the handle is

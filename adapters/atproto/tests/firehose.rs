@@ -100,6 +100,34 @@ impl Revs {
     }
 }
 
+/// The log's commits — `since`'s mixed-kind answer narrowed to the kind these
+/// log tests exercise. The log holds three kinds now (1, E); a test that
+/// recorded only commits reads only commits back.
+async fn commits(pool: &PgPool) -> Vec<firehose::CommitEvent> {
+    firehose::since(pool, None, 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            firehose::Event::Commit(commit) => Some(commit),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The commits after a cursor, same narrowing.
+async fn commits_after(pool: &PgPool, cursor: i64) -> Vec<firehose::CommitEvent> {
+    firehose::since(pool, Some(cursor), 100)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            firehose::Event::Commit(commit) => Some(commit),
+            _ => None,
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn the_cursor_increases_across_the_whole_instance() {
     // A consumer subscribes to the instance, not to one repo, so the sequence
@@ -136,7 +164,7 @@ async fn a_repo_events_revs_increase_per_repo() {
         previous = revs.next();
     }
 
-    let events = firehose::since(&pool, None, 10).await.unwrap();
+    let events = commits(&pool).await;
     for pair in events.windows(2) {
         assert!(
             pair[1].rev.as_str() > pair[0].rev.as_str(),
@@ -182,7 +210,7 @@ async fn an_event_carries_all_of_its_commits_ops_in_order() {
     )
     .await;
 
-    let events = firehose::since(&pool, None, 10).await.unwrap();
+    let events = commits(&pool).await;
     assert_eq!(events.len(), 1, "one commit is one event");
     let ops = &events[0].ops;
     assert_eq!(ops.len(), 3, "one op per write");
@@ -212,11 +240,21 @@ async fn a_consumer_resumes_from_its_cursor_without_a_gap_or_a_duplicate() {
         commit(&pool, DID, n, &revs.next(), vec![an_op(n)]).await;
     }
 
-    let first_page = firehose::since(&pool, None, 2).await.unwrap();
+    // The first page is two events — the page boundary is where the resume
+    // bug lives, so the page is small enough to actually cross it.
+    let first_page: Vec<firehose::CommitEvent> = firehose::since(&pool, None, 2)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            firehose::Event::Commit(commit) => Some(commit),
+            _ => None,
+        })
+        .collect();
     assert_eq!(first_page.len(), 2);
 
     let cursor = first_page.last().unwrap().seq;
-    let second_page = firehose::since(&pool, Some(cursor), 10).await.unwrap();
+    let second_page = commits_after(&pool, cursor).await;
 
     assert_eq!(second_page.len(), 3, "a gap would silently lose posts");
     assert!(
@@ -242,7 +280,7 @@ async fn a_fresh_consumer_receives_everything() {
     for n in 1..=3 {
         commit(&pool, DID, n, &revs.next(), vec![an_op(n)]).await;
     }
-    assert_eq!(firehose::since(&pool, None, 100).await.unwrap().len(), 3);
+    assert_eq!(commits(&pool).await.len(), 3);
 }
 
 #[tokio::test]
@@ -252,16 +290,11 @@ async fn a_consumer_at_the_head_receives_nothing_until_something_happens() {
     commit(&pool, DID, 1, &revs.next(), vec![an_op(1)]).await;
 
     let head = firehose::head(&pool).await.unwrap().expect("a head");
-    assert!(
-        firehose::since(&pool, Some(head), 100)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(commits_after(&pool, head).await.is_empty());
 
     let second = revs.next();
     commit(&pool, DID, 2, &second, vec![an_op(2)]).await;
-    let next = firehose::since(&pool, Some(head), 100).await.unwrap();
+    let next = commits_after(&pool, head).await;
     assert_eq!(next.len(), 1);
     assert_eq!(next[0].rev, second);
 }
@@ -282,7 +315,7 @@ async fn events_arrive_in_sequence_order() {
         commit(&pool, DID, n, &revs.next(), vec![an_op(n)]).await;
     }
 
-    let events = firehose::since(&pool, None, 100).await.unwrap();
+    let events = commits(&pool).await;
     let seqs: Vec<i64> = events.iter().map(|e| e.seq).collect();
     let mut sorted = seqs.clone();
     sorted.sort_unstable();
@@ -346,7 +379,7 @@ async fn a_delete_op_carries_no_record_cid() {
     assert_eq!(event.ops[0].action, Action::Delete);
     assert_eq!(event.ops[0].record_cid, None);
 
-    let read = firehose::since(&pool, None, 10).await.unwrap();
+    let read = commits(&pool).await;
     assert_eq!(read[0].ops[0].action, Action::Delete);
     assert_eq!(read[0].ops[0].record_cid, None);
 }
@@ -377,7 +410,7 @@ async fn every_action_survives_the_round_trip() {
         .unwrap();
     }
 
-    let events = firehose::since(&pool, None, 10).await.unwrap();
+    let events = commits(&pool).await;
     let actions: Vec<Action> = events
         .iter()
         .flat_map(|e| e.ops.iter().map(|op| op.action))
@@ -397,7 +430,7 @@ async fn an_events_timestamp_survives_the_log_round_trip() {
     let mut revs = Revs::new();
     let logged = commit(&pool, DID, 1, &revs.next(), vec![an_op(1)]).await;
 
-    let read = firehose::since(&pool, None, 10).await.unwrap();
+    let read = commits(&pool).await;
     assert_eq!(read.len(), 1);
     assert_eq!(
         read[0].time, logged.time,
@@ -418,6 +451,153 @@ async fn an_events_timestamp_survives_the_log_round_trip() {
             .format(&time::format_description::well_known::Rfc3339)
             .unwrap()
     );
+}
+
+// --- the other kinds, on the same log (1, E) --------------------------------------
+
+/// Record an `#identity` event — the same way the identity layer does, inside
+/// a transaction the caller owns.
+async fn an_identity(pool: &PgPool, did: &str, handle: Option<&str>) -> firehose::IdentityEvent {
+    let mut tx = pool.begin().await.unwrap();
+    let event = firehose::record_identity(&mut tx, did, handle)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    event
+}
+
+/// Record an `#account` event — the same way the account layers do, inside the
+/// transaction that makes the transition true.
+async fn an_account(
+    pool: &PgPool,
+    did: &str,
+    active: bool,
+    status: Option<&str>,
+) -> firehose::AccountEvent {
+    let mut tx = pool.begin().await.unwrap();
+    let event = firehose::record_account(&mut tx, did, active, status)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    event
+}
+
+#[tokio::test]
+async fn an_identity_event_round_trips_the_log() {
+    // The same property the commit log is held to, on the second kind: what
+    // was written is what `since` reads, and what it frames is what atrium's
+    // own type decodes (1, E).
+    let (_db, pool) = fresh().await;
+    let logged = an_identity(&pool, DID, Some("alice.brolly.test")).await;
+
+    let read = firehose::since(&pool, None, 10).await.unwrap();
+    let event = match read.as_slice() {
+        [firehose::Event::Identity(event)] => event,
+        other => panic!("expected one identity event, got {other:?}"),
+    };
+    assert_eq!(event.seq, logged.seq);
+    assert_eq!(event.did, DID);
+    assert_eq!(event.handle.as_deref(), Some("alice.brolly.test"));
+    assert_eq!(event.time, logged.time);
+
+    let decoded = decode_identity(&firehose::identity_frame(event).unwrap());
+    assert_eq!(decoded.seq, logged.seq);
+    assert_eq!(decoded.did.as_str(), DID);
+    assert_eq!(
+        decoded.handle.as_ref().map(|h| h.as_str()),
+        Some("alice.brolly.test")
+    );
+}
+
+#[tokio::test]
+async fn a_handle_that_cannot_ride_the_wire_is_omitted_not_stored() {
+    // "The handle is optional per the spec and best-effort, which a
+    // first-party PDS's is not" (1, E): ours is carried whenever it can ride
+    // the wire, and a handle that cannot is omitted at the write rather than
+    // stored as a row no frame can carry.
+    let (_db, pool) = fresh().await;
+    let logged = an_identity(&pool, DID, Some("not a handle")).await;
+    assert_eq!(logged.handle, None);
+
+    let read = firehose::since(&pool, None, 10).await.unwrap();
+    match read.as_slice() {
+        [firehose::Event::Identity(event)] => assert_eq!(event.handle, None),
+        other => panic!("expected one identity event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_account_event_round_trips_the_log() {
+    // A deletion — the hosting transition this instance actually emits today
+    // (1, E) — survives the log and rides the wire as atrium's own type.
+    let (_db, pool) = fresh().await;
+    let logged = an_account(&pool, DID, false, Some("deleted")).await;
+
+    let read = firehose::since(&pool, None, 10).await.unwrap();
+    let event = match read.as_slice() {
+        [firehose::Event::Account(event)] => event,
+        other => panic!("expected one account event, got {other:?}"),
+    };
+    assert_eq!(event.seq, logged.seq);
+    assert_eq!(event.did, DID);
+    assert!(!event.active);
+    assert_eq!(event.status.as_deref(), Some("deleted"));
+
+    let decoded = decode_account(&firehose::account_frame(event).unwrap());
+    assert_eq!(decoded.seq, logged.seq);
+    assert_eq!(decoded.did.as_str(), DID);
+    assert!(!decoded.active);
+    assert_eq!(decoded.status.as_deref(), Some("deleted"));
+}
+
+#[tokio::test]
+async fn an_unknown_status_is_refused_at_the_write() {
+    // The Sync spec names the statuses; the table's CHECK holds the
+    // vocabulary, so an invented one is a database error at the seam that
+    // tried it, not a string a consumer has to guess about (1, E).
+    let (_db, pool) = fresh().await;
+    let mut tx = pool.begin().await.unwrap();
+    assert!(
+        firehose::record_account(&mut tx, DID, false, Some("vanished"))
+            .await
+            .is_err(),
+        "a status the Sync spec does not name must be refused"
+    );
+}
+
+#[tokio::test]
+async fn the_log_holds_all_kinds_on_one_sequence() {
+    // One table, one cursor: a consumer's position has to cross kinds without
+    // a gap or a duplicate, exactly as it crosses repos (1, E).
+    let (_db, pool) = fresh().await;
+    let mut revs = Revs::new();
+    let commit1 = commit(&pool, DID, 1, &revs.next(), vec![an_op(1)]).await;
+    let identity = an_identity(&pool, DID, Some("alice.brolly.test")).await;
+    let account = an_account(&pool, DID, false, Some("deleted")).await;
+    let commit2 = commit(&pool, DID, 2, &revs.next(), vec![an_op(2)]).await;
+
+    assert!(commit1.seq < identity.seq && identity.seq < account.seq && account.seq < commit2.seq);
+    assert_eq!(firehose::head(&pool).await.unwrap(), Some(commit2.seq));
+
+    // The whole log, mixed, in sequence order.
+    let read = firehose::since(&pool, None, 10).await.unwrap();
+    let kinds: Vec<i64> = read.iter().map(firehose::Event::seq).collect();
+    assert_eq!(
+        kinds,
+        vec![commit1.seq, identity.seq, account.seq, commit2.seq]
+    );
+    assert!(matches!(read[0], firehose::Event::Commit(_)));
+    assert!(matches!(read[1], firehose::Event::Identity(_)));
+    assert!(matches!(read[2], firehose::Event::Account(_)));
+    assert!(matches!(read[3], firehose::Event::Commit(_)));
+
+    // A cursor between kinds resumes without a gap or a duplicate — the
+    // classic resume bug, wearing a different kind on each side.
+    let rest = firehose::since(&pool, Some(identity.seq), 10)
+        .await
+        .unwrap();
+    let kinds: Vec<i64> = rest.iter().map(firehose::Event::seq).collect();
+    assert_eq!(kinds, vec![account.seq, commit2.seq]);
 }
 
 // --- frames, against a foreign decoder (1, D) -------------------------------------
@@ -445,11 +625,24 @@ struct FrameHeader {
 /// then decode the body as atrium-api's own `subscribeRepos` commit type, not
 /// our frame function's inverse (1, D).
 fn decode(frame: &[u8]) -> subscribe_repos::Commit {
+    decode_as(frame, "#commit")
+}
+
+/// The same foreign decoder, on the other kinds' bodies (1, E).
+fn decode_identity(frame: &[u8]) -> subscribe_repos::Identity {
+    decode_as(frame, "#identity")
+}
+
+fn decode_account(frame: &[u8]) -> subscribe_repos::Account {
+    decode_as(frame, "#account")
+}
+
+fn decode_as<T: serde::de::DeserializeOwned>(frame: &[u8], t: &str) -> T {
     let mut reader = std::io::Cursor::new(frame);
     let header: FrameHeader =
         serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the header decodes");
-    assert_eq!(header.op, 1, "a commit frame is op 1");
-    assert_eq!(header.t, "#commit", "this is a #commit frame");
+    assert_eq!(header.op, 1, "an event frame is op 1");
+    assert_eq!(header.t, t, "this is a {t} frame");
     serde_ipld_dagcbor::de::from_reader_once(&mut reader)
         .expect("the body decodes as atrium's own type")
 }

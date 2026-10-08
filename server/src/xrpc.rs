@@ -18,7 +18,7 @@ use axum::routing::{get, post};
 use axum::{Json, body::Bytes};
 use axum_extra::extract::CookieJar;
 use brolly_atproto::blocks::PodBlocks;
-use brolly_atproto::firehose::CommitEvent;
+use brolly_atproto::firehose::{self, CommitEvent};
 use brolly_atproto::keys::SigningKey;
 use brolly_atproto::tid::Tid;
 use brolly_atproto::{ingest, repo, state};
@@ -593,7 +593,9 @@ async fn announce(state: &AppState, did: &str, landed: &Landed) {
     match brolly_atproto::firehose::record(&state.pool, &commit).await {
         Ok(event) => {
             // `send` fails only when nobody is listening, which is normal.
-            let _ = state.commits.send(event);
+            let _ = state
+                .commits
+                .send(brolly_atproto::firehose::Event::Commit(event));
         }
         Err(e) => tracing::error!(error = %e, "recording a firehose event failed"),
     }
@@ -1251,7 +1253,8 @@ pub async fn subscribe_repos(
 /// a diff no consumer could invert. The event is skipped with an error log;
 /// the cursor moves past it, and a consumer that wants that repo's history
 /// resyncs it by other means. (The *reason* a member's events stop being
-/// frameable is chunk 4's `#account` event, not this function's silence.)
+/// frameable is the `#account` event, which says so on the wire (1, E) — not
+/// this function's silence.)
 ///
 /// The member is resolved through the same resolver every other repo read
 /// uses — `did:plc` from the table, `did:web` structurally — with its
@@ -1301,13 +1304,50 @@ async fn frame_commit(state: &AppState, event: &CommitEvent) -> Option<Vec<u8>> 
     }
 }
 
+/// One logged event as a wire frame, dispatched on its kind (1, E).
+///
+/// `#commit` is the only kind that needs the member — its blocks are built at
+/// emission time from the member's storage (D5) — so it has its own path with
+/// its own failure handling. `#identity` and `#account` are self-contained:
+/// the DID is the subject, and they must *not* resolve the member, because an
+/// `#account` event's whole job is to be emittable about a member who is
+/// already gone.
+async fn frame_event(state: &AppState, event: &firehose::Event) -> Option<Vec<u8>> {
+    match event {
+        firehose::Event::Commit(commit) => frame_commit(state, commit).await,
+        firehose::Event::Identity(identity) => match firehose::identity_frame(identity) {
+            Ok(frame) => Some(frame),
+            Err(e) => {
+                tracing::error!(
+                    did = %identity.did,
+                    seq = identity.seq,
+                    error = %e,
+                    "framing a logged identity event failed; skipping its event"
+                );
+                None
+            }
+        },
+        firehose::Event::Account(account) => match firehose::account_frame(account) {
+            Ok(frame) => Some(frame),
+            Err(e) => {
+                tracing::error!(
+                    did = %account.did,
+                    seq = account.seq,
+                    error = %e,
+                    "framing a logged account event failed; skipping its event"
+                );
+                None
+            }
+        },
+    }
+}
+
 async fn stream_commits(
     state: AppState,
     cursor: Option<i64>,
     mut socket: axum::extract::ws::WebSocket,
 ) {
     use axum::extract::ws::Message;
-    use brolly_atproto::firehose;
 
     // How much history one page of backfill carries. A consumer far behind
     // makes several passes rather than one unbounded query.
@@ -1329,7 +1369,7 @@ async fn stream_commits(
             // A frame is built at emission time, from the log's pointers plus
             // the member's blocks (D5) — an event that cannot be built is
             // skipped loudly rather than emitted hollow (1, D).
-            let Some(frame) = frame_commit(&state, event).await else {
+            let Some(frame) = frame_event(&state, event).await else {
                 continue;
             };
             if socket.send(Message::Binary(frame.into())).await.is_err() {
@@ -1337,7 +1377,7 @@ async fn stream_commits(
                 // will resume; nothing to clean up.
                 return;
             }
-            position = Some(event.seq);
+            position = Some(event.seq());
         }
     }
 
@@ -1345,18 +1385,18 @@ async fn stream_commits(
     // drops resumes from the log, which is why the log exists.
     let mut live = state.commits.subscribe();
     while let Ok(event) = live.recv().await {
-        if position.is_some_and(|seen| event.seq <= seen) {
+        if position.is_some_and(|seen| event.seq() <= seen) {
             // Already delivered during backfill — the overlap window between
             // draining the table and attaching to the channel.
             continue;
         }
-        let Some(frame) = frame_commit(&state, &event).await else {
+        let Some(frame) = frame_event(&state, &event).await else {
             continue;
         };
         if socket.send(Message::Binary(frame.into())).await.is_err() {
             return;
         }
-        position = Some(event.seq);
+        position = Some(event.seq());
     }
 }
 

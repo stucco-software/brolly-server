@@ -42,7 +42,7 @@ async fn a_genesis_operation_is_logged_and_readable_back() {
     let user = a_user(&pool, "alice").await;
     let (signed, did, _, _) = a_genesis();
 
-    let cid = identity::record_operation(&pool, Some(user), &did, &signed)
+    let (cid, _) = identity::record_operation(&pool, Some(user), &did, &signed)
         .await
         .expect("record");
 
@@ -57,12 +57,42 @@ async fn a_genesis_operation_is_logged_and_readable_back() {
 }
 
 #[tokio::test]
+async fn recording_an_operation_logs_an_identity_event() {
+    // Every operation we record is an identity change — the genesis sets the
+    // handle and the keys — so its `#identity` event rides the operation's
+    // own transaction (1, E). The identity layer owns the transition; the
+    // caller does not have to remember to announce it.
+    let (_db, pool) = fresh().await;
+    let user = a_user(&pool, "alice").await;
+    let (signed, did, _, _) = a_genesis();
+
+    let (_, event) = identity::record_operation(&pool, Some(user), &did, &signed)
+        .await
+        .unwrap();
+    let event = event.expect("a first recording announces the identity");
+    assert_eq!(event.did, did);
+    assert_eq!(event.handle.as_deref(), Some(HANDLE));
+
+    // The event is on the firehose's log, where a durable consumer reads it.
+    let events = brolly_atproto::firehose::since(&pool, None, 10)
+        .await
+        .unwrap();
+    match events.as_slice() {
+        [brolly_atproto::firehose::Event::Identity(logged)] => {
+            assert_eq!(logged.seq, event.seq);
+            assert_eq!(logged.handle.as_deref(), Some(HANDLE));
+        }
+        other => panic!("expected one identity event, got {other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn the_head_is_what_a_rotation_chains_onto() {
     // The reason the log exists at all.
     let (_db, pool) = fresh().await;
     let user = a_user(&pool, "alice").await;
     let (genesis, did, _, rotation) = a_genesis();
-    let genesis_cid = identity::record_operation(&pool, Some(user), &did, &genesis)
+    let (genesis_cid, _) = identity::record_operation(&pool, Some(user), &did, &genesis)
         .await
         .unwrap();
 
@@ -74,7 +104,7 @@ async fn the_head_is_what_a_rotation_chains_onto() {
         &rotation,
     )
     .expect("rotate");
-    let rotated_cid = identity::record_operation(&pool, Some(user), &did, &rotated)
+    let (rotated_cid, _) = identity::record_operation(&pool, Some(user), &did, &rotated)
         .await
         .unwrap();
 
@@ -95,7 +125,7 @@ async fn an_unsubmitted_operation_is_visible_as_such() {
     let (_db, pool) = fresh().await;
     let user = a_user(&pool, "alice").await;
     let (signed, did, _, _) = a_genesis();
-    let cid = identity::record_operation(&pool, Some(user), &did, &signed)
+    let (cid, _) = identity::record_operation(&pool, Some(user), &did, &signed)
         .await
         .unwrap();
 
@@ -123,19 +153,35 @@ async fn recording_the_same_operation_twice_is_idempotent() {
     let user = a_user(&pool, "alice").await;
     let (signed, did, _, _) = a_genesis();
 
-    let first = identity::record_operation(&pool, Some(user), &did, &signed)
+    let (first, event) = identity::record_operation(&pool, Some(user), &did, &signed)
         .await
         .unwrap();
-    let second = identity::record_operation(&pool, Some(user), &did, &signed)
+    let (second, again) = identity::record_operation(&pool, Some(user), &did, &signed)
         .await
         .unwrap();
     assert_eq!(first, second);
+    assert!(
+        again.is_none(),
+        "an operation already recorded announces nothing the second time"
+    );
 
     let (count,): (i64,) = sqlx::query_as("SELECT count(*) FROM atproto_plc_operations")
         .fetch_one(&pool)
         .await
         .unwrap();
     assert_eq!(count, 1);
+    assert!(event.is_some(), "the first recording announced it");
+
+    // And the log holds one identity event, not two — the retry did not
+    // replay the announcement (1, E).
+    let events = brolly_atproto::firehose::since(&pool, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        events.len(),
+        1,
+        "a re-recorded operation must not announce itself twice"
+    );
 }
 
 #[tokio::test]

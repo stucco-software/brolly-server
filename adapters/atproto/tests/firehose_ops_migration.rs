@@ -124,15 +124,27 @@ async fn single_op_events_become_ops_rows_and_the_columns_go() {
         .await
         .unwrap();
     assert_eq!(events.len(), 2);
-    assert_eq!(events[0].ops.len(), 1);
+    let commits: Vec<&brolly_atproto::firehose::CommitEvent> = events
+        .iter()
+        .filter_map(|event| match event {
+            brolly_atproto::firehose::Event::Commit(commit) => Some(commit),
+            _ => None,
+        })
+        .collect();
     assert_eq!(
-        events[0].ops[0].action,
+        commits.len(),
+        2,
+        "the rows the old binary wrote were commits"
+    );
+    assert_eq!(commits[0].ops.len(), 1);
+    assert_eq!(
+        commits[0].ops[0].action,
         brolly_atproto::firehose::Action::Create
     );
-    assert_eq!(events[0].ops[0].path, "app.bsky.feed.post/3k1");
+    assert_eq!(commits[0].ops[0].path, "app.bsky.feed.post/3k1");
     assert_eq!(
-        events[1].ops[0].action,
+        commits[1].ops[0].action,
         brolly_atproto::firehose::Action::Delete
     );
-    assert_eq!(events[1].ops[0].record_cid, None);
+    assert_eq!(commits[1].ops[0].record_cid, None);
 }

@@ -355,12 +355,24 @@ pub async fn register_submit(
             )
             .await
             {
-                Ok(identity) => tracing::info!(
-                    user = %user.id,
-                    did = %identity.did,
-                    plc_registered = identity.plc_registered,
-                    "atproto identity provisioned"
-                ),
+                Ok(identity) => {
+                    // The identity event rides the live channel too, so a
+                    // consumer attached at signup learns the did↔handle pairing
+                    // from the stream instead of a poll (1, E). Durable
+                    // consumers read it from the log; `send` fails only when
+                    // nobody is listening, which is normal.
+                    if let Some(event) = identity.identity_event {
+                        let _ = state
+                            .commits
+                            .send(brolly_atproto::firehose::Event::Identity(event));
+                    }
+                    tracing::info!(
+                        user = %user.id,
+                        did = %identity.did,
+                        plc_registered = identity.plc_registered,
+                        "atproto identity provisioned"
+                    )
+                }
                 Err(e) => {
                     // Local provisioning failing is a real failure — the
                     // account would be permanently half-built. Network failure

@@ -58,6 +58,20 @@ pub struct Service {
     pub endpoint: String,
 }
 
+impl Operation {
+    /// The handle the operation names, if it names one (1, E).
+    ///
+    /// `alsoKnownAs` is the handle's home in a PLC operation — `at://handle` —
+    /// and the DID spec lets the field hold other identifier schemes beside.
+    /// Only an `at://` entry is a handle; an operation with none carries none,
+    /// which is exactly the `#identity` event's optional-handle case.
+    pub fn handle(&self) -> Option<&str> {
+        self.also_known_as
+            .iter()
+            .find_map(|alias| alias.strip_prefix("at://"))
+    }
+}
+
 #[derive(Debug)]
 pub enum PlcError {
     Encode(String),
@@ -376,6 +390,29 @@ mod tests {
         )
         .unwrap();
         assert_eq!(signed.also_known_as, vec![format!("at://{HANDLE}")]);
+    }
+
+    #[test]
+    fn the_handle_is_the_at_alias_not_the_whole_aka() {
+        // `alsoKnownAs` may hold identifier schemes beside `at://`; only an
+        // `at://` entry is a handle, and an operation with none carries none —
+        // the `#identity` event's optional-handle case (1, E).
+        let (signed, _) = create(
+            &SigningKey::generate(),
+            &SigningKey::generate(),
+            HANDLE,
+            PDS,
+        )
+        .unwrap();
+        assert_eq!(signed.handle(), Some(HANDLE));
+
+        let mut aliased = signed.clone();
+        aliased.also_known_as = vec!["https://example.com/#me".to_string()];
+        assert_eq!(aliased.handle(), None);
+
+        let mut bare = signed;
+        bare.also_known_as = Vec::new();
+        assert_eq!(bare.handle(), None);
     }
 
     #[test]

@@ -15,6 +15,7 @@ use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::firehose::{self, IdentityEvent};
 use crate::plc::{self, Operation};
 
 /// One entry in a member's PLC chain.
@@ -27,17 +28,31 @@ pub struct LoggedOperation {
     pub submitted: bool,
 }
 
-/// Record an operation we produced.
+/// Record an operation we produced, and announce the identity change it is
+/// (1, E).
+///
+/// Every operation recorded here is an identity change — the genesis sets the
+/// handle and the keys; a rotation or rename will change them — so the
+/// `#identity` event rides the operation's own transaction: an operation
+/// logged without its event is a change the stream never heard, and the
+/// identity layer is where the transition lives, not whichever caller happens
+/// to be provisioning.
+///
+/// Returns the operation's CID and the event, when one was logged. A
+/// re-record of an operation already in the chain (`ON CONFLICT DO NOTHING`)
+/// announces nothing the second time — the handle for that operation has
+/// already been on the wire.
 pub async fn record_operation(
     pool: &PgPool,
     user_id: Option<Uuid>,
     did: &str,
     signed: &Operation,
-) -> Result<String, DbError> {
+) -> Result<(String, Option<IdentityEvent>), DbError> {
     let cid = plc::operation_cid(signed).map_err(|e| DbError::Hash(e.to_string()))?;
     let json = serde_json::to_value(signed).map_err(|e| DbError::Hash(e.to_string()))?;
 
-    sqlx::query(
+    let mut tx = pool.begin().await?;
+    let inserted = sqlx::query(
         "INSERT INTO atproto_plc_operations (cid, user_id, did, operation, prev)
          VALUES ($1, $2, $3, $4, $5) ON CONFLICT (cid) DO NOTHING",
     )
@@ -46,10 +61,17 @@ pub async fn record_operation(
     .bind(did)
     .bind(&json)
     .bind(signed.prev.as_deref())
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
-    Ok(cid)
+    let event = if inserted.rows_affected() > 0 {
+        Some(firehose::record_identity(&mut tx, did, signed.handle()).await?)
+    } else {
+        None
+    };
+    tx.commit().await?;
+
+    Ok((cid, event))
 }
 
 /// Mark an operation as accepted by the directory.

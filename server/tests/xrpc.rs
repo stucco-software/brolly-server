@@ -174,6 +174,21 @@ async fn post_json(h: &Harness, uri: &str, body: serde_json::Value, cookie: Opti
 }
 
 /// A member with a pod, a repo, a signing key and a session.
+/// The log's commits — `since`'s mixed-kind answer narrowed to the kind these
+/// write-path tests exercise. The log holds three kinds now (1, E); a test
+/// that recorded only commits reads only commits back.
+async fn commits(pool: &sqlx::PgPool) -> Vec<brolly_atproto::firehose::CommitEvent> {
+    brolly_atproto::firehose::since(pool, None, 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .filter_map(|event| match event {
+            brolly_atproto::firehose::Event::Commit(commit) => Some(commit),
+            _ => None,
+        })
+        .collect()
+}
+
 async fn a_member(h: &Harness, username: &str) -> (uuid::Uuid, String) {
     let user = db::create_user(
         &h.db.pool,
@@ -544,9 +559,7 @@ async fn create_record_on_an_occupied_path_refuses_invalid_swap() {
     assert_eq!(second.json()["error"], "InvalidSwap");
 
     // The refusal announced nothing and replaced nothing.
-    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
-        .await
-        .unwrap();
+    let events = commits(&h.db.pool).await;
     assert_eq!(events.len(), 1);
     let fetched = get(
         &h,
@@ -634,9 +647,7 @@ async fn put_record_creates_and_replaces() {
     .await;
     assert_eq!(fetched.json()["value"]["text"], "replaced");
 
-    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
-        .await
-        .unwrap();
+    let events = commits(&h.db.pool).await;
     assert_eq!(events.len(), 2);
     assert_eq!(
         events[0].ops[0].action,
@@ -878,9 +889,7 @@ async fn apply_writes_applies_a_batch_as_one_commit() {
         "one result per write"
     );
 
-    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
-        .await
-        .unwrap();
+    let events = commits(&h.db.pool).await;
     assert_eq!(events.len(), 1, "a batch is one event");
     assert_eq!(events[0].ops.len(), 3, "one op per write");
     let actions: Vec<_> = events[0].ops.iter().map(|op| op.action).collect();
@@ -954,10 +963,7 @@ async fn an_invalid_op_refuses_the_whole_batch() {
 
     // Nothing landed and nothing was announced.
     assert!(
-        brolly_atproto::firehose::since(&h.db.pool, None, 10)
-            .await
-            .unwrap()
-            .is_empty(),
+        commits(&h.db.pool).await.is_empty(),
         "a refused batch must not be announced"
     );
     let fetched = get(
@@ -1001,10 +1007,7 @@ async fn a_batch_over_two_hundred_writes_is_refused() {
     );
     assert_eq!(refused.json()["error"], "InvalidRequest");
     assert!(
-        brolly_atproto::firehose::since(&h.db.pool, None, 10)
-            .await
-            .unwrap()
-            .is_empty(),
+        commits(&h.db.pool).await.is_empty(),
         "a refused batch must not be announced"
     );
 }
@@ -1032,12 +1035,7 @@ async fn a_record_over_a_megabyte_is_refused() {
         refused.text()
     );
     assert_eq!(refused.json()["error"], "PayloadTooLarge");
-    assert!(
-        brolly_atproto::firehose::since(&h.db.pool, None, 10)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    assert!(commits(&h.db.pool).await.is_empty());
 }
 
 #[tokio::test]
@@ -1082,9 +1080,7 @@ async fn two_concurrent_put_records_both_land() {
     }
 
     // Both events landed, in order, and the chain between them is linear.
-    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
-        .await
-        .unwrap();
+    let events = commits(&h.db.pool).await;
     assert_eq!(
         events.len(),
         2,
@@ -1456,9 +1452,7 @@ async fn a_write_is_announced_on_the_firehose() {
     .await;
     assert_eq!(created.status, StatusCode::OK, "{}", created.text());
 
-    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
-        .await
-        .expect("firehose");
+    let events = commits(&h.db.pool).await;
     assert_eq!(events.len(), 1, "the write was not announced");
     assert_eq!(
         events[0].ops.len(),
@@ -1500,9 +1494,7 @@ async fn a_delete_is_announced_too() {
     )
     .await;
 
-    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
-        .await
-        .unwrap();
+    let events = commits(&h.db.pool).await;
     assert_eq!(events.len(), 2);
     assert_eq!(
         events[1].ops[0].action,
@@ -1539,9 +1531,7 @@ async fn the_announcement_chains_to_the_previous_commit() {
         .await;
     }
 
-    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
-        .await
-        .unwrap();
+    let events = commits(&h.db.pool).await;
     assert_eq!(events.len(), 2);
     assert_eq!(
         events[1].prev_cid.as_deref(),
@@ -1668,6 +1658,170 @@ async fn the_firehose_is_apex_only() {
         tokio_tungstenite::connect_async(request).await.is_err(),
         "the firehose must not serve on a member subdomain"
     );
+}
+
+/// A frame's header, decoded the way a relay reads it: dispatch on `t` before
+/// the body is parsed (1, D).
+#[derive(serde::Deserialize)]
+struct FrameHeader {
+    op: i64,
+    t: String,
+}
+
+/// Read one binary frame off the socket and decode it the way a foreign
+/// consumer does: header first, then the body as atrium-api's own type for
+/// the kind the header names (1, E).
+async fn a_frame<T: serde::de::DeserializeOwned>(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> (String, T) {
+    use futures_util::StreamExt;
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("the stream should not stall")
+            .expect("the stream should not end")
+            .expect("a readable frame");
+        let tokio_tungstenite::tungstenite::Message::Binary(frame) = message else {
+            continue;
+        };
+        let mut reader = std::io::Cursor::new(&frame);
+        let header: FrameHeader =
+            serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the header decodes");
+        assert_eq!(header.op, 1, "an event frame is op 1");
+        let body = serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the body decodes");
+        return (header.t, body);
+    }
+}
+
+#[tokio::test]
+async fn registration_logs_an_identity_event() {
+    // The identity layer owns the transition, and the hook is there: the
+    // genesis operation lands and its `#identity` event lands with it, in the
+    // same transaction — the durable log, not the live channel, is what a
+    // reconnecting relay reads (1, E).
+    let h = harness().await;
+    a_registered_member(&h, "alice").await;
+
+    let user = db::find_by_username(&h.db.pool, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let did = user.did_plc.expect("registration mints a DID");
+
+    let events = brolly_atproto::firehose::since(&h.db.pool, None, 10)
+        .await
+        .unwrap();
+    let identity = events
+        .iter()
+        .find_map(|event| match event {
+            brolly_atproto::firehose::Event::Identity(identity) => Some(identity),
+            _ => None,
+        })
+        .expect("registration logs an #identity event");
+    assert_eq!(identity.did, did);
+    assert_eq!(identity.handle.as_deref(), Some("alice.brolly.test"));
+
+    // And the event frames as atrium's own type — the foreign decoder, on a
+    // row the real registration path wrote. The header is consumed first, the
+    // way a consumer dispatches before it parses the body (1, D).
+    let frame = brolly_atproto::firehose::identity_frame(identity).unwrap();
+    let mut reader = std::io::Cursor::new(&frame);
+    let header: FrameHeader =
+        serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the header decodes");
+    assert_eq!(header.t, "#identity");
+    let decoded: atrium_api::com::atproto::sync::subscribe_repos::Identity =
+        serde_ipld_dagcbor::de::from_reader_once(&mut reader).unwrap();
+    assert_eq!(decoded.did.as_str(), did);
+    assert_eq!(
+        decoded.handle.as_ref().map(|h| h.as_str()),
+        Some("alice.brolly.test")
+    );
+}
+
+#[tokio::test]
+async fn deleting_an_account_announces_it_on_the_firehose() {
+    // The whole arc on one sequence: signup logs `#identity`, a write logs
+    // `#commit`, deletion logs `#account` — and a relay connecting from zero
+    // receives them through the real socket, decoded by atrium's own types
+    // (1, E).
+    //
+    // The `#commit` in between is *not* delivered: its member is gone by the
+    // time this relay connects, and a diff for a deleted repo is not a diff a
+    // consumer can apply. The `#account` event is the frame that says why.
+    let h = harness().await;
+    let cookie = a_registered_member(&h, "alice").await;
+    let user = db::find_by_username(&h.db.pool, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let did = user.did_plc.expect("registration mints a DID");
+
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "gone soon"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    // Delete through the front door — the confirm field is the one the form
+    // asks for, the member's own username.
+    let deleted = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/account/delete")
+                .header(header::HOST, BASE)
+                .header(header::COOKIE, &cookie)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("confirm=alice"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::SEE_OTHER);
+
+    let addr = serve(h.router.clone()).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=0"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+
+    let (kind, identity): (
+        String,
+        atrium_api::com::atproto::sync::subscribe_repos::Identity,
+    ) = a_frame(&mut socket).await;
+    assert_eq!(kind, "#identity");
+    assert_eq!(identity.did.as_str(), did);
+    assert_eq!(
+        identity.handle.as_ref().map(|h| h.as_str()),
+        Some("alice.brolly.test")
+    );
+
+    // The commit for the deleted member is skipped — the member cannot be
+    // resolved, and the frame would pretend a diff nothing could invert.
+    let (kind, account): (
+        String,
+        atrium_api::com::atproto::sync::subscribe_repos::Account,
+    ) = a_frame(&mut socket).await;
+    assert_eq!(kind, "#account");
+    assert_eq!(account.did.as_str(), did);
+    assert!(!account.active, "a deleted account is not active");
+    assert_eq!(account.status.as_deref(), Some("deleted"));
+
+    // The cursor moved past the skipped commit: the account event's seq is the
+    // commit's plus two, and nothing else is coming.
+    assert_eq!(account.seq, 3, "identity, commit, account — in order");
 }
 
 // --- provisioning ---------------------------------------------------------------------

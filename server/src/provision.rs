@@ -91,6 +91,13 @@ pub struct AtprotoIdentity {
     /// It is recorded rather than retried inline so the member exists either
     /// way and `identity::unsubmitted` can pick it up later.
     pub plc_registered: bool,
+    /// The `#identity` event the genesis logged, for the live channel (1, E).
+    ///
+    /// `None` when the operation was already recorded — a re-run announces
+    /// nothing twice. Durable consumers read the event from the log either
+    /// way; this exists so the caller can hand it to consumers already
+    /// attached.
+    pub identity_event: Option<brolly_atproto::firehose::IdentityEvent>,
 }
 
 /// Give a member an ATProtocol identity: keys, a DID, and a repository.
@@ -145,7 +152,8 @@ pub async fn atproto_identity(
     let (operation, did) = plc::create(&signing, &rotation, &handle, &pds)
         .map_err(|e| DbError::Hash(format!("building the genesis operation: {e}")))?;
 
-    let operation_cid = identity::record_operation(pool, Some(user_id), &did, &operation).await?;
+    let (operation_cid, identity_event) =
+        identity::record_operation(pool, Some(user_id), &did, &operation).await?;
 
     // The DID goes on the member now, not after submission. It is derived from
     // the operation rather than assigned by the directory, so it is already
@@ -198,5 +206,6 @@ pub async fn atproto_identity(
         operation_cid,
         root_cid: root.to_string(),
         plc_registered,
+        identity_event,
     })
 }

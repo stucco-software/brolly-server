@@ -534,9 +534,58 @@ pub async fn delete_account(
         tracing::error!(error = %e, user = %session.user.id, "deleting the pod failed");
         return server_error();
     }
-    if let Err(e) = db::delete_user(&state.pool, session.user.id).await {
+
+    // The user row and the `#account` event land in one transaction (1, E):
+    // an event for a deletion that did not happen makes a relay drop a live
+    // repo, and a deletion without its event leaves the network serving a
+    // deleted one. The pod is already gone either way — `rm -rf` is not
+    // transactional — so the transaction covers what can be covered.
+    //
+    // Only a member with a DID announces: an account that never finished
+    // provisioning has no identity the network ever learned, and an event a
+    // consumer cannot resolve is noise.
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = %e, user = %session.user.id, "the deletion could not begin");
+            return server_error();
+        }
+    };
+    if let Err(e) = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(session.user.id)
+        .execute(&mut *tx)
+        .await
+    {
         tracing::error!(error = %e, user = %session.user.id, "deleting the user failed");
         return server_error();
+    }
+    let account_event = match session.user.did_plc.as_deref() {
+        Some(did) => {
+            match brolly_atproto::firehose::record_account(&mut tx, did, false, Some("deleted"))
+                .await
+            {
+                Ok(event) => Some(event),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        user = %session.user.id,
+                        "recording the deletion's firehose event failed"
+                    );
+                    return server_error();
+                }
+            }
+        }
+        None => None,
+    };
+    if let Err(e) = tx.commit().await {
+        tracing::error!(error = %e, user = %session.user.id, "the deletion could not commit");
+        return server_error();
+    }
+    if let Some(event) = account_event {
+        // `send` fails only when nobody is listening, which is normal.
+        let _ = state
+            .commits
+            .send(brolly_atproto::firehose::Event::Account(event));
     }
     tracing::info!(user = %session.user.id, "account deleted");
 
