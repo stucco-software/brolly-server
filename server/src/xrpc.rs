@@ -566,6 +566,14 @@ fn write_refused(e: brolly_atproto::repo::RepoError) -> Response {
 /// consumer that misses the broadcast resumes from the log, but an event that
 /// was broadcast and never logged is invisible to anyone who reconnects.
 ///
+/// The broadcast is the **fast path**, not the correctness mechanism (1, G):
+/// the notify that `record` rides inside its transaction is what the shared
+/// listener turns into a rebroadcast, and *that* is what reaches subscribers
+/// no matter which process wrote. This send spares this process's own writes
+/// the notify→listen→read round trip; the duplicate it creates — the listener
+/// rebroadcasts what was already sent here — is absorbed by the consumer's
+/// seq dedupe.
+///
 /// A failure here does not fail the write. The record is already committed to
 /// the repo, and refusing a successful write because its announcement failed
 /// would be the worse outcome — the log is repairable, a rejected write the
@@ -1208,19 +1216,27 @@ pub async fn describe_server(State(state): State<AppState>, headers: HeaderMap) 
 
 #[derive(Deserialize, Default)]
 pub struct SubscribeQuery {
-    /// Where to resume from. Absent means "only what happens next".
+    /// Where to resume from (1, F). The cursor is the last event processed,
+    /// exclusive.
+    ///
+    /// The event-stream spec's three cases: absent means the current position
+    /// — live only; `0` means the whole retained window from its oldest row;
+    /// and a cursor inside the window is backfilled from and then tailed. (This
+    /// handler used to treat an absent cursor as `0` — backfilling the entire
+    /// log to whoever asked for nothing — which the spec's text rules out, so
+    /// the meaning changed here rather than the spec's.)
     cursor: Option<i64>,
 }
 
 /// `com.atproto.sync.subscribeRepos` — the commit stream.
 ///
-/// Backfill from the cursor first, then live. Ungated (ADR 0016): consumers
-/// connect *to* us, so there is nothing outbound to suppress, and a PDS nobody
-/// can subscribe to is one nobody can read.
+/// Attach live first, then backfill, then tail (1, F) — the order is the
+/// correctness claim, argued on `stream_commits`.
 ///
-/// The backfill happens **before** the socket goes live, in sequence order, so
-/// a consumer never sees a newer commit before an older one — which would make
-/// `prev` unverifiable on its side.
+/// Ungated (ADR 0016): consumers connect *to* us, so there is nothing
+/// outbound to suppress, and a PDS nobody can subscribe to is one nobody
+/// can read.
+///
 /// Note the extractor ordering hazard here, which bit twice already in this
 /// codebase (`Form` on the Mastodon consent decision and on revoke): extractors
 /// run **before** the handler body, so `WebSocketUpgrade` answers 400 to a
@@ -1342,52 +1358,166 @@ async fn frame_event(state: &AppState, event: &firehose::Event) -> Option<Vec<u8
     }
 }
 
+/// One subscriber's stream: attach live, backfill, then tail (1, F).
+///
+/// The order is the whole design. The old order — drain the table, then
+/// subscribe — had a gap an event fit through exactly once per connection:
+/// anything committed after the last page was read but before the channel was
+/// subscribed was in neither. Subscribing *first* makes the gap structurally
+/// impossible — every event is in the table (committed before the last page
+/// read) or in the broadcast's bounded ring (sent after the subscription was
+/// taken), and what the overlap leaves in both is absorbed by the seq dedupe
+/// below.
+///
+/// The ring is the bounded buffer the spec asks for, and the lexicon already
+/// names what falling behind it means: `ConsumerTooSlow`, an error frame and a
+/// close — the consumer reconnects with its cursor, which is the designed
+/// recovery and the reason the error is an answer rather than silence.
 async fn stream_commits(
     state: AppState,
     cursor: Option<i64>,
     mut socket: axum::extract::ws::WebSocket,
 ) {
     use axum::extract::ws::Message;
+    use tokio::sync::broadcast::error::RecvError;
 
     // How much history one page of backfill carries. A consumer far behind
     // makes several passes rather than one unbounded query.
     const PAGE: i64 = 500;
 
+    // Attach live first (1, F) — before any table read below. The broadcast's
+    // own ring is the bounded buffer: capacity events can pile up here while
+    // the backfill runs, and a consumer that falls further behind is named
+    // `ConsumerTooSlow` at the drain below rather than allowed to grow without
+    // bound.
+    let mut live = state.commits.subscribe();
+
     let mut position = cursor;
-    loop {
-        let events = match firehose::since(&state.pool, position, PAGE).await {
-            Ok(events) => events,
+    if let Some(cursor) = cursor {
+        // The cursor-ful cases are below. A cursor-less consumer takes the
+        // live tail as-is: no table read, and no position filter — which
+        // means a rebroadcast the shared listener is still catching up on can
+        // arrive as a frame. That is deliberate: the frame is true, recent,
+        // and cheaper to absorb than to filter, and the alternative (seeding
+        // the position from a head read) would reopen exactly the gap the
+        // attach-first order closed (1, F, 1, G).
+        // A cursor ahead of the head is a client bug the stream names rather
+        // than absorbs (1, F): the lexicon's `FutureCursor`, an error frame,
+        // and the close the event-stream spec mandates after one. An empty log
+        // has a head of zero for this purpose — a cursor into an empty stream
+        // is still ahead of it.
+        let head = match firehose::head(&state.pool).await {
+            Ok(head) => head.unwrap_or(0),
             Err(e) => {
-                tracing::error!(error = %e, "firehose backfill failed");
+                tracing::error!(error = %e, "reading the firehose head failed");
                 return;
             }
         };
-        if events.is_empty() {
-            break;
+        if cursor > head {
+            close_with(
+                &mut socket,
+                firehose::error_frame(
+                    firehose::FUTURE_CURSOR,
+                    "the cursor is ahead of the stream's head",
+                ),
+            )
+            .await;
+            return;
         }
-        for event in &events {
-            // A frame is built at emission time, from the log's pointers plus
-            // the member's blocks (D5) — an event that cannot be built is
-            // skipped loudly rather than emitted hollow (1, D).
-            let Some(frame) = frame_event(&state, event).await else {
-                continue;
-            };
-            if socket.send(Message::Binary(frame.into())).await.is_err() {
-                // The consumer went away mid-backfill. It has its cursor and
-                // will resume; nothing to clean up.
+
+        // A cursor whose next event may have fallen off the log gets advice
+        // rather than silence (1, E, 1, F): `#info {name: "OutdatedCursor"}` —
+        // synthesized here, never logged, because it is about *this*
+        // connection's cursor — and then the oldest retained row. The boundary
+        // is `oldest - 1`: a cursor exactly one below the oldest row is the
+        // normal resume position and has missed nothing. (The only way below
+        // it today is a bigserial gap — a rolled-back insert consumes a seq —
+        // where the advice is over-cautious and harmless; when retention
+        // exists, the same advice is exactly right.)
+        match firehose::oldest(&state.pool).await {
+            Ok(Some(oldest)) if cursor < oldest - 1 => {
+                match firehose::info_frame(firehose::OUTDATED_CURSOR) {
+                    Ok(frame) => {
+                        if socket.send(Message::Binary(frame.into())).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "framing an OutdatedCursor info failed")
+                    }
+                }
+                position = Some(oldest - 1);
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "reading the firehose's oldest row failed");
                 return;
             }
-            position = Some(event.seq());
+        }
+
+        // Backfill, in pages, by seq, so a consumer never sees a newer commit
+        // before an older one — which would make `prev` unverifiable on its
+        // side.
+        loop {
+            let events = match firehose::since(&state.pool, position, PAGE).await {
+                Ok(events) => events,
+                Err(e) => {
+                    tracing::error!(error = %e, "firehose backfill failed");
+                    return;
+                }
+            };
+            if events.is_empty() {
+                break;
+            }
+            for event in &events {
+                // A frame is built at emission time, from the log's pointers plus
+                // the member's blocks (D5) — an event that cannot be built is
+                // skipped loudly rather than emitted hollow (1, D).
+                let Some(frame) = frame_event(&state, event).await else {
+                    continue;
+                };
+                if socket.send(Message::Binary(frame.into())).await.is_err() {
+                    // The consumer went away mid-backfill. It has its cursor and
+                    // will resume; nothing to clean up.
+                    return;
+                }
+                position = Some(event.seq());
+            }
         }
     }
 
-    // Live tail. A consumer that stays connected keeps receiving; one that
-    // drops resumes from the log, which is why the log exists.
-    let mut live = state.commits.subscribe();
-    while let Ok(event) = live.recv().await {
+    // Live tail: the buffered overlap first, then everything as it happens. A
+    // consumer that stays connected keeps receiving; one that drops resumes
+    // from the log, which is why the log exists.
+    loop {
+        let event = match live.recv().await {
+            Ok(event) => event,
+            Err(RecvError::Lagged(missed)) => {
+                // The consumer fell `missed` events behind the ring's bound.
+                // The lexicon names this outcome — `ConsumerTooSlow` — and the
+                // designed recovery is the cursor: reconnect and backfill
+                // (1, F).
+                tracing::warn!(missed, "a firehose consumer fell behind the buffer");
+                close_with(
+                    &mut socket,
+                    firehose::error_frame(
+                        firehose::CONSUMER_TOO_SLOW,
+                        "the consumer fell behind the buffer; reconnect with a cursor to resume",
+                    ),
+                )
+                .await;
+                return;
+            }
+            // The server is shutting down; there is nothing to close against.
+            Err(RecvError::Closed) => return,
+        };
         if position.is_some_and(|seen| event.seq() <= seen) {
-            // Already delivered during backfill — the overlap window between
-            // draining the table and attaching to the channel.
+            // Already delivered — the structural overlap (1, F, 1, G): an event
+            // can be in the last backfill page *and* in the ring (it committed
+            // while the page was being read), and it is in the ring twice when
+            // the writer's fast-path send is rebroadcast by the shared
+            // listener. The dedupe absorbs both; with the attach-first order
+            // there is no gap left for it to miss, only this overlap to absorb.
             continue;
         }
         let Some(frame) = frame_event(&state, &event).await else {
@@ -1397,6 +1527,21 @@ async fn stream_commits(
             return;
         }
         position = Some(event.seq());
+    }
+}
+
+/// An error frame, then the close the event-stream spec mandates immediately
+/// after one.
+async fn close_with(socket: &mut axum::extract::ws::WebSocket, frame: Result<Vec<u8>, String>) {
+    match frame {
+        Ok(frame) => {
+            // A send failure here is the consumer already gone — the close is
+            // moot either way.
+            let _ = socket
+                .send(axum::extract::ws::Message::Binary(frame.into()))
+                .await;
+        }
+        Err(e) => tracing::error!(error = %e, "framing a stream error failed"),
     }
 }
 

@@ -150,6 +150,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!(%addr, static_dir, "brolly-server listening");
 
+    // The shared firehose listener (1, G): one dedicated connection, taken
+    // from the pool and held for the process's lifetime, turning any
+    // process's committed events into this process's broadcasts. Spawned
+    // before the server accepts connections, so no subscriber can attach
+    // before the listener does.
+    tokio::spawn(brolly_atproto::firehose::listen(
+        state.pool.clone(),
+        state.commits.clone(),
+    ));
+
     axum::serve(listener, brolly_server::app(state, &static_dir)).await?;
     Ok(())
 }

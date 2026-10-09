@@ -37,6 +37,15 @@
 //! have — and `#info` is advice about one connection's cursor, synthesized per
 //! connection and never logged: logging it would replay advice at whoever
 //! reconnects (1, E).
+//!
+//! **Delivery is one order and two mechanisms** (1, F, 1, G). The log is the
+//! truth; the transactional `pg_notify` that rides every event write is the
+//! signal; one shared `LISTEN` task per process ([`listen`]) turns any
+//! process's signal into this process's broadcasts; and a stream attaches to
+//! the broadcast *before* it reads the table, so an event committed during
+//! the backfill is in the table or in the broadcast's bounded ring — never in
+//! a gap between the two. What the overlap leaves — the same event in the last
+//! page and the ring — is absorbed by the consumer's seq dedupe.
 
 use atrium_api::types::string::{Did, Handle, Tid};
 use brolly_identity::db::DbError;
@@ -45,6 +54,19 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use std::collections::BTreeMap;
 use time::OffsetDateTime;
+
+/// The channel every event write notifies, inside the transaction that wrote
+/// the row (1, G).
+///
+/// Transactional on purpose: a notify for a rolled-back write would be a false
+/// signal — the listener would wake, read, and find rows that are not true.
+/// The payload is only the seq, and no listener trusts it over the table:
+/// notifications can coalesce (identical payloads inside one transaction are
+/// delivered once) and can be lost wholesale (a listener briefly detached), so
+/// [`listen`] reads *past its own high-water mark* rather than at the payload —
+/// a lost notification is repaired by the next one, and the table read is
+/// what is always true.
+pub const NOTIFY_CHANNEL: &str = "atproto_events";
 
 /// What happened to one record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -254,6 +276,14 @@ pub async fn record(pool: &PgPool, commit: &NewCommit<'_>) -> Result<CommitEvent
         .await?;
     }
 
+    // The signal rides the write's transaction (1, G): a rolled-back write
+    // notifies no one. The row above is the truth; this is the poke.
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(NOTIFY_CHANNEL)
+        .bind(seq.to_string())
+        .execute(&mut *tx)
+        .await?;
+
     tx.commit().await?;
 
     Ok(CommitEvent {
@@ -427,8 +457,17 @@ pub async fn record_identity(
     )
     .bind(did)
     .bind(handle)
-    .fetch_one(conn)
+    .fetch_one(&mut *conn)
     .await?;
+
+    // The signal rides the caller's transaction, as the row does (1, G) — the
+    // identity layer logs the event beside the PLC operation it announces, so
+    // the notify belongs to the same commit.
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(NOTIFY_CHANNEL)
+        .bind(seq.to_string())
+        .execute(&mut *conn)
+        .await?;
 
     Ok(IdentityEvent {
         seq,
@@ -462,8 +501,16 @@ pub async fn record_account(
     .bind(did)
     .bind(active)
     .bind(status)
-    .fetch_one(conn)
+    .fetch_one(&mut *conn)
     .await?;
+
+    // The signal rides the caller's transaction, as the row does (1, G) — a
+    // deletion that rolled back must not have told the network it happened.
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(NOTIFY_CHANNEL)
+        .bind(seq.to_string())
+        .execute(&mut *conn)
+        .await?;
 
     Ok(AccountEvent {
         seq,
@@ -508,6 +555,133 @@ pub async fn head(pool: &PgPool) -> Result<Option<i64>, DbError> {
         .fetch_one(pool)
         .await?;
     Ok(seq)
+}
+
+/// The oldest retained row's cursor, for a consumer whose own cursor fell
+/// behind it (1, F).
+///
+/// Retention is a non-goal, so today this is always the first row ever
+/// written — but the cursor rules have to exist before the removal does,
+/// because a relay that silently skipped a gap would corrupt every consumer
+/// that trusted its cursor. `None` on an empty log, where every cursor is
+/// ahead of the head instead.
+pub async fn oldest(pool: &PgPool) -> Result<Option<i64>, DbError> {
+    // The same NULL-vs-zero-rows shape as `head`.
+    let (seq,): (Option<i64>,) = sqlx::query_as("SELECT min(seq) FROM atproto_firehose")
+        .fetch_one(pool)
+        .await?;
+    Ok(seq)
+}
+
+/// How much one pass of the shared listener's table read carries.
+const LISTEN_PAGE: i64 = 500;
+
+/// How long the shared listener waits before reattaching, after the database
+/// drops or refuses it.
+const LISTEN_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The shared `LISTEN` task — one per process, the correctness mechanism for
+/// live delivery (1, G).
+///
+/// The in-process broadcast is fast but process-local: an event written
+/// through another pool — `brolly-admin`, a worker, a second server process —
+/// would never reach an attached subscriber, no matter how promptly the
+/// writer sent. This task is the bridge: it holds one dedicated connection
+/// (`PgListener` detaches it from the pool, so the connection count stays
+/// flat — one per process, not one per subscriber), `LISTEN`s on
+/// [`NOTIFY_CHANNEL`], and on every notification reads the rows past its
+/// high-water mark and re-broadcasts them on the channel.
+///
+/// The mark starts at the head, not zero: history that predates this process
+/// is nobody's live event, and rebroadcasting it at boot would replay the
+/// whole log into a channel whose subscribers have their own cursors. `LISTEN`
+/// is established *before* the head is read, so an event committed in between
+/// is covered by a notification rather than lost between the two — the same
+/// attach-before-read ordering the stream itself uses (1, F).
+///
+/// A listener that dies must not die silently: cross-process delivery would
+/// be gone until the next restart, so a drop reattaches, reads past the mark
+/// it kept (repairing the outage window), and continues.
+pub async fn listen(pool: PgPool, commits: tokio::sync::broadcast::Sender<Event>) {
+    let mut hwm = 0;
+    let mut attached = false;
+    loop {
+        let mut listener = match sqlx::postgres::PgListener::connect_with(&pool).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                tracing::error!(error = %e, "the firehose listener cannot attach; retrying");
+                tokio::time::sleep(LISTEN_RETRY).await;
+                continue;
+            }
+        };
+        if let Err(e) = listener.listen(NOTIFY_CHANNEL).await {
+            tracing::error!(error = %e, "the firehose listener cannot LISTEN; retrying");
+            tokio::time::sleep(LISTEN_RETRY).await;
+            continue;
+        }
+        if attached {
+            // A reattach: the outage window's events are repaired here rather
+            // than waiting for whatever the next write happens to be.
+            if rebroadcast(&pool, &commits, &mut hwm).await.is_err() {
+                tokio::time::sleep(LISTEN_RETRY).await;
+                continue;
+            }
+        } else {
+            // The first attach: everything up to the current head predates
+            // this process's subscribers.
+            match head(&pool).await {
+                Ok(head) => hwm = head.unwrap_or(0),
+                Err(e) => {
+                    tracing::error!(error = %e, "the firehose listener cannot read the head; retrying");
+                    tokio::time::sleep(LISTEN_RETRY).await;
+                    continue;
+                }
+            }
+            attached = true;
+        }
+
+        loop {
+            match listener.recv().await {
+                // The payload is not read: the row is the truth, and the read
+                // past the mark covers coalesced and missed notifications
+                // alike (1, G).
+                Ok(_) => {
+                    if rebroadcast(&pool, &commits, &mut hwm).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "the firehose listener dropped; reattaching");
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(LISTEN_RETRY).await;
+    }
+}
+
+/// Read everything past the mark and hand it to the channel (1, G).
+///
+/// Paged, so a long outage does not become one unbounded query; the channel
+/// itself is the bound that matters — a subscriber that cannot keep up is
+/// dropped by it, named `ConsumerTooSlow` on its stream, and recovers by
+/// reconnecting with a cursor (1, F).
+async fn rebroadcast(
+    pool: &PgPool,
+    commits: &tokio::sync::broadcast::Sender<Event>,
+    hwm: &mut i64,
+) -> Result<(), DbError> {
+    loop {
+        let events = since(pool, Some(*hwm), LISTEN_PAGE).await?;
+        if events.is_empty() {
+            return Ok(());
+        }
+        for event in events {
+            // `send` fails only when nobody is listening, which is normal.
+            let _ = commits.send(event.clone());
+            *hwm = event.seq();
+        }
+    }
 }
 
 /// A `#commit` message, in the shape `subscribeRepos` defines (1, D).
@@ -677,6 +851,52 @@ pub fn sync_frame(event: &SyncEvent, blocks: &[u8]) -> Result<Vec<u8>, String> {
     body.insert("rev".to_string(), Ipld::String(event.rev.clone()));
     body.insert("blocks".to_string(), Ipld::Bytes(blocks.to_vec()));
     body.insert("time".to_string(), Ipld::String(wire_time(event.time)?));
+
+    frame_bytes(header, body)
+}
+
+/// The lexicon's own name for the advice that a cursor has fallen behind the
+/// log's oldest retained row (1, F) — its `#info` names, not invented ones.
+pub const OUTDATED_CURSOR: &str = "OutdatedCursor";
+/// The lexicon's own error for a cursor ahead of the head (1, F).
+pub const FUTURE_CURSOR: &str = "FutureCursor";
+/// The lexicon's own error for a consumer that fell behind the buffer (1, F).
+pub const CONSUMER_TOO_SLOW: &str = "ConsumerTooSlow";
+
+/// An `#info` message — advice about *this connection's* cursor (1, E, 1, F).
+///
+/// Synthesized at the connection and never logged, because it is not an event
+/// in the stream: logging it would replay advice at whoever reconnects next.
+/// It rides `op: 1` with a `t` like every event kind — what makes it advice
+/// rather than an event is the lexicon's own shape, which gives `#info` no
+/// `seq` at all. The `name` is the lexicon's vocabulary (`OutdatedCursor`);
+/// the optional human `message` is left to the connection to add if it ever
+/// needs one, which today it does not.
+pub fn info_frame(name: &str) -> Result<Vec<u8>, String> {
+    let mut header = BTreeMap::new();
+    header.insert("op".to_string(), Ipld::Integer(1));
+    header.insert("t".to_string(), Ipld::String("#info".to_string()));
+
+    let mut body = BTreeMap::new();
+    body.insert("name".to_string(), Ipld::String(name.to_string()));
+
+    frame_bytes(header, body)
+}
+
+/// A stream error — `op: -1`, the lexicon's own error names (1, F).
+///
+/// The error header deliberately carries no `t`: the event-stream spec says
+/// the type fragment "should not be included in header if `op` is `-1`", and
+/// the body's `error` is the whole type. The stream closes immediately after
+/// an error frame — the spec's "immediately", done by the caller that sends
+/// it.
+pub fn error_frame(error: &str, message: &str) -> Result<Vec<u8>, String> {
+    let mut header = BTreeMap::new();
+    header.insert("op".to_string(), Ipld::Integer(-1));
+
+    let mut body = BTreeMap::new();
+    body.insert("error".to_string(), Ipld::String(error.to_string()));
+    body.insert("message".to_string(), Ipld::String(message.to_string()));
 
     frame_bytes(header, body)
 }

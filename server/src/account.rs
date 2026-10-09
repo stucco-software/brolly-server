@@ -582,7 +582,10 @@ pub async fn delete_account(
         return server_error();
     }
     if let Some(event) = account_event {
-        // `send` fails only when nobody is listening, which is normal.
+        // The fast path (1, G): the transactional notify that rode the deletion
+        // above is what the shared listener turns into a rebroadcast, so this
+        // send is latency, not correctness. `send` fails only when nobody is
+        // listening, which is normal.
         let _ = state
             .commits
             .send(brolly_atproto::firehose::Event::Account(event));

@@ -28,6 +28,9 @@ struct Harness {
     _dir: tempfile::TempDir,
     router: axum::Router,
     stores: std::sync::Arc<brolly_store::StoreManager>,
+    /// The firehose channel's sender, kept so a test can subscribe a witness
+    /// of its own beside the sockets (1, G).
+    commits: tokio::sync::broadcast::Sender<brolly_atproto::firehose::Event>,
 }
 
 async fn harness() -> Harness {
@@ -35,6 +38,18 @@ async fn harness() -> Harness {
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
     let stores = std::sync::Arc::new(brolly_store::StoreManager::open(dir.path(), 8, 60).unwrap());
+    // The channel and the listener, composed exactly as `main` composes them
+    // (1, G): the writers' sends are the fast path, the listener is what makes
+    // delivery correct, and a harness that omits either is testing a topology
+    // production never runs. The capacity is 64 rather than 1024 so that a
+    // `ConsumerTooSlow` test can overflow the ring with one transaction
+    // instead of a thousand writes — the bound's meaning is what is under
+    // test, not its production size.
+    let commits = tokio::sync::broadcast::channel::<brolly_atproto::firehose::Event>(64).0;
+    tokio::spawn(brolly_atproto::firehose::listen(
+        db.pool.clone(),
+        commits.clone(),
+    ));
     let router = app(
         AppState {
             pool: db.pool.clone(),
@@ -59,8 +74,8 @@ async fn harness() -> Harness {
                 .await
                 .expect("instance actor"),
             ),
-            commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
+            commits: commits.clone(),
             // an_xrpc_write_proof_is_good_for_one_request pushes a PAR as this
             // client, so it's registered exactly as production would accept it.
             clients: std::sync::Arc::new(
@@ -104,6 +119,7 @@ async fn harness() -> Harness {
         _dir: dir,
         router,
         stores,
+        commits,
     }
 }
 
@@ -1661,11 +1677,14 @@ async fn the_firehose_is_apex_only() {
 }
 
 /// A frame's header, decoded the way a relay reads it: dispatch on `t` before
-/// the body is parsed (1, D).
+/// the body is parsed (1, D). `t` is optional because error frames carry none
+/// — the event-stream spec says the type fragment does not ride an error
+/// header (1, F).
 #[derive(serde::Deserialize)]
 struct FrameHeader {
     op: i64,
-    t: String,
+    #[serde(default)]
+    t: Option<String>,
 }
 
 /// Read one binary frame off the socket and decode it the way a foreign
@@ -1691,7 +1710,68 @@ async fn a_frame<T: serde::de::DeserializeOwned>(
             serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the header decodes");
         assert_eq!(header.op, 1, "an event frame is op 1");
         let body = serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the body decodes");
-        return (header.t, body);
+        return (header.t.expect("an event frame names its type"), body);
+    }
+}
+
+/// One binary frame off the socket — `None` when the stream closes or stalls,
+/// which is what every "and then the server closes" assertion needs to tell
+/// from a frame (1, F).
+async fn a_binary_frame(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> Option<Vec<u8>> {
+    use futures_util::StreamExt;
+    loop {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("the stream should not stall");
+        match message {
+            // The server closed — the event-stream spec's "immediately" after
+            // an error frame, or a shutdown.
+            None => return None,
+            Some(Err(_)) => return None,
+            Some(Ok(tokio_tungstenite::tungstenite::Message::Binary(frame))) => return Some(frame),
+            Some(Ok(_)) => continue,
+        }
+    }
+}
+
+/// One frame, dispatched the way a relay reads it: on the header's `op` and
+/// `t`, then decoded as atrium-api's own type for that kind (1, F). The kinds
+/// the cursor rules speak in — an `#info` with no `seq`, an error with no `t`
+/// `t` — are first-class here because they are what these tests assert on.
+#[derive(Debug)]
+enum AFrame {
+    Commit(Box<atrium_api::com::atproto::sync::subscribe_repos::Commit>),
+    Identity(atrium_api::com::atproto::sync::subscribe_repos::Identity),
+    Account(atrium_api::com::atproto::sync::subscribe_repos::Account),
+    Info(atrium_api::com::atproto::sync::subscribe_repos::Info),
+    Error(atrium_api::com::atproto::sync::subscribe_repos::Error),
+}
+
+async fn the_next_frame(
+    socket: &mut tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+) -> AFrame {
+    fn decode<T: serde::de::DeserializeOwned>(reader: &mut std::io::Cursor<&Vec<u8>>) -> T {
+        serde_ipld_dagcbor::de::from_reader_once(reader).expect("the body decodes")
+    }
+    let frame = a_binary_frame(socket)
+        .await
+        .expect("a readable frame — the stream closed early");
+    let mut reader = std::io::Cursor::new(&frame);
+    let header: FrameHeader =
+        serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the header decodes");
+    match (header.op, header.t.as_deref()) {
+        (1, Some("#commit")) => AFrame::Commit(Box::new(decode(&mut reader))),
+        (1, Some("#identity")) => AFrame::Identity(decode(&mut reader)),
+        (1, Some("#account")) => AFrame::Account(decode(&mut reader)),
+        (1, Some("#info")) => AFrame::Info(decode(&mut reader)),
+        (-1, None) => AFrame::Error(decode(&mut reader)),
+        other => panic!("a frame shape the relay does not know: {other:?}"),
     }
 }
 
@@ -1730,7 +1810,7 @@ async fn registration_logs_an_identity_event() {
     let mut reader = std::io::Cursor::new(&frame);
     let header: FrameHeader =
         serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the header decodes");
-    assert_eq!(header.t, "#identity");
+    assert_eq!(header.t.as_deref(), Some("#identity"));
     let decoded: atrium_api::com::atproto::sync::subscribe_repos::Identity =
         serde_ipld_dagcbor::de::from_reader_once(&mut reader).unwrap();
     assert_eq!(decoded.did.as_str(), did);
@@ -1822,6 +1902,539 @@ async fn deleting_an_account_announces_it_on_the_firehose() {
     // The cursor moved past the skipped commit: the account event's seq is the
     // commit's plus two, and nothing else is coming.
     assert_eq!(account.seq, 3, "identity, commit, account — in order");
+}
+
+/// A cursor for events that do not exist yet — the client bug the lexicon
+/// names rather than absorbs (1, F).
+#[tokio::test]
+async fn a_cursor_ahead_of_the_head_is_refused() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "the head"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    let addr = serve(h.router.clone()).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=99"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+
+    match the_next_frame(&mut socket).await {
+        AFrame::Error(atrium_api::com::atproto::sync::subscribe_repos::Error::FutureCursor(_)) => {}
+        other => panic!("a future cursor is a FutureCursor error, got {other:?}"),
+    }
+    // The close is the event-stream spec's "immediately" — not a retry, not
+    // silence: the client is wrong and must be told so before it waits.
+    assert!(
+        a_binary_frame(&mut socket).await.is_none(),
+        "the stream must close after an error frame"
+    );
+}
+
+/// A cursor the log can no longer fully serve — advice first, then the oldest
+/// row (1, E, 1, F). Retention is a non-goal, so the removed rows are a
+/// fixture for the day it is not; the rule has to exist before the removal
+/// does, or every consumer that trusts its cursor corrupts quietly.
+#[tokio::test]
+async fn an_outdated_cursor_is_advised_then_served_from_the_oldest_row() {
+    use brolly_atproto::firehose;
+
+    let h = harness().await;
+    // Account events — self-contained on the wire, so removing the first two
+    // takes no op rows with them (1, E).
+    for n in 1..=3 {
+        let mut tx = h.db.pool.begin().await.unwrap();
+        firehose::record_account(
+            &mut tx,
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            n != 3,
+            (n != 3).then_some("deleted"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+    }
+    // The retention fixture: rows 1 and 2 are gone, row 3 is the oldest.
+    sqlx::query("DELETE FROM atproto_firehose WHERE seq <= 2")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+
+    let addr = serve(h.router.clone()).await;
+
+    // A cursor one below the oldest row is the normal resume position: it has
+    // missed nothing, and advising it would be noise.
+    let (mut resumed, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=2"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+    match the_next_frame(&mut resumed).await {
+        AFrame::Account(account) => assert_eq!(account.seq, 3),
+        other => panic!("a cursor at the window's edge resumes directly, got {other:?}"),
+    }
+
+    // A cursor below that may have missed events it can never see: the advice
+    // is an `#info` — not an error, the stream can still serve — and the
+    // service resumes from the oldest row (1, F).
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=1"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+    match the_next_frame(&mut socket).await {
+        AFrame::Info(info) => assert_eq!(info.name, "OutdatedCursor"),
+        other => panic!("an outdated cursor is advised first, got {other:?}"),
+    }
+    match the_next_frame(&mut socket).await {
+        AFrame::Account(account) => assert_eq!(
+            account.seq, 3,
+            "the stream continues from the oldest retained row"
+        ),
+        other => panic!("the oldest row follows the advice, got {other:?}"),
+    }
+}
+
+/// The race the attach-first order closes (1, F): in the old order — drain
+/// the table, then subscribe — an event committed between the two was in
+/// neither and was missed, exactly once per connection. The writer is pinned
+/// behind a table lock until the subscriber's backfill has visibly delivered
+/// the committed rows, so the raced event's commit lands inside the window
+/// the old order lost — and must arrive exactly once, whichever side of the
+/// boundary it lands on: in the last page, or in the ring, or in both.
+#[tokio::test]
+async fn an_event_committed_during_the_backfill_is_delivered_exactly_once() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    for n in 1..=2 {
+        let created = post_json(
+            &h,
+            "/xrpc/com.atproto.repo.createRecord",
+            json!({
+                "collection": "app.bsky.feed.post",
+                "rkey": format!("3k{n}"),
+                "record": {"$type": "app.bsky.feed.post", "text": format!("post {n}")},
+            }),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+    }
+
+    // The gate: `SHARE ROW EXCLUSIVE` blocks the INSERT the write's
+    // announcement performs, and nothing a subscriber's backfill needs — a
+    // plain SELECT never waits on it.
+    let mut gate = h.db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE atproto_firehose IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+
+    // The raced write, pinned mid-announcement: its row exists only when the
+    // gate opens.
+    let router = h.router.clone();
+    let cookie2 = cookie.clone();
+    let raced = tokio::spawn(async move {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/xrpc/com.atproto.repo.createRecord")
+                    .header(header::HOST, BASE)
+                    .header(header::COOKIE, cookie2)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "collection": "app.bsky.feed.post",
+                            "rkey": "3kggggggggggg",
+                            "record": {"$type": "app.bsky.feed.post", "text": "the raced write"},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+
+    let addr = serve(h.router.clone()).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=0"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+
+    // The backfill delivers the two committed rows. The second frame proves
+    // the table was read past them; the raced write is still invisible — its
+    // row is uncommitted behind the gate.
+    let mut seqs = Vec::new();
+    while seqs.len() < 2 {
+        match the_next_frame(&mut socket).await {
+            AFrame::Commit(commit) => seqs.push(commit.seq),
+            other => panic!("the backfill delivers the committed rows, got {other:?}"),
+        }
+    }
+
+    // Open the gate: the write commits — inside the window the old order
+    // lost, between the subscriber's last page and its live tail.
+    gate.rollback().await.unwrap();
+    assert_eq!(raced.await.unwrap().status(), StatusCode::OK);
+
+    // A marker write, uncontended, to close the assertion's window: once its
+    // seq arrives, a duplicate of the raced event could only have been
+    // delivered before it — and the seq list would show it.
+    let marker = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3khhhhhhhhhhh",
+            "record": {"$type": "app.bsky.feed.post", "text": "the marker"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(marker.status, StatusCode::OK, "{}", marker.text());
+
+    while seqs.last().copied() != Some(4) {
+        match the_next_frame(&mut socket).await {
+            AFrame::Commit(commit) => seqs.push(commit.seq),
+            other => panic!("the live tail delivers, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3, 4],
+        "the raced event is delivered exactly once, in order — from the table, the ring, or both"
+    );
+}
+
+/// The event-stream spec's "no cursor" case: the current position, live only
+/// (1, F). This stream used to treat an absent cursor as `0` — the whole
+/// retained window — and the change is asserted here so it cannot drift back:
+/// the pre-attach history must not be replayed at a subscriber that never
+/// asked for it.
+#[tokio::test]
+async fn a_subscriber_without_a_cursor_receives_only_what_happens_next() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    // A witness on the channel before the setup write, so the test can tell
+    // when the listener has caught up: the setup event is sent to the channel
+    // twice — once by the writer's fast path, once by the listener's
+    // rebroadcast — and until both have landed, a socket attaching now could
+    // receive the second as a live frame (a new broadcast receiver sees only
+    // sends after its subscribe, and the listener's send is still pending).
+    // Waiting for both makes the live-only assertion about the *table*, which
+    // is the assertion the case is for.
+    let mut witness = h.commits.subscribe();
+    let first = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "before the attach"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    let mut deliveries_of_seq_1 = 0;
+    while deliveries_of_seq_1 < 2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), witness.recv())
+            .await
+            .expect("the setup event must reach the channel")
+            .expect("the channel outlives the harness");
+        if event.seq() == 1 {
+            deliveries_of_seq_1 += 1;
+        }
+    }
+
+    // The same gate discipline as the backfill-race test: a live-only stream
+    // sends nothing to prove its subscription with, so the first live write
+    // is pinned behind the gate until the socket has attached — the rollback's
+    // await is the yield that lets the stream task take its subscription
+    // before the write's announcement can send past it.
+    let mut gate = h.db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE atproto_firehose IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+
+    let router = h.router.clone();
+    let cookie2 = cookie.clone();
+    let live = tokio::spawn(async move {
+        router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/xrpc/com.atproto.repo.createRecord")
+                    .header(header::HOST, BASE)
+                    .header(header::COOKIE, cookie2)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "collection": "app.bsky.feed.post",
+                            "rkey": "3kbbbbbbbbbbb",
+                            "record": {"$type": "app.bsky.feed.post", "text": "live"},
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+
+    let addr = serve(h.router.clone()).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+
+    // Releasing the gate completes only after the stream task has had the
+    // yield it needs to subscribe; the pinned write's announcement cannot
+    // have preceded that.
+    gate.rollback().await.unwrap();
+    assert_eq!(live.await.unwrap().status(), StatusCode::OK);
+
+    // The marker that closes the window, uncontended.
+    let marker = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kccccccccccc",
+            "record": {"$type": "app.bsky.feed.post", "text": "the marker"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(marker.status, StatusCode::OK, "{}", marker.text());
+
+    let mut seqs = Vec::new();
+    while seqs.last().copied() != Some(3) {
+        match the_next_frame(&mut socket).await {
+            AFrame::Commit(commit) => seqs.push(commit.seq),
+            other => panic!("a live-only stream delivers what happens next, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        seqs,
+        vec![2, 3],
+        "no cursor is live only: the pre-attach history (seq 1) is not replayed"
+    );
+}
+
+/// The correctness mechanism of (1, G): the broadcast channel is
+/// process-local, so an event written through another pool — a second
+/// process's — reaches a live subscriber through the transactional notify and
+/// the shared listener, not through the writer. The witness receiver is the
+/// airtight half of the assertion: only the listener ever sends on the
+/// channel for this event, because the second "process" never held the
+/// sender. The socket is the end-to-end half.
+#[tokio::test]
+async fn a_second_processs_writes_reach_live_subscribers() {
+    use brolly_atproto::firehose;
+
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "the setup"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    // Pin the second process's write behind the gate until the socket has
+    // attached — the same discipline as the backfill-race test.
+    let mut gate = h.db.pool.begin().await.unwrap();
+    sqlx::query("LOCK TABLE atproto_firehose IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+
+    // The second process: its own pool, its own connection, an identity event
+    // logged in its own transaction (1, E, 1, G).
+    let url = h.db.url.clone();
+    let second = tokio::spawn(async move {
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let event = firehose::record_identity(
+            &mut tx,
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            Some("second.brolly.test"),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        event
+    });
+
+    // The witness on the channel, subscribed before the gate can open.
+    let mut witness = h.commits.subscribe();
+
+    let addr = serve(h.router.clone()).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=0"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+
+    // The setup commit arrives, which proves the subscription was taken
+    // before the table was read (1, F).
+    match the_next_frame(&mut socket).await {
+        AFrame::Commit(commit) => assert_eq!(commit.seq, 1),
+        other => panic!("the backfill delivers the setup, got {other:?}"),
+    }
+
+    // Open the gate: the second process's write commits, its notify rides the
+    // commit, and the listener — attached before any of this — picks it up.
+    gate.rollback().await.unwrap();
+    let event = second.await.unwrap();
+    assert_eq!(event.seq, 2);
+
+    // The airtight half: the witness receives the event, and the only sender
+    // that could have put it on the channel is the shared listener. (The
+    // setup commit's own broadcasts, however many the ring still holds, are
+    // skipped by seq.)
+    let heard = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), witness.recv())
+            .await
+            .expect("the listener must rebroadcast a second process's event")
+            .expect("the channel outlives the harness");
+        if event.seq() > 1 {
+            break event;
+        }
+    };
+    assert_eq!(
+        heard.seq(),
+        2,
+        "the listener rebroadcast the second process's event"
+    );
+
+    // The end-to-end half: a socket attached through the same channel
+    // receives it exactly once — a marker write closes the window the way the
+    // backfill-race test's does.
+    let marker = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kbbbbbbbbbbb",
+            "record": {"$type": "app.bsky.feed.post", "text": "the marker"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(marker.status, StatusCode::OK, "{}", marker.text());
+
+    let mut seqs = vec![1];
+    while seqs.last().copied() != Some(3) {
+        match the_next_frame(&mut socket).await {
+            AFrame::Commit(commit) => seqs.push(commit.seq),
+            AFrame::Identity(identity) => seqs.push(identity.seq),
+            other => panic!("the live tail delivers, got {other:?}"),
+        }
+    }
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3],
+        "the second process's event is delivered exactly once"
+    );
+}
+
+/// The bounded buffer's far side (1, F): the ring is the channel's capacity,
+/// and the lexicon names what hitting it means — `ConsumerTooSlow`, an error
+/// frame, and the close whose designed recovery is the cursor. The burst is
+/// `capacity + 6` events committed in one second-process transaction, so the
+/// listener's rebroadcast pass sends them all without an await point and the
+/// subscriber's receiver is provably behind the bound when the pass ends.
+#[tokio::test]
+async fn a_subscriber_slower_than_the_buffer_is_named_and_closed() {
+    use brolly_atproto::firehose;
+
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "the anchor"},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    let addr = serve(h.router.clone()).await;
+    let (mut socket, _) = tokio_tungstenite::connect_async(format!(
+        "ws://{addr}/xrpc/com.atproto.sync.subscribeRepos?cursor=0"
+    ))
+    .await
+    .expect("a relay must be able to open the stream");
+
+    // The anchor's delivery proves the subscription was taken (1, F) — the
+    // burst below must not race it.
+    match the_next_frame(&mut socket).await {
+        AFrame::Commit(commit) => assert_eq!(commit.seq, 1),
+        other => panic!("the backfill delivers the anchor, got {other:?}"),
+    }
+
+    // The burst: capacity + 6 account events in one transaction. One commit
+    // makes them all visible at once; the listener reads them in one pass and
+    // rebroadcasts in one slice; the ring holds 64, so the receiver misses
+    // the last six's predecessors and is told so.
+    let url = h.db.url.clone();
+    let burst = tokio::spawn(async move {
+        let pool = sqlx::PgPool::connect(&url).await.unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        for _ in 0..70 {
+            firehose::record_account(
+                &mut tx,
+                "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+                false,
+                Some("deleted"),
+            )
+            .await
+            .unwrap();
+        }
+        tx.commit().await.unwrap();
+    });
+    burst.await.unwrap();
+
+    match the_next_frame(&mut socket).await {
+        AFrame::Error(atrium_api::com::atproto::sync::subscribe_repos::Error::ConsumerTooSlow(
+            _,
+        )) => {}
+        other => panic!("a subscriber behind the buffer is told ConsumerTooSlow, got {other:?}"),
+    }
+    assert!(
+        a_binary_frame(&mut socket).await.is_none(),
+        "the stream must close after the error — the cursor is the recovery"
+    );
 }
 
 // --- provisioning ---------------------------------------------------------------------

@@ -50,7 +50,10 @@ base64 = "0.23.1"
 # The binary that passes one in installs the crypto provider (server/src/tls.rs).
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
 rand = "0.8"
-tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "io-util"] }
+# `time` for the shared listener's reconnect backoff (1, G): a listener that
+# died and hot-looped its reconnect would be worse than one that waits a
+# second between attempts.
+tokio = { version = "1.53.1", features = ["rt", "macros", "sync", "io-util", "time"] }
 tracing.workspace = true
 uuid = { version = "1.25.0", features = ["v4"] }
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "macros", "uuid", "time", "json"] }

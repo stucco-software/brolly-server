@@ -359,8 +359,11 @@ pub async fn register_submit(
                     // The identity event rides the live channel too, so a
                     // consumer attached at signup learns the did↔handle pairing
                     // from the stream instead of a poll (1, E). Durable
-                    // consumers read it from the log; `send` fails only when
-                    // nobody is listening, which is normal.
+                    // consumers read it from the log, and the shared listener
+                    // guarantees the delivery regardless of who wrote (1, G) —
+                    // this send is the fast path that spares the notify round
+                    // trip. `send` fails only when nobody is listening, which
+                    // is normal.
                     if let Some(event) = identity.identity_event {
                         let _ = state
                             .commits

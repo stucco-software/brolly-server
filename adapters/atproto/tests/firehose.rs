@@ -1133,3 +1133,72 @@ async fn a_record_the_slice_needs_is_actually_there() {
         Some(json!({"$type": "app.bsky.feed.post", "text": "hello atproto"}))
     );
 }
+
+// --- advice and errors, against a foreign decoder (1, F) ---------------------------
+
+/// The header an error frame carries: `op: -1` and deliberately no `t` — the
+/// event-stream spec says the type fragment "should not be included in header
+/// if `op` is `-1`" (1, F).
+#[derive(serde::Deserialize)]
+struct ErrorHeader {
+    op: i64,
+    #[serde(default)]
+    t: Option<String>,
+}
+
+#[test]
+fn an_outdated_cursor_info_is_what_atriums_decoder_expects() {
+    // `#info` rides `op: 1` with a `t` like every event kind — what makes it
+    // advice rather than an event is the lexicon's own shape, which gives it
+    // no `seq` (1, E). The name is the lexicon's vocabulary, and atrium's own
+    // `Info` type reads the body back (1, F).
+    let frame = firehose::info_frame(firehose::OUTDATED_CURSOR).expect("the frame encodes");
+    let mut reader = std::io::Cursor::new(&frame);
+    let header: FrameHeader =
+        serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the header decodes");
+    assert_eq!(header.op, 1, "#info is an op-1 frame, not an error");
+    assert_eq!(header.t, "#info");
+    let decoded: subscribe_repos::Info =
+        serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the body decodes");
+    assert_eq!(decoded.name, "OutdatedCursor");
+}
+
+#[test]
+fn a_stream_error_is_what_atriums_decoder_expects() {
+    // The lexicon's own error names, as atrium's own error enum reads them
+    // back — a `FutureCursor` that names a client bug and a `ConsumerTooSlow`
+    // that names the designed recovery's trigger (1, F). The header carries no
+    // `t`, which is why the header here is a different shape than the event
+    // frames'.
+    for (name, message) in [
+        (
+            firehose::FUTURE_CURSOR,
+            "the cursor is ahead of the stream's head",
+        ),
+        (
+            firehose::CONSUMER_TOO_SLOW,
+            "the consumer fell behind the buffer",
+        ),
+    ] {
+        let frame = firehose::error_frame(name, message).expect("the frame encodes");
+        let mut reader = std::io::Cursor::new(&frame);
+        let header: ErrorHeader =
+            serde_ipld_dagcbor::de::from_reader_once(&mut reader).expect("the header decodes");
+        assert_eq!(header.op, -1, "an error frame is op -1");
+        assert_eq!(header.t, None, "an error frame carries no type fragment");
+        let decoded: subscribe_repos::Error = serde_ipld_dagcbor::de::from_reader_once(&mut reader)
+            .expect("the body decodes as atrium's own error type");
+        let expected = match name {
+            firehose::FUTURE_CURSOR => subscribe_repos::Error::FutureCursor(Some(
+                "the cursor is ahead of the stream's head".into(),
+            )),
+            _ => subscribe_repos::Error::ConsumerTooSlow(Some(
+                "the consumer fell behind the buffer".into(),
+            )),
+        };
+        assert_eq!(
+            decoded, expected,
+            "{name} must decode as the lexicon's own error"
+        );
+    }
+}

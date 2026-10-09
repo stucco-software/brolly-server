@@ -23,6 +23,9 @@ use testcontainers_modules::testcontainers::runners::AsyncRunner;
 /// variable that lives as long as the test.
 pub struct TestDb {
     _container: ContainerAsync<Postgres>,
+    /// The connection URL — a second pool opened on it is the test stand-in
+    /// for a second process (1, G).
+    pub url: String,
     pub pool: PgPool,
 }
 
@@ -48,6 +51,7 @@ pub async fn postgres() -> TestDb {
 
     TestDb {
         _container: container,
+        url,
         pool,
     }
 }

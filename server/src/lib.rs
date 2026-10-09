@@ -78,8 +78,15 @@ pub struct AppState {
     /// consumers a poll, and carries every kind the log does: a relay that
     /// never hears an `#account` event while connected is exactly the consumer
     /// the log exists to protect. A lagging receiver is dropped by the channel
-    /// rather than allowed to grow unbounded; it reconnects with its cursor and
-    /// backfills, which is the path that already exists.
+    /// rather than allowed to grow unbounded; the stream names the outcome —
+    /// the lexicon's `ConsumerTooSlow` — and closes, and the consumer
+    /// reconnects with its cursor and backfills, which is the path that
+    /// already exists (1, F).
+    ///
+    /// Fed by two senders (1, G): the writers' fast-path sends, and the shared
+    /// `LISTEN` task (spawned in `main`) whose rebroadcasts are what make
+    /// delivery correct rather than merely fast — an event written by another
+    /// process reaches a live subscriber through it.
     pub commits: tokio::sync::broadcast::Sender<brolly_atproto::firehose::Event>,
     /// Used to register `did:plc` operations with the directory.
     ///
