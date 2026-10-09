@@ -4,15 +4,21 @@
 <!-- The spec names files and a migration this stage creates, so not every
      path it cites resolves until it's implemented. -->
 
-**Status:** Draft (2026-10-06), revised 2026-10-06 after one adversarial
-review against the ATProtocol Sync and Repository specifications
-(atproto.com, as of this date), the generated lexicon types in
+**Status:** Implemented, 2026-10-09, in five commits: `609fe0f` (TID revs and
+the compare-and-set head), `f72a280` (the write path is the lexicon's),
+`20836ee` (frames on IPLD), `4dde7c0` (the other events and the log's shape),
+`6fa7db7` (subscribers cannot miss). Drafted 2026-10-06 and revised the same
+day after one adversarial review against the ATProtocol Sync and Repository
+specifications (atproto.com, as of this date), the generated lexicon types in
 atrium-api 0.25.8, the public API surface of atrium-repo 0.1.8, and the code
 it cites. The review corrected the blocks cap (2 MB, not 200 KB), the
 `tooBig`/`blobs` fields (deprecated; fixed values, not mechanisms), the
 omission of `prevData` (effectively required), the per-op `prev` CID, the
 `createRecord` failure mode (refused today, not overwriting), and the
 concurrent-write answer (server-side optimistic retry, not a hard error).
+Implemented after its first review; this close's re-read of every section
+against the landed tree at `6fa7db7` was its second, and it found two factual
+wrinkles in §F, folded in below.
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 1. The
 foundation for finish-line items 1–3: "an account on the instance, using
 bsky.app, logs in, posts…", "the account's repo, commits and blobs are
@@ -319,13 +325,28 @@ seq-dedupe the handler already does (`xrpc.rs:736`) is kept — with the
 ordering fixed there is no gap left for it to miss, only the overlap to
 absorb.
 
-**Cursor rules.** Absent cursor → live only (today's behaviour, correct).
+**Cursor rules.** Absent cursor → live only — which is the event-stream
+spec's "the server starts transmitting from the current stream position",
+and what landed, but was *not* the tree's behaviour when this spec was
+written: the handler bound `cursor.unwrap_or(0)`, backfilling the whole
+retained window at whoever asked for nothing, conflating "absent" with the
+spec's separate `cursor=0` case ("start at the oldest available `seq`").
+Chunk 5 changed the meaning of an absent cursor deliberately, flagged in its
+commit — and one more nuance of a cursor-less stream is documented in the
+code rather than here: the shared listener's own catch-up rebroadcasts can
+arrive as frames after the attach, which are recent, true, and cheaper to
+absorb than to filter.
 A cursor before the oldest retained row → `#info` `OutdatedCursor` (E),
-then oldest-first from the oldest row. A cursor *ahead of the head* → the
+then oldest-first from the oldest row — with "before" read at the window's
+edge, `cursor < oldest - 1`: a cursor exactly one below the oldest row has
+missed nothing (its next event *is* the oldest row), and advising it would be
+noise on every ordinary resume. A cursor *ahead of the head* → the
 lexicon's `FutureCursor` stream error, then a close: a client asking for
 events that do not exist yet is a client bug the stream names rather than
 absorbs. The cursor is the `seq` of the last event processed, exclusive,
-as today.
+as today — the event-stream spec words the in-window case as
+"greater-or-equal `seq`", which reads inclusive, but the exclusive reading
+is what every resume test asserts and what relays do.
 
 ### G. Any process's events reach live subscribers
 
