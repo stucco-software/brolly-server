@@ -22,18 +22,24 @@ RUN apt-get update \
  && apt-get install -y --no-install-recommends ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
-# Not root. The data directory is the only thing it needs to write.
+# Not root at runtime, but the image starts as root: Railway bind-mounts its
+# volumes without inheriting the image directory's ownership, so the entrypoint
+# chowns the data directory and drops to this user before exec'ing the server.
 RUN useradd --system --create-home --uid 10001 brolly
 COPY --from=build /src/target/release/brolly-server /usr/local/bin/
 COPY --from=build /src/target/release/brolly-admin /usr/local/bin/
 COPY --from=build /src/server/static /srv/static
+COPY docker-entrypoint.sh /usr/local/bin/
+RUN chmod +x /usr/local/bin/docker-entrypoint.sh
 
 ENV BROLLY_STATIC_DIR=/srv/static \
     BROLLY_DATA_DIR=/var/lib/brolly \
     BROLLY_PORT=3000
 RUN mkdir -p /var/lib/brolly && chown brolly:brolly /var/lib/brolly
-USER brolly
-VOLUME ["/var/lib/brolly"]
+# No VOLUME instruction: Railway rejects Dockerfiles that declare one, and
+# every supported run (docker compose, Railway) mounts /var/lib/brolly itself.
+# A bare `docker run` without -v writes into the container layer.
 EXPOSE 3000
 
+ENTRYPOINT ["docker-entrypoint.sh"]
 CMD ["brolly-server"]
