@@ -1,4 +1,5 @@
-//! The XRPC surface: `com.atproto.repo.*` and `com.atproto.sync.*`.
+//! The XRPC surface: `com.atproto.repo.*`, `com.atproto.sync.*`, and the
+//! `com.atproto.server.*` session endpoints.
 //!
 //! Served on the **apex**, with the repo named by a `repo` parameter, because
 //! that is the shape a PDS has and the endpoint the PLC document advertises
@@ -21,8 +22,8 @@ use brolly_atproto::blocks::PodBlocks;
 use brolly_atproto::firehose::{self, CommitEvent};
 use brolly_atproto::keys::SigningKey;
 use brolly_atproto::tid::Tid;
-use brolly_atproto::{ingest, repo, state};
-use brolly_identity::db::{self, User};
+use brolly_atproto::{ingest, legacy, repo, state};
+use brolly_identity::db::{self, DbError, User};
 use brolly_identity::{extract, webid};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -48,6 +49,34 @@ fn auth_required() -> Response {
         StatusCode::UNAUTHORIZED,
         "AuthenticationRequired",
         "this method requires authentication",
+    )
+}
+
+/// The lexicon's own name for a refresh token that is unknown or spent (2, A).
+fn invalid_token() -> Response {
+    xrpc_error(
+        StatusCode::UNAUTHORIZED,
+        "InvalidToken",
+        "this session token is invalid",
+    )
+}
+
+/// The lexicon's own name for a refresh token past its expiry (2, A) — a
+/// different answer than an invalid one, because a client's recovery differs:
+/// re-login, not a retry.
+fn expired_token() -> Response {
+    xrpc_error(
+        StatusCode::UNAUTHORIZED,
+        "ExpiredToken",
+        "this session token has expired",
+    )
+}
+
+fn internal_error() -> Response {
+    xrpc_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "InternalServerError",
+        "something went wrong serving this request",
     )
 }
 
@@ -85,39 +114,128 @@ fn wrong_host(state: &AppState, headers: &HeaderMap) -> bool {
     extract::subdomain_user(host, &state.base_domain).is_some()
 }
 
+/// How a caller authenticated, narrowed to what the session surface asks
+/// (2, B): the privilege matrix reads provenance, not identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CallerKind {
+    /// The dashboard's session cookie: a primary-password login, in a browser.
+    Cookie,
+    /// An ATProtocol OAuth token, DPoP-bound.
+    Oauth,
+    /// A legacy session token through the primary password.
+    PrimaryPassword,
+    /// A legacy session token through an app password, carrying the one fact
+    /// the privilege matrix reads: that password's `privileged` flag.
+    AppPassword { privileged: bool },
+}
+
+impl CallerKind {
+    /// The management half of the privilege matrix (2, B): app-password
+    /// management is a primary-password action — the HTTP API spec's own
+    /// sentence about what app passwords may not do — and a browser session
+    /// cookie is one. OAuth tokens never manage app passwords: the profile's
+    /// `transition:generic` explicitly excludes account management.
+    fn may_manage_app_passwords(&self) -> bool {
+        matches!(self, CallerKind::Cookie | CallerKind::PrimaryPassword)
+    }
+
+    /// The email half (2, B): primary sessions see the email fields, an
+    /// app-password session only when its app password is privileged, and an
+    /// OAuth token never — nothing in its grant says it may.
+    fn may_see_email(&self) -> bool {
+        match self {
+            CallerKind::Cookie | CallerKind::PrimaryPassword => true,
+            CallerKind::AppPassword { privileged } => *privileged,
+            CallerKind::Oauth => false,
+        }
+    }
+}
+
+/// Who is making this call, and how they authenticated.
+struct Caller {
+    user: User,
+    kind: CallerKind,
+}
+
 /// Who is making this call.
 ///
 /// A **DPoP-bound ATProtocol token** first, because that is what a real client
-/// presents; a session cookie second, so the browser dashboard and tests can
-/// drive the same endpoints. Session-only auth was a placeholder — it is
-/// useless to any client that is not a browser on this origin.
+/// presents; the **access half of a legacy token pair** second (2, A), for
+/// bsky.app and every client like it; a session cookie last, so the browser
+/// dashboard and tests can drive the same endpoints. Session-only auth was a
+/// placeholder — it is useless to any client that is not a browser on this
+/// origin.
 ///
 /// The proof is verified against the presented token, not merely present: a
 /// bound token accepted without its proof is a bearer token wearing a costume.
-async fn caller(state: &AppState, headers: &HeaderMap, jar: &CookieJar) -> Option<User> {
-    if let Some(user) = token_caller(state, headers).await {
-        return Some(user);
+async fn caller(state: &AppState, headers: &HeaderMap, jar: &CookieJar) -> Option<Caller> {
+    // The Authorization header, when there is one, carries the credential the
+    // caller meant (extract's precedence): a DPoP-bound OAuth token, or the
+    // legacy pair's access half.
+    if let Some(authorization) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        && let Some(credential) = extract::credential(Some(authorization), None)
+    {
+        match credential {
+            brolly_identity::Credential::Dpop { token, .. } => {
+                if let Some(user) = token_caller(state, headers, &token).await {
+                    return Some(Caller {
+                        user,
+                        kind: CallerKind::Oauth,
+                    });
+                }
+            }
+            // The legacy arm (2, A): the access half of an opaque pair, in its
+            // own table. A Mastodon token lands here too, fails the lookup,
+            // and falls to the cookie below — the refusal a presented-but-
+            // unknown credential always got.
+            brolly_identity::Credential::Bearer(token) => {
+                if let Some(caller) = legacy_caller(state, &token).await {
+                    return Some(caller);
+                }
+            }
+            brolly_identity::Credential::Session(_) => {}
+        }
     }
+    // The cookie fallback stays last (2, D): the browser dashboard and the
+    // tests, as before this grew the token arms.
     let cookie = jar.get(SESSION_COOKIE)?;
-    db::user_for_session(&state.pool, cookie.value())
+    let user = db::user_for_session(&state.pool, cookie.value())
         .await
         .ok()
         .flatten()
-        .filter(User::is_active)
+        .filter(User::is_active)?;
+    Some(Caller {
+        user,
+        kind: CallerKind::Cookie,
+    })
 }
 
-async fn token_caller(state: &AppState, headers: &HeaderMap) -> Option<User> {
-    let authorization = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|h| h.to_str().ok())?;
-    let credential = extract::credential(Some(authorization), None)?;
-    let brolly_identity::Credential::Dpop { token, .. } = credential else {
-        // A plain `Bearer` here is not an ATProtocol credential. Honouring one
-        // would accept a token whose binding was never checked.
-        return None;
+/// The bearer arm of `caller` (2, A): a legacy access token, resolved against
+/// its own table with the kind in the lookup — so a refresh token presented
+/// here fails the query, not a check after it.
+async fn legacy_caller(state: &AppState, token: &str) -> Option<Caller> {
+    let grant = legacy::verify_access(&state.pool, token)
+        .await
+        .ok()
+        .flatten()?;
+    let user = db::find_by_id(&state.pool, grant.user_id)
+        .await
+        .ok()
+        .flatten()
+        .filter(User::is_active)?;
+    let kind = match grant.app_password_id {
+        None => CallerKind::PrimaryPassword,
+        Some(_) => CallerKind::AppPassword {
+            privileged: grant.privileged,
+        },
     };
+    Some(Caller { user, kind })
+}
 
-    let grant = brolly_atproto::oauth::verify_token(&state.pool, "access", &token)
+async fn token_caller(state: &AppState, headers: &HeaderMap, token: &str) -> Option<User> {
+    let grant = brolly_atproto::oauth::verify_token(&state.pool, "access", token)
         .await
         .ok()
         .flatten()?;
@@ -128,7 +246,7 @@ async fn token_caller(state: &AppState, headers: &HeaderMap) -> Option<User> {
     let url = format!("https://{}/xrpc/", state.base_domain);
     let method = "POST";
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let unspent = brolly_identity::dpop::verify(proof, method, &url, Some(&token), now).ok()?;
+    let unspent = brolly_identity::dpop::verify(proof, method, &url, Some(token), now).ok()?;
     if !unspent.bound_to(&grant.dpop_jkt) {
         tracing::warn!("an ATProtocol token was presented by a key it was not issued to");
         return None;
@@ -690,9 +808,10 @@ async fn create_record(
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(user) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
+    let user = caller.user;
     let Ok(input) = serde_json::from_slice::<CreateRecord>(&body) else {
         return invalid_request("body must be a JSON object with collection and record");
     };
@@ -802,9 +921,10 @@ async fn put_record(
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(user) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
+    let user = caller.user;
     let Ok(input) = serde_json::from_slice::<PutRecord>(&body) else {
         return invalid_request("body must be a JSON object with collection, rkey and record");
     };
@@ -881,9 +1001,10 @@ async fn swap_record(
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(user) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
+    let user = caller.user;
     let Ok(input) = serde_json::from_slice::<SwapRecord>(&body) else {
         return invalid_request(
             "body must be a JSON object with collection, rkey, record, swapRecord and swapCommit",
@@ -962,9 +1083,10 @@ async fn swap_commit(
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(user) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
+    let user = caller.user;
     let Ok(input) = serde_json::from_slice::<SwapCommit>(&body) else {
         return invalid_request(
             "body must be a JSON object with collection, rkey, record and commitCid",
@@ -1050,9 +1172,10 @@ async fn apply_writes(
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(user) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
+    let user = caller.user;
     let Ok(input) = serde_json::from_slice::<ApplyWrites>(&body) else {
         return invalid_request("body must be a JSON object with a non-empty writes array");
     };
@@ -1168,9 +1291,10 @@ async fn delete_record(
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(user) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers, &jar).await else {
         return auth_required();
     };
+    let user = caller.user;
     let Ok(input) = serde_json::from_slice::<DeleteRecord>(&body) else {
         return invalid_request("body must name a collection and rkey");
     };
@@ -1210,6 +1334,411 @@ pub async fn describe_server(State(state): State<AppState>, headers: HeaderMap) 
         "links": {},
     }))
     .into_response()
+}
+
+// --- sessions (2, A and 2, B) --------------------------------------------------
+//
+// The legacy session surface: four session endpoints, three app-password
+// ones, all apex-only like every other XRPC method. The tokens are the HTTP
+// API spec's opaque pair; `adapters/atproto/src/legacy.rs` owns their rows.
+
+/// The lexicon's `datetime` format: RFC 3339, the same wire format the
+/// firehose frames its timestamps in.
+fn wire_time(at: time::OffsetDateTime) -> String {
+    // A Postgres timestamp is always inside RFC 3339's range; the `None` arm
+    // exists only because the API returns `Result`.
+    at.format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default()
+}
+
+/// The shape every session answer shares (2, A): the lexicon's required
+/// fields, plus the email fields only for a session allowed to see them (2, B).
+fn session_view(state: &AppState, user: &User, email_visible: bool) -> Value {
+    let mut view = json!({
+        "handle": format!("{}.{}", user.username, state.base_domain),
+        "did": did_of(user, state),
+        // `status` is omitted: a disabled member's credentials stop resolving
+        // on their next request — the moderation stance every other surface
+        // already takes (2, A).
+        "active": true,
+    });
+    if email_visible && let Some(email) = &user.email {
+        view["email"] = json!(email);
+        view["emailConfirmed"] = json!(user.email_verified);
+    }
+    view
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateSessionInput {
+    identifier: String,
+    password: String,
+    // `authFactorToken` and `allowTakendown` are accepted and ignored (2,
+    // non-goals): there is no mail path to carry a factor, and the flag only
+    // *widens* access for taken-down accounts, so ignoring it is the safe
+    // direction.
+}
+
+/// Resolve a login identifier in every form brolly can name (2, A): `did:plc`
+/// (stored), `did:web` (derived from the subdomain), handle, email.
+///
+/// DID forms first, for the same suffix reason `resolve_repo` orders DID
+/// first: a `did:web` handle ends in the base domain too. Unlike
+/// `resolve_repo`, no `is_active` filter: a disabled member's *valid*
+/// credentials answer `AccountTakedown`, which must not be reachable without
+/// them.
+async fn login_user(state: &AppState, identifier: &str) -> Option<User> {
+    if let Some(did) = identifier.strip_prefix("did:plc:") {
+        let row: Option<(uuid::Uuid,)> = sqlx::query_as("SELECT id FROM users WHERE did_plc = $1")
+            .bind(format!("did:plc:{did}"))
+            .fetch_optional(&state.pool)
+            .await
+            .ok()
+            .flatten();
+        let (id,) = row?;
+        return db::find_by_id(&state.pool, id).await.ok().flatten();
+    }
+    // `did:web` is routing-only (D11): resolved structurally, never stored.
+    if let Some(host) = identifier.strip_prefix("did:web:") {
+        let username = extract::subdomain_user(host, &state.base_domain)?;
+        return db::find_by_username(&state.pool, &username)
+            .await
+            .ok()
+            .flatten();
+    }
+    // A handle: `alice.brolly.test`.
+    if let Some(handle) = identifier.strip_suffix(&format!(".{}", state.base_domain))
+        && let Some(user) = db::find_by_username(&state.pool, handle)
+            .await
+            .ok()
+            .flatten()
+    {
+        return Some(user);
+    }
+    // Email, last: the one identifier form no other surface resolves.
+    if identifier.contains('@') {
+        return db::find_by_email(&state.pool, identifier)
+            .await
+            .ok()
+            .flatten();
+    }
+    None
+}
+
+/// `com.atproto.server.createSession` (2, A).
+pub async fn create_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let Ok(input) = serde_json::from_slice::<CreateSessionInput>(&body) else {
+        return invalid_request("body must name an identifier and a password");
+    };
+    let Some(user) = login_user(&state, &input.identifier).await else {
+        // A login for nobody costs the same one Argon2 run as a wrong
+        // password for somebody — the `authenticate` pattern (2, A).
+        db::dummy_verify(&input.password);
+        return auth_required();
+    };
+
+    // The app-password table first — an indexed SHA-256 lookup — then Argon2
+    // against the primary hash (2, A).
+    let app_password = legacy::find_app_password(&state.pool, user.id, &input.password)
+        .await
+        .ok()
+        .flatten();
+    let (app_password_id, email_visible) = match app_password {
+        Some((id, privileged)) => (Some(id), privileged),
+        None => match db::verify_primary_password(&state.pool, user.id, &input.password).await {
+            Ok(Some(true)) => (None, true),
+            Ok(_) => return auth_required(),
+            Err(e) => {
+                tracing::error!(error = %e, "the primary password check failed");
+                return internal_error();
+            }
+        },
+    };
+
+    // Only now, with the credentials proven, does the account's status answer
+    // (2, A): brolly's `disabled` is the spec's `takendown` — the moderation
+    // reading of the two — and the lexicon's own error name says so.
+    if !user.is_active() {
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            "AccountTakedown",
+            "this account has been taken down",
+        );
+    }
+
+    let pair = match legacy::issue_pair(&state.pool, user.id, app_password_id).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            tracing::error!(error = %e, "issuing a legacy session failed");
+            return internal_error();
+        }
+    };
+    let mut view = session_view(&state, &user, email_visible);
+    view["accessJwt"] = json!(pair.access);
+    view["refreshJwt"] = json!(pair.refresh);
+    Json(view).into_response()
+}
+
+/// `com.atproto.server.getSession` (2, A): the current session, for the bearer
+/// access token.
+pub async fn get_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let Some(caller) = caller(&state, &headers, &jar).await else {
+        return auth_required();
+    };
+    Json(session_view(
+        &state,
+        &caller.user,
+        caller.kind.may_see_email(),
+    ))
+    .into_response()
+}
+
+/// The `Bearer` credential of a request, read through the identity-owned
+/// parser: `refreshSession` and `deleteSession` authenticate with the refresh
+/// half of the pair, which `caller`'s bearer arm — access only (2, A) — does
+/// not resolve.
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    let authorization = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())?;
+    match extract::credential(Some(authorization), None)? {
+        brolly_identity::Credential::Bearer(token) => Some(token),
+        _ => None,
+    }
+}
+
+/// `com.atproto.server.refreshSession` (2, A): authenticate with the
+/// *refresh* token, rotate the pair under the same `session_id`.
+pub async fn refresh_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let Some(token) = bearer_token(&headers) else {
+        return auth_required();
+    };
+    let grant = match legacy::inspect_refresh(&state.pool, &token).await {
+        Ok(legacy::RefreshToken::Valid(grant)) => grant,
+        Ok(legacy::RefreshToken::Expired) => return expired_token(),
+        Ok(legacy::RefreshToken::Invalid) => return invalid_token(),
+        Err(e) => {
+            tracing::error!(error = %e, "classifying a refresh token failed");
+            return internal_error();
+        }
+    };
+    let Ok(Some(user)) = db::find_by_id(&state.pool, grant.user_id).await else {
+        return invalid_token();
+    };
+    // A disabled member's refresh answers the lexicon's own name (2, A), for
+    // the same reason `createSession` does.
+    if !user.is_active() {
+        return xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            "AccountTakedown",
+            "this account has been taken down",
+        );
+    }
+    let pair = match legacy::rotate_pair(&state.pool, &grant).await {
+        Ok(Some(pair)) => pair,
+        // The classification above is a snapshot; the rotation is the race's
+        // arbiter (2, A): `None` means another refresh of the same session
+        // won, and a rotated refresh token is an invalid one.
+        Ok(None) => return invalid_token(),
+        Err(e) => {
+            tracing::error!(error = %e, "rotating a legacy session failed");
+            return internal_error();
+        }
+    };
+    let mut view = session_view(&state, &user, grant.may_see_email());
+    view["accessJwt"] = json!(pair.access);
+    view["refreshJwt"] = json!(pair.refresh);
+    Json(view).into_response()
+}
+
+/// `com.atproto.server.deleteSession` (2, A): authenticate with the refresh
+/// token, revoke every row sharing its `session_id` — the access token dies
+/// with the session, not at expiry.
+pub async fn delete_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let Some(token) = bearer_token(&headers) else {
+        return auth_required();
+    };
+    match legacy::inspect_refresh(&state.pool, &token).await {
+        Ok(legacy::RefreshToken::Valid(grant)) => {
+            match legacy::revoke_session(&state.pool, grant.session_id).await {
+                // Zero rows is still success: the session is revoked, by this
+                // request or by the one that raced it.
+                Ok(_) => Json(json!({})).into_response(),
+                Err(e) => {
+                    tracing::error!(error = %e, "revoking a legacy session failed");
+                    internal_error()
+                }
+            }
+        }
+        Ok(legacy::RefreshToken::Expired) => expired_token(),
+        Ok(legacy::RefreshToken::Invalid) => invalid_token(),
+        Err(e) => {
+            tracing::error!(error = %e, "classifying a refresh token failed");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CreateAppPasswordInput {
+    name: String,
+    privileged: Option<bool>,
+}
+
+/// The privilege answer (2, B): app-password management is a primary-password
+/// action — the HTTP API spec's own sentence about what app passwords may not
+/// do — and OAuth tokens never manage them at all.
+fn app_password_management_forbidden() -> Response {
+    xrpc_error(
+        StatusCode::FORBIDDEN,
+        "Forbidden",
+        "app passwords are managed with your primary password",
+    )
+}
+
+/// `com.atproto.server.createAppPassword` (2, B): the one response the
+/// plaintext ever appears in.
+pub async fn create_app_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    body: Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let Some(caller) = caller(&state, &headers, &jar).await else {
+        return auth_required();
+    };
+    if !caller.kind.may_manage_app_passwords() {
+        return app_password_management_forbidden();
+    }
+    let Ok(input) = serde_json::from_slice::<CreateAppPasswordInput>(&body) else {
+        return invalid_request("body must name the app password");
+    };
+    let name = input.name.trim();
+    if name.is_empty() {
+        return invalid_request("the name must not be empty");
+    }
+    match legacy::create_app_password(
+        &state.pool,
+        caller.user.id,
+        name,
+        input.privileged.unwrap_or(false),
+    )
+    .await
+    {
+        Ok((row, password)) => Json(json!({
+            "name": row.name,
+            "password": password,
+            "createdAt": wire_time(row.created_at),
+            "privileged": row.privileged,
+        }))
+        .into_response(),
+        Err(DbError::AppPasswordNameTaken) => {
+            invalid_request("you already have an app password with that name")
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "creating an app password failed");
+            internal_error()
+        }
+    }
+}
+
+/// `com.atproto.server.listAppPasswords` (2, B): the list without the
+/// password — the lexicon's list schema omits the field, and the stored hash
+/// could not return one anyway.
+pub async fn list_app_passwords(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let Some(caller) = caller(&state, &headers, &jar).await else {
+        return auth_required();
+    };
+    if !caller.kind.may_manage_app_passwords() {
+        return app_password_management_forbidden();
+    }
+    match legacy::list_app_passwords(&state.pool, caller.user.id).await {
+        Ok(rows) => Json(json!({
+            "passwords": rows
+                .iter()
+                .map(|row| json!({
+                    "name": row.name,
+                    "createdAt": wire_time(row.created_at),
+                    "privileged": row.privileged,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "listing app passwords failed");
+            internal_error()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RevokeAppPasswordInput {
+    name: String,
+}
+
+/// `com.atproto.server.revokeAppPassword` (2, B): the row dies, and the
+/// `ON DELETE CASCADE` kills its sessions *immediately* — the property an
+/// opaque-token server has that the reference's self-asserting JWTs do not.
+pub async fn revoke_app_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    jar: CookieJar,
+    body: Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let Some(caller) = caller(&state, &headers, &jar).await else {
+        return auth_required();
+    };
+    if !caller.kind.may_manage_app_passwords() {
+        return app_password_management_forbidden();
+    }
+    let Ok(input) = serde_json::from_slice::<RevokeAppPasswordInput>(&body) else {
+        return invalid_request("body must name the app password");
+    };
+    match legacy::revoke_app_password(&state.pool, caller.user.id, &input.name).await {
+        // The lexicon defines no error for an unknown name, and a password
+        // that is not there is the state it asks for.
+        Ok(_) => Json(json!({})).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "revoking an app password failed");
+            internal_error()
+        }
+    }
 }
 
 // --- firehose ---------------------------------------------------------------------
@@ -1576,6 +2105,32 @@ pub fn routes() -> Router<AppState> {
         .route("/xrpc/com.atproto.repo.applyWrites", post(apply_writes))
         .route("/xrpc/com.atproto.repo.swapRecord", post(swap_record))
         .route("/xrpc/com.atproto.repo.swapCommit", post(swap_commit))
+        // The legacy session surface (2, A and 2, B), apex-only like the rest.
+        .route(
+            "/xrpc/com.atproto.server.createSession",
+            post(create_session),
+        )
+        .route("/xrpc/com.atproto.server.getSession", get(get_session))
+        .route(
+            "/xrpc/com.atproto.server.refreshSession",
+            post(refresh_session),
+        )
+        .route(
+            "/xrpc/com.atproto.server.deleteSession",
+            post(delete_session),
+        )
+        .route(
+            "/xrpc/com.atproto.server.createAppPassword",
+            post(create_app_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.listAppPasswords",
+            get(list_app_passwords),
+        )
+        .route(
+            "/xrpc/com.atproto.server.revokeAppPassword",
+            post(revoke_app_password),
+        )
         // Last, and a wildcard: literal segments match first.
         .route(
             "/xrpc/{nsid}",

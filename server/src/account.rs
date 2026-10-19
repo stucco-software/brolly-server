@@ -328,6 +328,20 @@ pub async fn change_password(
             {
                 tracing::error!(error = %e, "revoking other sessions failed after a password change");
             }
+            // The ATProtocol sessions end too (2, G) — OAuth and legacy, both
+            // tables. The member asked to end other sessions, and before this
+            // only the browser ones ended; `oauth::revoke_all_for_user` existed
+            // with no caller at all.
+            if let Err(e) =
+                brolly_atproto::oauth::revoke_all_for_user(&state.pool, session.user.id).await
+            {
+                tracing::error!(error = %e, "revoking ATProto OAuth tokens failed after a password change");
+            }
+            if let Err(e) =
+                brolly_atproto::legacy::revoke_all_for_user(&state.pool, session.user.id).await
+            {
+                tracing::error!(error = %e, "revoking ATProto legacy sessions failed after a password change");
+            }
             Redirect::to("/account/security?saved=true").into_response()
         }
         Err(DbError::BadCredentials) => (

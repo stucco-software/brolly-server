@@ -22,6 +22,10 @@ pub enum DbError {
     BadCredentials,
     UsernameTaken,
     InviteInvalid,
+    /// An app password of that name already exists for the member (stage 2,
+    /// B). A variant of its own, like `UsernameTaken`, because the caller
+    /// answers it on its wire rather than logging it.
+    AppPasswordNameTaken,
 }
 
 impl std::fmt::Display for DbError {
@@ -32,6 +36,9 @@ impl std::fmt::Display for DbError {
             DbError::BadCredentials => write!(f, "invalid credentials"),
             DbError::UsernameTaken => write!(f, "username taken"),
             DbError::InviteInvalid => write!(f, "invite is invalid, expired, or used up"),
+            DbError::AppPasswordNameTaken => {
+                write!(f, "an app password with that name already exists")
+            }
         }
     }
 }
@@ -154,6 +161,49 @@ pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, DbError
     .await?)
 }
 
+/// The hash a login for a missing member is verified against, so a login for
+/// nobody and a wrong password for somebody cost the same one Argon2 run.
+/// (`authenticate`'s pattern; the legacy session surface shares it — stage 2, A.)
+const DUMMY_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$0000000000000000000000000000000000000000000";
+
+/// Cost one Argon2 verification and answer nothing, for a login whose
+/// identifier resolved to nobody (stage 2, A).
+pub fn dummy_verify(password: &str) {
+    let _ = verify_password(password, DUMMY_HASH);
+}
+
+/// Find a member by email — the last identifier form `createSession` accepts
+/// (stage 2, A), after the DID forms and the handle.
+pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>, DbError> {
+    Ok(sqlx::query_as::<_, User>(
+        "SELECT id, username, email, email_verified, did_plc, role, status
+         FROM users WHERE email = $1",
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await?)
+}
+
+/// Verify a member's primary password (stage 2, A).
+///
+/// `Ok(None)`: no such member — the caller that cares burns a
+/// [`dummy_verify`] first. `Ok(false)`: wrong password. The account's status
+/// is deliberately not consulted here: the caller decides what a disabled
+/// account's *valid* credentials answer, which is a different question from
+/// what bad credentials answer.
+pub async fn verify_primary_password(
+    pool: &PgPool,
+    user_id: Uuid,
+    password: &str,
+) -> Result<Option<bool>, DbError> {
+    let row: Option<(String,)> = sqlx::query_as("SELECT password_hash FROM users WHERE id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|(hash,)| verify_password(password, &hash)))
+}
+
 /// Verify a username/password pair.
 ///
 /// Returns [`DbError::BadCredentials`] for an unknown user, a wrong password,
@@ -167,11 +217,7 @@ pub async fn authenticate(pool: &PgPool, username: &str, password: &str) -> Resu
             .await?;
 
     let Some((hash, status, _)) = row else {
-        // Hash anyway so a missing user and a wrong password take similar time.
-        let _ = verify_password(
-            password,
-            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$0000000000000000000000000000000000000000000",
-        );
+        dummy_verify(password);
         return Err(DbError::BadCredentials);
     };
 

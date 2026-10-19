@@ -1399,6 +1399,662 @@ async fn an_xrpc_write_proof_is_good_for_one_request() {
     assert_eq!(third.status, StatusCode::OK, "{}", third.text());
 }
 
+// --- legacy sessions and app passwords (stage 2, chunk 1) ----------------------------
+
+const LOGIN_PASSWORD: &str = "correct-horse-battery";
+
+/// A member as the session endpoints see them: an email (verified), a
+/// `did:plc`, and `a_member`'s password. No pod, no repo, no keys — none of
+/// the seven session endpoints touches a repository, so none of that
+/// scaffolding is paid for here.
+async fn a_login_member(h: &Harness, username: &str) -> db::User {
+    let user = db::create_user(
+        &h.db.pool,
+        username,
+        Some(&format!("{username}@example.com")),
+        LOGIN_PASSWORD,
+        "member",
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE users SET email_verified = true WHERE id = $1")
+        .bind(user.id)
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+    let did = format!("did:plc:{username}did22222222222");
+    db::set_did_plc(&h.db.pool, user.id, &did).await.unwrap();
+    db::find_by_id(&h.db.pool, user.id).await.unwrap().unwrap()
+}
+
+async fn create_session(h: &Harness, identifier: &str, password: &str) -> Reply {
+    post_json(
+        h,
+        "/xrpc/com.atproto.server.createSession",
+        json!({"identifier": identifier, "password": password}),
+        None,
+    )
+    .await
+}
+
+async fn get_with_token(h: &Harness, uri: &str, token: &str) -> Reply {
+    send(
+        h,
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+async fn post_with_token(h: &Harness, uri: &str, token: &str, body: serde_json::Value) -> Reply {
+    send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await
+}
+
+/// An access token from a primary-password login — the credential the
+/// privilege matrix allows to manage app passwords (2, B).
+async fn primary_access(h: &Harness, username: &str) -> String {
+    let login = create_session(h, &format!("{username}.{BASE}"), LOGIN_PASSWORD).await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.text());
+    login.json()["accessJwt"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn create_session_accepts_every_identifier_form() {
+    // 2, A: handle, `did:plc` (stored), `did:web` (derived), email — DID forms
+    // first, so a `did:web` handle is never mistaken for a bare handle.
+    let h = harness().await;
+    let user = a_login_member(&h, "alice").await;
+    let handle = format!("alice.{BASE}");
+    let did = user.did_plc.clone().unwrap();
+
+    for identifier in [
+        handle.clone(),
+        format!("did:web:{handle}"),
+        did.clone(),
+        "alice@example.com".to_string(),
+    ] {
+        let reply = create_session(&h, &identifier, LOGIN_PASSWORD).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::OK,
+            "{identifier}: {}",
+            reply.text()
+        );
+        assert_eq!(reply.json()["handle"], handle);
+        assert_eq!(reply.json()["did"], did);
+        assert_eq!(reply.json()["active"], true);
+        // The primary-password session sees the email fields (2, B).
+        assert_eq!(reply.json()["email"], "alice@example.com");
+        assert_eq!(reply.json()["emailConfirmed"], true);
+    }
+}
+
+#[tokio::test]
+async fn bad_credentials_answer_authentication_required() {
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+
+    // A wrong password...
+    let reply = create_session(&h, &format!("alice.{BASE}"), "wrong-horse").await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.json()["error"], "AuthenticationRequired");
+
+    // ...and an unknown identifier, with the same answer and the same shape:
+    // the login surface does not enumerate its members. (The Argon2 run that
+    // keeps the two the same cost is `dummy_verify`, one verify either way.)
+    let reply = create_session(&h, "nobody.brolly.test", LOGIN_PASSWORD).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.json()["error"], "AuthenticationRequired");
+}
+
+#[tokio::test]
+async fn a_disabled_account_answers_account_takedown() {
+    let h = harness().await;
+    let user = a_login_member(&h, "alice").await;
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
+        .bind(user.id)
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+
+    // A wrong password still answers AuthenticationRequired: the takedown
+    // answer must not be reachable without valid credentials.
+    let reply = create_session(&h, &format!("alice.{BASE}"), "wrong-horse").await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.json()["error"], "AuthenticationRequired");
+
+    // The lexicon's own error name (2, A): brolly's `disabled` is the spec's
+    // `takendown`.
+    let reply = create_session(&h, &format!("alice.{BASE}"), LOGIN_PASSWORD).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+    assert_eq!(reply.json()["error"], "AccountTakedown");
+}
+
+#[tokio::test]
+async fn the_session_endpoints_are_apex_only() {
+    // ADR 0009 reserves `/xrpc/` on member subdomains, for the session
+    // endpoints like the rest of the surface.
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+
+    let reply = send(
+        &h,
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.server.createSession")
+            .header(header::HOST, format!("alice.{BASE}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({"identifier": "alice", "password": LOGIN_PASSWORD}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_legacy_session_writes_through_the_bearer_arm() {
+    // The arm this chunk adds (2, D): the write endpoints resolve a Bearer
+    // token against the legacy table, after the DPoP arm and before the
+    // cookie fallback.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let access = primary_access(&h, "alice").await;
+
+    let created = post_with_token(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        &access,
+        json!({
+            "collection": "app.bsky.feed.post",
+            "rkey": "3kaaaaaaaaaaa",
+            "record": {"$type": "app.bsky.feed.post", "text": "with the legacy token"},
+        }),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    // The read path agrees.
+    let fetched = get(
+        &h,
+        &format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.feed.post&rkey=3kaaaaaaaaaaa"
+        ),
+    )
+    .await;
+    assert_eq!(fetched.status, StatusCode::OK);
+    assert_eq!(fetched.json()["value"]["text"], "with the legacy token");
+    let _ = cookie;
+}
+
+#[tokio::test]
+async fn get_session_email_visibility_follows_the_privilege_matrix() {
+    // 2, B: primary / privileged / unprivileged.
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+
+    // Unauthenticated first: the matrix is about *visibility*, which needs an
+    // authenticated session to mean anything.
+    let reply = get(&h, "/xrpc/com.atproto.server.getSession").await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+
+    let access = primary_access(&h, "alice").await;
+
+    // The primary session sees the email.
+    let reply = get_with_token(&h, "/xrpc/com.atproto.server.getSession", &access).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["email"], "alice@example.com");
+    assert_eq!(reply.json()["emailConfirmed"], true);
+
+    for (name, privileged, visible) in [("plain", false, false), ("trusted", true, true)] {
+        let created = post_with_token(
+            &h,
+            "/xrpc/com.atproto.server.createAppPassword",
+            &access,
+            json!({"name": name, "privileged": privileged}),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+        assert_eq!(created.json()["privileged"], privileged);
+        let password = created.json()["password"].as_str().unwrap().to_string();
+
+        let login = create_session(&h, &format!("alice.{BASE}"), &password).await;
+        assert_eq!(login.status, StatusCode::OK, "{}", login.text());
+        // The app-password login answers by the same rule it will be held to.
+        assert_eq!(
+            login.json().get("email").is_some(),
+            visible,
+            "createSession for {name}"
+        );
+        let refresh = login.json()["refreshJwt"].as_str().unwrap().to_string();
+        let token = login.json()["accessJwt"].as_str().unwrap().to_string();
+
+        let reply = get_with_token(&h, "/xrpc/com.atproto.server.getSession", &token).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json().get("email").is_some(),
+            visible,
+            "getSession for {name}"
+        );
+
+        // Provenance survives rotation (2, A): the new pair carries the same
+        // `app_password_id`, so the same visibility.
+        let rotated = post_with_token(
+            &h,
+            "/xrpc/com.atproto.server.refreshSession",
+            &refresh,
+            json!({}),
+        )
+        .await;
+        assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.text());
+        let rotated_access = rotated.json()["accessJwt"].as_str().unwrap().to_string();
+        let reply =
+            get_with_token(&h, "/xrpc/com.atproto.server.getSession", &rotated_access).await;
+        assert_eq!(reply.status, StatusCode::OK);
+        assert_eq!(
+            reply.json().get("email").is_some(),
+            visible,
+            "getSession after refresh for {name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn refresh_session_rotates_the_pair() {
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+    let login = create_session(&h, &format!("alice.{BASE}"), LOGIN_PASSWORD).await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.text());
+    let access = login.json()["accessJwt"].as_str().unwrap().to_string();
+    let refresh = login.json()["refreshJwt"].as_str().unwrap().to_string();
+
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.refreshSession",
+        &refresh,
+        json!({}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["handle"], format!("alice.{BASE}"));
+    assert_eq!(reply.json()["active"], true);
+    let new_access = reply.json()["accessJwt"].as_str().unwrap().to_string();
+    let new_refresh = reply.json()["refreshJwt"].as_str().unwrap().to_string();
+    assert_ne!(new_access, access);
+    assert_ne!(new_refresh, refresh);
+
+    // The new pair lives...
+    let reply = get_with_token(&h, "/xrpc/com.atproto.server.getSession", &new_access).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    // ...and the old pair is dead, both halves (2, A: "revoke the old rows"):
+    // the refresh by rotation, the access with the session.
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.refreshSession",
+        &refresh,
+        json!({}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.json()["error"], "InvalidToken");
+    let reply = get_with_token(&h, "/xrpc/com.atproto.server.getSession", &access).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_refresh_token_answers_by_its_own_condition() {
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+
+    // Unknown → `InvalidToken`, the lexicon's own name (2, A).
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.refreshSession",
+        "not-a-token",
+        json!({}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.json()["error"], "InvalidToken");
+
+    // Expired → `ExpiredToken`, distinguished from invalid because a client's
+    // recovery differs: re-login, not a retry.
+    let login = create_session(&h, &format!("alice.{BASE}"), LOGIN_PASSWORD).await;
+    let refresh = login.json()["refreshJwt"].as_str().unwrap().to_string();
+    sqlx::query(
+        "UPDATE atproto_legacy_tokens SET expires_at = now() - interval '1 second'
+         WHERE token_hash = $1",
+    )
+    .bind(db::hash_secret(&refresh))
+    .execute(&h.db.pool)
+    .await
+    .unwrap();
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.refreshSession",
+        &refresh,
+        json!({}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+    assert_eq!(reply.json()["error"], "ExpiredToken");
+}
+
+#[tokio::test]
+async fn delete_session_kills_both_halves_of_the_pair() {
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+    let login = create_session(&h, &format!("alice.{BASE}"), LOGIN_PASSWORD).await;
+    let access = login.json()["accessJwt"].as_str().unwrap().to_string();
+    let refresh = login.json()["refreshJwt"].as_str().unwrap().to_string();
+
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.deleteSession",
+        &refresh,
+        json!({}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    // The access token died with the session, not at expiry (2, A)...
+    let reply = get_with_token(&h, "/xrpc/com.atproto.server.getSession", &access).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+    // ...and the refresh with it.
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.refreshSession",
+        &refresh,
+        json!({}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.json()["error"], "InvalidToken");
+}
+
+#[tokio::test]
+async fn app_passwords_take_the_http_api_specs_own_format() {
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+    let access = primary_access(&h, "alice").await;
+
+    for _ in 0..8 {
+        let created = post_with_token(
+            &h,
+            "/xrpc/com.atproto.server.createAppPassword",
+            &access,
+            json!({"name": format!("app-{}", uuid::Uuid::new_v4())}),
+        )
+        .await;
+        assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+        let body = created.json();
+        let password = body["password"].as_str().unwrap();
+        // ^[a-z0-9]{4}(-[a-z0-9]{4}){3}$, by hand: no regex crate in the tree.
+        let groups: Vec<&str> = password.split('-').collect();
+        assert_eq!(groups.len(), 4, "{password}");
+        for group in &groups {
+            assert_eq!(group.len(), 4, "{password}");
+            assert!(
+                group
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit()),
+                "{password}"
+            );
+        }
+        // The lexicon's `datetime` format.
+        let created_at = body["createdAt"].as_str().unwrap();
+        assert!(created_at.contains('T'), "{created_at}");
+    }
+}
+
+#[tokio::test]
+async fn the_plaintext_appears_once_and_the_list_omits_it() {
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+    let access = primary_access(&h, "alice").await;
+
+    let created = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.createAppPassword",
+        &access,
+        json!({"name": "my phone"}),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+    let password = created.json()["password"].as_str().unwrap().to_string();
+    assert_eq!(created.json()["name"], "my phone");
+
+    // The list carries the row without the password (2, B): the lexicon's
+    // list schema omits the field, and the stored hash could not return one.
+    let listed = get_with_token(&h, "/xrpc/com.atproto.server.listAppPasswords", &access).await;
+    assert_eq!(listed.status, StatusCode::OK, "{}", listed.text());
+    let body = listed.json();
+    let passwords = body["passwords"].as_array().unwrap();
+    assert_eq!(passwords.len(), 1);
+    assert_eq!(passwords[0]["name"], "my phone");
+    assert!(passwords[0].get("password").is_none());
+    // And the whole body carries no trace of the plaintext.
+    assert!(!listed.text().contains(&password));
+
+    // A duplicate name is refused, not silently duplicated.
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.createAppPassword",
+        &access,
+        json!({"name": "my phone"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.text());
+}
+
+#[tokio::test]
+async fn an_app_password_session_cannot_manage_app_passwords() {
+    // The privilege matrix (2, B): the HTTP API spec's own sentence — app
+    // passwords do not make changes to authentication settings, which
+    // includes app passwords themselves.
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+    let access = primary_access(&h, "alice").await;
+
+    let created = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.createAppPassword",
+        &access,
+        json!({"name": "the only one"}),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+    let password = created.json()["password"].as_str().unwrap().to_string();
+
+    let login = create_session(&h, &format!("alice.{BASE}"), &password).await;
+    assert_eq!(login.status, StatusCode::OK, "{}", login.text());
+    let app_access = login.json()["accessJwt"].as_str().unwrap().to_string();
+
+    // All three, because the rule is the surface's, not one endpoint's.
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.createAppPassword",
+        &app_access,
+        json!({"name": "another"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
+    let reply = get_with_token(&h, "/xrpc/com.atproto.server.listAppPasswords", &app_access).await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.revokeAppPassword",
+        &app_access,
+        json!({"name": "the only one"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+
+    // An OAuth token cannot manage them either (2, B): the profile's
+    // `transition:generic` excludes account management. Presented as the
+    // DPoP credential it is, so the 403 is a privilege answer, not a 401.
+    let (_, cookie) = a_member(&h, "bob").await;
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key).await;
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let reply = send(
+        &h,
+        Request::builder()
+            .uri("/xrpc/com.atproto.server.listAppPasswords")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("DPoP {token}"))
+            .header(
+                "DPoP",
+                dpop_proof(&key, "POST", &format!("https://{BASE}/xrpc/"), Some(&ath)),
+            )
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
+}
+
+#[tokio::test]
+async fn revoking_an_app_password_kills_its_sessions_immediately() {
+    // The whole point of opaque rows (2, B): the reference's self-asserting
+    // JWT sessions outlive revocation until their next refresh; rows with
+    // `ON DELETE CASCADE` do not.
+    let h = harness().await;
+    a_login_member(&h, "alice").await;
+    let access = primary_access(&h, "alice").await;
+
+    let created = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.createAppPassword",
+        &access,
+        json!({"name": "phone"}),
+    )
+    .await;
+    let password = created.json()["password"].as_str().unwrap().to_string();
+
+    let login = create_session(&h, &format!("alice.{BASE}"), &password).await;
+    let app_access = login.json()["accessJwt"].as_str().unwrap().to_string();
+    let app_refresh = login.json()["refreshJwt"].as_str().unwrap().to_string();
+
+    // Alive before...
+    let reply = get_with_token(&h, "/xrpc/com.atproto.server.getSession", &app_access).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    // ...dead the moment the row dies, both halves, and the password with
+    // them.
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.revokeAppPassword",
+        &access,
+        json!({"name": "phone"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    let reply = get_with_token(&h, "/xrpc/com.atproto.server.getSession", &app_access).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+    let reply = post_with_token(
+        &h,
+        "/xrpc/com.atproto.server.refreshSession",
+        &app_refresh,
+        json!({}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(reply.json()["error"], "InvalidToken");
+
+    let login = create_session(&h, &format!("alice.{BASE}"), &password).await;
+    assert_eq!(login.status, StatusCode::UNAUTHORIZED, "{}", login.text());
+    assert_eq!(login.json()["error"], "AuthenticationRequired");
+}
+
+#[tokio::test]
+async fn changing_a_password_ends_the_atproto_sessions() {
+    // The wiring this chunk adds (2, G): a password change ends the ATProto
+    // sessions too — both tables — not just the browser ones.
+    let h = harness().await;
+    let user = a_login_member(&h, "alice").await;
+
+    // A legacy session...
+    let login = create_session(&h, &format!("alice.{BASE}"), LOGIN_PASSWORD).await;
+    let access = login.json()["accessJwt"].as_str().unwrap().to_string();
+
+    // ...and an OAuth one, driven as a real client drives it (PAR, consent,
+    // decision, token), through the browser session the dashboard uses.
+    let session = db::create_session(&h.db.pool, user.id, time::Duration::hours(1), None)
+        .await
+        .unwrap();
+    let cookie = format!("brolly_session={session}");
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let oauth_token = atproto_access_token(&h, &cookie, &key).await;
+
+    let reply = send(
+        &h,
+        Request::builder()
+            .method("POST")
+            .uri("/account/security")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, cookie)
+            .body(Body::from(
+                form_urlencoded::Serializer::new(String::new())
+                    .append_pair("current_password", LOGIN_PASSWORD)
+                    .append_pair("new_password", "a-new-longer-password")
+                    .finish(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.text());
+
+    // The legacy session is dead...
+    let reply = get_with_token(&h, "/xrpc/com.atproto.server.getSession", &access).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+
+    // ...and the OAuth one with it, which is the half that had no caller at
+    // all before this (`oauth::revoke_all_for_user`).
+    let target = format!("https://{BASE}/xrpc/");
+    let ath = B64.encode(Sha256::digest(oauth_token.as_bytes()));
+    let reply = send(
+        &h,
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.repo.createRecord")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("DPoP {oauth_token}"))
+            .header("DPoP", dpop_proof(&key, "POST", &target, Some(&ath)))
+            .body(Body::from(
+                json!({
+                    "collection": "app.bsky.feed.post",
+                    "rkey": "3kaaaaaaaaaaa",
+                    "record": {"$type": "app.bsky.feed.post", "text": "after"},
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+}
+
 // --- hygiene ---------------------------------------------------------------------------
 
 #[tokio::test]

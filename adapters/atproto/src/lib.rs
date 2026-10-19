@@ -12,6 +12,7 @@ pub mod firehose;
 pub mod identity;
 pub mod ingest;
 pub mod keys;
+pub mod legacy;
 pub mod oauth;
 pub mod plc;
 pub mod repo;
