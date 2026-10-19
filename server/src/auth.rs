@@ -13,13 +13,16 @@
 
 use askama::Template;
 use axum::Form;
+use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use brolly_identity::db::{self, DbError, User};
+use brolly_identity::webid;
 use serde::Deserialize;
+use serde_json::json;
 
 use crate::{AppState, Chrome, render};
 
@@ -153,19 +156,31 @@ fn register_page<'a>(
     username: &str,
     invite: &str,
 ) -> AuthPage<'a> {
+    // The door's policy is the deployment's, not the page's: an instance with
+    // `BROLLY_PUBLIC_REGISTRATION` set asks for no invite, and one without it
+    // is invite-only. The field is dropped rather than marked optional, so a
+    // public signup form never suggests an invite exists to present.
+    let (intro, mut fields) = if state.public_registration {
+        ("Your data lives in your own pod.", vec![])
+    } else {
+        (
+            "This server is invite-only. Your data lives in your own pod.",
+            vec![Field::text("invite", "Invite code", "off").keep(invite)],
+        )
+    };
+    fields.extend([
+        Field::text("username", "Username", "username").keep(username),
+        Field::optional_email("email", "Email (optional, for password resets)"),
+        Field::password("password", "Password", "new-password"),
+    ]);
     AuthPage {
         chrome: state.chrome(),
         heading: "Create an account",
-        intro: Some("This server is invite-only. Your data lives in your own pod."),
+        intro: Some(intro),
         error,
         action: "/register",
         submit: "Create account",
-        fields: vec![
-            Field::text("invite", "Invite code", "off").keep(invite),
-            Field::text("username", "Username", "username").keep(username),
-            Field::optional_email("email", "Email (optional, for password resets)"),
-            Field::password("password", "Password", "new-password"),
-        ],
+        fields,
         alternate: Some(Alternate {
             prefix: "Already have an account?",
             href: "/login",
@@ -249,6 +264,11 @@ pub async fn login_submit(
 
 #[derive(Deserialize)]
 pub struct RegisterForm {
+    /// Absent, not empty, when the form does not render the field — a public
+    /// instance's form carries no invite input, so the browser posts no
+    /// `invite` key at all. `#[serde(default)]` makes that an empty string
+    /// rather than a 422 the form never meant to provoke.
+    #[serde(default)]
     invite: String,
     username: String,
     email: String,
@@ -265,64 +285,69 @@ pub async fn register_form(State(state): State<AppState>, jar: CookieJar) -> Res
     render(&register_page(&state, None, "", ""))
 }
 
-/// `POST /register`
+/// What can go wrong creating a member, shared by the form and the API.
+///
+/// The two surfaces answer the same failures differently — a page re-rendered
+/// with a message on one, a JSON error code on the other — so the core says
+/// what went wrong and each surface decides what it looks like.
+#[derive(Debug, PartialEq)]
+pub(crate) enum RegistrationError {
+    /// The username is not a valid subdomain-shaped handle. The detail is the
+    /// same message the form has always shown.
+    Username(String),
+    UsernameTaken,
+    PasswordShort,
+    /// A required invite was absent, or a presented one was invalid, expired
+    /// or used up. The two cases share an code deliberately: the endpoint is
+    /// not an oracle for which invite codes exist.
+    InviteInvalid,
+    ServerError,
+}
+
+/// Create a member and everything their account is: the row, the pod with its
+/// storage root and ACL, and the ATProtocol identity.
+///
+/// The invite policy is the deployment's (`BROLLY_PUBLIC_REGISTRATION`): an
+/// invite is *required* on a private instance and *optional* on a public one.
+/// Optional, never ignored — a presented invite is redeemed even on a public
+/// instance, because the bootstrap admin invite is how an empty instance gets
+/// its first admin on either policy, and an admin invite silently treated as
+/// no invite would register the operator as a plain member.
 ///
 /// The invite is redeemed *before* the user is created, so a failed creation
 /// cannot consume an invite silently — and redemption is a single conditional
 /// UPDATE, so two simultaneous registrations cannot both claim the last use.
-pub async fn register_submit(
-    State(state): State<AppState>,
-    jar: CookieJar,
-    Form(form): Form<RegisterForm>,
-) -> Response {
-    if let Err(message) = validate_username(&form.username) {
-        return (
-            StatusCode::BAD_REQUEST,
-            render(&register_page(
-                &state,
-                Some(message),
-                &form.username,
-                &form.invite,
-            )),
-        )
-            .into_response();
+async fn create_member(
+    state: &AppState,
+    username: &str,
+    email: Option<&str>,
+    password: &str,
+    invite: Option<&str>,
+) -> Result<User, RegistrationError> {
+    if let Err(message) = validate_username(username) {
+        return Err(RegistrationError::Username(message.to_string()));
     }
-    if form.password.chars().count() < 12 {
-        return (
-            StatusCode::BAD_REQUEST,
-            render(&register_page(
-                &state,
-                Some("Use at least 12 characters. Length beats punctuation."),
-                &form.username,
-                &form.invite,
-            )),
-        )
-            .into_response();
+    if password.chars().count() < 12 {
+        return Err(RegistrationError::PasswordShort);
     }
 
-    // The invite says what the account becomes. An ordinary one grants
-    // nothing and the redeemer is a member; the bootstrap invite an empty
-    // instance mints for itself grants admin, which is the only way a first
-    // admin exists at all (`admin::bootstrap`).
-    let granted = match db::redeem_invite(&state.pool, &form.invite).await {
-        Ok(role) => role,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                render(&register_page(
-                    &state,
-                    Some("That invite is not valid, has expired, or has been used up."),
-                    &form.username,
-                    "",
-                )),
-            )
-                .into_response();
-        }
+    // An invite says what the account becomes. An ordinary one grants nothing
+    // and the redeemer is a member; the bootstrap invite an empty instance
+    // mints for itself grants admin, which is the only way a first admin
+    // exists at all (`admin::bootstrap`).
+    let role = match (state.public_registration, invite) {
+        // Private and no invite: the door does not open.
+        (false, None) => return Err(RegistrationError::InviteInvalid),
+        // A presented invite is redeemed under either policy.
+        (_, Some(code)) => match db::redeem_invite(&state.pool, code).await {
+            Ok(granted) => granted.unwrap_or_else(|| crate::admin::MEMBER.to_string()),
+            Err(_) => return Err(RegistrationError::InviteInvalid),
+        },
+        // Public and no invite: a plain member.
+        (true, None) => crate::admin::MEMBER.to_string(),
     };
-    let role = granted.as_deref().unwrap_or(crate::admin::MEMBER);
 
-    let email = (!form.email.trim().is_empty()).then(|| form.email.trim());
-    match db::create_user(&state.pool, &form.username, email, &form.password, role).await {
+    match db::create_user(&state.pool, username, email, password, &role).await {
         Ok(user) => {
             // Give them a pod they can write to. WAC grants nothing by
             // default, so without this the first write any new member attempts
@@ -332,12 +357,12 @@ pub async fn register_submit(
                     if let Err(e) = crate::provision::pod(&pod, &user.username, &state.base_domain)
                     {
                         tracing::error!(error = %e, user = %user.id, "pod provisioning failed");
-                        return server_error();
+                        return Err(RegistrationError::ServerError);
                     }
                 }
                 Err(e) => {
                     tracing::error!(error = %e, user = %user.id, "pod unavailable at registration");
-                    return server_error();
+                    return Err(RegistrationError::ServerError);
                 }
             }
 
@@ -381,35 +406,196 @@ pub async fn register_submit(
                     // account would be permanently half-built. Network failure
                     // is not, and is handled inside as `plc_registered: false`.
                     tracing::error!(error = %e, user = %user.id, "atproto provisioning failed");
-                    return server_error();
+                    return Err(RegistrationError::ServerError);
                 }
             }
-
-            match db::create_session(&state.pool, user.id, time::Duration::days(30), None).await {
-                Ok(token) => {
-                    (jar.add(session_cookie(token)), Redirect::to("/account")).into_response()
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, "session creation failed after registration");
-                    server_error()
-                }
-            }
+            Ok(user)
         }
-        Err(DbError::UsernameTaken) => (
-            StatusCode::CONFLICT,
-            render(&register_page(
-                &state,
-                Some("That username is taken."),
-                &form.username,
-                &form.invite,
-            )),
-        )
-            .into_response(),
+        Err(DbError::UsernameTaken) => Err(RegistrationError::UsernameTaken),
         Err(e) => {
             tracing::error!(error = %e, "registration failed");
+            Err(RegistrationError::ServerError)
+        }
+    }
+}
+
+/// `POST /register`
+///
+/// The browser form. The invite field is rendered only on an invite-only
+/// instance, but a public one still redeems an invite that is posted to it —
+/// the bootstrap admin invite reaches an empty public instance through this
+/// form as through the API.
+pub async fn register_submit(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Form(form): Form<RegisterForm>,
+) -> Response {
+    let email = (!form.email.trim().is_empty()).then(|| form.email.trim());
+    let invite = (!form.invite.trim().is_empty()).then(|| form.invite.trim());
+    let member = create_member(&state, &form.username, email, &form.password, invite).await;
+
+    let user = match member {
+        Ok(user) => user,
+        Err(RegistrationError::Username(message)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                render(&register_page(
+                    &state,
+                    Some(&message),
+                    &form.username,
+                    &form.invite,
+                )),
+            )
+                .into_response();
+        }
+        Err(RegistrationError::PasswordShort) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                render(&register_page(
+                    &state,
+                    Some("Use at least 12 characters. Length beats punctuation."),
+                    &form.username,
+                    &form.invite,
+                )),
+            )
+                .into_response();
+        }
+        Err(RegistrationError::InviteInvalid) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                render(&register_page(
+                    &state,
+                    Some("That invite is not valid, has expired, or has been used up."),
+                    &form.username,
+                    "",
+                )),
+            )
+                .into_response();
+        }
+        Err(RegistrationError::UsernameTaken) => {
+            return (
+                StatusCode::CONFLICT,
+                render(&register_page(
+                    &state,
+                    Some("That username is taken."),
+                    &form.username,
+                    &form.invite,
+                )),
+            )
+                .into_response();
+        }
+        Err(RegistrationError::ServerError) => return server_error(),
+    };
+
+    match db::create_session(&state.pool, user.id, time::Duration::days(30), None).await {
+        Ok(token) => (jar.add(session_cookie(token)), Redirect::to("/account")).into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "session creation failed after registration");
             server_error()
         }
     }
+}
+
+/// The account-creation API's request body.
+#[derive(Deserialize)]
+pub struct CreateAccount {
+    username: String,
+    /// Optional on every policy — an instance never requires an email, and
+    /// brolly has no email path yet, so the address is stored for the day it
+    // does rather than used.
+    email: Option<String>,
+    password: String,
+    /// Required on a private instance, optional on a public one. A public
+    /// deployment's signup surface simply omits it.
+    invite: Option<String>,
+}
+
+/// `POST /api/accounts` — account creation as an API, for a signup surface on
+/// another origin.
+///
+/// The form is for a person with a browser; this is for a first-party site or
+/// app that wants to offer signup for the instance — the marketing page in
+/// front of a public deployment, or an invite-based signup flow like the
+/// predecessor StuccoID app ran against CSS's `.account` API. The policy is
+/// the same env var the form reads: private instances require an invite here
+/// exactly as there, so the API is not the way around an invite-only door.
+///
+/// Answers `201` with the new member's username and WebID and nothing else —
+/// no session. A session here would be a cookie a cross-origin script cannot
+/// use (`SameSite=Lax`) and a bearer a signup surface has no reason to hold;
+/// the member logs in through the front door or OIDC like anyone else.
+///
+/// Apex-only, like the OAuth surface (ADR 0009): a member's subdomain is
+/// their pod, and an instance-level endpoint does not answer there.
+pub async fn create_account(
+    State(state): State<AppState>,
+    Json(request): Json<CreateAccount>,
+) -> Response {
+    let email = request
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|e| !e.is_empty());
+    let invite = request
+        .invite
+        .as_deref()
+        .map(str::trim)
+        .filter(|i| !i.is_empty());
+
+    match create_member(&state, &request.username, email, &request.password, invite).await {
+        Ok(user) => (
+            StatusCode::CREATED,
+            Json(json!({
+                "username": user.username,
+                "webid": webid::webid(&user.username, &state.base_domain),
+            })),
+        )
+            .into_response(),
+        Err(RegistrationError::Username(message)) => {
+            account_error(StatusCode::BAD_REQUEST, "invalid_username", &message)
+        }
+        Err(RegistrationError::PasswordShort) => account_error(
+            StatusCode::BAD_REQUEST,
+            "password_too_short",
+            "Use at least 12 characters. Length beats punctuation.",
+        ),
+        // The two invite failures are deliberately one code: the endpoint
+        // does not tell a caller which invite codes exist, the same
+        // indistinguishability the unknown-client refusal on `authorize`
+        // preserves (spec 6, H3).
+        Err(RegistrationError::InviteInvalid) => account_error(
+            StatusCode::BAD_REQUEST,
+            "invite_invalid",
+            "An invite is required, or the one presented is not valid, has expired, or has been used up.",
+        ),
+        Err(RegistrationError::UsernameTaken) => account_error(
+            StatusCode::CONFLICT,
+            "username_taken",
+            "That username is taken.",
+        ),
+        Err(RegistrationError::ServerError) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({
+                "error": "server_error",
+                "error_description": "Something went wrong. Try again.",
+            })),
+        )
+            .into_response(),
+    }
+}
+
+/// An account-creation error as JSON, in the OAuth error shape the rest of
+/// the server already speaks — `error` for the code a caller switches on,
+/// `error_description` for the text a person can read.
+fn account_error(status: StatusCode, error: &str, description: &str) -> Response {
+    (
+        status,
+        Json(json!({
+            "error": error,
+            "error_description": description,
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /logout`

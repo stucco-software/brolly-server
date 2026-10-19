@@ -106,6 +106,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         privacy_url: std::env::var("BROLLY_PRIVACY_URL")
             .ok()
             .filter(|s| !s.is_empty()),
+        // Off by default: an open registration door is a public deployment's
+        // decision, not a private community's default. Read here with the rest
+        // of the door's config; the form and the account-creation API both
+        // read it from the state.
+        public_registration: std::env::var("BROLLY_PUBLIC_REGISTRATION")
+            .is_ok_and(|v| v == "1" || v == "true"),
         max_upload_bytes,
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),

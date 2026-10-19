@@ -16,6 +16,14 @@ use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 
 async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
+    harness_with(false).await
+}
+
+/// The door's policy is the deployment's: every test here runs against one of
+/// the two, so the harness takes it rather than the env var.
+async fn harness_with(
+    public_registration: bool,
+) -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -27,6 +35,7 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
         source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
         terms_url: None,
         privacy_url: None,
+        public_registration,
         max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
         stores: std::sync::Arc::new(
             brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),
@@ -729,4 +738,258 @@ async fn register_renders_the_door_too() {
     assert!(!body.contains("shell-header"));
     assert!(body.contains("<h1>brolly.test</h1>"));
     assert!(body.contains("name=\"invite\""));
+}
+
+// --- the registration policy (public vs invite-only) --------------------------
+
+/// A JSON POST helper for the account-creation API. The API's callers are
+/// scripts on other origins, so the tests are too.
+async fn post_json(router: &axum::Router, path: &str, body: &str) -> (StatusCode, String) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    (status, body)
+}
+
+/// On an invite-only instance the register form asks for an invite, and says
+/// so — a visitor should learn the door's policy from the page, not from a
+/// failed submission.
+#[tokio::test]
+async fn a_private_instance_form_asks_for_an_invite() {
+    let (_db, _dir, router) = harness().await;
+    let (_, body, _) = get_as(&router, "/register", None).await;
+
+    assert!(body.contains("name=\"invite\""), "got: {body}");
+    assert!(body.contains("invite-only"), "got: {body}");
+}
+
+/// On a public instance the form asks for no invite: the field is dropped, not
+/// marked optional, so a signup page never suggests an invite exists to
+/// present.
+#[tokio::test]
+async fn a_public_instance_form_asks_for_no_invite() {
+    let (_db, _dir, router) = harness_with(true).await;
+    let (_, body, _) = get_as(&router, "/register", None).await;
+
+    assert!(!body.contains("name=\"invite\""), "got: {body}");
+    assert!(!body.contains("invite-only"), "got: {body}");
+}
+
+/// The default is the conservative door: no invite, no account — on the API
+/// exactly as on the form, so the API is not a way around an invite-only
+/// instance.
+#[tokio::test]
+async fn a_private_instance_api_requires_an_invite() {
+    let (_db, _dir, router) = harness().await;
+
+    let (status, body) = post_json(
+        &router,
+        "/api/accounts",
+        r#"{"username":"alice","password":"correct-horse-battery"}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("\"invite_invalid\""), "got: {body}");
+}
+
+/// A public instance's API creates the account with no invite, and answers
+/// with the two facts a signup surface needs: the handle and the WebID.
+#[tokio::test]
+async fn a_public_instance_api_creates_an_account() {
+    let (db, _dir, router) = harness_with(true).await;
+
+    let (status, body) = post_json(
+        &router,
+        "/api/accounts",
+        r#"{"username":"alice","email":"alice@example.org","password":"correct-horse-battery"}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CREATED, "got: {body}");
+    assert!(body.contains("\"username\":\"alice\""), "got: {body}");
+    assert!(
+        body.contains("\"webid\":\"https://alice.brolly.test/profile#me\""),
+        "got: {body}"
+    );
+
+    // The API creates the member — the full member, pod and ATProto identity
+    // included — not a row that half-works. `find_by_username` answering is
+    // the row; the login working is the password.
+    db::find_by_username(&db.pool, "alice")
+        .await
+        .unwrap()
+        .expect("the API created the member");
+    let (_, _, cookies, _) = post(
+        &router,
+        "/login",
+        "username=alice&password=correct-horse-battery",
+    )
+    .await;
+    assert!(!cookies.is_empty(), "the created member can log in");
+}
+
+/// The API answers a signup surface on another origin, and CORS is what lets
+/// that surface's script read the answer — including the error, which is how
+/// it learns a handle is taken.
+#[tokio::test]
+async fn the_api_answers_a_cross_origin_caller() {
+    let (_db, _dir, router) = harness_with(true).await;
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/accounts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::ORIGIN, "https://signup.example.org")
+                .body(Body::from(
+                    r#"{"username":"alice","password":"correct-horse-battery"}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://signup.example.org"),
+        "the origin is echoed, so the calling script can read the answer"
+    );
+}
+
+/// A taken username is a conflict, with a code a signup surface can switch on
+/// rather than a message it has to parse — the predecessor's app had to
+/// regex-match CSS's prose to learn this, which is the trap the codes exist
+/// to close.
+#[tokio::test]
+async fn the_api_names_a_taken_username() {
+    let (_db, _dir, router) = harness_with(true).await;
+    let first = post_json(
+        &router,
+        "/api/accounts",
+        r#"{"username":"alice","password":"correct-horse-battery"}"#,
+    )
+    .await;
+    assert_eq!(first.0, StatusCode::CREATED);
+
+    let (status, body) = post_json(
+        &router,
+        "/api/accounts",
+        r#"{"username":"alice","password":"correct-horse-battery"}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.contains("\"username_taken\""), "got: {body}");
+}
+
+/// A public instance still redeems an invite that is presented — optional,
+/// never ignored. The bootstrap admin invite is how an empty instance gets its
+/// first admin on either policy, and treating a presented admin invite as no
+/// invite would register the operator as a plain member.
+#[tokio::test]
+async fn a_public_instance_still_redeems_a_presented_invite() {
+    let (db, _dir, router) = harness_with(true).await;
+    let code = db::create_invite(&db.pool, None, 1, None, Some("admin"))
+        .await
+        .unwrap();
+
+    let (status, _) = post_json(
+        &router,
+        "/api/accounts",
+        &format!(r#"{{"username":"alice","password":"correct-horse-battery","invite":"{code}"}}"#),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let alice = db::find_by_username(&db.pool, "alice")
+        .await
+        .unwrap()
+        .expect("created");
+    assert_eq!(
+        alice.role, "admin",
+        "the invite's grant survived the policy"
+    );
+}
+
+/// A presented-but-invalid invite is refused on a public instance too. Serving
+/// it as a plain member registration would silently downgrade an admin
+/// bootstrap attempt, and telling the caller which invites exist would make
+/// the endpoint an oracle.
+#[tokio::test]
+async fn a_public_instance_refuses_an_invalid_presented_invite() {
+    let (_db, _dir, router) = harness_with(true).await;
+
+    let (status, body) = post_json(
+        &router,
+        "/api/accounts",
+        r#"{"username":"alice","password":"correct-horse-battery","invite":"nonsense"}"#,
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("\"invite_invalid\""), "got: {body}");
+}
+
+/// The form on a public instance takes the same path: no invite needed — and
+/// the browser posts no `invite` key at all, because the field is not
+/// rendered, so this posts exactly what that form submits.
+#[tokio::test]
+async fn a_public_instance_form_registers_without_an_invite() {
+    let (_db, _dir, router) = harness_with(true).await;
+
+    let (status, _, cookies, location) = post(
+        &router,
+        "/register",
+        "username=alice&email=&password=correct-horse-battery",
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/account"));
+    assert!(!cookies.is_empty(), "the member is logged in");
+}
+
+/// A member's subdomain is their pod, and an instance-level endpoint does not
+/// answer there (ADR 0009) — the same 404 the OAuth surface gives, not a 201
+/// from someone else's pod host.
+#[tokio::test]
+async fn the_api_does_not_answer_on_a_member_subdomain() {
+    let (_db, _dir, router) = harness_with(true).await;
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/accounts")
+                .header(header::HOST, "alice.brolly.test")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"username":"alice","password":"correct-horse-battery"}"#.to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }

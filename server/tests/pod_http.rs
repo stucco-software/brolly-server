@@ -116,6 +116,7 @@ async fn harness_with(max_upload_bytes: usize) -> Harness {
             source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
             terms_url: None,
             privacy_url: None,
+            public_registration: false,
             max_upload_bytes,
             stores: std::sync::Arc::clone(&stores),
             provider_key: std::sync::Arc::new(

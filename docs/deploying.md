@@ -62,6 +62,7 @@ repository heads, the PLC log.
 | `BROLLY_PORT` | no | `3000` | |
 | `BROLLY_STATIC_DIR` | no | `/srv/static` in the image | |
 | `BROLLY_PLC_SUBMIT` | no | off | `1` publishes `did:plc` operations to the real directory. |
+| `BROLLY_PUBLIC_REGISTRATION` | no | off | `1` opens registration to anyone, on both the `/register` form and the `POST /api/accounts` API. Off, an instance is invite-only. |
 | `RUST_LOG` | no | `info` | JSON on stdout. |
 
 ### `BROLLY_BASE_DOMAIN` is effectively permanent
@@ -71,6 +72,25 @@ it, so changing it after members exist orphans all of them: their WebIDs stop
 resolving, their DID documents point at a host that no longer serves them, and
 every issued token fails its audience check. Decide it before the first
 registration, not after.
+
+### `BROLLY_PUBLIC_REGISTRATION`
+
+Off, an instance is invite-only — the default, because an open registration
+form is an abuse surface a private community never asked for. Set `1` on a
+public deployment (a pod provider with a signup page) and both registration
+surfaces open: the `/register` form drops its invite field, and
+
+```
+curl -d '{"username":"alice","password":"at-least-12-chars"}' \
+  https://your-domain/api/accounts
+```
+
+answers `201` with the new member's `username` and `webid` — for a signup
+surface on another origin, which the CORS layer answers. A presented invite
+is still redeemed under either policy (`invite` in the body, optional),
+because the bootstrap admin invite is how an empty instance gets its first
+admin on either policy. The API creates no session; the member logs in
+through the front door or OIDC like anyone else.
 
 ### `BROLLY_PLC_SUBMIT`
 

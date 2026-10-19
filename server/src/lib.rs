@@ -53,6 +53,17 @@ pub struct AppState {
     pub source_url: String,
     pub terms_url: Option<String>,
     pub privacy_url: Option<String>,
+    /// Whether this instance lets anyone register, or only invite-holders.
+    ///
+    /// `BROLLY_PUBLIC_REGISTRATION`, read once at startup. The default is the
+    /// conservative one — **invite-only** — because an open registration form
+    /// is an abuse surface a small private community never asked for, while a
+    /// public deployment (a pod provider with a signup page) sets one variable
+    /// to open the door. The policy governs both registration surfaces, the
+    /// `/register` form and the `POST /api/accounts` API: on a private
+    /// instance the API requires an invite exactly as the form does, so the
+    /// API is not a way around the door.
+    pub public_registration: bool,
     /// The one upload limit (spec 4, H3): the `DefaultBodyLimit` on the pod
     /// and media routes. Instance state rather than a constant at the route,
     /// because `BROLLY_MAX_UPLOAD_BYTES` overrides it — read once in `main`,
@@ -340,6 +351,17 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             solid_oidc::apex_only,
         ));
 
+    // Account creation as an API, for a signup surface on another origin. The
+    // same `apex_only` guard for the same reason as the OAuth surface: a
+    // member's subdomain is their pod, and an instance-level endpoint does not
+    // answer there (ADR 0009).
+    let accounts = Router::new()
+        .route("/api/accounts", post(auth::create_account))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            solid_oidc::apex_only,
+        ));
+
     Router::new()
         // `/` and `/login` are one template on two routes. Collapsing them
         // would mean re-pointing five redirects that target the login form
@@ -445,6 +467,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .merge(xrpc::routes())
         .merge(atproto_oauth::routes())
         .merge(oauth)
+        .merge(accounts)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.
         // The upload limit (spec 4, H3) is the method router's own layer, so
