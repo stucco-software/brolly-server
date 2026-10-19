@@ -112,6 +112,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // read it from the state.
         public_registration: std::env::var("BROLLY_PUBLIC_REGISTRATION")
             .is_ok_and(|v| v == "1" || v == "true"),
+        // `www` points wherever the deployment says, or nowhere. Validated
+        // here rather than in the middleware so a typo is a startup failure
+        // with the offending value in the log, not a 500 on every request to
+        // the host.
+        www_redirect: match std::env::var("BROLLY_WWW_REDIRECT") {
+            Ok(value) => match brolly_server::parse_www_redirect(&value) {
+                Ok(base) => Some(base),
+                Err(reason) => {
+                    tracing::error!(
+                        value = %value,
+                        reason = %reason,
+                        "BROLLY_WWW_REDIRECT is not a usable redirect base"
+                    );
+                    return Err(reason.into());
+                }
+            },
+            Err(_) => None,
+        },
         max_upload_bytes,
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),

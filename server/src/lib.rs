@@ -8,9 +8,11 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 use axum::Router;
-use axum::http::{Method, header};
+use axum::extract::State;
+use axum::http::{Method, StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{any, get, post};
+use brolly_identity::extract;
 use sqlx::PgPool;
 use tower_http::services::ServeDir;
 
@@ -60,10 +62,25 @@ pub struct AppState {
     /// is an abuse surface a small private community never asked for, while a
     /// public deployment (a pod provider with a signup page) sets one variable
     /// to open the door. The policy governs both registration surfaces, the
+    /// The policy governs both registration surfaces, the
     /// `/register` form and the `POST /api/accounts` API: on a private
     /// instance the API requires an invite exactly as the form does, so the
     /// API is not a way around the door.
     pub public_registration: bool,
+    /// Where `www.{base_domain}` redirects to, when it redirects.
+    ///
+    /// `BROLLY_WWW_REDIRECT`, read once at startup: an absolute URL — a
+    /// marketing site, a landing page, another deployment's public surface —
+    /// that every request to the `www` host is sent to with its path and
+    /// query intact. `www` is a reserved username, so no member can ever own
+    /// the host and the redirect can never shadow a pod.
+    ///
+    /// Unset, the `www` host keeps its incidental behaviour: it matches the
+    /// apex's routes (login, register) because routing is by path, while the
+    /// host-checked surfaces (OAuth, pods) 404 it — a broken half-apex that
+    /// exists only because nothing claimed the name. Setting the variable
+    /// claims it.
+    pub www_redirect: Option<String>,
     /// The one upload limit (spec 4, H3): the `DefaultBodyLimit` on the pod
     /// and media routes. Instance state rather than a constant at the route,
     /// because `BROLLY_MAX_UPLOAD_BYTES` overrides it — read once in `main`,
@@ -325,6 +342,98 @@ async fn nosniff(request: axum::extract::Request, next: axum::middleware::Next) 
     response
 }
 
+/// Validate a `BROLLY_WWW_REDIRECT` value: an absolute `https` (or `http`, for
+/// a local surface) URL with no query and no fragment, returned without its
+/// trailing slash.
+///
+/// The query and fragment are refused because the redirect *appends* the
+/// incoming request's own path and query to this base — a configured query
+/// would be silently dropped for every request that carries one, and a
+/// fragment never reaches the server at all. A path is allowed and becomes a
+/// prefix (`https://example.org/stuccoid` + `/pricing` ->
+/// `https://example.org/stuccoid/pricing`).
+pub fn parse_www_redirect(value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value).map_err(|e| format!("not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "scheme must be http or https, not {}",
+            url.scheme()
+        ));
+    }
+    if url.query().is_some() {
+        return Err(
+            "a query has nowhere to go: the redirect appends the request's own query".into(),
+        );
+    }
+    if url.fragment().is_some() {
+        return Err("a fragment is never sent to a server".into());
+    }
+    // Reconstruction rather than `url.as_str()`: `Url::parse` keeps whatever
+    // it was given, and a trailing slash on the base would double up against
+    // a path that starts with one.
+    let mut base = format!("{}://{}{}", url.scheme(), url.authority(), url.path());
+    while base.ends_with('/') {
+        base.pop();
+    }
+    if base.ends_with(':') || base.is_empty() {
+        return Err("no host".into());
+    }
+    Ok(base)
+}
+
+/// Send the `www` host wherever the deployment pointed it (`BROLLY_WWW_REDIRECT`).
+///
+/// Routing is by path, so without this the `www` host matches the apex's
+/// routes — login and register render, while the host-checked surfaces (the
+/// OAuth sub-router, the pods) answer 404 — a broken half-apex under a name
+/// no member can own (`www` is reserved). Configured, every request to the
+/// host is sent to the configured base with its path and query intact, so a
+/// deep link to `www.{base}/pricing` lands on the target's `/pricing`.
+///
+/// **308, and everything redirects, not just `GET`.** The `www` host is not
+/// a surface this server serves — it is an alias for one that lives elsewhere
+/// — so there is no method or path here to be selective about. A browser
+/// follows a 308 without changing the method or the body (RFC 9110
+/// §15.4.9), which is what an alias owes every caller.
+///
+/// Layered inside `cors`, so a cross-origin script that fetches a `www` URL
+/// still receives the CORS headers on the redirect it must be able to read.
+async fn www_redirect(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    // Read the host, path and query before the request is consumed.
+    let host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let path = request.uri().path().to_string();
+    let query = request.uri().query().map(str::to_string);
+
+    // Only the exact `www` subdomain, by the same normalization
+    // `subdomain_user` applies (case, port), and only when a target is
+    // configured — an unset variable leaves every host exactly as it was.
+    if let Some(base) = state.www_redirect.as_deref()
+        && extract::subdomain_user(&host, &state.base_domain).as_deref() == Some("www")
+    {
+        let location = match query {
+            Some(query) => format!("{base}{path}?{query}"),
+            None => format!("{base}{path}"),
+        };
+        return (
+            StatusCode::PERMANENT_REDIRECT,
+            [(header::LOCATION, location)],
+            "www lives elsewhere",
+        )
+            .into_response();
+    }
+
+    next.run(request).await
+}
+
 /// Build the application router.
 ///
 /// Adapters contribute their own routers here. Nothing else in the workspace
@@ -500,6 +609,14 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .nest_service("/static", ServeDir::new(static_dir))
         // Default-deny on subdomains. No LDP fallback (ADR 0010).
         .fallback(pod::subdomain_fallback)
+        // The `www` host, when the deployment points it somewhere
+        // (`BROLLY_WWW_REDIRECT`). Inside the layers below so the redirect
+        // still carries `nosniff` and answers a cross-origin caller's CORS
+        // read.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            www_redirect,
+        ))
         // `nosniff` on every response (spec 4, H4). One layer here, not per
         // route: per-route application is how the header ends up missing on
         // the one route that matters, and the cost of the redundant cases is

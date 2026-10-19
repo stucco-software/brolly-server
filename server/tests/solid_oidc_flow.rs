@@ -50,6 +50,7 @@ async fn harness_with(
         terms_url: None,
         privacy_url: None,
         public_registration: false,
+        www_redirect: None,
         max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
         stores: std::sync::Arc::new(
             brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),
@@ -919,6 +920,7 @@ async fn our_own_profile_is_not_a_client_id_document() {
         terms_url: None,
         privacy_url: None,
         public_registration: false,
+        www_redirect: None,
         max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
         stores: std::sync::Arc::new(
             brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),

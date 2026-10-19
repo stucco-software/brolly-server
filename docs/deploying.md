@@ -63,6 +63,7 @@ repository heads, the PLC log.
 | `BROLLY_STATIC_DIR` | no | `/srv/static` in the image | |
 | `BROLLY_PLC_SUBMIT` | no | off | `1` publishes `did:plc` operations to the real directory. |
 | `BROLLY_PUBLIC_REGISTRATION` | no | off | `1` opens registration to anyone, on both the `/register` form and the `POST /api/accounts` API. Off, an instance is invite-only. |
+| `BROLLY_WWW_REDIRECT` | no | — | Where `www.{base_domain}` goes: an absolute URL (a path prefix is allowed), and every request to the `www` host is sent there with its path and query. Unset, `www` is untouched. |
 | `RUST_LOG` | no | `info` | JSON on stdout. |
 
 ### `BROLLY_BASE_DOMAIN` is effectively permanent
@@ -91,6 +92,25 @@ is still redeemed under either policy (`invite` in the body, optional),
 because the bootstrap admin invite is how an empty instance gets its first
 admin on either policy. The API creates no session; the member logs in
 through the front door or OIDC like anyone else.
+
+### `BROLLY_WWW_REDIRECT`
+
+`www` is a reserved username, so no member can ever own the host — but
+routing is by path, so an unconfigured `www.{base_domain}` answers the
+apex's routes (login renders) while the host-checked surfaces (OAuth, pods)
+404 it: a broken half-apex nobody asked for. Point it somewhere:
+
+```
+BROLLY_WWW_REDIRECT=https://stucco.software/stuccoid
+```
+
+and every request to the host — every method, every path — is sent to that
+base with the request's own path and query appended, as a `308`. A deep link
+to `www.example.org/pricing` lands on the target's `/pricing`. Point it at
+the apex itself and `www` becomes a full alias of the instance's public
+surface. The value is validated at startup (an absolute `http`/`https` URL,
+no query, no fragment); a typo is a refusal to boot with the value in the
+log, not a broken redirect.
 
 ### `BROLLY_PLC_SUBMIT`
 

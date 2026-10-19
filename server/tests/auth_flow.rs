@@ -24,6 +24,15 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
 async fn harness_with(
     public_registration: bool,
 ) -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
+    harness_as(public_registration, None).await
+}
+
+/// And the `www` host is the deployment's too: the redirect tests pass a
+/// target, everything else runs with the host unclaimed.
+async fn harness_as(
+    public_registration: bool,
+    www_redirect: Option<&str>,
+) -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -36,6 +45,7 @@ async fn harness_with(
         terms_url: None,
         privacy_url: None,
         public_registration,
+        www_redirect: www_redirect.map(str::to_string),
         max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
         stores: std::sync::Arc::new(
             brolly_store::StoreManager::open(dir.path(), 4, 60).expect("stores"),
@@ -992,4 +1002,167 @@ async fn the_api_does_not_answer_on_a_member_subdomain() {
         .unwrap();
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+// --- the www host (BROLLY_WWW_REDIRECT) ---------------------------------------
+
+/// A `GET` with an explicit host, for the host-routed surfaces.
+async fn get_on_host(
+    router: &axum::Router,
+    path: &str,
+    host: &str,
+) -> (StatusCode, String, Option<String>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(path)
+                .header(header::HOST, host)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    (status, body, location)
+}
+
+/// Configured, the `www` host sends everything to the configured base, with
+/// the path and query intact — a deep link to `www/pricing` lands on the
+/// target's `/pricing`, not its front page.
+#[tokio::test]
+async fn a_configured_www_host_redirects_with_path_and_query() {
+    let (_db, _dir, router) = harness_as(false, Some("https://stucco.software/stuccoid")).await;
+
+    let (status, _, location) =
+        get_on_host(&router, "/pricing?section=member", "www.brolly.test").await;
+
+    assert_eq!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        location.as_deref(),
+        Some("https://stucco.software/stuccoid/pricing?section=member"),
+        "the base's path is a prefix, and the request's query rides along"
+    );
+}
+
+/// Every host the caller might write reaches the redirect: ports in
+/// development, capitals in address bars — the same normalization
+/// `subdomain_user` applies everywhere else.
+#[tokio::test]
+async fn the_www_redirect_normalizes_the_host() {
+    let (_db, _dir, router) = harness_as(false, Some("https://example.org")).await;
+
+    for host in ["www.brolly.test:3000", "WWW.BROLLY.TEST"] {
+        let (status, _, location) = get_on_host(&router, "/", host).await;
+        assert_eq!(status, StatusCode::PERMANENT_REDIRECT, "host was {host}");
+        assert_eq!(
+            location.as_deref(),
+            Some("https://example.org/"),
+            "host was {host}"
+        );
+    }
+}
+
+/// The redirect is the whole host, not a surface: the apex's own routes do
+/// not answer on `www` — a login POST aimed there is sent to the target,
+/// method and body intact, which is what a 308 promises (RFC 9110 §15.4.9).
+#[tokio::test]
+async fn the_www_host_redirects_every_method_and_path() {
+    let (_db, _dir, router) = harness_as(false, Some("https://example.org")).await;
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/login")
+                .header(header::HOST, "www.brolly.test")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from("username=alice&password=secret-secret"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(
+        response
+            .headers()
+            .get(header::LOCATION)
+            .and_then(|v| v.to_str().ok()),
+        Some("https://example.org/login"),
+        "the apex's login route must not answer on www"
+    );
+}
+
+/// Unconfigured, the `www` host is what it always was — the apex's routes
+/// answer by path, because routing does not look at the host. The variable
+/// claims the host; nothing about it is claimed by default.
+#[tokio::test]
+async fn an_unconfigured_www_host_is_untouched() {
+    let (_db, _dir, router) = harness_as(false, None).await;
+
+    let (status, body, _) = get_on_host(&router, "/", "www.brolly.test").await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("<h1>brolly.test</h1>"), "got: {body}");
+}
+
+/// Only the `www` host redirects. The apex and a member's subdomain keep
+/// their own surfaces, and a foreign host — DNS pointed at us by someone
+/// else's name — is not the deployment's to send anywhere.
+#[tokio::test]
+async fn the_redirect_claims_only_the_www_host() {
+    let (_db, _dir, router) = harness_as(false, Some("https://example.org")).await;
+
+    // The apex still serves its own front door.
+    let (status, _, _) = get_on_host(&router, "/", "brolly.test").await;
+    assert_eq!(status, StatusCode::OK);
+
+    // A member's subdomain still serves its pod, not the marketing site.
+    let (status, _, location) = get_on_host(&router, "/", "alice.brolly.test").await;
+    assert_ne!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(location, None);
+
+    // A foreign host is nobody's to redirect.
+    let (status, _, location) = get_on_host(&router, "/", "example.net").await;
+    assert_ne!(status, StatusCode::PERMANENT_REDIRECT);
+    assert_eq!(location, None);
+}
+
+/// The redirect base is validated where a typo is a startup error with the
+/// value in the log, not a 500 on every request to the host.
+#[test]
+fn the_redirect_base_is_validated() {
+    use brolly_server::parse_www_redirect;
+
+    // A bare origin, an origin with a path prefix, and a trailing slash that
+    // must not double up against a request path.
+    assert_eq!(
+        parse_www_redirect("https://example.org").as_deref(),
+        Ok("https://example.org")
+    );
+    assert_eq!(
+        parse_www_redirect("https://example.org/stuccoid/").as_deref(),
+        Ok("https://example.org/stuccoid")
+    );
+    // http stays legal: a local surface during a migration is a real case.
+    assert_eq!(
+        parse_www_redirect("http://localhost:3000").as_deref(),
+        Ok("http://localhost:3000")
+    );
+
+    // Not a URL, a scheme nobody can serve, a query with nowhere to go, a
+    // fragment that never reaches a server.
+    assert!(parse_www_redirect("example.org").is_err());
+    assert!(parse_www_redirect("ftp://example.org").is_err());
+    assert!(parse_www_redirect("https://example.org?a=b").is_err());
+    assert!(parse_www_redirect("https://example.org/#section").is_err());
 }
