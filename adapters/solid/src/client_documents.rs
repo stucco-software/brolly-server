@@ -32,9 +32,11 @@ use url::{Host, Url};
 /// that sounds like a browser, or a server such as this one serves the HTML
 /// page it keeps for browsers, and it must include `application/ld+json`,
 /// because that is the only serialization the Solid-OIDC spec *requires* a
-/// Client ID Document to be available as.
+/// Client ID Document to be available as. `application/json` rides along:
+/// Penny — and a fair share of the ecosystem beside — serves its document
+/// under that label, and it parses as JSON-LD or not at all.
 pub const ACCEPT: &str = "text/turtle, application/n-triples, application/n-quads, \
-                          application/trig, application/ld+json";
+                          application/trig, application/ld+json, application/json";
 
 /// Where the normative JSON-LD context lives. The one remote document the
 /// parse is allowed to know the contents of — see [`OIDC_CONTEXT`].
@@ -180,6 +182,25 @@ impl std::fmt::Display for InvalidDocument {
 
 impl std::error::Error for InvalidDocument {}
 
+/// The format a fetched document's content type names.
+///
+/// `application/json` is a JSON-LD attempt, not a `NotRdf`. The Solid-OIDC
+/// spec (§5.1) says the document "MUST be serialized as an
+/// `application/ld+json` document", but the label is where the ecosystem's
+/// compliance ends: Penny — a finish-line client — serves the spec's own
+/// JSON form under the plain `application/json`. The bytes are what matter,
+/// and they take the same JSON-LD parse an honest `application/ld+json`
+/// takes — the normative context or no parse, the client's own triples or no
+/// client — so a plain JSON body fails exactly as it would have under the
+/// honest label. Nothing else moves: `text/html` and `text/plain` are still
+/// `NotRdf`, because they are the labels an HTML page wears.
+fn document_format(content_type: &str) -> Result<ReadFormat, InvalidDocument> {
+    if syntax::media_type_of(content_type) == "application/json" {
+        return Ok(ReadFormat::JsonLd);
+    }
+    syntax::read_format(content_type).map_err(|_| InvalidDocument::NotRdf(content_type.to_string()))
+}
+
 /// Parse and validate the document at `client_id`: the content-type check and
 /// the RDF parse the fetch is parameterized with (spec 6, H3).
 ///
@@ -193,8 +214,7 @@ pub fn parse(
     content_type: &str,
     body: &[u8],
 ) -> Result<ClientIdDocument, InvalidDocument> {
-    let format = syntax::read_format(content_type)
-        .map_err(|_| InvalidDocument::NotRdf(content_type.to_string()))?;
+    let format = document_format(content_type)?;
     // `application/rdf+xml` is a `NotRdf` too, by design: we serialize it but
     // never parse it (ADR 0007), and a fetched document is exactly the
     // untrusted input that rule exists for.
@@ -427,8 +447,47 @@ mod tests {
     }
 
     #[test]
+    fn the_json_label_parses_as_json_ld() {
+        // Penny's exact shape (observed 2026-10-06): the spec's own §5.1
+        // example under the plain `application/json` label. The label is the
+        // only nonconformance, and it is not one to break a finish-line
+        // client over.
+        let body = r#"{
+                "@context": "https://www.w3.org/ns/solid/oidc-context.jsonld",
+                "client_id": "https://penny.example/clientid.json",
+                "client_name": "Penny",
+                "redirect_uris": ["https://penny.example", "https://penny.example/"],
+                "token_endpoint_auth_method": "none",
+                "grant_types": ["refresh_token", "authorization_code"],
+                "response_types": ["code"],
+                "scope": "openid webid offline_access"
+            }"#;
+        let url = Url::parse("https://penny.example/clientid.json").unwrap();
+        let document = parse(&url, "application/json", body.as_bytes()).unwrap();
+        assert_eq!(document.client_id(), "https://penny.example/clientid.json");
+        assert_eq!(document.client_name(), Some("Penny"));
+        assert!(allows_redirect(&document, "https://penny.example"));
+        assert!(allows_redirect(&document, "https://penny.example/"));
+        assert!(!allows_redirect(&document, "https://attacker.example"));
+        // Parameters on the label do not defeat the match either.
+        assert!(parse(&url, "application/json; charset=utf-8", body.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn a_plain_json_body_under_the_json_label_is_not_a_client() {
+        // The label alone grants nothing: a body that is not the spec's JSON
+        // form fails under `application/json` exactly as it would under
+        // `application/ld+json` — here, by naming no redirect URIs.
+        let body = r#"{"hello": "world"}"#;
+        assert_eq!(
+            parse(&url(), "application/json", body.as_bytes()),
+            Err(InvalidDocument::NotAClientDocument)
+        );
+    }
+
+    #[test]
     fn the_content_type_must_be_rdf_we_parse() {
-        for content_type in ["text/html", "application/json", "text/plain", ""] {
+        for content_type in ["text/html", "text/plain", ""] {
             assert_eq!(
                 parse(&url(), content_type, b"<> a <https://example/Thing> ."),
                 Err(InvalidDocument::NotRdf(content_type.to_string())),

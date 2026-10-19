@@ -90,8 +90,17 @@ pub fn parse(
     content_type: &str,
     body: &[u8],
 ) -> Result<WebIdDocument, InvalidWebIdDocument> {
-    let format = syntax::read_format(content_type)
-        .map_err(|_| InvalidWebIdDocument::NotRdf(content_type.to_string()))?;
+    // `application/json` is a JSON-LD attempt, the same as a Client ID
+    // Document's (see `client_documents::document_format`): the fetch this
+    // rides asks for `application/json`, a serving pod may answer with it, and
+    // the JSON-LD parse behind the door resolves no remote context and reads
+    // only the WebID's own triples, so the label alone grants nothing.
+    let format = if syntax::media_type_of(content_type) == "application/json" {
+        ReadFormat::JsonLd
+    } else {
+        syntax::read_format(content_type)
+            .map_err(|_| InvalidWebIdDocument::NotRdf(content_type.to_string()))?
+    };
     // `application/rdf+xml` is a `NotRdf` too, by design: we serialize it but
     // never parse it (ADR 0007), and a fetched document is exactly the
     // untrusted input that rule exists for.
@@ -198,13 +207,30 @@ mod tests {
     #[test]
     fn the_content_type_must_be_rdf_we_parse() {
         let webid = Url::parse(WEBID).unwrap();
-        for content_type in ["text/html", "application/json", "application/rdf+xml"] {
+        for content_type in ["text/html", "application/rdf+xml"] {
             let refused = parse(&webid, content_type, b"<a> <b> <c> .");
             assert!(
                 matches!(refused, Err(InvalidWebIdDocument::NotRdf(_))),
                 "{content_type} was parsed"
             );
         }
+    }
+
+    #[test]
+    fn the_json_label_parses_as_json_ld() {
+        // The fetch asks for `application/json` (it rides the Client ID
+        // Document `Accept`), so a serving pod may answer with it. Absolute
+        // IRIs, no remote context: the shape that parses under the label. The
+        // issuer rides as a node object (`{"@id": ...}`) — a bare string
+        // would be a literal, and a literal is not an issuer anyone can name.
+        let webid = Url::parse(WEBID).unwrap();
+        let body = format!(
+            r#"{{"@id": "{WEBID}",
+                 "http://www.w3.org/ns/solid/terms#oidcIssuer": {{"@id": "{ISSUER}"}}}}"#
+        );
+        let document = parse(&webid, "application/json", body.as_bytes()).unwrap();
+        assert!(document.names(ISSUER));
+        assert!(!document.names("https://other-idp.example"));
     }
 
     #[test]
