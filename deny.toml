@@ -32,6 +32,35 @@ ignore = [
   # these and reconsider accepting RDF/XML on input.
   "RUSTSEC-2026-0194",
   "RUSTSEC-2026-0195",
+
+  # RUSTSEC-2026-0387 — secret-dependent branches in crypto-bigint operations
+  # meant to be constant-time (subtraction, zero counting, division,
+  # Montgomery multiplication; limb-wise early-exit equality).
+  #
+  # Fixed in 0.7.6, and the 0.7.x copy in the tree is on it. The copy this
+  # entry covers is 0.5.5, which has no fixed release in its line: it is
+  # pinned by elliptic-curve 0.13 <- p256 0.13 / k256 0.13 <- atrium-crypto
+  # (ADR 0002), which is every ECDSA signature the instance makes — Solid
+  # tokens, DPoP verification, ATProto commits. The exposure is a timing side
+  # channel on signing-key arithmetic; exploiting it remotely means inducing
+  # and finely timing a great many signatures over the network, against a
+  # server whose per-request work dwarfs a field operation.
+  #
+  # Review trigger: an atrium-crypto release on elliptic-curve 0.14 (which
+  # pulls crypto-bigint 0.7), or any way to put p256/k256 0.14 under it; or by
+  # 2027-04-25, whichever comes first.
+  "RUSTSEC-2026-0387",
+
+  # RUSTSEC-2026-0374 — basic-toml is unmaintained (archived 2025-03-02).
+  #
+  # Build-time only: it parses askama's configuration inside askama_derive, a
+  # proc-macro, and no byte of it reaches the binary. A TOML parser reading a
+  # file we author is not an attack surface, and the crate was feature-frozen
+  # by design before it was archived.
+  #
+  # Review trigger: an askama release that drops it, or an askama major bump
+  # for any other reason.
+  "RUSTSEC-2026-0374",
 ]
 
 [bans]
