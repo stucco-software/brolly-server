@@ -119,26 +119,21 @@ pub fn issue_id_token(
     Ok(key.sign(&claims)?)
 }
 
-/// What [`verify_access`] found.
-pub enum Access {
-    /// A token without `cnf.jkt`. Nothing to prove, so nothing to spend.
-    Bearer(AccessClaims),
-    /// A DPoP-bound token whose proof checked out and was signed by the
-    /// token's key. The claims stay wrapped until the proof is spent. Spending
-    /// needs the database, and keeping it out of this function keeps this
-    /// function synchronous.
-    Bound(dpop::Unspent<AccessClaims>),
-}
-
 /// Verify an access token **and** the proof that it belongs to this caller.
 ///
 /// Both or neither: a token whose `cnf.jkt` does not match the proof's key was
-/// not presented by its holder, and a bound token with no proof at all is
-/// refused rather than downgraded to bearer semantics. Downgrading is the
+/// not presented by its holder, and a token with no binding at all is refused
+/// rather than read with bearer semantics. Every access token we mint carries
+/// `cnf.jkt` and `aud: solid`, so a token signed by our key *without* them is
+/// one of the other things the key signs — an ID token, which names the same
+/// WebID and is handed to every relying party by design, or a consent request
+/// token. Neither is a credential for the pod, and the bearer arm this
+/// function used to have was how an ID token became one. Downgrading is the
 /// mistake that makes DPoP decorative.
 ///
-/// A bound token comes back as [`Access::Bound`]. Its claims are reachable only
-/// by spending the proof, so the caller can't skip the replay check.
+/// The claims come back [`Unspent`](dpop::Unspent): reachable only by spending
+/// the proof, so the caller can't skip the replay check. The rules here are
+/// the same ones [`verify_remote_access`] applies to a foreign issuer's token.
 pub fn verify_access(
     key: &ProviderKey,
     token: &str,
@@ -146,8 +141,12 @@ pub fn verify_access(
     method: &str,
     url: &str,
     now: i64,
-) -> Result<Access, TokenError> {
+) -> Result<dpop::Unspent<AccessClaims>, TokenError> {
     let claims = key.verify(token, now)?;
+    if !audience_is_solid(&claims) {
+        return Err(JwtError::Claim("aud must be solid".into()).into());
+    }
+
     let access = AccessClaims {
         webid: claims["webid"].as_str().unwrap_or_default().to_string(),
         client_id: claims["client_id"].as_str().unwrap_or_default().to_string(),
@@ -155,9 +154,19 @@ pub fn verify_access(
     };
 
     let Some(jkt) = claims["cnf"]["jkt"].as_str() else {
-        return Ok(Access::Bearer(access));
+        return Err(JwtError::Claim("cnf.jkt is required".into()).into());
     };
-    bind_proof(token, jkt, proof, method, url, now, access).map(Access::Bound)
+    bind_proof(token, jkt, proof, method, url, now, access)
+}
+
+/// Is `solid` among the token's audiences? `aud` may be a string or a list of
+/// strings (RFC 7519 §4.1.3); either way, `solid` must be in it.
+fn audience_is_solid(claims: &serde_json::Value) -> bool {
+    match &claims["aud"] {
+        serde_json::Value::String(aud) => aud == "solid",
+        serde_json::Value::Array(auds) => auds.iter().any(|aud| aud.as_str() == Some("solid")),
+        _ => false,
+    }
 }
 
 /// The proof half both verification paths share (spec 6, H5): a token bound
@@ -417,13 +426,10 @@ pub fn foreign_issuer(token: &str, ours: &str) -> Option<String> {
 ///
 /// * The signature is checked against `jwks` — the issuer's own set, the key
 ///   chosen by the token's `kid`. ES256 only, no other algorithm accepted.
-/// * `aud` must be `solid`: a token minted for some other resource server is
-///   not ours to accept.
-/// * `cnf.jkt` is **required**. [`verify_access`] answers a token without it
-///   as [`Access::Bearer`] — no proof at all — unreachable for our tokens,
-///   which always carry the binding, but reachable for a foreign issuer that
-///   mints none. The remote path has no bearer arm: a foreign token without
-///   a binding is refused rather than downgraded to a proof-free read.
+///
+/// The audience and binding rules — `aud` must be `solid`, `cnf.jkt` is
+/// required, a token without a binding is refused rather than downgraded to a
+/// proof-free read — are the same on both paths.
 ///
 /// An unknown `kid` comes back as [`JwtError::UnknownKey`], which is what a
 /// rotation looks like from the outside; the caller re-fetches the set once
@@ -443,14 +449,7 @@ pub fn verify_remote_access(
     };
     let claims = key.verify(token, now)?;
 
-    // `aud` may be a string or a list of strings (RFC 7519 §4.1.3); either
-    // way, `solid` must be among them.
-    let audience = match &claims["aud"] {
-        serde_json::Value::String(aud) => aud == "solid",
-        serde_json::Value::Array(auds) => auds.iter().any(|aud| aud.as_str() == Some("solid")),
-        _ => false,
-    };
-    if !audience {
+    if !audience_is_solid(&claims) {
         return Err(JwtError::Claim("aud must be solid".into()).into());
     }
 
@@ -460,9 +459,6 @@ pub fn verify_remote_access(
         scope: claims["scope"].as_str().unwrap_or_default().to_string(),
     };
 
-    // The no-bearer-arm rule (H5): there is no `Access::Bearer` to answer
-    // with on this path, so a token without a binding is refused — the
-    // tightest closure the rule can take.
     let Some(jkt) = claims["cnf"]["jkt"].as_str() else {
         return Err(JwtError::Claim("cnf.jkt is required".into()).into());
     };
@@ -598,11 +594,7 @@ mod tests {
         .unwrap();
         let proof = proof_for(&client, "GET", URL, Some(&token), 1000);
 
-        let Access::Bound(unspent) =
-            verify_access(&p, &token, Some(&proof), "GET", URL, 1000).unwrap()
-        else {
-            panic!("a token with cnf.jkt must come back bound to its proof");
-        };
+        let unspent = verify_access(&p, &token, Some(&proof), "GET", URL, 1000).unwrap();
         // The claims stay wrapped until the pod spends the proof.
         assert!(unspent.bound_to(&jkt_of(&client)));
     }
@@ -697,26 +689,71 @@ mod tests {
     }
 
     #[test]
-    fn a_token_without_a_binding_is_bearer_and_its_claims_are_readable() {
-        // Unchanged behaviour: only cnf.jkt makes a proof necessary, so there
-        // is nothing to spend.
+    fn a_token_without_a_binding_is_refused_not_downgraded() {
+        // Our access tokens always carry `cnf.jkt`, so one without it is not
+        // an access token we minted — and a proof-free read is exactly the
+        // downgrade that makes DPoP decorative. The remote path already
+        // refuses these; ours must too.
         let p = provider();
         let token = p
             .sign(&json!({
                 "webid": WEBID,
+                "aud": "solid",
                 "client_id": "urn:uuid:c",
                 "scope": "webid",
                 "exp": 1000 + ACCESS_TOKEN_TTL,
             }))
             .unwrap();
 
-        let Access::Bearer(claims) = verify_access(&p, &token, None, "GET", URL, 1000).unwrap()
-        else {
-            panic!("a token without cnf.jkt has no proof to spend");
-        };
-        assert_eq!(claims.webid, WEBID);
-        assert_eq!(claims.client_id, "urn:uuid:c");
-        assert_eq!(claims.scope, "webid");
+        let result = verify_access(&p, &token, None, "GET", URL, 1000);
+
+        assert!(
+            matches!(result, Err(TokenError::Jwt(JwtError::Claim(_)))),
+            "a token without cnf.jkt must be refused, not read as a bearer"
+        );
+    }
+
+    #[test]
+    fn an_id_token_is_not_an_access_token() {
+        // The ID token is signed by the same key, names the same WebID, and
+        // is handed to every relying party by design. Presented to the pod
+        // without a proof it must be refused as a token — not as a proof
+        // failure, and never read.
+        let p = provider();
+        let token = issue_id_token(&p, ISSUER, WEBID, "urn:uuid:c", None, 1000).unwrap();
+
+        let result = verify_access(&p, &token, None, "GET", URL, 1000);
+
+        assert!(
+            matches!(result, Err(TokenError::Jwt(JwtError::Claim(_)))),
+            "an ID token must not verify as an access token"
+        );
+    }
+
+    #[test]
+    fn a_token_for_another_audience_is_refused() {
+        // Bound and ours, but minted for some other resource server. Same
+        // rule as the remote path: `solid` must be among the audiences.
+        let p = provider();
+        let client = client_key(7);
+        let token = p
+            .sign(&json!({
+                "webid": WEBID,
+                "aud": "urn:uuid:c",
+                "client_id": "urn:uuid:c",
+                "scope": "webid",
+                "exp": 1000 + ACCESS_TOKEN_TTL,
+                "cnf": {"jkt": jkt_of(&client)},
+            }))
+            .unwrap();
+        let proof = proof_for(&client, "GET", URL, Some(&token), 1000);
+
+        let result = verify_access(&p, &token, Some(&proof), "GET", URL, 1000);
+
+        assert!(
+            matches!(result, Err(TokenError::Jwt(JwtError::Claim(_)))),
+            "a token whose aud is not solid must be refused"
+        );
     }
 
     #[test]

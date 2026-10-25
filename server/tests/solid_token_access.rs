@@ -256,7 +256,9 @@ fn dpop_proof(key: &SigningKey, method: &str, url: &str, ath: Option<&str>) -> S
 }
 
 /// Drive the whole provider flow and return the access token issued to `key`.
-async fn access_token(harness: &Harness, key: &SigningKey) -> String {
+/// The token endpoint's whole answer, after a full code flow for a freshly
+/// registered client: `access_token`, `id_token`, and the rest.
+async fn token_response(harness: &Harness, key: &SigningKey) -> serde_json::Value {
     let apex = |method: &str, uri: &str| {
         Request::builder()
             .method(method)
@@ -369,7 +371,11 @@ async fn access_token(harness: &Harness, key: &SigningKey) -> String {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "token endpoint: {body}");
-    serde_json::from_str::<serde_json::Value>(&body).unwrap()["access_token"]
+    serde_json::from_str(&body).unwrap()
+}
+
+async fn access_token(harness: &Harness, key: &SigningKey) -> String {
+    token_response(harness, key).await["access_token"]
         .as_str()
         .unwrap()
         .to_string()
@@ -539,6 +545,31 @@ async fn a_solid_token_presented_as_a_bearer_is_not_accepted() {
         challenge, r#"Bearer error="invalid_token""#,
         "got: {challenge}"
     );
+}
+
+#[tokio::test]
+async fn an_id_token_is_not_a_pod_credential() {
+    // The provider hands an ID token to every relying party by design. It is
+    // signed by the same key as an access token and names the same WebID, so
+    // the pod has to tell them apart by what an ID token lacks: a `cnf.jkt`
+    // binding, and `solid` as its audience. Accepting one would let any RP —
+    // or anyone who reads one out of a log — read and write the pod for the
+    // token's lifetime, with no proof at all.
+    let harness = harness().await;
+    let key = client_key();
+    let id_token = token_response(&harness, &key).await["id_token"]
+        .as_str()
+        .expect("the code flow issues an ID token")
+        .to_string();
+
+    let (status, challenge) =
+        challenged(&harness, read_note(Some(&format!("DPoP {id_token}")), None)).await;
+
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // The token's fault, not a proof's: there is no binding a proof could
+    // satisfy, so a `invalid_dpop_proof` challenge would send the client
+    // looking for a fix that does not exist.
+    assert!(challenge.contains(INVALID_TOKEN), "got: {challenge}");
 }
 
 #[tokio::test]

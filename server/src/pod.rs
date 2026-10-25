@@ -314,11 +314,12 @@ pub(crate) async fn subject_for(
         Credential::Dpop { token, proof } => {
             // Token and proof are verified together or not at all: a token
             // whose `cnf.jkt` does not match the proof was not presented by
-            // its holder, and a bound token with no proof is refused rather
-            // than downgraded to bearer semantics.
+            // its holder, and a token with no binding is refused rather than
+            // downgraded to bearer semantics — our key also signs ID tokens,
+            // which name the same WebID and go to every relying party.
             //
-            // A bound token's claims arrive `Unspent`. Spending records the
-            // proof so it can't be sent again.
+            // The claims arrive `Unspent`. Spending records the proof so it
+            // can't be sent again.
             let proof = (!proof.is_empty()).then_some(proof);
             let now = time::OffsetDateTime::now_utc().unix_timestamp();
             // The issuer split (spec 6, H5): a token whose `iss` names another
@@ -349,8 +350,7 @@ pub(crate) async fn subject_for(
                 url,
                 now,
             ) {
-                Ok(tokens::Access::Bearer(claims)) => claims,
-                Ok(tokens::Access::Bound(unspent)) => match unspent.spend(&state.pool, now).await {
+                Ok(unspent) => match unspent.spend(&state.pool, now).await {
                     Ok(claims) => claims,
                     Err(DpopError::Storage(e)) => {
                         tracing::error!(error = %e, "recording a DPoP proof failed");
