@@ -102,13 +102,23 @@ struct AuthPage<'a> {
 ///
 /// Only a path on this host, never an absolute URL: `next` arrives in a query
 /// parameter, so honouring `https://elsewhere.example` would turn the login
-/// page into an open redirect that phishing can point at.
+/// page into an open redirect that phishing can point at — and login is the
+/// front of every OAuth flow, so the page it lands on is one a member has
+/// every reason to trust.
+///
+/// "A path on this host" is decided the way a browser decides it, not by
+/// looking at the first two characters. Browsers strip ASCII tab and newline
+/// from a URL before parsing it and read a backslash as a slash (WHATWG URL
+/// §4.4), so `/<TAB>/evil.example` and `/a\evil.example` are both
+/// `//evil.example` — scheme-relative, another host — by the time one acts
+/// on the `Location`. `HeaderValue` passes a tab through. So the rule is no
+/// control character and no backslash anywhere in the value, on top of the
+/// leading-slash shape.
 fn safe_next(next: Option<&str>) -> Option<&str> {
     let next = next?;
     let looks_local = next.starts_with('/')
         && !next.starts_with("//")
-        // `/\evil.example` is a scheme-relative URL to some browsers.
-        && !next.starts_with("/\\");
+        && !next.chars().any(|c| c.is_ascii_control() || c == '\\');
     looks_local.then_some(next)
 }
 
@@ -701,6 +711,41 @@ mod tests {
             assert!(
                 validate_username(name).is_err(),
                 "{name} should be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn next_is_a_local_path_or_nothing() {
+        assert_eq!(safe_next(Some("/account")), Some("/account"));
+        assert_eq!(
+            safe_next(Some("/oauth/solid/authorize?x=1")),
+            Some("/oauth/solid/authorize?x=1")
+        );
+        assert_eq!(safe_next(None), None);
+        for bad in [
+            "https://evil.example/",
+            "//evil.example/",
+            "/\\evil.example/",
+            // Browsers strip ASCII tab and newline before parsing a URL
+            // (WHATWG URL §4.4), so `/<TAB>/evil.example` is `//evil.example`
+            // to every one of them — a scheme-relative URL to another host.
+            // HeaderValue lets a tab through, so this has to be refused here.
+            "/\t/evil.example/",
+            "/\n/evil.example/",
+            "/\r/evil.example/",
+            // A backslash anywhere, not only second: `/a\evil.example` is
+            // not a path either browser-side.
+            "/a\\evil.example/",
+            // Any other control character: it is never a path, and
+            // HeaderValue refuses some of them with a 500.
+            "/\x01/x",
+            "/\x7f/x",
+        ] {
+            assert_eq!(
+                safe_next(Some(bad)),
+                None,
+                "{bad:?} must not be a destination"
             );
         }
     }

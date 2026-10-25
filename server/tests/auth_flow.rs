@@ -353,6 +353,35 @@ async fn a_rejected_username_does_not_consume_the_invite() {
     );
 }
 
+/// `next` is the open-redirect surface of the door, and a browser's idea of
+/// where `Location: /<TAB>/evil.example/` points is `//evil.example/` — it
+/// strips the tab before parsing (WHATWG URL §4.4) — so what the server
+/// thinks is "a path starting with a slash" lands a freshly signed-in
+/// member on another host. Such a `next` is dropped, not sanitised: the
+/// member lands where they would have with no `next` at all.
+#[tokio::test]
+async fn a_next_a_browser_would_read_as_another_host_is_dropped() {
+    let (db, _dir, router) = harness().await;
+    db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+
+    for next in [
+        "%2F%09%2Fevil.example%2F",
+        "%2F%0A%2Fevil.example%2F",
+        "%2Fa%5Cevil.example%2F",
+    ] {
+        let (status, _, _, location) = post(
+            &router,
+            &format!("/login?next={next}"),
+            "username=alice&password=correct-horse-battery",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "next={next}");
+        assert_eq!(location.as_deref(), Some("/account"), "next={next}");
+    }
+}
+
 #[tokio::test]
 async fn login_succeeds_and_sets_a_session() {
     let (db, _dir, router) = harness().await;
