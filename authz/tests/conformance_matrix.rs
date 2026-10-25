@@ -12,7 +12,7 @@
 //! surface that grows its own logic makes this test fail.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use brolly_authz::{AccessMode, Agent, EffectiveAcl, authorize, effective_acl};
+use brolly_authz::{AccessMode, Agent, AuthzError, EffectiveAcl, authorize, effective_acl};
 use brolly_store::StoreManager;
 use brolly_store::resources::{Content, Pod, PodRead};
 use oxigraph::model::{GraphName, NamedNode, NamedOrBlankNode, Quad, Term};
@@ -433,4 +433,21 @@ fn an_empty_recorded_acl_governs_and_grants_nothing() {
         &dave,
         AccessMode::Append
     ));
+}
+
+/// The candidate list is spliced into the query as IRI terms, so each
+/// candidate must *be* an IRI — checked here, in the crate that builds the
+/// query, not promised by whoever called it. A path that cannot be an IRI is
+/// its own error, raised before any query is built: not a parse failure from
+/// the engine with the caller's text inside it.
+#[test]
+fn a_path_that_is_not_an_iri_is_refused_before_the_query() {
+    let (_mgr, _dir, store) = fixture();
+
+    let result = effective_acl(&store.read_store(), BASE, "/~/a> } }");
+
+    assert!(
+        matches!(result, Err(AuthzError::NotAnIri(_))),
+        "expected NotAnIri, got {result:?}"
+    );
 }

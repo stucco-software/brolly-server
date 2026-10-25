@@ -9,12 +9,16 @@ use oxigraph::sparql::QueryResults;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AuthzError {
     Query(String),
+    /// A resource path that cannot be an IRI. Raised before any query is
+    /// built, so the caller's text never reaches the engine as query text.
+    NotAnIri(String),
 }
 
 impl std::fmt::Display for AuthzError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             AuthzError::Query(e) => write!(f, "authz query: {e}"),
+            AuthzError::NotAnIri(iri) => write!(f, "not an IRI: {iri}"),
         }
     }
 }
@@ -120,13 +124,22 @@ pub fn effective_acl(
     path: &str,
 ) -> Result<Option<EffectiveAcl>, AuthzError> {
     let candidates = acl_candidates(base, path);
+    // The candidates are spliced into the query as IRI terms, so each one is
+    // parsed as an IRI first — here, where the query is built, rather than
+    // on a promise from the caller that the path was validated upstream. An
+    // IRI cannot contain the characters that would end a term or a pattern,
+    // which is what makes the splice safe; a candidate that fails to parse
+    // is refused as its own error before the engine sees any of it.
     let values = candidates
         .iter()
-        .map(|c| format!("<{c}>"))
-        .collect::<Vec<_>>()
+        .map(|c| {
+            NamedNode::new(c)
+                .map(|n| n.to_string())
+                .map_err(|_| AuthzError::NotAnIri(c.clone()))
+        })
+        .collect::<Result<Vec<_>, _>>()?
         .join(" ");
 
-    // Candidates are server-generated from a validated path, never user text.
     let query = format!(
         r#"
         SELECT DISTINCT ?acl WHERE {{

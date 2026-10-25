@@ -27,6 +27,7 @@ use std::sync::Arc;
 use url::Url;
 
 use crate::AppState;
+use oxigraph_model::NamedNode;
 
 /// Everything a pod request needs once the host and credential are resolved.
 pub struct PodRequest {
@@ -114,6 +115,17 @@ async fn resolve(
 
     let base = format!("https://{username}.{}", state.base_domain);
     let apex = format!("https://{}", state.base_domain);
+
+    // A target is an IRI before it is anything else. The decoded path becomes
+    // the resource IRI, and the IRI becomes the ACL candidate list the access
+    // decision is built from, so a path that cannot be one has no business
+    // reaching either: it is a 400 by its shape alone, for every method and
+    // every caller, before the credential is looked at — the shape is public
+    // knowledge, and there is nothing a 401 would protect.
+    if let Err(rule) = well_formed_path(path, uri.path(), &base) {
+        return Err((StatusCode::BAD_REQUEST, rule).into_response());
+    }
+
     // The pod is resolved before the credential, so a bad credential sent to a
     // pod that doesn't exist is still 404. That is a routing answer, not an
     // access decision, like `subdomain_fallback`'s.
@@ -132,6 +144,47 @@ async fn resolve(
         pod,
         blobs,
     })
+}
+
+/// Is `decoded` — the request's path, `/~/…`, percent-decoded — one the pod
+/// can name a resource by? `raw` is the same path before decoding.
+///
+/// Four refusals, each with the one-line reason the 400 carries:
+///
+/// * A percent-encoded slash. `%2F` decodes to `/`, so `a%2Fb` and `a/b`
+///   would be one resource reached by two spellings, of which only one is
+///   the IRI the server mints, lists and authorizes.
+/// * A control character — which includes the NUL that `%00` decodes to.
+/// * A dot segment or an empty segment. The router does not normalise them,
+///   so `pub/../x` would be a resource literally named `../x` inside `pub/`:
+///   governed by `pub/.acl`, listed by `pub/` as a member every client
+///   resolves to `x`. The trailing empty segment of a container path is the
+///   one empty segment that means something.
+/// * Anything else an IRI reference cannot carry — `>`, space, `}`, `|`,
+///   `\`, `"` and the rest — decided by parsing `base` + `decoded` as the IRI
+///   it is about to become.
+fn well_formed_path(decoded: &str, raw: &str, base: &str) -> Result<(), &'static str> {
+    if raw.to_ascii_lowercase().contains("%2f") {
+        return Err("a percent-encoded slash is not a path separator");
+    }
+    if decoded.chars().any(char::is_control) {
+        return Err("a path cannot contain a control character");
+    }
+    let inside = decoded.strip_prefix("/~/").unwrap_or(decoded);
+    let segments: Vec<&str> = inside.split('/').collect();
+    let last = segments.len().saturating_sub(1);
+    for (i, segment) in segments.iter().enumerate() {
+        if *segment == "." || *segment == ".." {
+            return Err("a path cannot contain a dot segment");
+        }
+        if segment.is_empty() && i != last {
+            return Err("a path cannot contain an empty segment");
+        }
+    }
+    if NamedNode::new(format!("{base}{decoded}")).is_err() {
+        return Err("a path must be a valid IRI reference");
+    }
+    Ok(())
 }
 
 /// Who is calling, and whether they proved it.

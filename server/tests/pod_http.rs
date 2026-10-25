@@ -4937,6 +4937,97 @@ async fn a_meta_links_its_subject_and_its_subjects_acl() {
 /// syntactic public knowledge, so there is no existence to protect. Even the
 /// owner, who may write anywhere here, and an anonymous caller, who may do
 /// nothing, get the same 404 — not a store refusal, not a 401.
+/// A request target that is not an IRI is a 400, decided by its shape alone
+/// — before any lookup, and before the authorization query it would
+/// otherwise be spliced into as text. The decoded path becomes the resource
+/// IRI, and the IRI becomes the ACL candidate list the access decision is
+/// built from; a path that cannot be an IRI has no business reaching either.
+#[tokio::test]
+async fn a_path_that_is_not_an_iri_is_refused_before_anything_looks_at_it() {
+    let h = harness().await;
+    for path in [
+        // `>`, space and `}` — the three characters that would close an IRI
+        // term, a VALUES list, and a graph pattern in the query.
+        "/~/a%3E%20%7D%20%7D",
+        // A control character.
+        "/~/a%01b",
+        // A NUL.
+        "/~/a%00b",
+        // Characters an IRI reference cannot carry.
+        "/~/a%7Cb",
+        "/~/a%5Cb",
+        "/~/a%22b",
+    ] {
+        for (method, body) in [
+            ("GET", None),
+            ("HEAD", None),
+            ("OPTIONS", None),
+            ("DELETE", None),
+            ("PUT", Some(("text/turtle", NOTE))),
+            ("POST", Some(("text/turtle", NOTE))),
+        ] {
+            let (status, text, _) = h.send(method, path, body, true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {text}");
+        }
+        // Anonymous too: the shape is public knowledge, so there is nothing
+        // a 401 would protect.
+        let (status, _, _) = h.send("GET", path, None, false).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "anonymous GET {path}");
+    }
+}
+
+/// Dot segments and empty segments are refused, not resolved. The router does
+/// not normalise them, so `/~/pub/../x` would be a resource named `../x`
+/// inside `/~/pub/` — governed by `/~/pub/.acl`, listed by `/~/pub/` as a
+/// member every client resolves to `/~/x`. A path that needs normalising is
+/// a 400; the client can send the normalised one.
+#[tokio::test]
+async fn dot_and_empty_segments_are_refused_not_resolved() {
+    let h = harness().await;
+    for path in [
+        "/~/pub/../x",
+        "/~/pub/./x",
+        "/~/../x",
+        "/~/..",
+        "/~/.",
+        "/~/a//b",
+        // Percent-encoded spellings decode to the same segments.
+        "/~/pub/%2E%2E/x",
+        "/~/pub/%2E/x",
+    ] {
+        for (method, body) in [
+            ("GET", None),
+            ("PUT", Some(("text/turtle", NOTE))),
+            ("POST", Some(("text/turtle", NOTE))),
+        ] {
+            let (status, text, _) = h.send(method, path, body, true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {text}");
+        }
+    }
+    // Nothing was minted under any of them.
+    let pod = h.stores.pod(h.user).unwrap();
+    assert!(
+        pod.read(|r| r.meta(&format!("{ROOT}pub/")))
+            .unwrap()
+            .is_none(),
+        "a container was created for a refused path"
+    );
+}
+
+/// `%2F` decodes to `/`, so `a%2Fb` and `a/b` would be one resource reached
+/// by two spellings — of which only one is the IRI the server mints, lists
+/// and authorizes. Refused rather than merged.
+#[tokio::test]
+async fn an_encoded_slash_is_refused() {
+    let h = harness().await;
+    for path in ["/~/a%2Fb", "/~/a%2fb", "/~/a%2F"] {
+        for (method, body) in [("GET", None), ("PUT", Some(("text/turtle", NOTE)))] {
+            let (status, text, _) = h.send(method, path, body, true).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{method} {path}: {text}");
+        }
+    }
+}
+
 #[tokio::test]
 async fn an_auxiliary_of_an_auxiliary_is_a_fiction_every_method_answers_404() {
     let h = harness().await;
