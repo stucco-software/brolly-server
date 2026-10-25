@@ -127,9 +127,12 @@ fn fixture() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     );
     acls.push((g, quads));
 
-    // /~/friends.acl — group access. The group document lives at a graph the
-    // ACL does not name, which is what the predecessor's fragment-stripping
-    // assumed.
+    // /~/friends.acl — group access. The group is `groups/inner#g`, so its
+    // document — the graph a server dereferences the group IRI to — is
+    // `groups/inner`. Membership is read from there and nowhere else: a
+    // `vcard:hasMember` triple for the same group IRI written into some other
+    // graph is not membership, or else Append on any resource in the pod
+    // would be enough to join every group its ACLs name.
     let g = format!("{ROOT}friends.acl");
     let quads = authorization(
         &g,
@@ -142,12 +145,21 @@ fn fixture() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
     );
     acls.push((g, quads));
 
-    let group_doc = format!("{ROOT}groups/somewhere-else");
+    let group_doc = format!("{ROOT}groups/inner");
     let group = [t(
         &group_doc,
         &format!("{ROOT}groups/inner#g"),
         &format!("{VCARD}hasMember"),
         "https://carol.example/profile#me",
+    )];
+    // The planted claim: dave, naming himself a member of the same group, in
+    // a graph the group IRI does not name.
+    let planted_doc = format!("{ROOT}groups/somewhere-else");
+    let planted = [t(
+        &planted_doc,
+        &format!("{ROOT}groups/inner#g"),
+        &format!("{VCARD}hasMember"),
+        "https://dave.example/profile#me",
     )];
 
     // /~/notes/.acl — inherited default: authenticated append on the container.
@@ -170,6 +182,7 @@ fn fixture() -> (StoreManager, tempfile::TempDir, std::sync::Arc<Pod>) {
                 w.put(acl, Content::Auxiliary(quads))?;
             }
             w.put(&group_doc, Content::Rdf(&group))?;
+            w.put(&planted_doc, Content::Rdf(&planted))?;
             Ok(())
         })
         .expect("seed acls");
@@ -244,14 +257,14 @@ fn matrix() -> Vec<Case> {
             agent: carol(),
             mode: AccessMode::Read,
             expect: true,
-            why: "vcard:hasMember in another graph still joins",
+            why: "vcard:hasMember in the group's own document is membership",
         },
         Case {
             path: "/~/friends",
             agent: dave(),
             mode: AccessMode::Read,
             expect: false,
-            why: "non-members must not match the group",
+            why: "a hasMember triple planted in some other graph is not membership",
         },
         Case {
             path: "/~/notes/first",

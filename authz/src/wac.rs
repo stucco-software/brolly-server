@@ -160,9 +160,14 @@ pub fn effective_acl(
 /// [`EffectiveAcl::scope`], not from the requested resource — see that field.
 ///
 /// One query per decision. The four WAC agent-matching rules are a `UNION`, and
-/// `acl:agentGroup` membership is a join into whichever graph holds the group —
-/// the predecessor derived the group's graph by stripping the IRI fragment,
-/// which only worked when the group document was named the way it expected.
+/// `acl:agentGroup` membership is a join into the group's own document — the
+/// group IRI with its fragment stripped, which is the resource a server
+/// dereferences the group to (WAC §"Groups of Agents"). That is the *only*
+/// graph consulted: a `vcard:hasMember` triple for the same group IRI written
+/// into any other resource is not membership. Matching membership in whichever
+/// graph held the triple — which this once did — meant Append on any one
+/// resource in the pod (a public inbox, a shared document) was enough to
+/// write oneself into every group its ACLs name.
 pub fn authorize(
     store: &impl PodRead,
     acl: &EffectiveAcl,
@@ -191,14 +196,17 @@ pub fn authorize(
     let agent_branches = match agent {
         Agent::Anonymous => String::new(),
         Agent::Authenticated(_) => format!(
-            r#"
+            r##"
             UNION {{ ?auth <{acl_ns}agentClass> <{acl_ns}AuthenticatedAgent> }}
             UNION {{ ?auth <{acl_ns}agent> ?agent }}
             UNION {{
               ?auth <{acl_ns}agentGroup> ?group .
+              BIND(IRI(IF(CONTAINS(STR(?group), "#"),
+                          STRBEFORE(STR(?group), "#"),
+                          STR(?group))) AS ?groupDoc)
               GRAPH ?groupDoc {{ ?group <{vcard_member}> ?agent }}
             }}
-            "#
+            "##
         ),
     };
 
