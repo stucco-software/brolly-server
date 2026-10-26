@@ -1747,6 +1747,23 @@ pub async fn options(
     if description.granted.is_empty() {
         return ldp_error(LdpError::Denied, request.authenticated, &request.apex);
     }
+    // What the caller may *do* here is H4's answer; whether anything is
+    // *there* is Read's to tell. The `rel="type"` links go out only for a
+    // target that exists, so to a caller without Read — the inbox's
+    // Append-only poster — the target is described as if absent: the same
+    // `Link` set, the same `Allow`, whether or not something is at the path.
+    // Nothing else in the headers depends on existence for such a caller:
+    // GET and HEAD need Read, DELETE needs Write, and the creation methods
+    // are offered whether or not the target exists.
+    let description = if description.holds(AccessMode::Read) {
+        description
+    } else {
+        Description {
+            meta: None,
+            granted: description.granted,
+            public: description.public,
+        }
+    };
     let resource = format!("{}{path}", request.base);
     let mut response = StatusCode::NO_CONTENT.into_response();
     apply(

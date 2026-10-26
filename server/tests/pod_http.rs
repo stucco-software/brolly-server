@@ -3068,6 +3068,80 @@ async fn options_offers_creation_where_nothing_exists_yet() {
     assert_eq!(status, StatusCode::NOT_FOUND, "asking created nothing");
 }
 
+/// An Append-only caller — the inbox, the drop box — may ask what it may do
+/// at a path, and H4 answers. It may not learn whether anything is *there*:
+/// a `rel="type"` link goes out only for a target that exists, so an
+/// `OPTIONS` per guessed name enumerated a container the caller could not
+/// list. To a caller without Read, an existing target and a missing one
+/// answer identically.
+#[tokio::test]
+async fn options_tells_an_append_only_caller_nothing_about_what_exists() {
+    let h = harness().await;
+    let pod = h.stores.pod(h.user).unwrap();
+    let inbox = format!("{ROOT}inbox/");
+    let g = format!("{inbox}.acl");
+    let owner = format!("{g}#owner");
+    let bob = format!("{g}#bob");
+    let quads = [
+        t(&g, &owner, &format!("{ACL}accessTo"), &inbox),
+        t(&g, &owner, &format!("{ACL}default"), &inbox),
+        t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Write")),
+        t(&g, &owner, &format!("{ACL}mode"), &format!("{ACL}Control")),
+        t(
+            &g,
+            &owner,
+            &format!("{ACL}agent"),
+            &format!("{BASE}/profile#me"),
+        ),
+        t(&g, &bob, &format!("{ACL}accessTo"), &inbox),
+        t(&g, &bob, &format!("{ACL}default"), &inbox),
+        t(&g, &bob, &format!("{ACL}mode"), &format!("{ACL}Append")),
+        t(&g, &bob, &format!("{ACL}agent"), BOB_WEBID),
+    ];
+    pod.write(|w| w.put(&g, Content::Auxiliary(&quads)).map(|_| ()))
+        .unwrap();
+    let (status, _, _) = h
+        .send("PUT", "/~/inbox/present", Some(("text/turtle", NOTE)), true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let bob = member_session(&h, "bob").await;
+    let (present_status, _, present) = send_as(&h, &bob, "OPTIONS", "/~/inbox/present", None).await;
+    let (absent_status, _, absent) = send_as(&h, &bob, "OPTIONS", "/~/inbox/absent", None).await;
+    assert_eq!(present_status, StatusCode::NO_CONTENT);
+    assert_eq!(absent_status, StatusCode::NO_CONTENT);
+
+    for name in [
+        "allow",
+        "accept-patch",
+        "accept-post",
+        "accept-put",
+        "wac-allow",
+        "etag",
+        "last-modified",
+    ] {
+        assert_eq!(
+            present.get(name),
+            absent.get(name),
+            "{name} tells a caller who may not read whether the target exists"
+        );
+    }
+    // The `acl` and `describedby` links name the target, so they differ by
+    // the one thing the caller chose. With the name put back, nothing else
+    // may differ — and in particular no `rel="type"`.
+    assert_eq!(
+        header_of(&present, "link").replace("/inbox/present", "/inbox/absent"),
+        header_of(&absent, "link"),
+        "link tells a caller who may not read whether the target exists"
+    );
+    assert!(
+        !header_of(&present, "link").contains("rel=\"type\""),
+        "no type for a caller who may not read: {}",
+        header_of(&present, "link")
+    );
+}
+
 /// Solid Protocol §5.4 names exactly two resources a server must refuse to
 /// delete, and requires `DELETE` to be missing from their `Allow`. What this
 /// guards: a client invited to remove the pod's root, leaving the member
