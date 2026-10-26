@@ -370,7 +370,11 @@ pub fn verify(
             found: claims.htu,
         });
     }
-    if (now - claims.iat).abs() > MAX_AGE_SECONDS {
+    // Saturating: `iat` is the client's claim and i64::MIN is a legal JSON
+    // integer, so this is the one arithmetic in the verifier an attacker
+    // chooses an operand of. Plain subtraction panics in a debug build and
+    // wraps in release — to a value inside the window.
+    if now.saturating_sub(claims.iat).saturating_abs() > MAX_AGE_SECONDS {
         return Err(DpopError::Expired);
     }
 
@@ -568,6 +572,23 @@ mod tests {
             verify(&proof, "GET", URL, None, 0).err(),
             Some(DpopError::Expired)
         );
+    }
+
+    #[test]
+    fn an_absurd_iat_is_stale_not_a_panic() {
+        // `iat` is the client's claim, and i64::MIN is a legal JSON integer.
+        // `now - iat` overflows on it: a panic in a debug build, a wrap in
+        // release that lands inside the freshness window. Either way it is
+        // the one arithmetic in the verifier an attacker chooses the operand
+        // of, and the answer is simply "stale".
+        for iat in [i64::MIN, i64::MAX, i64::MIN + 1] {
+            let proof = make_proof(&key(), "GET", URL, iat, None, "dpop+jwt");
+            assert_eq!(
+                verify(&proof, "GET", URL, None, 1_000).err(),
+                Some(DpopError::Expired),
+                "iat = {iat}"
+            );
+        }
     }
 
     #[test]
