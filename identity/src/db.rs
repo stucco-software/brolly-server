@@ -21,6 +21,10 @@ pub enum DbError {
     /// user" and "wrong password" so callers cannot leak which.
     BadCredentials,
     UsernameTaken,
+    /// The email already belongs to an account. Unique because `createSession`
+    /// accepts an email as an identifier; its own variant because the member
+    /// retyping a free username must not be told the username is the problem.
+    EmailTaken,
     InviteInvalid,
     /// An app password of that name already exists for the member (stage 2,
     /// B). A variant of its own, like `UsernameTaken`, because the caller
@@ -35,6 +39,7 @@ impl std::fmt::Display for DbError {
             DbError::Hash(e) => write!(f, "password hashing: {e}"),
             DbError::BadCredentials => write!(f, "invalid credentials"),
             DbError::UsernameTaken => write!(f, "username taken"),
+            DbError::EmailTaken => write!(f, "email taken"),
             DbError::InviteInvalid => write!(f, "invite is invalid, expired, or used up"),
             DbError::AppPasswordNameTaken => {
                 write!(f, "an app password with that name already exists")
@@ -130,7 +135,14 @@ pub async fn create_user(
     .fetch_one(pool)
     .await
     .map_err(|e| match &e {
-        sqlx::Error::Database(db) if db.is_unique_violation() => DbError::UsernameTaken,
+        // Two unique columns, two answers: the constraint names which.
+        sqlx::Error::Database(db) if db.is_unique_violation() => {
+            if db.constraint() == Some("users_email_key") {
+                DbError::EmailTaken
+            } else {
+                DbError::UsernameTaken
+            }
+        }
         _ => DbError::Sql(e),
     })
 }

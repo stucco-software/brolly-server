@@ -703,6 +703,67 @@ async fn a_wrong_password_reveals_nothing_about_the_account() {
     assert!(extract(&existing_body) && extract(&missing_body));
 }
 
+/// A taken username is the one rejection that happened *after* the invite
+/// was redeemed, so the invitee who typed a name somebody already has was
+/// locked out and needed a new invite — while the comment on create_member
+/// promised the opposite. Availability is checked first now.
+#[tokio::test]
+async fn a_taken_username_does_not_consume_the_invite() {
+    let (db, _dir, router) = harness().await;
+    db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let code = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
+
+    let (status, _, _, _) = post(
+        &router,
+        "/register",
+        &format!("invite={code}&username=alice&email=&password=correct-horse-battery"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    let (retry, _, _, _) = post(
+        &router,
+        "/register",
+        &format!("invite={code}&username=alice2&email=&password=correct-horse-battery"),
+    )
+    .await;
+    assert_eq!(
+        retry,
+        StatusCode::SEE_OTHER,
+        "a taken username must not burn the invite"
+    );
+}
+
+/// Email is unique because createSession accepts it as an identifier, and a
+/// second account on the same address was reported as a *username* clash —
+/// the one unique violation mapped to the one error. The member retyping a
+/// free username got the same answer forever. Named for what it is now.
+#[tokio::test]
+async fn the_api_names_a_taken_email_as_such() {
+    let (_db, _dir, router) = harness_with(true).await;
+    let first = post_json(
+        &router,
+        "/api/accounts",
+        r#"{"username":"alice","email":"alice@example.org","password":"correct-horse-battery"}"#,
+    )
+    .await;
+    assert_eq!(first.0, StatusCode::CREATED, "{}", first.1);
+
+    let (status, body) = post_json(
+        &router,
+        "/api/accounts",
+        r#"{"username":"alice2","email":"alice@example.org","password":"correct-horse-battery"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert!(body.contains("\"email_taken\""), "got: {body}");
+    assert!(!body.contains("username_taken"), "got: {body}");
+}
+
 #[tokio::test]
 async fn a_short_password_is_refused_before_the_invite_is_spent() {
     let (db, _dir, router) = harness().await;

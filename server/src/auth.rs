@@ -322,6 +322,7 @@ pub(crate) enum RegistrationError {
     /// same message the form has always shown.
     Username(String),
     UsernameTaken,
+    EmailTaken,
     PasswordShort,
     /// A required invite was absent, or a presented one was invalid, expired
     /// or used up. The two cases share an code deliberately: the endpoint is
@@ -340,9 +341,14 @@ pub(crate) enum RegistrationError {
 /// its first admin on either policy, and an admin invite silently treated as
 /// no invite would register the operator as a plain member.
 ///
-/// The invite is redeemed *before* the user is created, so a failed creation
-/// cannot consume an invite silently — and redemption is a single conditional
-/// UPDATE, so two simultaneous registrations cannot both claim the last use.
+/// Everything that can be refused is refused *before* the invite is redeemed
+/// — the username's shape, the password's length, and whether the username
+/// and email are free — so a refusal does not consume an invite: the invitee
+/// who typed a name somebody already has tries again with the same code.
+/// Redemption is a single conditional UPDATE, so two simultaneous
+/// registrations cannot both claim the last use; the one race left is two
+/// registrations of the same free name at once, where the unique constraint
+/// refuses the second after its invite was spent.
 async fn create_member(
     state: &AppState,
     username: &str,
@@ -355,6 +361,24 @@ async fn create_member(
     }
     if password.chars().count() < 12 {
         return Err(RegistrationError::PasswordShort);
+    }
+    match db::find_by_username(&state.pool, username).await {
+        Ok(Some(_)) => return Err(RegistrationError::UsernameTaken),
+        Ok(None) => {}
+        Err(e) => {
+            tracing::error!(error = %e, "username lookup failed at registration");
+            return Err(RegistrationError::ServerError);
+        }
+    }
+    if let Some(email) = email {
+        match db::find_by_email(&state.pool, email).await {
+            Ok(Some(_)) => return Err(RegistrationError::EmailTaken),
+            Ok(None) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "email lookup failed at registration");
+                return Err(RegistrationError::ServerError);
+            }
+        }
     }
 
     // An invite says what the account becomes. An ordinary one grants nothing
@@ -438,6 +462,7 @@ async fn create_member(
             Ok(user)
         }
         Err(DbError::UsernameTaken) => Err(RegistrationError::UsernameTaken),
+        Err(DbError::EmailTaken) => Err(RegistrationError::EmailTaken),
         Err(e) => {
             tracing::error!(error = %e, "registration failed");
             Err(RegistrationError::ServerError)
@@ -510,6 +535,18 @@ pub async fn register_submit(
                 render(&register_page(
                     &state,
                     Some("That username is taken."),
+                    &form.username,
+                    &form.invite,
+                )),
+            )
+                .into_response();
+        }
+        Err(RegistrationError::EmailTaken) => {
+            return (
+                StatusCode::CONFLICT,
+                render(&register_page(
+                    &state,
+                    Some("That email already has an account."),
                     &form.username,
                     &form.invite,
                 )),
@@ -608,6 +645,11 @@ pub async fn create_account(
             StatusCode::CONFLICT,
             "username_taken",
             "That username is taken.",
+        ),
+        Err(RegistrationError::EmailTaken) => account_error(
+            StatusCode::CONFLICT,
+            "email_taken",
+            "That email already has an account.",
         ),
         Err(RegistrationError::ServerError) => (
             StatusCode::INTERNAL_SERVER_ERROR,
