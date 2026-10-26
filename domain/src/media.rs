@@ -62,6 +62,16 @@ pub const ALLOWED_MEDIA_TYPES: &[&str] = &[
 /// one constant is worth more than a fudge factor.
 pub const MAX_UPLOAD_BYTES: usize = 10 * 1024 * 1024;
 
+/// How much a member's pod may hold, by default — every byte under its
+/// directory, the RDF store and the blobs alike — before a write is refused
+/// with 507. `BROLLY_POD_QUOTA_BYTES` overrides it. A pod's floor is a few
+/// hundred kilobytes of store before anything is written (ADR 0006), which
+/// is why the number is a gigabyte and not a figure a small instance would
+/// have to raise on its first day. The quota is the instance's defence
+/// against a caller with Append on one public container filling the disk,
+/// not a product tier: it bounds the damage one grant can do.
+pub const DEFAULT_POD_QUOTA_BYTES: u64 = 1024 * 1024 * 1024;
+
 /// True when `media_type` — a bare, parameter-stripped type — is one this
 /// server stores as media. The stripping is the caller's
 /// ([`crate::syntax::media_type_of`]): `image/png; charset=utf-8` is

@@ -91,6 +91,10 @@ pub struct AppState {
     /// before the state is built, and threaded here. Defaults to the same
     /// constant the Mastodon instance configuration advertises.
     pub max_upload_bytes: usize,
+    /// How much a member's pod may hold, in bytes on disk, before a write is
+    /// refused with 507. `BROLLY_POD_QUOTA_BYTES`, read once in `main`;
+    /// defaults to `media::DEFAULT_POD_QUOTA_BYTES`.
+    pub pod_quota_bytes: u64,
     pub stores: std::sync::Arc<brolly_store::StoreManager>,
     /// The Solid-OIDC provider's signing key, loaded once at startup.
     ///

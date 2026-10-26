@@ -84,6 +84,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(brolly_domain::media::MAX_UPLOAD_BYTES);
+    // And the pod's quota, the same way.
+    let pod_quota_bytes = std::env::var("BROLLY_POD_QUOTA_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(brolly_domain::media::DEFAULT_POD_QUOTA_BYTES);
 
     let state = brolly_server::AppState {
         limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
@@ -132,6 +137,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(_) => None,
         },
         max_upload_bytes,
+        pod_quota_bytes,
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),
         instance_actor: std::sync::Arc::new(instance_actor),

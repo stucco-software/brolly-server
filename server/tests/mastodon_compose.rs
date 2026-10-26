@@ -40,6 +40,15 @@ async fn harness() -> Harness {
 /// The harness with an overridden upload limit, for the tests that pin the
 /// limit's behaviour (spec 4, H3) without putting megabytes in a multipart.
 async fn harness_with(max_upload_bytes: usize) -> Harness {
+    harness_sized(
+        max_upload_bytes,
+        brolly_domain::media::DEFAULT_POD_QUOTA_BYTES,
+    )
+    .await
+}
+
+/// And with a pod quota, for the tests that fill one.
+async fn harness_sized(max_upload_bytes: usize, pod_quota_bytes: u64) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
@@ -57,6 +66,7 @@ async fn harness_with(max_upload_bytes: usize) -> Harness {
             limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
             www_redirect: None,
             max_upload_bytes,
+            pod_quota_bytes,
             stores: std::sync::Arc::clone(&stores),
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)
@@ -260,6 +270,51 @@ async fn visibility_is_honoured_rather_than_defaulted() {
 }
 
 // --- defect 1: media --------------------------------------------------------------
+
+/// The pod's quota holds for a Mastodon upload too: it is the same pod and
+/// the same disk, whichever protocol wrote. A client that would pass it gets
+/// Mastodon's error shape, not a dropped connection.
+#[tokio::test]
+async fn an_upload_past_the_pods_quota_is_refused() {
+    let h = harness_sized(brolly_domain::media::MAX_UPLOAD_BYTES, 2 * 1024 * 1024).await;
+    let (_user, token) = a_member(&h, "alice").await;
+    let boundary = "----brollytest";
+    let big = || {
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\n\
+             Content-Type: image/png\r\n\r\n"
+        );
+        body.push_str(&"x".repeat(1024 * 1024));
+        body.push_str(&format!("\r\n--{boundary}--\r\n"));
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/media")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    let first = send(&h, big()).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+
+    let second = send(&h, big()).await;
+    assert_eq!(
+        second.status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "{}",
+        second.body
+    );
+    assert!(
+        second.json()["error"].as_str().is_some(),
+        "Mastodon's error shape: {}",
+        second.body
+    );
+}
 
 #[tokio::test]
 async fn an_uploaded_image_reaches_the_post() {

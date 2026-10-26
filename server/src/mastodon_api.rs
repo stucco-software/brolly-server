@@ -567,6 +567,11 @@ pub async fn upload_media(
             "Validation failed: File can't be blank",
         );
     };
+    // The pod's quota, the same one a Solid write is held to: same pod,
+    // same disk, whichever protocol wrote.
+    if !crate::pod::within_quota(&state, user.id, bytes.len()) {
+        return error(StatusCode::INSUFFICIENT_STORAGE, "The pod is at its quota");
+    }
 
     let id = status_id::mint_note_id();
     let path = format!("/~/media/{id}");

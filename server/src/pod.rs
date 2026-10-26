@@ -187,6 +187,36 @@ fn well_formed_path(decoded: &str, raw: &str, base: &str) -> Result<(), &'static
     Ok(())
 }
 
+/// Does the pod have room for `incoming` more bytes under its quota?
+///
+/// Measured, not tracked: the pod's directory on disk — store and blobs
+/// together — is the one number that cannot drift from what the member
+/// actually holds, and a write that frees space makes room again without
+/// bookkeeping. One directory walk per write is the price; a pod is a
+/// handful of store files and one file per blob. Conservative on a replace:
+/// the incoming bytes count in full even where they displace old ones.
+///
+/// Fails open. A pod whose size cannot be read is an operational fault to
+/// log loudly, not a reason to refuse a member their own write — the quota
+/// bounds what one grant can cost the instance; it is not the thing that
+/// keeps the instance up.
+pub(crate) fn within_quota(state: &AppState, user: uuid::Uuid, incoming: usize) -> bool {
+    match state.stores.pod_bytes(user) {
+        Ok(used) => used.saturating_add(incoming as u64) <= state.pod_quota_bytes,
+        Err(e) => {
+            tracing::error!(error = %e, user = %user, "could not measure the pod for its quota");
+            true
+        }
+    }
+}
+
+/// 507 (RFC 4918 §11.5): the server cannot store the representation. The
+/// one status whose meaning is exactly this, and one a WebDAV-aware Solid
+/// client already knows.
+fn quota_exceeded() -> Response {
+    (StatusCode::INSUFFICIENT_STORAGE, "the pod is at its quota").into_response()
+}
+
 /// Who is calling, and whether they proved it.
 pub(crate) struct Caller {
     pub subject: Subject,
@@ -1427,6 +1457,11 @@ pub async fn put(
         Ok(r) => r,
         Err(response) => return response,
     };
+    // The quota, before the body is parsed or a lock is taken: a write the
+    // pod has no room for is refused as cheaply as a 404.
+    if !within_quota(&state, request.user.id, body.len()) {
+        return quota_exceeded();
+    }
     let Some(content_type) = content_type(&headers, &body, true) else {
         return missing_content_type();
     };
@@ -1496,6 +1531,11 @@ pub async fn post(
         Ok(r) => r,
         Err(response) => return response,
     };
+    // The quota, before the body is parsed or a lock is taken: a write the
+    // pod has no room for is refused as cheaply as a 404.
+    if !within_quota(&state, request.user.id, body.len()) {
+        return quota_exceeded();
+    }
     let Some(content_type) = content_type(&headers, &body, true) else {
         return missing_content_type();
     };
@@ -1566,6 +1606,11 @@ pub async fn patch(
         Ok(r) => r,
         Err(response) => return response,
     };
+    // The quota, before the body is parsed or a lock is taken: a write the
+    // pod has no room for is refused as cheaply as a 404.
+    if !within_quota(&state, request.user.id, body.len()) {
+        return quota_exceeded();
+    }
     let Some(content_type) = content_type(&headers, &body, false) else {
         return missing_content_type();
     };

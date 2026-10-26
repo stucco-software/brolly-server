@@ -61,6 +61,8 @@ repository heads, the PLC log.
 | `BROLLY_DATA_DIR` | no | `/var/lib/brolly` in the image | Must be the volume mount. |
 | `BROLLY_PORT` | no | `3000` | |
 | `BROLLY_STATIC_DIR` | no | `/srv/static` in the image | |
+| `BROLLY_MAX_UPLOAD_BYTES` | no | `10485760` (10 MiB) | The most one upload may be. Advertised to Mastodon clients as the same number. |
+| `BROLLY_POD_QUOTA_BYTES` | no | `1073741824` (1 GiB) | The most a member's pod may hold on disk, store and blobs together. A write that would pass it is a `507`. Bounds what one grant — a public inbox, a shared container — can cost the instance. |
 | `BROLLY_PLC_SUBMIT` | no | off | `1` publishes `did:plc` operations to the real directory. |
 | `BROLLY_PUBLIC_REGISTRATION` | no | off | `1` opens registration to anyone, on both the `/register` form and the `POST /api/accounts` API. Off, an instance is invite-only. |
 | `BROLLY_WWW_REDIRECT` | no | — | Where `www.{base_domain}` goes: an absolute URL (a path prefix is allowed), and every request to the `www` host is sent there with its path and query. Unset, `www` is untouched. |

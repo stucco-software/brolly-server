@@ -68,6 +68,15 @@ async fn harness() -> Harness {
 /// The harness with an overridden upload limit, for the tests that pin the
 /// limit's behaviour (spec 4, H3) without putting megabytes on the wire.
 async fn harness_with(max_upload_bytes: usize) -> Harness {
+    harness_sized(
+        max_upload_bytes,
+        brolly_domain::media::DEFAULT_POD_QUOTA_BYTES,
+    )
+    .await
+}
+
+/// And with a pod quota, for the tests that fill one.
+async fn harness_sized(max_upload_bytes: usize, pod_quota_bytes: u64) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
@@ -120,6 +129,7 @@ async fn harness_with(max_upload_bytes: usize) -> Harness {
             limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
             www_redirect: None,
             max_upload_bytes,
+            pod_quota_bytes,
             stores: std::sync::Arc::clone(&stores),
             provider_key: std::sync::Arc::new(
                 brolly_solid::oidc::store::load_or_create_key(&db.pool)
@@ -821,6 +831,68 @@ async fn every_response_carries_nosniff() {
             "{path}: the layer must be app-wide, not per-route"
         );
     }
+}
+
+/// A pod has a quota, and a write that would pass it is a 507. The disk is
+/// the instance's, and a public inbox or a shared container is a grant to
+/// write to it: without a ceiling, Append on one container is enough to
+/// fill the box for everybody. The quota is what the directory holds —
+/// store and blobs — so freeing space makes room again.
+#[tokio::test]
+async fn a_pod_refuses_a_write_past_its_quota() {
+    // Two mebibytes over a store whose empty floor is a few hundred
+    // kibibytes: one mebibyte of upload fits, a second does not.
+    let h = harness_sized(brolly_domain::media::MAX_UPLOAD_BYTES, 2 * 1024 * 1024).await;
+    let mebibyte = "x".repeat(1024 * 1024);
+
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/one.pdf",
+            Some(("application/pdf", &mebibyte)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, _, _) = h
+        .send(
+            "PUT",
+            "/~/two.pdf",
+            Some(("application/pdf", &mebibyte)),
+            true,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::INSUFFICIENT_STORAGE,
+        "a second mebibyte would pass the quota"
+    );
+    let (status, _, _) = h.send("GET", "/~/two.pdf", None, true).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the refused write left nothing"
+    );
+
+    // Not only binaries: a document counts the same.
+    let (status, _, _) = h
+        .send("PUT", "/~/big", Some(("text/turtle", &mebibyte)), true)
+        .await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+
+    // Freeing space makes room again.
+    let (status, _, _) = h.send("DELETE", "/~/one.pdf", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/two.pdf",
+            Some(("application/pdf", &mebibyte)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
 /// Nothing served by the instance may be framed, and a referrer leaves the

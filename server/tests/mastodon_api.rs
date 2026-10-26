@@ -41,6 +41,7 @@ async fn harness() -> Harness {
             limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
             www_redirect: None,
             max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
+            pod_quota_bytes: brolly_domain::media::DEFAULT_POD_QUOTA_BYTES,
             stores: std::sync::Arc::new(
                 brolly_store::StoreManager::open(dir.path(), 4, 60).unwrap(),
             ),
