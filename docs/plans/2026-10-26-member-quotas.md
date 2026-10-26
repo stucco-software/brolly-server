@@ -19,7 +19,7 @@
 - No HTML via `format!`; one stylesheet; no literal colours outside `tokens.css`; every page one `h1`; every form control labelled. `server/tests/ui_invariants.rs` enforces the mechanical ones.
 - Trunk-based: commit straight to `main`, one commit per chunk, every commit green. There is no git remote; do not try to push.
 - Pre-commit (lefthook) runs `cargo fmt --all -- --check`, `cargo clippy --workspace --all-targets -- -D warnings`, `./tools/check-doc-paths.sh`. Run them yourself before `git commit` so the hook is a formality.
-- **The working tree holds uncommitted theme work** (`theme_css` in `lib.rs`, `main.rs`, templates, and every test's `AppState` literal). Leave it alone: never `git add -A`, `git add .`, `git stash`, or `git checkout --` a file. Stage only the files each task names. If a file you must edit also carries theme hunks (`server/src/lib.rs`, `server/src/main.rs`, `server/tests/*.rs` all do), `git add -p` is not available (non-interactive) — instead stage the whole file; the theme hunks are the operator's and committing them alongside is acceptable *only* for test-harness literals and `lib.rs`/`main.rs`, which the operator has said are in progress. Say so in the commit body when it happens.
+- **The working tree holds uncommitted theme work** (`theme_css` in `lib.rs`, `main.rs`, two templates, and every test's `AppState` literal). Leave it alone: never `git add -A`, `git add .`, `git stash`, or `git checkout --` a file. Stage only the files each task names. **A theme hunk must never ride into a commit:** `theme_css` is not a field of `AppState` at `HEAD`, so a commit carrying `theme_css: false,` in a test literal — or the field in `lib.rs` without `main.rs` — does not build on its own, and every commit must. `git add -p` is not available (non-interactive); instead build a theme-free patch for each such file and stage it with `git apply --cached`: `git diff -- <file> > /tmp/<file>.patch`, delete the `theme_css` hunks from the patch, `git apply --cached --check /tmp/<file>.patch && git apply --cached /tmp/<file>.patch`. The working tree keeps the theme lines. After committing, `git show HEAD | grep -c theme_css` must print 0 and `git diff | grep -c theme_css` must be what it was before.
 - Gate shell chains on cargo's own exit status: `cargo test … > /tmp/x.log 2>&1 && …`, never `cargo test … | grep … && …` (the pipeline's status is `grep`'s).
 - Commit messages: conventional prefix, a body that says why, and the trailer `Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>`.
 
@@ -794,7 +794,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 EOF
 ```
 
-If `server/tests/pod_http.rs` or `server/tests/mastodon_compose.rs` carries the operator's `theme_css` hunk, it goes in with this commit; say so in one line of the body ("Carries the in-progress theme_css line in two test harnesses.").
+`server/tests/pod_http.rs` and `server/tests/mastodon_compose.rs` carry the operator's `theme_css` line: stage them theme-free with `git apply --cached` as the preamble describes.
 
 ---
 
@@ -1689,7 +1689,7 @@ Co-Authored-By: Claude Fable 5.1 <noreply@anthropic.com>
 EOF
 ```
 
-(`server/src/lib.rs` and `server/tests/*.rs` carry the operator's theme hunks; they go in with this commit — say so in one line of the body.)
+(`server/src/lib.rs`, `server/tests/admin.rs` and `server/tests/ui_invariants.rs` carry the operator's theme hunks: stage each theme-free with `git apply --cached` as the preamble describes. `lib.rs`'s theme hunks are the `theme_css` field, the `Chrome` field and its assignment — drop all three from the patch.)
 
 ---
 
