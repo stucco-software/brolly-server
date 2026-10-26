@@ -332,16 +332,48 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
 /// every response: per-route application is how it ends up missing on the one
 /// route that matters.
 ///
-/// No CSP header in this stage: the allow-list (H2) excludes the scriptable
-/// types, and a CSP layered on client-typed storage is a bandage on a hole H2
-/// already closed. Reopened if SVG is ever admitted.
-async fn nosniff(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+/// Two more ride the same layer, for the same reason:
+///
+/// * `Content-Security-Policy: frame-ancestors 'none'`, and `X-Frame-Options:
+///   DENY` for the browsers that predate CSP 2. Nothing the instance serves
+///   may be framed. The page this protects is the consent screen — rendered
+///   inside somebody else's OAuth flow, the highest-stakes page in the product
+///   — and `SameSite=Lax` is not its defence: `alice.<apex>` is same-site with
+///   the apex, so a document on a member host could frame it with the
+///   member's own session and dress the Authorise button as something else.
+///   The media allow-list keeps such a document out today; this keeps the
+///   frame out whatever the allow-list admits tomorrow.
+/// * `Referrer-Policy: strict-origin-when-cross-origin`. A pod URL, an OAuth
+///   `state`, a consent request token in a query — none of it belongs in
+///   another site's access log.
+///
+/// No further CSP directives in this stage: the allow-list (H2) excludes the
+/// scriptable types, and a script policy layered on client-typed storage is a
+/// bandage on a hole H2 already closed. Reopened if SVG is ever admitted.
+async fn security_headers(
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
     let mut response = next.run(request).await;
-    // Inserted, not appended: nothing else writes this header, so there is no
-    // value to preserve, and a duplicate would be a spec violation either way.
-    response.headers_mut().insert(
+    // Inserted, not appended: nothing else writes these headers, so there is
+    // no value to preserve, and a duplicate would be a spec violation either
+    // way.
+    let headers = response.headers_mut();
+    headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+    );
+    headers.insert(
+        header::X_FRAME_OPTIONS,
+        axum::http::HeaderValue::from_static("DENY"),
+    );
+    headers.insert(
+        header::REFERRER_POLICY,
+        axum::http::HeaderValue::from_static("strict-origin-when-cross-origin"),
     );
     response
 }
@@ -639,11 +671,11 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             state.clone(),
             www_redirect,
         ))
-        // `nosniff` on every response (spec 4, H4). One layer here, not per
-        // route: per-route application is how the header ends up missing on
-        // the one route that matters, and the cost of the redundant cases is
-        // zero.
-        .layer(axum::middleware::from_fn(nosniff))
+        // `nosniff`, `frame-ancestors 'none'` and the referrer policy on every
+        // response (spec 4, H4). One layer here, not per route: per-route
+        // application is how a header ends up missing on the one route that
+        // matters, and the cost of the redundant cases is zero.
+        .layer(axum::middleware::from_fn(security_headers))
         // The caller's address for the door's rate limits, resolved once.
         .layer(axum::middleware::from_fn(client_address))
         // Outermost, so it covers the OAuth sub-router and the fallback too —

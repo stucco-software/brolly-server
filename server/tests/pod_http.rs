@@ -823,6 +823,47 @@ async fn every_response_carries_nosniff() {
     }
 }
 
+/// Nothing served by the instance may be framed, and a referrer leaves the
+/// instance with its origin only. One layer, every response, for the same
+/// reason as `nosniff`: the consent screen — rendered inside somebody else's
+/// OAuth flow, the highest-stakes page in the product — is the one that must
+/// not be clickjackable, and per-route application is how it would end up
+/// being the one that is. `alice.<apex>` is same-site with the apex, so
+/// `SameSite=Lax` is not the defence here; this is.
+#[tokio::test]
+async fn every_response_refuses_framing_and_limits_the_referrer() {
+    let h = harness().await;
+    h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
+        .await;
+
+    for (path, expected) in [
+        ("/~/paper.pdf", StatusCode::OK),
+        ("/profile", StatusCode::OK),
+        ("/health", StatusCode::OK),
+        ("/~/nothing-here", StatusCode::NOT_FOUND),
+    ] {
+        let (status, _, headers) = h.send("GET", path, None, true).await;
+        assert_eq!(status, expected, "{path}");
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap()),
+            Some("frame-ancestors 'none'"),
+            "{path}: frame-ancestors"
+        );
+        assert_eq!(
+            headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
+            Some("DENY"),
+            "{path}: X-Frame-Options, for the browsers that predate CSP 2"
+        );
+        assert_eq!(
+            headers.get("referrer-policy").map(|v| v.to_str().unwrap()),
+            Some("strict-origin-when-cross-origin"),
+            "{path}: Referrer-Policy"
+        );
+    }
+}
+
 // --- the settings resources (spec 6, H2) --------------------------------------
 
 /// The IRIs provisioning creates, as `provision::pod` derives them.
