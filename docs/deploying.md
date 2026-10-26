@@ -122,6 +122,29 @@ host you do not control yet is not easily undone.
 This is the only ATProtocol behaviour that is gated. Everything else — keys,
 DIDs, repositories, XRPC, the firehose — is unconditional by ADR 0016.
 
+## Rate limits, and whose address they key on
+
+The endpoints that take a credential or mint an account are rate limited,
+in memory, per instance:
+
+| Gate | Keyed by | Burst, then one attempt per |
+|---|---|---|
+| `POST /login` | the caller's address **and**, separately, the username | 10, then 30 s |
+| `POST /register`, `POST /api/accounts` | the caller's address | 5, then 10 min |
+| `POST /account/security` (password change) | the member | 5, then 60 s |
+
+A refused attempt is a `429` with `Retry-After` in seconds. The username gate
+is what makes rotating addresses worthless against one account; the address
+gate is what makes one address worthless against many.
+
+**The caller's address is the rightmost `X-Forwarded-For` entry** when the
+header is present — the one the proxy in front of the deployment appended —
+and the peer address otherwise. So the server must only be reachable through
+that proxy: a client that can reach it directly can send any
+`X-Forwarded-For` it likes and pick its own bucket. Railway and the compose
+stack both satisfy this. The username and member gates do not depend on the
+address at all.
+
 ## Claiming a new instance
 
 Registration is invite-only and invites come from an admin, so a brand new

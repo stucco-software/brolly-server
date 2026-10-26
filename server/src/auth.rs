@@ -12,6 +12,7 @@
 //! and it is enforced by `tests/ui_invariants.rs`.
 
 use askama::Template;
+use axum::Extension;
 use axum::Form;
 use axum::Json;
 use axum::extract::{Query, State};
@@ -24,6 +25,7 @@ use brolly_identity::webid;
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::ratelimit::{ClientKey, Gate, too_many};
 use crate::{AppState, Chrome, render};
 
 /// Name of the session cookie.
@@ -236,9 +238,23 @@ pub struct LoginForm {
 pub async fn login_submit(
     State(state): State<AppState>,
     Query(query): Query<Next>,
+    Extension(ClientKey(client)): Extension<ClientKey>,
     jar: CookieJar,
     Form(form): Form<LoginForm>,
 ) -> Response {
+    // Two gates, both spent before the password is looked at: the address,
+    // against one place spraying guesses across accounts, and the username,
+    // against many places converging on one — the second is what makes
+    // rotating addresses worthless. The username is normalised the way the
+    // lookup normalises it, so `Alice` and `alice` are one bucket.
+    let account = format!("user:{}", form.username.trim().to_lowercase());
+    if let Err(wait) = state
+        .limiter
+        .check(Gate::Login, &format!("addr:{client}"))
+        .and_then(|()| state.limiter.check(Gate::Login, &account))
+    {
+        return too_many(wait);
+    }
     let action = login_action(query.next.as_deref());
     match db::authenticate(&state.pool, &form.username, &form.password).await {
         Ok(user) => {
@@ -437,9 +453,15 @@ async fn create_member(
 /// form as through the API.
 pub async fn register_submit(
     State(state): State<AppState>,
+    Extension(ClientKey(client)): Extension<ClientKey>,
     jar: CookieJar,
     Form(form): Form<RegisterForm>,
 ) -> Response {
+    // One gate for both creation surfaces: an account is the most expensive
+    // thing an anonymous caller can have the instance make.
+    if let Err(wait) = state.limiter.check(Gate::Signup, &client) {
+        return too_many(wait);
+    }
     let email = (!form.email.trim().is_empty()).then(|| form.email.trim());
     let invite = (!form.invite.trim().is_empty()).then(|| form.invite.trim());
     let member = create_member(&state, &form.username, email, &form.password, invite).await;
@@ -539,8 +561,12 @@ pub struct CreateAccount {
 /// their pod, and an instance-level endpoint does not answer there.
 pub async fn create_account(
     State(state): State<AppState>,
+    Extension(ClientKey(client)): Extension<ClientKey>,
     Json(request): Json<CreateAccount>,
 ) -> Response {
+    if let Err(wait) = state.limiter.check(Gate::Signup, &client) {
+        return too_many(wait);
+    }
     let email = request
         .email
         .as_deref()

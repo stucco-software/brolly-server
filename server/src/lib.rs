@@ -29,6 +29,7 @@ pub mod outbox;
 pub mod pod;
 pub mod profile;
 pub mod provision;
+pub mod ratelimit;
 pub mod solid_oidc;
 pub mod tls;
 pub mod xrpc;
@@ -67,6 +68,9 @@ pub struct AppState {
     /// instance the API requires an invite exactly as the form does, so the
     /// API is not a way around the door.
     pub public_registration: bool,
+    /// The door's rate limits: one bucket per gate and key, in memory. See
+    /// [`ratelimit`].
+    pub limiter: std::sync::Arc<ratelimit::Limiter>,
     /// Where `www.{base_domain}` redirects to, when it redirects.
     ///
     /// `BROLLY_WWW_REDIRECT`, read once at startup: an absolute URL — a
@@ -340,6 +344,24 @@ async fn nosniff(request: axum::extract::Request, next: axum::middleware::Next) 
         axum::http::HeaderValue::from_static("nosniff"),
     );
     response
+}
+
+/// Resolve the caller's address once per request, for the handlers that rate
+/// limit on it (`ratelimit::client_key`): the proxy's word when there is a
+/// proxy, the peer when `main` served with connect info, a shared key
+/// otherwise. In the request's extensions rather than recomputed per handler,
+/// so there is one answer to "who is this" per request.
+async fn client_address(
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| c.0);
+    let key = ratelimit::client_key(request.headers(), peer);
+    request.extensions_mut().insert(ratelimit::ClientKey(key));
+    next.run(request).await
 }
 
 /// Validate a `BROLLY_WWW_REDIRECT` value: an absolute `https` (or `http`, for
@@ -622,6 +644,8 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // the one route that matters, and the cost of the redundant cases is
         // zero.
         .layer(axum::middleware::from_fn(nosniff))
+        // The caller's address for the door's rate limits, resolved once.
+        .layer(axum::middleware::from_fn(client_address))
         // Outermost, so it covers the OAuth sub-router and the fallback too —
         // a 404 that a browser cannot read is a 404 nobody can debug.
         .layer(axum::middleware::from_fn(cors))

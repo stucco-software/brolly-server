@@ -86,6 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(brolly_domain::media::MAX_UPLOAD_BYTES);
 
     let state = brolly_server::AppState {
+        limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
         pool,
         base_domain: base_domain.clone(),
         // Falls back to the domain rather than to a brand: an operator who
@@ -184,6 +185,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.commits.clone(),
     ));
 
-    axum::serve(listener, brolly_server::app(state, &static_dir)).await?;
+    // With the peer address, so the rate limits have a key when no proxy is
+    // in front of the deployment to report one.
+    axum::serve(
+        listener,
+        brolly_server::app(state, &static_dir)
+            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

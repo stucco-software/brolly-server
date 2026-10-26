@@ -26,6 +26,7 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
         terms_url: None,
         privacy_url: None,
         public_registration: false,
+        limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
         www_redirect: None,
         max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
         stores: std::sync::Arc::new(

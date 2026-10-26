@@ -58,6 +58,7 @@ async fn harness() -> Harness {
             terms_url: None,
             privacy_url: None,
             public_registration: false,
+            limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
             www_redirect: None,
             max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
             stores: std::sync::Arc::clone(&stores),
@@ -110,12 +111,14 @@ struct Reply {
     body: String,
     location: Option<String>,
     content_type: Option<String>,
+    headers: axum::http::HeaderMap,
 }
 
 impl Harness {
     async fn send(&self, request: Request<Body>) -> Reply {
         let response = self.router.clone().oneshot(request).await.unwrap();
         let status = response.status();
+        let headers = response.headers().clone();
         let location = response
             .headers()
             .get(header::LOCATION)
@@ -134,6 +137,7 @@ impl Harness {
             body,
             location,
             content_type,
+            headers,
         }
     }
 
@@ -343,6 +347,45 @@ async fn changing_a_password_requires_the_current_one() {
             .await
             .is_ok(),
         "a failed change must not have changed anything"
+    );
+}
+
+/// A hijacked session is the one place the current password is guessable
+/// from inside the account, so the change form has its own gate — per
+/// member, because the session is the member's and the address is whatever
+/// the thief's is.
+#[tokio::test]
+async fn guessing_the_current_password_is_limited() {
+    let h = harness().await;
+    let cookie = h.login().await;
+
+    for i in 0..5 {
+        let reply = h
+            .post(
+                "/account/security",
+                "current_password=wrong&new_password=an-entirely-new-password",
+                Some(&cookie),
+            )
+            .await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "attempt {i}");
+    }
+    let reply = h
+        .post(
+            "/account/security",
+            &format!("current_password={PASSWORD}&new_password=an-entirely-new-password"),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::TOO_MANY_REQUESTS);
+    assert!(
+        reply.headers.contains_key(header::RETRY_AFTER),
+        "a wait is named"
+    );
+    assert!(
+        db::authenticate(&h.db.pool, "alice", PASSWORD)
+            .await
+            .is_ok(),
+        "the refused attempt changed nothing, right answer or not"
     );
 }
 

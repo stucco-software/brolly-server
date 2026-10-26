@@ -45,6 +45,7 @@ async fn harness_as(
         terms_url: None,
         privacy_url: None,
         public_registration,
+        limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
         www_redirect: www_redirect.map(str::to_string),
         max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
         stores: std::sync::Arc::new(
@@ -79,6 +80,51 @@ async fn harness_as(
     };
     let router = app(state, "server/static");
     (db, dir, router)
+}
+
+/// `post`, as seen from `ip` — the address the proxy in front of a deployment
+/// reports in `X-Forwarded-For`.
+async fn post_from(
+    router: &axum::Router,
+    path: &str,
+    body: &str,
+    ip: &str,
+) -> (StatusCode, String, Vec<String>, Option<String>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header("x-forwarded-for", ip)
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let cookies: Vec<String> = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok().map(str::to_string))
+        .collect();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let retry_after = response
+        .headers()
+        .get(header::RETRY_AFTER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    // `Retry-After` rides in the location slot's neighbour so the tuple shape
+    // stays the one every other test destructures.
+    (status, body, cookies, location.or(retry_after))
 }
 
 /// Returns `Location` too: several flows assert where a successful POST lands.
@@ -380,6 +426,127 @@ async fn a_next_a_browser_would_read_as_another_host_is_dropped() {
         assert_eq!(status, StatusCode::SEE_OTHER, "next={next}");
         assert_eq!(location.as_deref(), Some("/account"), "next={next}");
     }
+}
+
+/// Guessing a known member's password is the attack the door exists to
+/// resist, and argon2's cost alone is a brake, not a wall. The gate here is
+/// per *username*, so an attacker rotating addresses gains nothing: ten
+/// wrong answers for alice, from ten different places, and the eleventh is
+/// refused with a `Retry-After` — whoever sends it, including alice.
+#[tokio::test]
+async fn login_attempts_on_one_account_are_limited_whatever_the_address() {
+    let (db, _dir, router) = harness().await;
+    db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        let (status, _, _, _) = post_from(
+            &router,
+            "/login",
+            "username=alice&password=wrong",
+            &format!("203.0.113.{i}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {i}");
+    }
+    let (status, _, _, retry_after) = post_from(
+        &router,
+        "/login",
+        "username=alice&password=correct-horse-battery",
+        "203.0.113.200",
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    let seconds: u64 = retry_after.expect("Retry-After").parse().unwrap();
+    assert!(seconds >= 1, "a wait, not a free retry");
+
+    // Bob's door is bob's: another account is untouched.
+    let (status, _, _, _) = post_from(
+        &router,
+        "/login",
+        "username=bob&password=wrong",
+        "203.0.113.200",
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+/// And per *address*: one place spraying guesses across many usernames is
+/// the other shape of the same attack.
+#[tokio::test]
+async fn login_attempts_from_one_address_are_limited_whatever_the_account() {
+    let (_db, _dir, router) = harness().await;
+    for i in 0..10 {
+        let (status, _, _, _) = post_from(
+            &router,
+            "/login",
+            &format!("username=user{i}&password=wrong"),
+            "203.0.113.7",
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {i}");
+    }
+    let (status, _, _, _) = post_from(
+        &router,
+        "/login",
+        "username=user99&password=wrong",
+        "203.0.113.7",
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+}
+
+/// Registration mints a pod, keypairs and an identity per account — the most
+/// expensive thing an anonymous caller can make the instance do. On a public
+/// instance that is a disk-and-CPU faucet without a gate; on a private one
+/// it is invite guessing (infeasible at 256 bits, but free is still wrong).
+/// Both surfaces, the form and the API, share one gate per address.
+#[tokio::test]
+async fn account_creation_from_one_address_is_limited_across_both_surfaces() {
+    let (_db, _dir, router) = harness_with(true).await;
+    let mut created = 0;
+    for i in 0..5 {
+        let (status, _, _, _) = post_from(
+            &router,
+            "/register",
+            &format!("username=member{i}&email=&password=correct-horse-battery"),
+            "203.0.113.7",
+        )
+        .await;
+        assert_eq!(status, StatusCode::SEE_OTHER, "registration {i}");
+        created += 1;
+    }
+    assert_eq!(created, 5);
+
+    // The sixth, through the other surface, is the same gate.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/accounts")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("x-forwarded-for", "203.0.113.7")
+                .body(Body::from(
+                    r#"{"username":"member6","password":"correct-horse-battery"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(response.headers().contains_key(header::RETRY_AFTER));
+
+    // Somebody else, somewhere else, is not held up by it.
+    let (status, _, _, _) = post_from(
+        &router,
+        "/register",
+        "username=elsewhere&email=&password=correct-horse-battery",
+        "198.51.100.1",
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
 }
 
 #[tokio::test]

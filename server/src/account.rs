@@ -23,6 +23,7 @@ use brolly_store::resources::PodRead;
 use serde::Deserialize;
 
 use crate::auth::SESSION_COOKIE;
+use crate::ratelimit::{Gate, too_many};
 use crate::{AppState, Chrome, render};
 
 /// One tab in the dashboard.
@@ -297,6 +298,16 @@ pub async fn change_password(
         Ok(s) => s,
         Err(response) => return response,
     };
+    // Per member, not per address: the one way to guess a current password
+    // is from inside a session, and the session is the member's wherever
+    // the thief is sitting. Spent before anything is checked, so a refused
+    // attempt changes nothing whether or not it was right.
+    if let Err(wait) = state
+        .limiter
+        .check(Gate::PasswordChange, &session.user.id.to_string())
+    {
+        return too_many(wait);
+    }
     let sessions = db::count_sessions(&state.pool, session.user.id)
         .await
         .unwrap_or(0);

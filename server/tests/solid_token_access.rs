@@ -155,6 +155,7 @@ async fn harness_with((issuer_discovery, issuer_jwks, webid_documents): RemoteLo
             terms_url: None,
             privacy_url: None,
             public_registration: false,
+            limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
             www_redirect: None,
             max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
             stores,
