@@ -103,7 +103,9 @@ fact that a quota was set.
 `find_by_id` (the Mastodon id resolver, ADR 0015), `find_by_email`, and
 `user_for_session` — and a fifth copy is how one gets missed (the first
 draft of this spec missed `find_by_id`), so this chunk puts the list in one
-`const USER_COLUMNS: &str` and uses it from all four. Nothing constructs
+`const USER_COLUMNS: [&str; 8]` with a `user_columns(prefix)` joiner (the
+session query reads through a join and needs `u.`), and uses it from all
+four and from `create_user`'s `RETURNING`. Nothing constructs
 `User` literally (it is `sqlx::FromRow` only), so the new field is a
 one-place change.
 
@@ -164,8 +166,10 @@ pub fn parse_size(text: &str) -> Result<u64, SizeError>
 
 /// The inverse for display: the largest binary unit not exceeding the
 /// value; printed whole when the value is an exact multiple of it, else to
-/// one decimal — "5 GiB", "512 MiB", "1.5 GiB", "412.5 MiB", "1023 B",
-/// "0 B". Always a string `parse_size` accepts.
+/// one decimal, rounded down — "5 GiB", "512 MiB", "1.5 GiB", "412.5 MiB",
+/// "1023.9 MiB", "1023 B", "0 B". Always a string `parse_size` accepts, and
+/// never more than the value given (rounding up would carry a byte under a
+/// gibibyte to "1024.0 MiB", and i64::MAX past the ceiling).
 pub fn format_size(bytes: u64) -> String
 ```
 
@@ -176,8 +180,8 @@ the grammar has no sign. A fraction on input is allowed so that every string
 `format_size` prints parses back: the console prefills the field with the
 formatted override, and an admin who saves a row untouched must not be
 refused a value the system itself displayed. Saving a displayed value sets
-the displayed value — within half a unit's tenth of what was stored, which
-is the precision the display promised. The console field, the CLI argument,
+the displayed value — within a tenth of the unit shown, and never above
+what was stored, which is the precision the display promised. The console field, the CLI argument,
 the CLI's readback, the console cell and the member overview all go through
 these two, so a number reads the same everywhere it appears. The word
 `default` is not a size: the console clears on an empty field and the CLI on
@@ -210,8 +214,9 @@ column. Each row shows:
 
 - the effective quota, formatted (`format_size`), from `UserRow.quota_bytes`
   or the instance default;
-- a chip: `default`; `set by @nikolas, 26 Oct 2026` when the console set it;
-  `set 26 Oct 2026` when the CLI did (`quota_set_by` is `NULL`) — all from
+- a chip: `default`; `set by @nikolas, 2026-10-26` when the console set it;
+  `set 2026-10-26` when the CLI did (`quota_set_by` is `NULL`) — dates ISO,
+  as the Joined column's are — all from
   `UserRow`, no query per row;
 - current usage, formatted, from `stores.pod_bytes` — so the admin sets a
   number against what the member holds — or the word `unknown` when the
@@ -281,8 +286,8 @@ template's "Data stored" row (`overview.html:34`) becomes:
 ```html
 <dd>
   <meter min="0" max="{{ quota_bytes }}" value="{{ pod_bytes }}"
-         high="{{ warn_at }}">{{ used }} of {{ quota }}</meter>
-  {{ used }} of {{ quota }}
+         high="{{ warn_at }}" aria-label="Data stored, against the quota"></meter>
+  <span>{{ used }} of {{ quota }}</span>
 </dd>
 ```
 
@@ -290,9 +295,10 @@ template's "Data stored" row (`overview.html:34`) becomes:
 so the native rendering turns when a member is close. No `low`: there is no
 "too little" storage. `<meter>` is native, needs no script, and is styled
 from the token layer only — one rule in `server/static/brolly.css`, no
-literal colours (the ui_invariants gate). The text beside the meter carries
-the same words, so a screen reader and a text browser read the same thing a
-sighted member sees. A member an admin has set below their usage sees the
+literal colours (the ui_invariants gate). The meter is empty and named by
+`aria-label`; the words live once, in the span beside it, so a screen reader
+and a text browser read what a sighted member sees and neither reads it
+twice. A member an admin has set below their usage sees the
 meter full and the text honest — `1.2 GiB of 1 GiB` — which is the state H3
 describes: nothing deleted, adds refused until they are under.
 
@@ -301,7 +307,7 @@ describes: nothing deleted, adds refused until they are under.
 | Where | What |
 |---|---|
 | `migrations/<ts>_identity_user_quotas.sql` | three columns, one `CHECK` |
-| `identity/src/db.rs` | `User.quota_bytes`, `User::quota`, `USER_COLUMNS` (used by `find_by_username`, `find_by_id`, `find_by_email`, `user_for_session`), `UserRow`'s three quota fields and the self-join in `list_users`, `set_quota`, `quota_provenance`, `QuotaProvenance` |
+| `identity/src/db.rs` | `User.quota_bytes`, `User::quota`, `USER_COLUMNS` + `user_columns(prefix)` (used by `create_user`, `find_by_username`, `find_by_id`, `find_by_email`, `user_for_session`), `UserRow`'s three quota fields and the self-join in `list_users`, `set_quota`, `quota_provenance`, `QuotaProvenance` |
 | `domain/src/media.rs` | `parse_size`, `format_size`, `SizeError` |
 | `server/src/pod.rs` | `within_quota(state, &User, incoming)` |
 | `server/src/mastodon_api.rs` | the upload's call site |
