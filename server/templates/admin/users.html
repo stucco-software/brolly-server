@@ -20,6 +20,7 @@
             <th scope="col">Status</th>
             <th scope="col">Joined</th>
             <th scope="col">Federation identity</th>
+            <th scope="col">Quota</th>
           </tr>
         </thead>
         <tbody>
@@ -43,6 +44,23 @@
               {% else %}
               <span class="hint">none yet</span>
               {% endif %}
+            </td>
+            <td>
+              <span class="mono">{{ member.quota }}</span>
+              {% if member.quota_is_default %}
+              <span class="hint">default</span>
+              {% else %}
+              <mark class="chip chip-quota">{{ member.quota_note }}</mark>
+              {% endif %}
+              <span class="hint">{{ member.usage }} used</span>
+              <form method="post" action="/admin/users/{{ member.username }}/quota" class="inline-form">
+                <label class="visually-hidden" for="quota-{{ member.username }}">Quota for @{{ member.username }}</label>
+                <input id="quota-{{ member.username }}" name="quota" value="{{ member.quota_entered }}" placeholder="5G, blank for default">
+                <button type="submit">Save</button>
+                {% if let Some(error) = member.quota_error %}
+                <span class="error">{{ error }}</span>
+                {% endif %}
+              </form>
             </td>
           </tr>
           {% endfor %}

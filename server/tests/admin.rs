@@ -126,6 +126,53 @@ async fn get_as(router: &axum::Router, path: &str, cookie: Option<&str>) -> (Sta
     (status, String::from_utf8_lossy(&bytes).to_string())
 }
 
+/// `post`, as whoever holds `cookie`, from `origin` when given.
+async fn post_as(
+    router: &axum::Router,
+    path: &str,
+    body: &str,
+    cookie: &str,
+    origin: Option<&str>,
+) -> (StatusCode, String, Option<String>) {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::COOKIE, cookie);
+    if let Some(origin) = origin {
+        request = request.header(header::ORIGIN, origin);
+    }
+    let response = router
+        .clone()
+        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
+        .to_string();
+    (status, body, location)
+}
+
+/// An admin's cookie and a member to act on.
+async fn an_admin_and_alice(
+    db: &brolly_test_support::TestDb,
+    router: &axum::Router,
+) -> (String, uuid::Uuid) {
+    let invite = db::create_invite(&db.pool, None, 1, None, Some("admin"))
+        .await
+        .unwrap();
+    let keeper = register(router, "keeper", &invite).await;
+    let alice = db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    (keeper, alice.id)
+}
+
 const ADMIN_PAGES: [&str; 2] = ["/admin", "/admin/users"];
 
 // --- the guard ---------------------------------------------------------------
@@ -382,4 +429,188 @@ async fn the_member_list_marks_only_the_exceptional() {
         2,
         "only the exceptional values are marked; got: {body}"
     );
+}
+
+// --- quotas ------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_admin_sets_a_members_quota_from_the_list() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, alice) = an_admin_and_alice(&db, &router).await;
+
+    let (status, _, location) = post_as(
+        &router,
+        "/admin/users/alice/quota",
+        "quota=5G",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/admin/users"));
+    assert_eq!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        Some(5 << 30)
+    );
+
+    let (status, body) = get_as(&router, "/admin/users", Some(&keeper)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("5 GiB"), "{body}");
+    assert!(body.contains("set by @keeper"), "{body}");
+    assert!(
+        body.contains(r#"value="5 GiB""#),
+        "the field is prefilled with the formatted override: {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_blank_quota_restores_the_default() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, alice) = an_admin_and_alice(&db, &router).await;
+    db::set_quota(&db.pool, alice, Some(5 << 30), None)
+        .await
+        .unwrap();
+
+    let (status, _, _) = post_as(
+        &router,
+        "/admin/users/alice/quota",
+        "quota=  ",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        None
+    );
+    let (_, body) = get_as(&router, "/admin/users", Some(&keeper)).await;
+    assert!(!body.contains("set by"), "the provenance is gone: {body}");
+    assert!(
+        body.contains(r#">default<"#),
+        "the row says default (the placeholder says it too, so match the element): {body}"
+    );
+}
+
+#[tokio::test]
+async fn a_cli_set_quota_shows_a_date_and_no_name() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, alice) = an_admin_and_alice(&db, &router).await;
+    db::set_quota(&db.pool, alice, Some(2 << 30), None)
+        .await
+        .unwrap();
+
+    let (_, body) = get_as(&router, "/admin/users", Some(&keeper)).await;
+    assert!(body.contains("2 GiB"), "{body}");
+    assert!(body.contains("set 20"), "a date, from this century: {body}");
+    assert!(!body.contains("set by"), "{body}");
+}
+
+#[tokio::test]
+async fn a_bad_size_is_named_against_the_row_and_sets_nothing() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, alice) = an_admin_and_alice(&db, &router).await;
+
+    let (status, body, _) = post_as(
+        &router,
+        "/admin/users/alice/quota",
+        "quota=5X",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("is not a unit"), "{body}");
+    assert!(
+        body.contains(r#"value="5X""#),
+        "the bad value is kept: {body}"
+    );
+    assert_eq!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_member_cannot_set_a_quota() {
+    let (db, _dir, router) = harness().await;
+    let (_keeper, alice) = an_admin_and_alice(&db, &router).await;
+    let invite = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
+    let mallory = register(&router, "mallory", &invite).await;
+
+    let (status, _, _) = post_as(
+        &router,
+        "/admin/users/alice/quota",
+        "quota=5G",
+        &mallory,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the console does not exist for a member"
+    );
+    assert_eq!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        None
+    );
+}
+
+#[tokio::test]
+async fn a_cross_origin_quota_post_is_refused() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, alice) = an_admin_and_alice(&db, &router).await;
+
+    let (status, _, _) = post_as(
+        &router,
+        "/admin/users/alice/quota",
+        "quota=5G",
+        &keeper,
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_member_is_not_found() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+
+    let (status, _, _) = post_as(
+        &router,
+        "/admin/users/nobody/quota",
+        "quota=5G",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

@@ -502,3 +502,38 @@ async fn a_negative_quota_cannot_be_stored() {
         "refused by the non-negative CHECK, not something else: {err:?}"
     );
 }
+
+#[tokio::test]
+async fn the_member_list_carries_each_quota_and_who_set_it() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(&pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let bob = db::create_user(&pool, "bob", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let keeper = db::create_user(&pool, "keeper", None, "correct-horse-battery", "admin")
+        .await
+        .unwrap();
+    db::set_quota(&pool, alice.id, Some(5 << 30), Some(keeper.id))
+        .await
+        .unwrap();
+    db::set_quota(&pool, bob.id, Some(2 << 30), None)
+        .await
+        .unwrap();
+
+    let rows = db::list_users(&pool).await.unwrap();
+    let row = |name: &str| rows.iter().find(|r| r.username == name).unwrap();
+
+    assert_eq!(row("alice").quota_bytes, Some(5 << 30));
+    assert_eq!(row("alice").quota_set_by.as_deref(), Some("keeper"));
+    assert!(row("alice").quota_set_at.is_some());
+
+    assert_eq!(row("bob").quota_bytes, Some(2 << 30));
+    assert_eq!(row("bob").quota_set_by, None, "CLI-set: no name");
+    assert!(row("bob").quota_set_at.is_some());
+
+    assert_eq!(row("keeper").quota_bytes, None);
+    assert_eq!(row("keeper").quota_set_by, None);
+    assert_eq!(row("keeper").quota_set_at, None);
+}

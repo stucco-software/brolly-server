@@ -385,8 +385,9 @@ async fn security_headers(
 /// The paths a browser posts the instance's own forms to. Every one of them
 /// is a page the instance renders, acted on with the session cookie, and a
 /// post to any of them from another origin is refused by [`same_origin`]
-/// before the handler runs. `server/tests/ui_invariants.rs` checks that every
-/// `<form method="post">` in the templates lands here.
+/// before the handler runs. An entry ending in `/` is a prefix.
+/// `server/tests/ui_invariants.rs` checks that every `<form method="post">` in
+/// the templates lands here.
 ///
 /// Not on the list, deliberately: the OAuth token, PAR and registration
 /// endpoints, `/api/accounts`, the Mastodon client API, XRPC, and the pod —
@@ -404,7 +405,23 @@ pub const SAME_ORIGIN_FORMS: &[&str] = &[
     "/oauth/solid/authorize",
     "/oauth/authorize",
     "/oauth/atproto/authorize",
+    // An entry ending in `/` is a prefix: the console's per-member actions
+    // carry the username in the path.
+    "/admin/users/",
 ];
+
+/// Is `path` one the same-origin rule guards? An entry ending in `/` is a
+/// prefix, anything else an exact path.
+fn form_post_is_guarded(path: &str) -> bool {
+    SAME_ORIGIN_FORMS.iter().any(|entry| {
+        if let Some(prefix) = entry.strip_suffix('/') {
+            path.strip_prefix(prefix)
+                .is_some_and(|rest| rest.starts_with('/') && rest.len() > 1)
+        } else {
+            *entry == path
+        }
+    })
+}
 
 /// A form post from any origin but ours is refused.
 ///
@@ -427,9 +444,7 @@ async fn same_origin(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
-    if request.method() == axum::http::Method::POST
-        && SAME_ORIGIN_FORMS.contains(&request.uri().path())
-    {
+    if request.method() == axum::http::Method::POST && form_post_is_guarded(request.uri().path()) {
         let ours = format!("https://{}", state.base_domain);
         let headers = request.headers();
         let from = headers
@@ -642,6 +657,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // The admin console (plan §4.4).
         .route("/admin", get(admin::overview))
         .route("/admin/users", get(admin::users))
+        .route("/admin/users/{username}/quota", post(admin::set_quota))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             solid_oidc::apex_only,
@@ -806,5 +822,26 @@ pub fn render<T: askama::Template>(template: &T) -> Response {
             )
                 .into_response()
         }
+    }
+}
+
+#[cfg(test)]
+mod same_origin_tests {
+    use super::*;
+
+    #[test]
+    fn a_listed_prefix_covers_the_paths_under_it_and_nothing_else() {
+        assert!(form_post_is_guarded("/login"));
+        assert!(form_post_is_guarded("/admin/users/alice/quota"));
+        assert!(form_post_is_guarded("/admin/users/alice/anything-later"));
+        assert!(
+            !form_post_is_guarded("/admin/users"),
+            "the list page itself is a GET"
+        );
+        assert!(
+            !form_post_is_guarded("/admin/userspace"),
+            "a prefix is a path prefix"
+        );
+        assert!(!form_post_is_guarded("/oauth/solid/token"));
     }
 }

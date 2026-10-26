@@ -11,11 +11,14 @@
 //! invite, and no way to register, so something has to break the cycle.
 
 use askama::Template;
-use axum::extract::State;
+use axum::Form;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
+use brolly_domain::media::{format_size, parse_size};
 use brolly_identity::db::{self, DbError, User};
+use serde::Deserialize;
 
 use crate::auth::session_user;
 use crate::{AppState, Chrome, render};
@@ -175,6 +178,19 @@ struct MemberView {
     status: String,
     did: Option<String>,
     created: String,
+    /// The effective quota, formatted.
+    quota: String,
+    /// `default`, `set by @keeper, 2026-10-26`, or `set 2026-10-26`.
+    quota_note: String,
+    quota_is_default: bool,
+    /// What the pod holds, formatted — or `unknown` when the directory
+    /// cannot be read. Not `0`: a console about to set a limit must not
+    /// show a full pod as empty.
+    usage: String,
+    /// What the field shows: the formatted override, or the value an admin
+    /// just submitted and had refused.
+    quota_entered: String,
+    quota_error: Option<String>,
 }
 
 #[derive(Template)]
@@ -185,33 +201,133 @@ struct UsersPage<'a> {
     members: Vec<MemberView>,
 }
 
+/// The members page, with at most one row's field carrying a refused value
+/// and its error. `None` for a plain load.
+async fn users_page<'a>(
+    state: &'a AppState,
+    refused: Option<(&str, &str, &str)>,
+) -> Result<UsersPage<'a>, ()> {
+    let rows = db::list_users(&state.pool).await.map_err(|e| {
+        tracing::error!(error = %e, "admin member list failed");
+    })?;
+    let members = rows
+        .into_iter()
+        .map(|row| {
+            // `UserRow` is not a `User`, so the override-or-default rule is
+            // restated here — the same rule as `User::quota`, the one other
+            // place it lives.
+            let quota_bytes = row
+                .quota_bytes
+                .map(|b| u64::try_from(b).unwrap_or(0))
+                .unwrap_or(state.pod_quota_bytes);
+            let quota_note = match (row.quota_bytes, row.quota_set_at, row.quota_set_by) {
+                (None, _, _) => "default".to_string(),
+                (Some(_), Some(at), Some(by)) => format!("set by @{by}, {}", at.date()),
+                (Some(_), Some(at), None) => format!("set {}", at.date()),
+                // The CHECK says this cannot happen; say so rather than lie.
+                (Some(_), None, _) => "set".to_string(),
+            };
+            let (quota_entered, quota_error) = match refused {
+                Some((name, entered, error)) if name == row.username => {
+                    (entered.to_string(), Some(error.to_string()))
+                }
+                _ => (
+                    row.quota_bytes
+                        .map(|b| format_size(u64::try_from(b).unwrap_or(0)))
+                        .unwrap_or_default(),
+                    None,
+                ),
+            };
+            MemberView {
+                usage: state
+                    .stores
+                    .pod_bytes(row.id)
+                    .map(format_size)
+                    .unwrap_or_else(|_| "unknown".to_string()),
+                username: row.username,
+                role: row.role,
+                status: row.status,
+                did: row.did_plc,
+                // Date only. The time an account was created to the second has
+                // never answered a question an operator was actually asking.
+                created: row.created_at.date().to_string(),
+                quota: format_size(quota_bytes),
+                quota_is_default: row.quota_bytes.is_none(),
+                quota_note,
+                quota_entered,
+                quota_error,
+            }
+        })
+        .collect();
+    Ok(UsersPage {
+        chrome: state.chrome(),
+        tabs: tabs("/admin/users"),
+        members,
+    })
+}
+
 /// `GET /admin/users`
 pub async fn users(State(state): State<AppState>, jar: CookieJar) -> Response {
     if let Err(response) = require_admin(&state, &jar, "/admin/users").await {
         return response;
     }
+    match users_page(&state, None).await {
+        Ok(page) => render(&page),
+        Err(()) => server_error(),
+    }
+}
 
-    let Ok(rows) = db::list_users(&state.pool).await else {
-        tracing::error!("admin member list failed");
-        return server_error();
+#[derive(Deserialize)]
+pub struct QuotaForm {
+    quota: String,
+}
+
+/// `POST /admin/users/{username}/quota` — the console's first write.
+///
+/// Empty clears the override; otherwise the one size grammar. A refused size
+/// re-renders the list as a 400 with the message against that row and the
+/// value kept, and sets nothing. Lowering a quota below what a member holds
+/// refuses their next add until they are under it; it deletes nothing.
+pub async fn set_quota(
+    State(state): State<AppState>,
+    jar: CookieJar,
+    Path(username): Path<String>,
+    Form(form): Form<QuotaForm>,
+) -> Response {
+    let admin = match require_admin(&state, &jar, "/admin/users").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let member = match db::find_by_username(&state.pool, &username).await {
+        Ok(Some(member)) => member,
+        Ok(None) => return not_found(),
+        Err(e) => {
+            tracing::error!(error = %e, "member lookup failed");
+            return server_error();
+        }
     };
 
-    let members = rows
-        .into_iter()
-        .map(|row| MemberView {
-            username: row.username,
-            role: row.role,
-            status: row.status,
-            did: row.did_plc,
-            // Date only. The time an account was created to the second has
-            // never answered a question an operator was actually asking.
-            created: row.created_at.date().to_string(),
-        })
-        .collect();
+    let entered = form.quota.trim();
+    let quota_bytes = if entered.is_empty() {
+        None
+    } else {
+        match parse_size(entered) {
+            Ok(bytes) => Some(i64::try_from(bytes).unwrap_or(i64::MAX)),
+            Err(e) => {
+                let error = e.to_string();
+                return match users_page(&state, Some((username.as_str(), entered, error.as_str())))
+                    .await
+                {
+                    Ok(page) => (StatusCode::BAD_REQUEST, render(&page)).into_response(),
+                    Err(()) => server_error(),
+                };
+            }
+        }
+    };
 
-    render(&UsersPage {
-        chrome: state.chrome(),
-        tabs: tabs("/admin/users"),
-        members,
-    })
+    if let Err(e) = db::set_quota(&state.pool, member.id, quota_bytes, Some(admin.id)).await {
+        tracing::error!(error = %e, member = %member.id, "setting a quota failed");
+        return server_error();
+    }
+    Redirect::to("/admin/users").into_response()
 }

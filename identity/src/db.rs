@@ -606,9 +606,15 @@ pub async fn quota_provenance(
 
 /// One row of the admin user list (ADR 0005, R5).
 ///
-/// Postgres answers this alone. `display_name` is deliberately absent: it lives
-/// in each member's pod, and opening one store per row to render a table is the
-/// exact mistake ADR 0005 exists to prevent. It arrives with the actor index.
+/// Postgres answers this alone. `display_name` is deliberately absent: it
+/// lives in each member's pod, and opening one *store* per row to render a
+/// table is the exact mistake ADR 0005 exists to prevent. (Measuring a pod's
+/// directory on disk is not that: no store is opened, no LRU slot taken,
+/// which is why the console may show usage per row.) It arrives with the
+/// actor index.
+///
+/// The quota and its provenance ride here so the console's list is one
+/// query however many members: the setter's name is a self-join on `users`.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct UserRow {
     pub id: Uuid,
@@ -617,6 +623,12 @@ pub struct UserRow {
     pub status: String,
     pub did_plc: Option<String>,
     pub created_at: time::OffsetDateTime,
+    /// An admin's override, or `None` for the instance default.
+    pub quota_bytes: Option<i64>,
+    pub quota_set_at: Option<time::OffsetDateTime>,
+    /// The setter's username; `None` when the CLI set it, when the admin has
+    /// since been deleted, or when there is no override.
+    pub quota_set_by: Option<String>,
 }
 
 /// Every account, newest first.
@@ -626,8 +638,10 @@ pub struct UserRow {
 /// pointers only, so the fix is a LIMIT and a cursor rather than a new store.
 pub async fn list_users(pool: &PgPool) -> Result<Vec<UserRow>, DbError> {
     Ok(sqlx::query_as::<_, UserRow>(
-        "SELECT id, username, role, status, did_plc, created_at
-         FROM users ORDER BY created_at DESC",
+        "SELECT u.id, u.username, u.role, u.status, u.did_plc, u.created_at,
+                u.quota_bytes, u.quota_set_at, s.username AS quota_set_by
+           FROM users u LEFT JOIN users s ON s.id = u.quota_set_by
+          ORDER BY u.created_at DESC",
     )
     .fetch_all(pool)
     .await?)

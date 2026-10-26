@@ -545,3 +545,21 @@ textarea { width: 100%; }
 .app:last-child { border-block-end: 0; }
 .app-identity { display: flex; flex-direction: column; gap: var(--sp--2); }
 .app-id { overflow-wrap: anywhere; }
+
+/* A label that is read, not seen: the clip pattern. */
+.visually-hidden {
+  position: absolute;
+  inline-size: 1px;
+  block-size: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+/* A form that sits inside a table cell. */
+.inline-form { display: flex; gap: var(--sp--2); align-items: center; margin-block-start: var(--sp--2); }
+.inline-form input { inline-size: 8em; }
+/* Provenance, not status: muted, so it does not read as a role or a warning
+   beside the chips that are. Every chip carries a background — a bare
+   <mark> is the browser's own yellow, which the token invariant cannot see. */
+.chip-quota { background: var(--muted); color: var(--muted-fg); }

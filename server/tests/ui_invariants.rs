@@ -204,8 +204,17 @@ fn every_form_post_is_same_origin_checked() {
             if action.starts_with("{{") {
                 continue;
             }
+            // A templated action — `/admin/users/{{ member.username }}/quota`
+            // — is matched by its literal prefix against a prefix entry (one
+            // ending in `/`); a literal action by an exact entry.
+            let listed = match action.split_once("{{") {
+                Some((literal, _)) => list
+                    .iter()
+                    .any(|entry| entry.ends_with('/') && literal.starts_with(entry)),
+                None => list.contains(&action),
+            };
             assert!(
-                list.contains(&action),
+                listed,
                 "{}: form action {action} is not in SAME_ORIGIN_FORMS",
                 path.display()
             );
