@@ -677,8 +677,65 @@ fn session_cookie(token: String) -> Cookie<'static> {
 /// Usernames become subdomains and WebIDs, so the rules are stricter than a
 /// display name's — see `identity::webid`.
 fn validate_username(username: &str) -> Result<(), &'static str> {
-    const RESERVED: [&str; 8] = [
-        "admin", "root", "api", "oauth", "www", "mail", "support", "brolly",
+    // A username is a subdomain, so the reservation is routing and
+    // convention, not taste: names that would shadow the instance's own
+    // hosts or read as official; the labels mail and DNS conventions give
+    // meaning to under a wildcard (`mta-sts` publishes a mail policy for the
+    // whole domain, `autoconfig`/`autodiscover` tell mail clients where to
+    // send a password, `wpad` configures proxies); and the names a browser
+    // or a person would take for infrastructure rather than a member.
+    const RESERVED: &[&str] = &[
+        // The instance's own
+        "admin",
+        "root",
+        "api",
+        "oauth",
+        "www",
+        "brolly",
+        "login",
+        "register",
+        "account",
+        "accounts",
+        "auth",
+        "id",
+        "app",
+        "apps",
+        "status",
+        "help",
+        "docs",
+        "support",
+        "abuse",
+        "security",
+        // Mail
+        "mail",
+        "smtp",
+        "imap",
+        "pop",
+        "pop3",
+        "webmail",
+        "mta-sts",
+        "autoconfig",
+        "autodiscover",
+        "postmaster",
+        "hostmaster",
+        "webmaster",
+        "noreply",
+        "no-reply",
+        // DNS, proxies, the host itself
+        "ns",
+        "ns1",
+        "ns2",
+        "dns",
+        "wpad",
+        "isatap",
+        "localhost",
+        "broadcasthost",
+        // Static assets
+        "static",
+        "assets",
+        "cdn",
+        "media",
+        "files",
     ];
 
     if username.len() < 2 || username.len() > 32 {
@@ -694,6 +751,12 @@ fn validate_username(username: &str) -> Result<(), &'static str> {
     }
     if username.starts_with('-') || username.ends_with('-') {
         return Err("Usernames cannot start or end with a hyphen.");
+    }
+    // The IDN prefix: a browser renders `xn--pple-43d` as `аpple`. The
+    // charset above rules out non-ASCII; this rules out the ASCII that
+    // becomes it.
+    if username.starts_with("xn--") {
+        return Err("Usernames cannot start with xn--.");
     }
     if RESERVED.contains(&username) {
         return Err("That username is reserved.");
@@ -732,13 +795,41 @@ mod tests {
 
     #[test]
     fn reserved_usernames_are_refused() {
-        // These would shadow apex hosts or read as official.
-        for name in ["admin", "api", "www", "oauth"] {
+        // These would shadow apex hosts, read as official, or claim a label
+        // that mail and DNS conventions give meaning to under the wildcard.
+        for name in [
+            "admin",
+            "api",
+            "www",
+            "oauth",
+            "mta-sts",
+            "autoconfig",
+            "autodiscover",
+            "localhost",
+            "ns1",
+            "static",
+            "cdn",
+            "login",
+            "account",
+            "register",
+            "status",
+        ] {
             assert!(
                 validate_username(name).is_err(),
                 "{name} should be reserved"
             );
         }
+    }
+
+    #[test]
+    fn a_punycode_label_is_refused() {
+        // `xn--` is the IDN prefix: a browser renders `xn--pple-43d` as
+        // `аpple`, and a username is a subdomain. The charset already rules
+        // out non-ASCII; this rules out the ASCII that becomes it.
+        assert!(validate_username("xn--pple-43d").is_err());
+        assert!(validate_username("xn--80ak6aa92e").is_err());
+        // Which does not catch a name that merely contains the letters.
+        assert!(validate_username("txn--ok").is_ok());
     }
 
     #[test]
