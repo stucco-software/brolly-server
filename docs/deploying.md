@@ -95,10 +95,10 @@ through the front door or OIDC like anyone else.
 
 ### `BROLLY_WWW_REDIRECT`
 
-`www` is a reserved username, so no member can ever own the host — but
-routing is by path, so an unconfigured `www.{base_domain}` answers the
-apex's routes (login renders) while the host-checked surfaces (OAuth, pods)
-404 it: a broken half-apex nobody asked for. Point it somewhere:
+`www` is a reserved username, so no member can ever own the host — and the
+instance's own pages (the door, the dashboard, the console, OAuth) are
+apex-only, so an unconfigured `www.{base_domain}` answers 404 for
+everything: a dead host nobody asked for. Point it somewhere:
 
 ```
 BROLLY_WWW_REDIRECT=https://stucco.software/stuccoid

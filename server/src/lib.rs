@@ -595,13 +595,19 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             solid_oidc::apex_only,
         ));
 
-    Router::new()
-        // `/` and `/login` are one template on two routes. Collapsing them
-        // would mean re-pointing five redirects that target the login form
-        // (account.rs, solid_oidc.rs, mastodon_oauth.rs, atproto_oauth.rs,
-        // admin.rs) — the fiddliest flows in the workspace.
-        .route("/", get(auth::login_form))
-        .route("/health", get(health))
+    // The instance's own pages — the door, the member dashboard, the admin
+    // console — and nothing of a member's. A member's subdomain is their pod
+    // (ADR 0009), and `apex_only` wraps the group for the reason it wraps the
+    // OAuth surface: a login form on alice.<apex> is a place to type a
+    // password the instance never named, and a session minted there would be
+    // a host-only cookie on a member host — the one host a member's own
+    // documents are served from, and so the one host a session cookie must
+    // never exist on. `/` gets the same guard on its own route, below: ADR
+    // 0010 reserves a member's root for a profile page that does not exist
+    // yet, and until it does the root answers what `subdomain_fallback`
+    // answers for `SubdomainRoute::Root` — a 404 — not the login form the
+    // route order used to let through.
+    let door = Router::new()
         // Auth surfaces ship with identity, not after it (plan §4.4).
         .route("/login", get(auth::login_form).post(auth::login_submit))
         .route(
@@ -610,8 +616,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         )
         // POST so a prefetch or a cross-site <img> cannot log someone out.
         .route("/logout", post(auth::logout))
-        // The member dashboard (plan §4.4). Apex-only in practice because a
-        // subdomain's `/account` is a pod path, not this.
+        // The member dashboard (plan §4.4).
         .route("/account", get(account::overview))
         .route(
             "/account/profile",
@@ -630,11 +635,29 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             "/account/delete",
             get(account::delete_form).post(account::delete_account),
         )
-        // The admin console (plan §4.4). Apex-only for the same reason as
-        // `/account`, and `/admin/*` is already a reserved path on member
-        // subdomains by ADR 0009.
+        // The admin console (plan §4.4).
         .route("/admin", get(admin::overview))
         .route("/admin/users", get(admin::users))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            solid_oidc::apex_only,
+        ));
+
+    Router::new()
+        // `/` and `/login` are one template on two routes. Collapsing them
+        // would mean re-pointing five redirects that target the login form
+        // (account.rs, solid_oidc.rs, mastodon_oauth.rs, atproto_oauth.rs,
+        // admin.rs) — the fiddliest flows in the workspace.
+        .route(
+            "/",
+            get(auth::login_form).layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                solid_oidc::apex_only,
+            )),
+        )
+        .route("/health", get(health))
+        // The door, the dashboard and the console: apex-only, below.
+        .merge(door)
         // ActivityPub discovery. `/actor` is served on both the apex and
         // member subdomains and means a different actor on each — one route
         // with a host branch, because a route matches before the host is

@@ -591,6 +591,70 @@ async fn a_form_post_from_another_origin_is_refused() {
     assert_eq!(response.status(), StatusCode::SEE_OTHER);
 }
 
+/// The door, the dashboard and the admin console are the instance's, and a
+/// member's subdomain is their pod (ADR 0009): none of it answers there. A
+/// login form on alice.<apex> is a place to type a password that the
+/// instance never named, and a session minted there is a host-only cookie on
+/// a member host — the one place a session cookie must never exist, since
+/// that host is the one a member's own documents would be served from.
+#[tokio::test]
+async fn the_door_the_dashboard_and_the_console_are_apex_only() {
+    let (db, _dir, router) = harness().await;
+    db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+
+    // Each with the method it accepts and a body it would take, so a 404 is
+    // the host rule and not the router's own 405 or 415.
+    // `/` too: ADR 0010 reserves a member's root for a profile page that
+    // does not exist yet, and until it does the root answers what the
+    // fallback answers for `SubdomainRoute::Root` — a 404 — rather than the
+    // login form the route order let through.
+    for (method, path) in [
+        ("GET", "/"),
+        ("GET", "/login"),
+        ("POST", "/login"),
+        ("GET", "/register"),
+        ("POST", "/register"),
+        ("POST", "/logout"),
+        ("GET", "/account"),
+        ("GET", "/account/profile"),
+        ("POST", "/account/profile"),
+        ("GET", "/account/security"),
+        ("POST", "/account/security"),
+        ("GET", "/account/apps"),
+        ("POST", "/account/apps"),
+        ("GET", "/account/export"),
+        ("GET", "/account/delete"),
+        ("POST", "/account/delete"),
+        ("GET", "/admin"),
+        ("GET", "/admin/users"),
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header(header::HOST, "alice.brolly.test")
+                    .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                    .body(Body::from("username=alice&password=correct-horse-battery"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{method} {path} answered on a member subdomain"
+        );
+        assert!(
+            response.headers().get(header::SET_COOKIE).is_none(),
+            "{method} {path}: a cookie was set on a member host"
+        );
+    }
+}
+
 #[tokio::test]
 async fn login_succeeds_and_sets_a_session() {
     let (db, _dir, router) = harness().await;
@@ -1340,17 +1404,18 @@ async fn the_www_host_redirects_every_method_and_path() {
     );
 }
 
-/// Unconfigured, the `www` host is what it always was — the apex's routes
-/// answer by path, because routing does not look at the host. The variable
-/// claims the host; nothing about it is claimed by default.
+/// Unconfigured, the `www` host is nobody's: `www` is a reserved username, so
+/// it is never a member's pod, and the instance's own pages are apex-only, so
+/// it is not the door either. It answers 404 for everything — a dead host,
+/// not the half-apex it used to be — until the variable claims it.
 #[tokio::test]
-async fn an_unconfigured_www_host_is_untouched() {
+async fn an_unconfigured_www_host_is_nobodys() {
     let (_db, _dir, router) = harness_as(false, None).await;
 
-    let (status, body, _) = get_on_host(&router, "/", "www.brolly.test").await;
+    let (status, _, location) = get_on_host(&router, "/", "www.brolly.test").await;
 
-    assert_eq!(status, StatusCode::OK);
-    assert!(body.contains("<h1>brolly.test</h1>"), "got: {body}");
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(location, None);
 }
 
 /// Only the `www` host redirects. The apex and a member's subdomain keep
