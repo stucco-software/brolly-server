@@ -828,6 +828,7 @@ async fn authorization_code_grant(state: &AppState, request: TokenRequest, jkt: 
             &grant.webid,
             &grant.scope,
             Some(jkt),
+            &store::Lineage::fresh(),
         )
         .await
         {
@@ -861,13 +862,39 @@ async fn refresh_token_grant(state: &AppState, request: TokenRequest, jkt: &str)
         );
     };
 
-    let grant = match store::rotate_refresh(&state.pool, token).await {
-        Ok(Some(grant)) => grant,
-        Ok(None) => {
+    // A grant is a grant to one client (RFC 6749 §6): the presenting client
+    // is part of the lookup, as it is for a code.
+    let Some(client_id) = request.client_id.as_deref() else {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "client_id is required",
+        );
+    };
+
+    // The token is bound to a key too, and the key is part of the lookup
+    // rather than checked after the token is spent: a thief with the token
+    // but not the key is refused, and the owner's token survives the attempt.
+    // A replay — the right client and key, a token already spent — ends the
+    // whole family: one of the two holders is not the client.
+    let grant = match store::rotate_refresh(&state.pool, token, client_id, Some(jkt)).await {
+        Ok(store::Rotation::Rotated(grant)) => grant,
+        Ok(store::Rotation::Replayed) => {
+            tracing::warn!(
+                client_id,
+                "a spent refresh token was replayed; its grant is revoked"
+            );
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_grant",
-                "this refresh token is expired, already used, or not one of ours",
+                "this refresh token was already used; the grant has been revoked",
+            );
+        }
+        Ok(store::Rotation::Refused) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "this refresh token is expired, not this client's, bound to another key, or not one of ours",
             );
         }
         Err(e) => {
@@ -876,19 +903,6 @@ async fn refresh_token_grant(state: &AppState, request: TokenRequest, jkt: &str)
         }
     };
 
-    // The refresh token is bound to a key too, so stealing the token alone does
-    // not let the thief mint access tokens.
-    if let Some(expected) = grant.dpop_jkt.as_deref()
-        && expected != jkt
-    {
-        tracing::warn!("a refresh token was presented by a key it was not issued to");
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "this refresh token was issued to a different key",
-        );
-    }
-
     let replacement = match store::issue_refresh(
         &state.pool,
         &grant.client_id,
@@ -896,6 +910,7 @@ async fn refresh_token_grant(state: &AppState, request: TokenRequest, jkt: &str)
         &grant.webid,
         &grant.scope,
         Some(jkt),
+        &grant.lineage(),
     )
     .await
     {

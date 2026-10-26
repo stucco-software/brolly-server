@@ -231,6 +231,14 @@ pod that was never provisioned can get there.
 `brolly-admin acl-uncontain` is gone. The upgrade never lists an `.acl` as a
 member, so a pod that was never swept needs nothing more.
 
+### Solid refresh tokens issued before the family migration
+
+`20261026000001_solid_refresh_families` gives every Solid refresh token a
+family and an absolute end date. Tokens issued before it keep working: each
+becomes its own family, and its absolute end is the sliding expiry it
+already had, so nothing a live app holds stops early. Forward-only, like
+every migration here.
+
 ### Activities stored before `865cc98`
 
 From `865cc98` on, the server chooses the id of every object a member

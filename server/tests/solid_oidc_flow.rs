@@ -1902,6 +1902,114 @@ async fn a_refresh_token_rotates_and_the_old_one_dies() {
     );
 }
 
+/// A client through the whole code flow: its id, its key, and the refresh
+/// token it was issued.
+async fn a_refreshing_client(harness: &Harness) -> (String, SigningKey, String) {
+    let client_id = register(harness).await;
+    let cookie = a_logged_in_member(harness).await;
+    let (verifier, challenge) = pkce();
+    let code = a_code(harness, &client_id, &challenge, &cookie).await;
+    let first = redeem(harness, &client_id, &code, &verifier).await;
+    assert_eq!(first.status, StatusCode::OK, "token: {}", first.body);
+    let refresh = first.json()["refresh_token"]
+        .as_str()
+        .expect("offline_access was requested")
+        .to_string();
+    (client_id, client_key(), refresh)
+}
+
+/// Present `token` at the token endpoint as `client_id`, proven with `key`.
+async fn refresh_as(harness: &Harness, token: &str, client_id: &str, key: &SigningKey) -> Reply {
+    let url = format!("https://{BASE}/oauth/solid/token");
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", token)
+        .append_pair("client_id", client_id)
+        .finish();
+    send(
+        harness,
+        builder("POST", "/oauth/solid/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("DPoP", dpop_proof(key, "POST", &url, None))
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+}
+
+/// A thief with the token but not the key is refused — and the owner is not
+/// logged out by the attempt. Spending the token before checking the key
+/// turned every stolen token into a logout button: the legitimate client's
+/// next refresh found its token already revoked.
+#[tokio::test]
+async fn a_stolen_refresh_token_presented_with_the_wrong_key_does_not_log_the_owner_out() {
+    let harness = harness().await;
+    let (client_id, key, refresh) = a_refreshing_client(&harness).await;
+
+    let thief = SigningKey::from_slice(&[9u8; 32]).unwrap();
+    let theft = refresh_as(&harness, &refresh, &client_id, &thief).await;
+    assert_eq!(theft.status, StatusCode::BAD_REQUEST);
+    assert_eq!(theft.json()["error"], "invalid_grant");
+
+    let owner = refresh_as(&harness, &refresh, &client_id, &key).await;
+    assert_eq!(
+        owner.status,
+        StatusCode::OK,
+        "the owner's token must survive a thief's attempt: {}",
+        owner.body
+    );
+}
+
+/// A spent refresh token presented again is theft made visible — one of the
+/// two holders is not the client — and the answer is to end the grant, not
+/// just refuse the replay: every token in the family is revoked, the live
+/// one included, so whichever holder was the thief has nothing left.
+#[tokio::test]
+async fn a_replayed_refresh_token_revokes_the_whole_grant() {
+    let harness = harness().await;
+    let (client_id, key, first) = a_refreshing_client(&harness).await;
+
+    let rotated = refresh_as(&harness, &first, &client_id, &key).await;
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    let second = rotated.json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let replay = refresh_as(&harness, &first, &client_id, &key).await;
+    assert_eq!(replay.status, StatusCode::BAD_REQUEST);
+    assert_eq!(replay.json()["error"], "invalid_grant");
+
+    let after = refresh_as(&harness, &second, &client_id, &key).await;
+    assert_eq!(
+        after.status,
+        StatusCode::BAD_REQUEST,
+        "the live token must die with the family: {}",
+        after.body
+    );
+    assert_eq!(after.json()["error"], "invalid_grant");
+}
+
+/// The code grant checks that the presenting client is the one the code was
+/// issued to; the refresh grant must too. The key binding makes this hard to
+/// exploit on its own, but a grant is a grant to one client, and a token
+/// endpoint that lets another client's id ride it is wrong on its face.
+#[tokio::test]
+async fn a_refresh_token_is_bound_to_the_client_it_was_issued_to() {
+    let harness = harness().await;
+    let (client_id, key, refresh) = a_refreshing_client(&harness).await;
+    let other_client = register(&harness).await;
+    assert_ne!(other_client, client_id);
+
+    let wrong = refresh_as(&harness, &refresh, &other_client, &key).await;
+    assert_eq!(wrong.status, StatusCode::BAD_REQUEST, "{}", wrong.body);
+    assert_eq!(wrong.json()["error"], "invalid_grant");
+
+    // And the attempt did not cost the real client its token.
+    let right = refresh_as(&harness, &refresh, &client_id, &key).await;
+    assert_eq!(right.status, StatusCode::OK, "{}", right.body);
+}
+
 #[tokio::test]
 async fn a_refresh_token_cannot_be_used_by_a_different_key() {
     // Theft of the refresh token alone must not be enough.

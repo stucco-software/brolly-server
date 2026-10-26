@@ -2,6 +2,7 @@
 
 use brolly_identity::db::{DbError, generate_secret, hash_secret};
 use sqlx::PgPool;
+use time::{Duration, OffsetDateTime};
 use uuid::Uuid;
 
 use super::keys::ProviderKey;
@@ -146,6 +147,35 @@ pub async fn code_was_used(pool: &PgPool, code: &str) -> Result<bool, DbError> {
     Ok(matches!(row, Some((true,))))
 }
 
+/// How long one refresh token is good for, unused. Rotation issues a fresh
+/// one with a fresh window — bounded by the family's absolute lifetime.
+pub const REFRESH_TOKEN_LIFETIME: Duration = Duration::days(30);
+
+/// How long a grant lives from the day it was made, however often it is
+/// refreshed. Rotation alone would make a grant immortal — each replacement
+/// starts a fresh sliding window — so the family carries one absolute date,
+/// copied forward through every rotation, past which no replacement is
+/// issued and none is accepted.
+pub const REFRESH_GRANT_LIFETIME: Duration = Duration::days(90);
+
+/// What a refresh token inherits: the family it belongs to — the grant it
+/// descends from through rotation — and when that grant ends for good.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Lineage {
+    pub family: Uuid,
+    pub grant_expires_at: OffsetDateTime,
+}
+
+impl Lineage {
+    /// A new grant: its own family, the full lifetime ahead of it.
+    pub fn fresh() -> Self {
+        Lineage {
+            family: Uuid::new_v4(),
+            grant_expires_at: OffsetDateTime::now_utc() + REFRESH_GRANT_LIFETIME,
+        }
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct RefreshGrant {
     pub client_id: String,
@@ -153,8 +183,22 @@ pub struct RefreshGrant {
     pub webid: String,
     pub scope: String,
     pub dpop_jkt: Option<String>,
+    pub family: Uuid,
+    pub grant_expires_at: OffsetDateTime,
 }
 
+impl RefreshGrant {
+    /// What a replacement for this token inherits.
+    pub fn lineage(&self) -> Lineage {
+        Lineage {
+            family: self.family,
+            grant_expires_at: self.grant_expires_at,
+        }
+    }
+}
+
+/// Mint a refresh token in `lineage`'s family. Its own expiry is the sliding
+/// window or the family's end, whichever is sooner.
 pub async fn issue_refresh(
     pool: &PgPool,
     client_id: &str,
@@ -162,12 +206,14 @@ pub async fn issue_refresh(
     webid: &str,
     scope: &str,
     dpop_jkt: Option<&str>,
+    lineage: &Lineage,
 ) -> Result<String, DbError> {
     let token = generate_secret();
     sqlx::query(
         "INSERT INTO solid_refresh_tokens
-           (token_hash, client_id, user_id, webid, scope, dpop_jkt, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now() + interval '30 days')",
+           (token_hash, client_id, user_id, webid, scope, dpop_jkt,
+            family, grant_expires_at, expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, LEAST(now() + $9, $8))",
     )
     .bind(hash_secret(&token))
     .bind(client_id)
@@ -175,25 +221,94 @@ pub async fn issue_refresh(
     .bind(webid)
     .bind(scope)
     .bind(dpop_jkt)
+    .bind(lineage.family)
+    .bind(lineage.grant_expires_at)
+    .bind(REFRESH_TOKEN_LIFETIME)
     .execute(pool)
     .await?;
     Ok(token)
 }
 
+/// What presenting a refresh token came to.
+#[derive(Debug, Clone)]
+pub enum Rotation {
+    /// Spent, and its grant is the caller's to replace.
+    Rotated(RefreshGrant),
+    /// Already spent — and now its whole family is revoked. One of the two
+    /// holders of a rotated token is not the client; ending the grant is the
+    /// answer, not just refusing the replay.
+    Replayed,
+    /// Unknown, expired, past its grant's end, another client's, or bound to
+    /// another key. Nothing was spent: a thief with the token but not the
+    /// key must not be able to log the owner out by trying.
+    Refused,
+}
+
 /// Redeem and revoke a refresh token in one statement.
 ///
-/// Rotation: the old token is spent by the act of using it, so a stolen refresh
-/// token and the legitimate one cannot both keep working — whichever is used
-/// second fails, which is how theft becomes visible.
-pub async fn rotate_refresh(pool: &PgPool, token: &str) -> Result<Option<RefreshGrant>, DbError> {
-    Ok(sqlx::query_as::<_, RefreshGrant>(
+/// Rotation: the old token is spent by the act of using it, so a stolen
+/// refresh token and the legitimate one cannot both keep working — whichever
+/// is used second fails, which is how theft becomes visible. The client and
+/// the key are part of the `WHERE`, not checked afterwards: a token presented
+/// by the wrong client or the wrong key is not spent, so the attempt costs its
+/// owner nothing.
+pub async fn rotate_refresh(
+    pool: &PgPool,
+    token: &str,
+    client_id: &str,
+    dpop_jkt: Option<&str>,
+) -> Result<Rotation, DbError> {
+    let hash = hash_secret(token);
+    let rotated = sqlx::query_as::<_, RefreshGrant>(
         "UPDATE solid_refresh_tokens SET revoked_at = now()
-         WHERE token_hash = $1 AND revoked_at IS NULL AND expires_at > now()
-         RETURNING client_id, user_id, webid, scope, dpop_jkt",
+         WHERE token_hash = $1
+           AND revoked_at IS NULL
+           AND expires_at > now()
+           AND grant_expires_at > now()
+           AND client_id = $2
+           AND dpop_jkt IS NOT DISTINCT FROM $3
+         RETURNING client_id, user_id, webid, scope, dpop_jkt, family, grant_expires_at",
     )
-    .bind(hash_secret(token))
+    .bind(&hash)
+    .bind(client_id)
+    .bind(dpop_jkt)
     .fetch_optional(pool)
-    .await?)
+    .await?;
+    if let Some(grant) = rotated {
+        return Ok(Rotation::Rotated(grant));
+    }
+
+    // Not rotated. A replay — this exact token, already spent, by the client
+    // and key it belongs to — ends the family. Anything else is refused and
+    // leaves the family alone: a wrong key or a wrong client is not evidence
+    // that the right one's token has leaked, only that someone tried.
+    sqlx::query(
+        "UPDATE solid_refresh_tokens SET revoked_at = now()
+         WHERE family = (SELECT family FROM solid_refresh_tokens
+                          WHERE token_hash = $1 AND revoked_at IS NOT NULL
+                            AND client_id = $2 AND dpop_jkt IS NOT DISTINCT FROM $3)
+           AND revoked_at IS NULL",
+    )
+    .bind(&hash)
+    .bind(client_id)
+    .bind(dpop_jkt)
+    .execute(pool)
+    .await?;
+    let spent_before = sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM solid_refresh_tokens
+                        WHERE token_hash = $1 AND revoked_at IS NOT NULL
+                          AND client_id = $2 AND dpop_jkt IS NOT DISTINCT FROM $3)",
+    )
+    .bind(&hash)
+    .bind(client_id)
+    .bind(dpop_jkt)
+    .fetch_one(pool)
+    .await?;
+    Ok(if spent_before {
+        Rotation::Replayed
+    } else {
+        Rotation::Refused
+    })
 }
 
 /// Revoke every refresh token for a user — used when a grant is withdrawn.

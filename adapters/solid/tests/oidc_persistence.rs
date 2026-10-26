@@ -236,24 +236,59 @@ async fn a_refresh_token_is_spent_by_using_it() {
         "https://alice.brolly.id/profile#me",
         "openid webid offline_access",
         Some("jkt-abc"),
+        &store::Lineage::fresh(),
     )
     .await
     .expect("issue refresh");
 
-    let grant = store::rotate_refresh(&pool, &token)
-        .await
-        .expect("rotate")
-        .expect("a fresh refresh token rotates");
+    let store::Rotation::Rotated(grant) =
+        store::rotate_refresh(&pool, &token, &client_id, Some("jkt-abc"))
+            .await
+            .expect("rotate")
+    else {
+        panic!("a fresh refresh token rotates");
+    };
     assert_eq!(grant.user_id, user);
     assert_eq!(grant.scope, "openid webid offline_access");
     assert_eq!(grant.dpop_jkt.as_deref(), Some("jkt-abc"));
 
     assert!(
-        store::rotate_refresh(&pool, &token)
-            .await
-            .expect("second rotate")
-            .is_none(),
+        matches!(
+            store::rotate_refresh(&pool, &token, &client_id, Some("jkt-abc"))
+                .await
+                .expect("second rotate"),
+            store::Rotation::Replayed
+        ),
         "rotation is what makes refresh-token theft visible; the old token must die"
+    );
+}
+
+#[tokio::test]
+async fn a_grant_ends_on_its_absolute_date_however_often_it_is_refreshed() {
+    // Rotation alone would make a grant immortal: each replacement starts a
+    // fresh sliding window. The family's absolute date is copied forward, and
+    // a token issued past it — or whose window would reach past it — is not
+    // accepted.
+    let (_db, pool) = fresh().await;
+    let user = a_user(&pool, "alice").await;
+    let client_id = a_client(&pool).await;
+
+    let ended = store::Lineage {
+        family: Uuid::new_v4(),
+        grant_expires_at: time::OffsetDateTime::now_utc() - time::Duration::seconds(1),
+    };
+    let token = store::issue_refresh(&pool, &client_id, user, "webid-a", "openid", None, &ended)
+        .await
+        .expect("issue");
+
+    assert!(
+        matches!(
+            store::rotate_refresh(&pool, &token, &client_id, None)
+                .await
+                .expect("rotate"),
+            store::Rotation::Refused
+        ),
+        "a token in a family past its end is refused, not rotated"
     );
 }
 
@@ -264,15 +299,39 @@ async fn withdrawing_a_grant_revokes_every_refresh_token_for_that_user() {
     let bob = a_user(&pool, "bob").await;
     let client_id = a_client(&pool).await;
 
-    let alice_one = store::issue_refresh(&pool, &client_id, alice, "webid-a", "openid", None)
-        .await
-        .expect("issue");
-    let alice_two = store::issue_refresh(&pool, &client_id, alice, "webid-a", "openid", None)
-        .await
-        .expect("issue");
-    let bobs = store::issue_refresh(&pool, &client_id, bob, "webid-b", "openid", None)
-        .await
-        .expect("issue");
+    let alice_one = store::issue_refresh(
+        &pool,
+        &client_id,
+        alice,
+        "webid-a",
+        "openid",
+        None,
+        &store::Lineage::fresh(),
+    )
+    .await
+    .expect("issue");
+    let alice_two = store::issue_refresh(
+        &pool,
+        &client_id,
+        alice,
+        "webid-a",
+        "openid",
+        None,
+        &store::Lineage::fresh(),
+    )
+    .await
+    .expect("issue");
+    let bobs = store::issue_refresh(
+        &pool,
+        &client_id,
+        bob,
+        "webid-b",
+        "openid",
+        None,
+        &store::Lineage::fresh(),
+    )
+    .await
+    .expect("issue");
 
     let revoked = store::revoke_all_for_user(&pool, alice)
         .await
@@ -281,18 +340,22 @@ async fn withdrawing_a_grant_revokes_every_refresh_token_for_that_user() {
 
     for token in [&alice_one, &alice_two] {
         assert!(
-            store::rotate_refresh(&pool, token)
-                .await
-                .expect("rotate")
-                .is_none(),
+            !matches!(
+                store::rotate_refresh(&pool, token, &client_id, None)
+                    .await
+                    .expect("rotate"),
+                store::Rotation::Rotated(_)
+            ),
             "a withdrawn grant must not still refresh"
         );
     }
     assert!(
-        store::rotate_refresh(&pool, &bobs)
-            .await
-            .expect("rotate")
-            .is_some(),
+        matches!(
+            store::rotate_refresh(&pool, &bobs, &client_id, None)
+                .await
+                .expect("rotate"),
+            store::Rotation::Rotated(_)
+        ),
         "one user's revocation must not touch another's"
     );
 }
@@ -305,9 +368,17 @@ async fn deleting_a_user_takes_their_grants_with_them() {
     let user = a_user(&pool, "alice").await;
     let client_id = a_client(&pool).await;
 
-    store::issue_refresh(&pool, &client_id, user, "webid", "openid", None)
-        .await
-        .expect("issue");
+    store::issue_refresh(
+        &pool,
+        &client_id,
+        user,
+        "webid",
+        "openid",
+        None,
+        &store::Lineage::fresh(),
+    )
+    .await
+    .expect("issue");
     store::issue_code(
         &pool,
         &client_id,
