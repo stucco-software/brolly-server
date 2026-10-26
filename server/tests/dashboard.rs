@@ -594,6 +594,36 @@ async fn the_apps_page_lists_what_the_member_has_authorised() {
     );
 }
 
+/// The security page says "Other sessions have been signed out" after a
+/// password change. An authorised Solid app holds a session too — a refresh
+/// token that outlives any browser — and it must end with the rest, or the
+/// page is lying about the one thing a member changing a compromised
+/// password most needs to be true.
+#[tokio::test]
+async fn changing_a_password_ends_the_solid_apps_too() {
+    let h = harness().await;
+    let cookie = h.login().await;
+    an_authorised_app(&h, &cookie, "Notes App").await;
+    let before = h.get("/account/apps", Some(&cookie)).await;
+    assert!(before.body.contains("Notes App"), "{}", before.body);
+
+    let reply = h
+        .post(
+            "/account/security",
+            &format!("current_password={PASSWORD}&new_password=an-entirely-new-password"),
+            Some(&cookie),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{}", reply.body);
+
+    let after = h.get("/account/apps", Some(&cookie)).await;
+    assert!(
+        !after.body.contains("Notes App"),
+        "the app's grant must end with the password: {}",
+        after.body
+    );
+}
+
 #[tokio::test]
 async fn revoking_an_app_stops_it_refreshing() {
     // The consent screen promises "you can revoke this at any time from your

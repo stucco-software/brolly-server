@@ -353,6 +353,18 @@ pub async fn change_password(
             {
                 tracing::error!(error = %e, "revoking ATProto legacy sessions failed after a password change");
             }
+            // And the Solid apps and the Mastodon clients: a refresh token or
+            // a bearer is a session that outlives any browser, and the page
+            // promises the others have ended. Both functions existed with no
+            // caller here.
+            if let Err(e) = oidc_store::revoke_all_for_user(&state.pool, session.user.id).await {
+                tracing::error!(error = %e, "revoking Solid app grants failed after a password change");
+            }
+            if let Err(e) =
+                brolly_mastodon::oauth::revoke_all_for_user(&state.pool, session.user.id).await
+            {
+                tracing::error!(error = %e, "revoking Mastodon client tokens failed after a password change");
+            }
             Redirect::to("/account/security?saved=true").into_response()
         }
         Err(DbError::BadCredentials) => (

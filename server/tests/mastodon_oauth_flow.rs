@@ -336,6 +336,44 @@ async fn a_client_gets_a_working_bearer_token() {
     assert_eq!(grant.scopes, "read write");
 }
 
+/// A Mastodon client's bearer token is a session like any other, and the
+/// password-change page promises to end the others. It must.
+#[tokio::test]
+async fn changing_a_password_ends_the_mastodon_clients_too() {
+    let h = harness().await;
+    let bearer = a_bearer_token(&h).await;
+    let verify = || {
+        builder("GET", "/api/v1/accounts/verify_credentials")
+            .header(header::AUTHORIZATION, format!("Bearer {bearer}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+    assert_eq!(send(&h, verify()).await.status, StatusCode::OK);
+
+    let login = post_form(
+        &h,
+        "/login",
+        "username=alice&password=correct-horse-battery-staple",
+        None,
+    )
+    .await;
+    let cookie = login.cookies[0].split(';').next().unwrap().to_string();
+    let changed = post_form(
+        &h,
+        "/account/security",
+        "current_password=correct-horse-battery-staple&new_password=an-entirely-new-password",
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(changed.status, StatusCode::SEE_OTHER, "{}", changed.body);
+
+    assert_eq!(
+        send(&h, verify()).await.status,
+        StatusCode::UNAUTHORIZED,
+        "the client's token must end with the password"
+    );
+}
+
 #[tokio::test]
 async fn the_token_response_has_the_shape_clients_parse() {
     let h = harness().await;
