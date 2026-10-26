@@ -549,6 +549,48 @@ async fn account_creation_from_one_address_is_limited_across_both_surfaces() {
     assert_eq!(status, StatusCode::SEE_OTHER);
 }
 
+/// A browser names where a POST came from, and a form post from any origin
+/// but ours is refused before the handler runs — whatever the cookie says.
+/// `SameSite=Lax` keeps the session cookie off a cross-*site* post, but a
+/// member's own subdomain is same-site with the apex, so the day a member
+/// can serve a document is the day Lax stops being a defence. This is the
+/// defence that does not depend on that day never coming.
+#[tokio::test]
+async fn a_form_post_from_another_origin_is_refused() {
+    let (db, _dir, router) = harness().await;
+    db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let login = |origin: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri("/login")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::ORIGIN, origin)
+            .body(Body::from("username=alice&password=correct-horse-battery"))
+            .unwrap()
+    };
+
+    let response = router
+        .clone()
+        .oneshot(login("https://evil.example"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    assert!(
+        response.headers().get(header::SET_COOKIE).is_none(),
+        "no session for a cross-origin post"
+    );
+
+    // Our own origin, as every browser sends it on a same-origin post.
+    let response = router
+        .clone()
+        .oneshot(login("https://brolly.test"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+}
+
 #[tokio::test]
 async fn login_succeeds_and_sets_a_session() {
     let (db, _dir, router) = harness().await;

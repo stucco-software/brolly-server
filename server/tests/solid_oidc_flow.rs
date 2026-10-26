@@ -638,6 +638,56 @@ async fn pkce_is_mandatory_and_plain_is_refused() {
     );
 }
 
+/// The consent decision is a form post from our own page and nowhere else:
+/// an Allow posted from another origin with the member's session is refused.
+/// The token endpoint, two routes over, is posted to by apps on other
+/// origins by design, and must not be caught by the same rule.
+#[tokio::test]
+async fn a_consent_decision_from_another_origin_is_refused_but_the_token_endpoint_is_not() {
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let cookie = a_logged_in_member(&harness).await;
+    let (_verifier, challenge) = pkce();
+
+    let consent = get(
+        &harness,
+        &authorize_url(&client_id, &challenge),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(consent.status, StatusCode::OK, "{}", consent.body);
+    let token = request_token(&consent.body);
+
+    let decision = send(
+        &harness,
+        builder("POST", "/oauth/solid/authorize")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::COOKIE, &cookie)
+            .header(header::ORIGIN, "https://evil.example")
+            .body(Body::from(format!(
+                "request={}&decision=allow",
+                urlencode(&token)
+            )))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(decision.status, StatusCode::FORBIDDEN, "{}", decision.body);
+    assert!(decision.location.is_none(), "no code was issued");
+
+    // The token endpoint answers a cross-origin caller on the merits of the
+    // request — here, a bad one — not with a refusal to look.
+    let redeem = send(
+        &harness,
+        builder("POST", "/oauth/solid/token")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::ORIGIN, "https://app.example")
+            .body(Body::from("grant_type=authorization_code&code=nope"))
+            .unwrap(),
+    )
+    .await;
+    assert_ne!(redeem.status, StatusCode::FORBIDDEN, "{}", redeem.body);
+}
+
 #[tokio::test]
 async fn consent_names_the_app_and_the_member() {
     let harness = harness().await;

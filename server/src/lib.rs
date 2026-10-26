@@ -378,6 +378,76 @@ async fn security_headers(
     response
 }
 
+/// The paths a browser posts the instance's own forms to. Every one of them
+/// is a page the instance renders, acted on with the session cookie, and a
+/// post to any of them from another origin is refused by [`same_origin`]
+/// before the handler runs. `server/tests/ui_invariants.rs` checks that every
+/// `<form method="post">` in the templates lands here.
+///
+/// Not on the list, deliberately: the OAuth token, PAR and registration
+/// endpoints, `/api/accounts`, the Mastodon client API, XRPC, and the pod —
+/// all posted to from other origins by design, and none acted on with a
+/// cookie.
+pub const SAME_ORIGIN_FORMS: &[&str] = &[
+    "/login",
+    "/register",
+    "/logout",
+    "/account/profile",
+    "/account/security",
+    "/account/apps",
+    "/account/delete",
+    // The three consent decisions (ADR 0011): one screen, three callers.
+    "/oauth/solid/authorize",
+    "/oauth/authorize",
+    "/oauth/atproto/authorize",
+];
+
+/// A form post from any origin but ours is refused.
+///
+/// `SameSite=Lax` keeps the session cookie off a cross-*site* post, and that
+/// is the defence the forms have leaned on. It leans on a fact about the
+/// deployment, not the request: `alice.<apex>` is same-site with the apex, so
+/// the day a member can serve a document that submits a form — one
+/// allow-list change — is the day Lax stops being a defence for the delete
+/// button and the consent screen. This is the defence that does not depend
+/// on that day never coming.
+///
+/// A browser names where a post came from in `Origin`, and every browser
+/// sends it on a cross-origin post. When it is present it must be our apex
+/// origin — `null`, which a sandboxed frame or a privacy mode sends, is not
+/// ours. Absent, `Referer` is read the same way. Absent both, the post is let
+/// through: no browser omits both on a cross-origin post, so what is left is
+/// a same-origin post from an old browser, or a client that is not one.
+async fn same_origin(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    if request.method() == axum::http::Method::POST
+        && SAME_ORIGIN_FORMS.contains(&request.uri().path())
+    {
+        let ours = format!("https://{}", state.base_domain);
+        let headers = request.headers();
+        let from = headers
+            .get(header::ORIGIN)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .or_else(|| {
+                headers
+                    .get(header::REFERER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|r| url::Url::parse(r).ok())
+                    .map(|u| u.origin().ascii_serialization())
+            });
+        if let Some(from) = from
+            && from != ours
+        {
+            return (StatusCode::FORBIDDEN, "cross-origin form post refused").into_response();
+        }
+    }
+    next.run(request).await
+}
+
 /// Resolve the caller's address once per request, for the handlers that rate
 /// limit on it (`ratelimit::client_key`): the proxy's word when there is a
 /// proxy, the peer when `main` served with connect info, a shared key
@@ -676,6 +746,11 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // application is how a header ends up missing on the one route that
         // matters, and the cost of the redundant cases is zero.
         .layer(axum::middleware::from_fn(security_headers))
+        // Form posts come from our own pages or not at all.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            same_origin,
+        ))
         // The caller's address for the door's rate limits, resolved once.
         .layer(axum::middleware::from_fn(client_address))
         // Outermost, so it covers the OAuth sub-router and the fallback too —

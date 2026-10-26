@@ -157,6 +157,79 @@ fn the_token_file_is_never_hand_edited() {
     );
 }
 
+/**
+ * Every form the templates post is on the same-origin list.
+ *
+ * `same_origin` refuses a cross-origin post to the paths in
+ * `SAME_ORIGIN_FORMS`, and nothing else. A form whose action is not on the
+ * list is a form the check silently does not cover — which is the failure
+ * mode of every allow-list. Literal actions are read off the templates;
+ * the dynamic ones (`{{ action }}`: the login form's `next`-carrying action,
+ * and the consent screen's per-protocol decision endpoint) are pinned by
+ * name, so a renamed route fails here rather than in production.
+ */
+#[test]
+fn every_form_post_is_same_origin_checked() {
+    let list = brolly_server::SAME_ORIGIN_FORMS;
+    // Every template, partials included: the nav partials carry the logout
+    // form, and `collect_templates` skips them for the page-level checks.
+    fn every_html(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).expect("templates dir").flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                every_html(&path, out);
+            } else if path.extension().is_some_and(|e| e == "html") {
+                out.push(path);
+            }
+        }
+    }
+    let mut templates = Vec::new();
+    every_html(&workspace_root().join("server/templates"), &mut templates);
+
+    let mut seen = 0;
+    for path in &templates {
+        let text = std::fs::read_to_string(path).expect("read template");
+        for line in text
+            .lines()
+            .filter(|l| l.contains("<form") && l.contains(r#"method="post""#))
+        {
+            seen += 1;
+            let action = line
+                .split(r#"action=""#)
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .unwrap_or_else(|| {
+                    panic!("{}: a post form without an action: {line}", path.display())
+                });
+            if action.starts_with("{{") {
+                continue;
+            }
+            assert!(
+                list.contains(&action),
+                "{}: form action {action} is not in SAME_ORIGIN_FORMS",
+                path.display()
+            );
+        }
+    }
+    assert!(
+        seen >= 8,
+        "expected the door, consent, dashboard and both nav forms, found {seen}"
+    );
+
+    for dynamic in [
+        "/login",
+        "/register",
+        "/oauth/solid/authorize",
+        "/oauth/authorize",
+        "/oauth/atproto/authorize",
+    ] {
+        assert!(
+            list.contains(&dynamic),
+            "{dynamic} is rendered as a form action and must be listed"
+        );
+    }
+}
+
 #[test]
 fn components_use_tokens_not_literal_colors() {
     // Literal colours belong in batklubb.config.js, which generates tokens.css.

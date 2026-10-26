@@ -737,6 +737,35 @@ async fn deleting_an_account_requires_typing_the_username() {
     );
 }
 
+/// The one irreversible button, posted from somewhere else with the member's
+/// own session: refused, and the account is still there.
+#[tokio::test]
+async fn deleting_an_account_from_another_origin_is_refused() {
+    let h = harness().await;
+    let cookie = h.login().await;
+
+    let reply = h
+        .send(
+            Request::builder()
+                .method("POST")
+                .uri("/account/delete")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, &cookie)
+                .header(header::ORIGIN, "https://evil.example")
+                .body(Body::from("confirm=alice"))
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN);
+    assert!(
+        db::find_by_username(&h.db.pool, "alice")
+            .await
+            .unwrap()
+            .is_some(),
+        "the account must survive a cross-origin post"
+    );
+}
+
 #[tokio::test]
 async fn deleting_an_account_removes_the_user_and_the_pod() {
     let h = harness().await;
