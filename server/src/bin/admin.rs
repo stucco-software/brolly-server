@@ -22,6 +22,7 @@ USAGE:
     brolly-admin plc-retry [--dry-run]
     brolly-admin blob-sweep [--apply]
     brolly-admin whoami <username>
+    brolly-admin quota <username> [<size>|default]
 
 COMMANDS:
     invite       Mint an invite code and print it. The code is shown once;
@@ -37,11 +38,16 @@ COMMANDS:
                  H7). Read-only without it. Runs with the server STOPPED:
                  a running server holds the stores' locks.
     whoami       Print what a member's identity resolves to.
+    quota        Print a member's quota, or set it: a size like 5G, 512M
+                 or 1.5G (binary units; plain digits are bytes), or the
+                 word default to clear the override. The instance default
+                 is BROLLY_POD_QUOTA_BYTES, read here as the server reads it.
 
 ENVIRONMENT:
-    DATABASE_URL          required
-    BROLLY_BASE_DOMAIN    defaults to brolly.test
-    BROLLY_DATA_DIR       blob-sweep only; defaults to data, as the server does
+    DATABASE_URL            required
+    BROLLY_BASE_DOMAIN      defaults to brolly.test
+    BROLLY_DATA_DIR         blob-sweep only; defaults to data, as the server does
+    BROLLY_POD_QUOTA_BYTES  quota only; the instance default, as the server reads it
 ";
 
 #[tokio::main]
@@ -91,6 +97,7 @@ async fn main() -> ExitCode {
         "plc-retry" => plc_retry(&pool, &args).await,
         "blob-sweep" => blob_sweep(&pool, &args).await,
         "whoami" => whoami(&pool, &base_domain, &args).await,
+        "quota" => quota(&pool, &args).await,
         other => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             ExitCode::FAILURE
@@ -218,6 +225,85 @@ async fn set_role(pool: &sqlx::PgPool, args: &[String], role: &str) -> ExitCode 
             ExitCode::FAILURE
         }
     }
+}
+
+/// `quota <username>` prints; `quota <username> <size>` sets; `quota
+/// <username> default` clears. The CLI is the database, not a person, so
+/// the setter is recorded as nobody. The instance default is read as the
+/// server reads it, so the readback names the number the writes use.
+async fn quota(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
+    let Some(username) = args.get(1) else {
+        eprintln!("usage: brolly-admin quota <username> [<size>|default]");
+        return ExitCode::FAILURE;
+    };
+    let user = match brolly_identity::db::find_by_username(pool, username).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            eprintln!("no such member: {username}");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("lookup failed: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    enum Change {
+        Print,
+        Clear,
+        Set(i64),
+    }
+    let change = match args.get(2).map(String::as_str) {
+        None => Change::Print,
+        Some("default") => Change::Clear,
+        Some(size) => match brolly_domain::media::parse_size(size) {
+            Ok(bytes) => Change::Set(i64::try_from(bytes).unwrap_or(i64::MAX)),
+            Err(e) => {
+                eprintln!("{size}: {e}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let quota_bytes = match change {
+        Change::Print => None,
+        Change::Clear => Some(None),
+        Change::Set(bytes) => Some(Some(bytes)),
+    };
+    if let Some(quota_bytes) = quota_bytes
+        && let Err(e) = brolly_identity::db::set_quota(pool, user.id, quota_bytes, None).await
+    {
+        eprintln!("could not set the quota: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    // Read back rather than echo: what is printed is what is stored.
+    let instance_default = std::env::var("BROLLY_POD_QUOTA_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(brolly_domain::media::DEFAULT_POD_QUOTA_BYTES);
+    let (user, provenance) = match (
+        brolly_identity::db::find_by_username(pool, username).await,
+        brolly_identity::db::quota_provenance(pool, user.id).await,
+    ) {
+        (Ok(Some(user)), Ok(provenance)) => (user, provenance),
+        (Err(e), _) | (_, Err(e)) => {
+            eprintln!("readback failed: {e}");
+            return ExitCode::FAILURE;
+        }
+        (Ok(None), _) => {
+            eprintln!("no such member: {username}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let origin = match provenance {
+        Some(p) => format!("set {}", p.set_at.date()),
+        None => "instance default".to_string(),
+    };
+    println!(
+        "@{username}: {} ({origin})",
+        brolly_domain::media::format_size(user.quota(instance_default))
+    );
+    ExitCode::SUCCESS
 }
 
 async fn plc_retry(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {

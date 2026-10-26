@@ -178,6 +178,7 @@ brolly-admin invite --uses 5            # ordinary invites
 brolly-admin invite --admin             # hands someone else the instance
 brolly-admin promote <username>
 brolly-admin demote <username>          # refuses the last active admin
+brolly-admin quota <username> 5G        # a member's own quota; `default` clears it
 ```
 
 `brolly-admin invite --admin` is the one to reach for when handing an instance
