@@ -569,7 +569,7 @@ pub async fn upload_media(
     };
     // The pod's quota, the same one a Solid write is held to: same pod,
     // same disk, whichever protocol wrote.
-    if !crate::pod::within_quota(&state, user.id, bytes.len()) {
+    if !crate::pod::within_quota(&state, &user, bytes.len()) {
         return error(StatusCode::INSUFFICIENT_STORAGE, "The pod is at its quota");
     }
 

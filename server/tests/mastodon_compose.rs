@@ -316,6 +316,42 @@ async fn an_upload_past_the_pods_quota_is_refused() {
     );
 }
 
+/// The upload honours a member's override the way a Solid write does.
+#[tokio::test]
+async fn an_upload_honours_the_members_own_quota() {
+    let h = harness_sized(brolly_domain::media::MAX_UPLOAD_BYTES, 2 * 1024 * 1024).await;
+    let (user, token) = a_member(&h, "alice").await;
+    db::set_quota(&h.db.pool, user, Some(4 * 1024 * 1024), None)
+        .await
+        .unwrap();
+    let boundary = "----brollytest";
+    let big = || {
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.png\"\r\n\
+             Content-Type: image/png\r\n\r\n"
+        );
+        body.push_str(&"x".repeat(1024 * 1024));
+        body.push_str(&format!("\r\n--{boundary}--\r\n"));
+        Request::builder()
+            .method("POST")
+            .uri("/api/v1/media")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header(
+                header::CONTENT_TYPE,
+                format!("multipart/form-data; boundary={boundary}"),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    };
+
+    // Two mebibytes would have been one too many under the instance default.
+    let first = send(&h, big()).await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.body);
+    let second = send(&h, big()).await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.body);
+}
+
 #[tokio::test]
 async fn an_uploaded_image_reaches_the_post() {
     // The defect exactly: upload worked, the post had no image, nothing said so.

@@ -189,22 +189,24 @@ fn well_formed_path(decoded: &str, raw: &str, base: &str) -> Result<(), &'static
 
 /// Does the pod have room for `incoming` more bytes under its quota?
 ///
-/// Measured, not tracked: the pod's directory on disk — store and blobs
-/// together — is the one number that cannot drift from what the member
-/// actually holds, and a write that frees space makes room again without
-/// bookkeeping. One directory walk per write is the price; a pod is a
-/// handful of store files and one file per blob. Conservative on a replace:
-/// the incoming bytes count in full even where they displace old ones.
+/// The quota is the member's: an admin's override if one is set, else the
+/// instance default — `User::quota` decides, and the row is the one every
+/// write handler already loaded, so this costs no query. Measured, not
+/// tracked: the pod's directory on disk — store and blobs together — is
+/// the one number that cannot drift from what the member actually holds,
+/// and a write that frees space makes room again without bookkeeping.
+/// Conservative on a replace: the incoming bytes count in full even where
+/// they displace old ones.
 ///
 /// Fails open. A pod whose size cannot be read is an operational fault to
 /// log loudly, not a reason to refuse a member their own write — the quota
 /// bounds what one grant can cost the instance; it is not the thing that
 /// keeps the instance up.
-pub(crate) fn within_quota(state: &AppState, user: uuid::Uuid, incoming: usize) -> bool {
-    match state.stores.pod_bytes(user) {
-        Ok(used) => used.saturating_add(incoming as u64) <= state.pod_quota_bytes,
+pub(crate) fn within_quota(state: &AppState, user: &User, incoming: usize) -> bool {
+    match state.stores.pod_bytes(user.id) {
+        Ok(used) => used.saturating_add(incoming as u64) <= user.quota(state.pod_quota_bytes),
         Err(e) => {
-            tracing::error!(error = %e, user = %user, "could not measure the pod for its quota");
+            tracing::error!(error = %e, user = %user.id, "could not measure the pod for its quota");
             true
         }
     }
@@ -1459,7 +1461,7 @@ pub async fn put(
     };
     // The quota, before the body is parsed or a lock is taken: a write the
     // pod has no room for is refused as cheaply as a 404.
-    if !within_quota(&state, request.user.id, body.len()) {
+    if !within_quota(&state, &request.user, body.len()) {
         return quota_exceeded();
     }
     let Some(content_type) = content_type(&headers, &body, true) else {
@@ -1533,7 +1535,7 @@ pub async fn post(
     };
     // The quota, before the body is parsed or a lock is taken: a write the
     // pod has no room for is refused as cheaply as a 404.
-    if !within_quota(&state, request.user.id, body.len()) {
+    if !within_quota(&state, &request.user, body.len()) {
         return quota_exceeded();
     }
     let Some(content_type) = content_type(&headers, &body, true) else {
@@ -1608,7 +1610,7 @@ pub async fn patch(
     };
     // The quota, before the body is parsed or a lock is taken: a write the
     // pod has no room for is refused as cheaply as a 404.
-    if !within_quota(&state, request.user.id, body.len()) {
+    if !within_quota(&state, &request.user, body.len()) {
         return quota_exceeded();
     }
     let Some(content_type) = content_type(&headers, &body, false) else {

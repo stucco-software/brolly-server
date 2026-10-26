@@ -895,6 +895,48 @@ async fn a_pod_refuses_a_write_past_its_quota() {
     assert_eq!(status, StatusCode::CREATED, "{body}");
 }
 
+/// An admin's override is the member's quota, not the instance's number.
+/// Set directly in the database here — the console and the CLI are later
+/// chunks — and read by the write path off the row it already loads.
+#[tokio::test]
+async fn a_members_own_quota_overrides_the_instance_default() {
+    let h = harness_sized(brolly_domain::media::MAX_UPLOAD_BYTES, 2 * 1024 * 1024).await;
+    db::set_quota(&h._db.pool, h.user, Some(4 * 1024 * 1024), None)
+        .await
+        .unwrap();
+    let mebibyte = "x".repeat(1024 * 1024);
+
+    // Three mebibytes fit under four where the instance default is two.
+    for name in ["one", "two", "three"] {
+        let (status, body, _) = h
+            .send(
+                "PUT",
+                &format!("/~/{name}.pdf"),
+                Some(("application/pdf", &mebibyte)),
+                true,
+            )
+            .await;
+        assert_eq!(status, StatusCode::CREATED, "{name}: {body}");
+    }
+
+    // Lowered below what the pod holds: an add is refused, a delete is not,
+    // and the delete is how the member gets back under.
+    db::set_quota(&h._db.pool, h.user, Some(1024 * 1024), None)
+        .await
+        .unwrap();
+    let (status, _, _) = h
+        .send(
+            "PUT",
+            "/~/four.pdf",
+            Some(("application/pdf", &mebibyte)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::INSUFFICIENT_STORAGE);
+    let (status, _, _) = h.send("DELETE", "/~/one.pdf", None, true).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "a delete always runs");
+}
+
 /// Nothing served by the instance may be framed, and a referrer leaves the
 /// instance with its origin only. One layer, every response, for the same
 /// reason as `nosniff`: the consent screen — rendered inside somebody else's

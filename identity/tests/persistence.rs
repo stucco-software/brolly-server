@@ -372,3 +372,128 @@ async fn a_member_is_findable_by_their_primary_key() {
         "an id we never issued must not resolve to anyone"
     );
 }
+
+// --- quotas -----------------------------------------------------------------
+
+#[tokio::test]
+async fn a_quota_override_round_trips_and_clears() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(&pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    assert_eq!(alice.quota_bytes, None, "a new member has no override");
+    assert_eq!(alice.quota(1 << 30), 1 << 30, "so the default applies");
+
+    db::set_quota(&pool, alice.id, Some(5 << 30), None)
+        .await
+        .unwrap();
+    let alice = db::find_by_username(&pool, "alice").await.unwrap().unwrap();
+    assert_eq!(alice.quota_bytes, Some(5 << 30));
+    assert_eq!(alice.quota(1 << 30), 5 << 30, "the override wins");
+
+    // Every path that loads a User carries it.
+    assert_eq!(
+        db::find_by_id(&pool, alice.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        Some(5 << 30)
+    );
+    let token = db::create_session(&pool, alice.id, time::Duration::hours(1), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        db::user_for_session(&pool, &token)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        Some(5 << 30)
+    );
+
+    db::set_quota(&pool, alice.id, None, None).await.unwrap();
+    let alice = db::find_by_username(&pool, "alice").await.unwrap().unwrap();
+    assert_eq!(alice.quota_bytes, None, "cleared");
+    assert_eq!(alice.quota(1 << 30), 1 << 30);
+}
+
+#[tokio::test]
+async fn provenance_names_the_console_admin_and_not_the_cli() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(&pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let keeper = db::create_user(&pool, "keeper", None, "correct-horse-battery", "admin")
+        .await
+        .unwrap();
+
+    assert!(
+        db::quota_provenance(&pool, alice.id)
+            .await
+            .unwrap()
+            .is_none(),
+        "no override, no provenance"
+    );
+
+    db::set_quota(&pool, alice.id, Some(5 << 30), Some(keeper.id))
+        .await
+        .unwrap();
+    let by_console = db::quota_provenance(&pool, alice.id)
+        .await
+        .unwrap()
+        .expect("set");
+    assert_eq!(by_console.set_by.as_deref(), Some("keeper"));
+
+    db::set_quota(&pool, alice.id, Some(6 << 30), None)
+        .await
+        .unwrap();
+    let by_cli = db::quota_provenance(&pool, alice.id)
+        .await
+        .unwrap()
+        .expect("set");
+    assert_eq!(by_cli.set_by, None, "the CLI is the database, not a person");
+    assert!(by_cli.set_at >= by_console.set_at);
+}
+
+#[tokio::test]
+async fn deleting_the_admin_keeps_the_quota_and_loses_the_name() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(&pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let keeper = db::create_user(&pool, "keeper", None, "correct-horse-battery", "admin")
+        .await
+        .unwrap();
+    db::set_quota(&pool, alice.id, Some(5 << 30), Some(keeper.id))
+        .await
+        .unwrap();
+
+    db::delete_user(&pool, keeper.id).await.unwrap();
+
+    let alice = db::find_by_username(&pool, "alice").await.unwrap().unwrap();
+    assert_eq!(
+        alice.quota_bytes,
+        Some(5 << 30),
+        "ON DELETE SET NULL, not CASCADE"
+    );
+    let provenance = db::quota_provenance(&pool, alice.id)
+        .await
+        .unwrap()
+        .expect("still set");
+    assert_eq!(provenance.set_by, None);
+}
+
+#[tokio::test]
+async fn a_negative_quota_cannot_be_stored() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(&pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    assert!(
+        db::set_quota(&pool, alice.id, Some(-1), None)
+            .await
+            .is_err(),
+        "the CHECK refuses it; set_quota does not pretend otherwise"
+    );
+}

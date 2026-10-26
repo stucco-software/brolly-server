@@ -9,7 +9,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use atrium_api::types::string::Tid;
-use brolly_identity::db::{self, MIGRATOR};
+use brolly_identity::db::MIGRATOR;
 use sqlx::PgPool;
 
 /// Everything before the rev change. The full migrator then runs on top and
@@ -49,16 +49,19 @@ fn s32(mut value: i64) -> String {
 }
 
 async fn a_member(pool: &PgPool, username: &str, did: &str) -> uuid::Uuid {
-    let user = db::create_user(pool, username, None, "correct-horse-battery", "member")
-        .await
-        .unwrap();
-    sqlx::query("UPDATE users SET did_plc = $1 WHERE id = $2")
-        .bind(did)
-        .bind(user.id)
-        .execute(pool)
-        .await
-        .unwrap();
-    user.id
+    // By SQL, not `db::create_user`: that returns today's columns, which this
+    // pre-migration schema does not have.
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO users (id, username, password_hash, did_plc) VALUES ($1, $2, 'x', $3)",
+    )
+    .bind(id)
+    .bind(username)
+    .bind(did)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
 }
 
 async fn an_event(pool: &PgPool, did: &str, n: i64, rev: i64, created_at: &str) {

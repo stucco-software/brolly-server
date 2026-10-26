@@ -65,6 +65,9 @@ pub struct User {
     pub did_plc: Option<String>,
     pub role: String,
     pub status: String,
+    /// An admin's quota override in bytes, or `None` for the instance default.
+    /// Combined with the default by [`User::quota`] and nowhere else.
+    pub quota_bytes: Option<i64>,
 }
 
 impl User {
@@ -74,6 +77,40 @@ impl User {
     pub fn is_active(&self) -> bool {
         self.status == "active"
     }
+    /// The member's quota: an admin's override if there is one, else the
+    /// instance default. The only place the two are combined. A stored
+    /// value is never negative (the column's `CHECK`); the conversion
+    /// saturates at zero regardless, so this is total.
+    pub fn quota(&self, instance_default: u64) -> u64 {
+        match self.quota_bytes {
+            Some(bytes) => u64::try_from(bytes).unwrap_or(0),
+            None => instance_default,
+        }
+    }
+}
+
+/// The columns a `User` is read from, in `FromRow` order. One list, used by
+/// every query that produces a `User`: a fifth hand-written copy is how one
+/// gets missed, and sqlx reports a missing column at runtime, per query.
+const USER_COLUMNS: [&str; 8] = [
+    "id",
+    "username",
+    "email",
+    "email_verified",
+    "did_plc",
+    "role",
+    "status",
+    "quota_bytes",
+];
+
+/// `USER_COLUMNS` joined for a `SELECT`, each prefixed (`"u."` for a join,
+/// `""` for a bare table).
+fn user_columns(prefix: &str) -> String {
+    USER_COLUMNS
+        .iter()
+        .map(|c| format!("{prefix}{c}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn hash_password(password: &str) -> Result<String, DbError> {
@@ -122,39 +159,39 @@ pub async fn create_user(
     let hash = hash_password(password)?;
     let id = Uuid::new_v4();
 
-    sqlx::query_as::<_, User>(
+    let sql = format!(
         "INSERT INTO users (id, username, email, password_hash, role)
          VALUES ($1, $2, $3, $4, $5)
-         RETURNING id, username, email, email_verified, did_plc, role, status",
-    )
-    .bind(id)
-    .bind(username)
-    .bind(email)
-    .bind(&hash)
-    .bind(role)
-    .fetch_one(pool)
-    .await
-    .map_err(|e| match &e {
-        // Two unique columns, two answers: the constraint names which.
-        sqlx::Error::Database(db) if db.is_unique_violation() => {
-            if db.constraint() == Some("users_email_key") {
-                DbError::EmailTaken
-            } else {
-                DbError::UsernameTaken
+         RETURNING {}",
+        user_columns("")
+    );
+    sqlx::query_as::<_, User>(&sql)
+        .bind(id)
+        .bind(username)
+        .bind(email)
+        .bind(&hash)
+        .bind(role)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| match &e {
+            // Two unique columns, two answers: the constraint names which.
+            sqlx::Error::Database(db) if db.is_unique_violation() => {
+                if db.constraint() == Some("users_email_key") {
+                    DbError::EmailTaken
+                } else {
+                    DbError::UsernameTaken
+                }
             }
-        }
-        _ => DbError::Sql(e),
-    })
+            _ => DbError::Sql(e),
+        })
 }
 
 pub async fn find_by_username(pool: &PgPool, username: &str) -> Result<Option<User>, DbError> {
-    Ok(sqlx::query_as::<_, User>(
-        "SELECT id, username, email, email_verified, did_plc, role, status
-         FROM users WHERE username = $1",
-    )
-    .bind(username)
-    .fetch_optional(pool)
-    .await?)
+    let sql = format!("SELECT {} FROM users WHERE username = $1", user_columns(""));
+    Ok(sqlx::query_as::<_, User>(&sql)
+        .bind(username)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// Look a member up by their primary key.
@@ -164,13 +201,11 @@ pub async fn find_by_username(pool: &PgPool, username: &str) -> Result<Option<Us
 /// which is what lets that whole scheme work with no routing table and no
 /// index.
 pub async fn find_by_id(pool: &PgPool, id: Uuid) -> Result<Option<User>, DbError> {
-    Ok(sqlx::query_as::<_, User>(
-        "SELECT id, username, email, email_verified, did_plc, role, status
-         FROM users WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(pool)
-    .await?)
+    let sql = format!("SELECT {} FROM users WHERE id = $1", user_columns(""));
+    Ok(sqlx::query_as::<_, User>(&sql)
+        .bind(id)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// The hash a login for a missing member is verified against, so a login for
@@ -188,13 +223,11 @@ pub fn dummy_verify(password: &str) {
 /// Find a member by email — the last identifier form `createSession` accepts
 /// (stage 2, A), after the DID forms and the handle.
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>, DbError> {
-    Ok(sqlx::query_as::<_, User>(
-        "SELECT id, username, email, email_verified, did_plc, role, status
-         FROM users WHERE email = $1",
-    )
-    .bind(email)
-    .fetch_optional(pool)
-    .await?)
+    let sql = format!("SELECT {} FROM users WHERE email = $1", user_columns(""));
+    Ok(sqlx::query_as::<_, User>(&sql)
+        .bind(email)
+        .fetch_optional(pool)
+        .await?)
 }
 
 /// Verify a member's primary password (stage 2, A).
@@ -278,14 +311,15 @@ pub async fn create_session(
 
 /// Resolve a session token to its user, if the session is live.
 pub async fn user_for_session(pool: &PgPool, token: &str) -> Result<Option<User>, DbError> {
-    Ok(sqlx::query_as::<_, User>(
-        "SELECT u.id, u.username, u.email, u.email_verified, u.did_plc, u.role, u.status
-         FROM sessions s JOIN users u ON u.id = s.user_id
+    let sql = format!(
+        "SELECT {} FROM sessions s JOIN users u ON u.id = s.user_id
          WHERE s.token_hash = $1 AND s.expires_at > now() AND u.status = 'active'",
-    )
-    .bind(hash_secret(token))
-    .fetch_optional(pool)
-    .await?)
+        user_columns("u.")
+    );
+    Ok(sqlx::query_as::<_, User>(&sql)
+        .bind(hash_secret(token))
+        .fetch_optional(pool)
+        .await?)
 }
 
 pub async fn revoke_session(pool: &PgPool, token: &str) -> Result<(), DbError> {
@@ -504,6 +538,70 @@ pub async fn set_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), Db
         .execute(pool)
         .await?;
     Ok(())
+}
+
+/// Set or clear a member's quota override. `None` clears it. `set_by` is
+/// the admin acting through the console, `None` for the CLI — the CLI is
+/// the database, not a person. One statement either way, so the three
+/// columns can never disagree; a negative value is refused by the column's
+/// `CHECK` and comes back as the database error it is.
+pub async fn set_quota(
+    pool: &PgPool,
+    user_id: Uuid,
+    quota_bytes: Option<i64>,
+    set_by: Option<Uuid>,
+) -> Result<(), DbError> {
+    match quota_bytes {
+        Some(bytes) => {
+            sqlx::query(
+                "UPDATE users
+                    SET quota_bytes = $2, quota_set_at = now(), quota_set_by = $3
+                  WHERE id = $1",
+            )
+            .bind(user_id)
+            .bind(bytes)
+            .bind(set_by)
+            .execute(pool)
+            .await?;
+        }
+        None => {
+            sqlx::query(
+                "UPDATE users
+                    SET quota_bytes = NULL, quota_set_at = NULL, quota_set_by = NULL
+                  WHERE id = $1",
+            )
+            .bind(user_id)
+            .execute(pool)
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+/// Who set a member's quota override and when: the CLI's readback, since
+/// `User` carries the number but not the provenance. (The console reads the
+/// same facts off `UserRow` instead, one query for the whole list.)
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct QuotaProvenance {
+    pub set_at: time::OffsetDateTime,
+    /// The setter's username; `None` when the CLI set it, or when the admin
+    /// who did has since been deleted.
+    pub set_by: Option<String>,
+}
+
+/// `None` when the member has no override.
+pub async fn quota_provenance(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<QuotaProvenance>, DbError> {
+    Ok(sqlx::query_as::<_, QuotaProvenance>(
+        "SELECT u.quota_set_at AS set_at, s.username AS set_by
+           FROM users u LEFT JOIN users s ON s.id = u.quota_set_by
+          WHERE u.id = $1 AND u.quota_bytes IS NOT NULL",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?)
 }
 
 /// One row of the admin user list (ADR 0005, R5).
