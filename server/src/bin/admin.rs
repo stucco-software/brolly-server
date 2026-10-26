@@ -236,6 +236,14 @@ async fn quota(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
         eprintln!("usage: brolly-admin quota <username> [<size>|default]");
         return ExitCode::FAILURE;
     };
+    // An unquoted `512 MiB` arrives as two arguments; reading only the first
+    // would set 512 bytes and succeed. Refuse rather than misread.
+    if args.len() > 3 {
+        eprintln!(
+            "usage: brolly-admin quota <username> [<size>|default] — quote a size with a space: \"512 MiB\""
+        );
+        return ExitCode::FAILURE;
+    }
     let user = match brolly_identity::db::find_by_username(pool, username).await {
         Ok(Some(user)) => user,
         Ok(None) => {
@@ -255,8 +263,9 @@ async fn quota(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
     }
     let change = match args.get(2).map(String::as_str) {
         None => Change::Print,
-        Some("default") => Change::Clear,
+        Some(word) if word.eq_ignore_ascii_case("default") => Change::Clear,
         Some(size) => match brolly_domain::media::parse_size(size) {
+            // `parse_size` caps at `i64::MAX`, so the fallback cannot fire.
             Ok(bytes) => Change::Set(i64::try_from(bytes).unwrap_or(i64::MAX)),
             Err(e) => {
                 eprintln!("{size}: {e}");
@@ -264,17 +273,27 @@ async fn quota(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
             }
         },
     };
-    let quota_bytes = match change {
-        Change::Print => None,
-        Change::Clear => Some(None),
-        Change::Set(bytes) => Some(Some(bytes)),
+    let written = match change {
+        Change::Print => Ok(false),
+        Change::Clear => brolly_identity::db::set_quota(pool, user.id, None, None)
+            .await
+            .map(|()| true),
+        Change::Set(bytes) => brolly_identity::db::set_quota(pool, user.id, Some(bytes), None)
+            .await
+            .map(|()| true),
     };
-    if let Some(quota_bytes) = quota_bytes
-        && let Err(e) = brolly_identity::db::set_quota(pool, user.id, quota_bytes, None).await
-    {
-        eprintln!("could not set the quota: {e}");
-        return ExitCode::FAILURE;
-    }
+    let written = match written {
+        Ok(written) => written,
+        Err(e) => {
+            eprintln!("could not set the quota: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let readback_failed = if written {
+        "quota set; readback failed"
+    } else {
+        "readback failed"
+    };
 
     // Read back rather than echo: what is printed is what is stored.
     let instance_default = std::env::var("BROLLY_POD_QUOTA_BYTES")
@@ -282,16 +301,16 @@ async fn quota(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
         .and_then(|v| v.parse().ok())
         .unwrap_or(brolly_domain::media::DEFAULT_POD_QUOTA_BYTES);
     let (user, provenance) = match (
-        brolly_identity::db::find_by_username(pool, username).await,
+        brolly_identity::db::find_by_id(pool, user.id).await,
         brolly_identity::db::quota_provenance(pool, user.id).await,
     ) {
         (Ok(Some(user)), Ok(provenance)) => (user, provenance),
         (Err(e), _) | (_, Err(e)) => {
-            eprintln!("readback failed: {e}");
+            eprintln!("{readback_failed}: {e}");
             return ExitCode::FAILURE;
         }
         (Ok(None), _) => {
-            eprintln!("no such member: {username}");
+            eprintln!("{readback_failed}: no such member: {username}");
             return ExitCode::FAILURE;
         }
     };
