@@ -89,9 +89,9 @@ impl User {
     }
 }
 
-/// The columns a `User` is read from, in `FromRow` order. One list, used by
-/// every query that produces a `User`: a fifth hand-written copy is how one
-/// gets missed, and sqlx reports a missing column at runtime, per query.
+/// The columns a `User` is read from. One list, used by every query that
+/// produces a `User`: a fifth hand-written copy is how one gets missed, and
+/// sqlx reports a missing column at runtime, per query.
 const USER_COLUMNS: [&str; 8] = [
     "id",
     "username",

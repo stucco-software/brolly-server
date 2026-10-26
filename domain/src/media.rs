@@ -101,7 +101,8 @@ impl std::fmt::Display for SizeError {
 
 impl std::error::Error for SizeError {}
 
-/// The binary units a size may name, and their byte counts.
+/// The units `format_size` prints, and their byte counts; `parse_size`
+/// accepts these and their short and `…B` spellings.
 const SIZE_UNITS: [(&str, u64); 4] = [
     ("KiB", 1 << 10),
     ("MiB", 1 << 20),
@@ -134,14 +135,15 @@ pub fn parse_size(text: &str) -> Result<u64, SizeError> {
     if number.is_empty() {
         return Err(SizeError::NotANumber);
     }
-    let unit = unit.trim().to_ascii_lowercase();
-    let multiplier = match unit.as_str() {
+    // Matched lowercased, reported as typed.
+    let unit = unit.trim();
+    let multiplier = match unit.to_ascii_lowercase().as_str() {
         "" | "b" => 1u64,
         "k" | "kb" | "kib" => 1 << 10,
         "m" | "mb" | "mib" => 1 << 20,
         "g" | "gb" | "gib" => 1 << 30,
         "t" | "tb" | "tib" => 1 << 40,
-        other => return Err(SizeError::UnknownUnit(other.to_string())),
+        _ => return Err(SizeError::UnknownUnit(unit.to_string())),
     };
 
     let (whole, fraction) = match number.split_once('.') {
@@ -155,10 +157,15 @@ pub fn parse_size(text: &str) -> Result<u64, SizeError> {
     if fraction.is_some() && multiplier == 1 {
         return Err(SizeError::NotANumber);
     }
-    let whole: u128 = whole.parse().map_err(|_| SizeError::NotANumber)?;
+    // All digits by now, so the only way this fails is a number too long
+    // for u128: too large, not "not a number".
+    let whole: u128 = whole.parse().map_err(|_| SizeError::TooLarge)?;
     // Up to eighteen fractional digits are exact in u128; more cannot
     // change a byte count at any unit this grammar names.
     let fraction = fraction.unwrap_or("");
+    if !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(SizeError::NotANumber);
+    }
     let fraction = &fraction[..fraction.len().min(18)];
     let fraction_value: u128 = if fraction.is_empty() {
         0
@@ -180,11 +187,13 @@ pub fn parse_size(text: &str) -> Result<u64, SizeError> {
 /// The inverse of [`parse_size`], for display: the largest binary unit not
 /// exceeding the value; printed whole when the value is an exact multiple
 /// of it, else to one decimal, *rounded down* — `5 GiB`, `512 MiB`,
-/// `1.5 GiB`, `412.5 MiB`, `1023.9 MiB`, `1023 B`, `0 B`. Always a string
-/// `parse_size` accepts, and never more than the value it was given: rounding
-/// to nearest would print `1024.0 MiB` for a byte under a gibibyte and
-/// `8388608.0 TiB` for `i64::MAX` — which parses as too large, so a value
-/// the console displayed would be refused on an untouched save.
+/// `1.5 GiB`, `412.5 MiB`, `1023.9 MiB`, `1023 B`, `0 B`. A string
+/// `parse_size` accepts for any value up to `i64::MAX` — the ceiling
+/// `parse_size` enforces and the column holds — and never more than the
+/// value it was given: rounding to nearest would print `1024.0 MiB` for a
+/// byte under a gibibyte and `8388608.0 TiB` for `i64::MAX` — which parses
+/// as too large, so a value the console displayed would be refused on an
+/// untouched save.
 pub fn format_size(bytes: u64) -> String {
     for (name, unit) in SIZE_UNITS.iter().rev() {
         if bytes >= *unit {
@@ -284,15 +293,26 @@ mod tests {
         assert_eq!(parse_size("G"), Err(SizeError::NotANumber));
         assert_eq!(parse_size(".5G"), Err(SizeError::NotANumber));
         assert_eq!(parse_size("1.2.3G"), Err(SizeError::NotANumber));
+        // A second point past the eighteenth fractional character is still
+        // not a number: the fraction is checked before it is cut.
+        assert_eq!(
+            parse_size("1.000000000000000000.5G"),
+            Err(SizeError::NotANumber)
+        );
         // A fraction of a byte is nothing.
         assert_eq!(parse_size("1.5"), Err(SizeError::NotANumber));
-        assert_eq!(parse_size("5X"), Err(SizeError::UnknownUnit("x".into())));
+        assert_eq!(parse_size("5X"), Err(SizeError::UnknownUnit("X".into())));
         assert_eq!(
             parse_size("5 bytes"),
             Err(SizeError::UnknownUnit("bytes".into()))
         );
         // The column is BIGINT: nothing above i64::MAX is a quota.
         assert_eq!(parse_size("99999999999G"), Err(SizeError::TooLarge));
+        // Too long for any integer type is too large, not "not a number".
+        assert_eq!(
+            parse_size("1000000000000000000000000000000000000000"),
+            Err(SizeError::TooLarge)
+        );
         assert_eq!(parse_size("9223372036854775807"), Ok(i64::MAX as u64));
         assert_eq!(parse_size("9223372036854775808"), Err(SizeError::TooLarge));
     }

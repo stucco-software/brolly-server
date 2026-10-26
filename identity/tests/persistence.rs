@@ -490,10 +490,15 @@ async fn a_negative_quota_cannot_be_stored() {
     let alice = db::create_user(&pool, "alice", None, "correct-horse-battery", "member")
         .await
         .unwrap();
+    let err = db::set_quota(&pool, alice.id, Some(-1), None)
+        .await
+        .expect_err("the CHECK refuses it; set_quota does not pretend otherwise");
     assert!(
-        db::set_quota(&pool, alice.id, Some(-1), None)
-            .await
-            .is_err(),
-        "the CHECK refuses it; set_quota does not pretend otherwise"
+        matches!(
+            err,
+            DbError::Sql(sqlx::Error::Database(ref db))
+                if db.constraint() == Some("users_quota_bytes_nonnegative")
+        ),
+        "refused by the non-negative CHECK, not something else: {err:?}"
     );
 }
