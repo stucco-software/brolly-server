@@ -46,6 +46,9 @@ Keep them to a screen or two.
 | [0013](0013-binary-resources-as-content-addressed-blobs.md) | Binary resources are content-addressed blobs beside the graph | Accepted |
 | [0014](0014-local-delivery-is-in-process.md) | Local delivery is in-process; outbound signing stays dormant | Accepted |
 | [0015](0015-mastodon-status-id-scheme.md) | Mastodon status IDs must be sortable, not numeric | Accepted |
+| [0016](0016-the-federation-switch-is-activitypub-only.md) | The federation switch is ActivityPub-only | Accepted |
+| [0017](0017-read-access-follows-the-publication.md) | Read access follows the publication | Accepted |
+| [0018](0018-a-pod-serves-documents.md) | A pod serves documents | Accepted |
 
 ## When to write one
 
