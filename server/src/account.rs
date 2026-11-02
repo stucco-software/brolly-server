@@ -109,6 +109,14 @@ struct Overview<'a> {
     storage_root: String,
     did: Option<&'a str>,
     pod_bytes: u64,
+    /// The effective quota: an admin's override or the instance default
+    /// (`User::quota`). The meter's ceiling.
+    quota_bytes: u64,
+    /// 90% of it: where the meter turns.
+    warn_at: u64,
+    /// Both, formatted for the words beside the meter.
+    used: String,
+    quota: String,
     /// Whether to offer a way into the admin console.
     ///
     /// The console has no other entry point, and guessing `/admin` answers 404
@@ -124,6 +132,8 @@ pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response
         Err(response) => return response,
     };
 
+    let pod_bytes = state.stores.pod_bytes(session.user.id).unwrap_or(0);
+    let quota_bytes = session.user.quota(state.pod_quota_bytes);
     render(&Overview {
         chrome: state.chrome(),
         tabs: tabs("/account"),
@@ -131,7 +141,11 @@ pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response
         webid: webid::webid(&session.user.username, &state.base_domain),
         storage_root: routing::storage_root(&session.user.username, &state.base_domain),
         did: session.user.did_plc.as_deref(),
-        pod_bytes: state.stores.pod_bytes(session.user.id).unwrap_or(0),
+        pod_bytes,
+        quota_bytes,
+        warn_at: quota_bytes / 10 * 9,
+        used: brolly_domain::media::format_size(pod_bytes),
+        quota: brolly_domain::media::format_size(quota_bytes),
         is_admin: session.user.is_admin(),
     })
 }

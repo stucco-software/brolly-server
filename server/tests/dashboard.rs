@@ -249,6 +249,48 @@ async fn the_overview_shows_the_member_what_is_theirs() {
     );
 }
 
+/// A member sees what they hold against what they may hold — the same
+/// number the writes enforce — so the quota is news before a 507 makes it
+/// news.
+#[tokio::test]
+async fn the_overview_shows_usage_against_the_quota() {
+    let h = harness().await;
+    let cookie = h.login().await;
+
+    let reply = h.get("/account", Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        reply.body.contains("of 1 GiB"),
+        "the instance default: {}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains(r#"<meter min="0" max="1073741824""#),
+        "{}",
+        reply.body
+    );
+
+    db::set_quota(&h.db.pool, h.user, Some(5 << 30), None)
+        .await
+        .unwrap();
+    let reply = h.get("/account", Some(&cookie)).await;
+    assert!(
+        reply.body.contains("of 5 GiB"),
+        "the override: {}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains(r#"max="5368709120""#),
+        "the meter's ceiling is the effective quota: {}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains(r#"high="4831838208""#),
+        "it turns at 90%: {}",
+        reply.body
+    );
+}
+
 // --- profile ----------------------------------------------------------------
 
 #[tokio::test]

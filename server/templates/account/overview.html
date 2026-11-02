@@ -32,7 +32,10 @@
         </dd>
 
         <dt>Data stored</dt>
-        <dd>{{ pod_bytes }} bytes</dd>
+        <dd>
+          <meter min="0" max="{{ quota_bytes }}" value="{{ pod_bytes }}" high="{{ warn_at }}" class="usage" aria-label="Data stored, against the quota"></meter>
+          <span>{{ used }} of {{ quota }}</span>
+        </dd>
       </dl>
 
       {% if is_admin %}

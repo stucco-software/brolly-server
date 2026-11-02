@@ -553,3 +553,6 @@ textarea { width: 100%; }
    beside the chips that are. Every chip carries a background — a bare
    <mark> is the browser's own yellow, which the token invariant cannot see. */
 .chip-quota { background: var(--muted); color: var(--muted-fg); }
+/* Usage against quota on the overview: the native meter, full width, and
+   the words beside it carry the same figures for a screen reader. */
+meter.usage { display: block; inline-size: 100%; block-size: var(--sp-0); margin-block-end: var(--sp--2); }
