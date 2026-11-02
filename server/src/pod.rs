@@ -258,12 +258,13 @@ impl Caller {
 
 /// Why a presented credential produced no subject (H2).
 ///
-/// **Only an `Authorization` header gets here.** A `brolly_session` cookie is
-/// `SameSite=Lax` (`server/tests/auth_flow.rs:249`), so a browser sends it on
-/// any top-level navigation: a logged-out member opening a public image in
-/// their own pod never offered it, and meeting them with a challenge for a
-/// credential they did not present would be wrong. A cookie that doesn't
-/// resolve falls through to [`Caller::anonymous`] and H1 decides.
+/// **Only an `Authorization` header gets here.** A `__Host-brolly_session`
+/// cookie is `SameSite=Lax` (`auth::tests::the_session_cookie_is_hardened`),
+/// so a browser sends it on any top-level navigation: a logged-out member
+/// opening a public image in their own pod never offered it, and meeting them
+/// with a challenge for a credential they did not present would be wrong. A
+/// cookie that doesn't resolve falls through to [`Caller::anonymous`] and H1
+/// decides.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Refused {
     /// The token: a header we couldn't parse, or a token that is unknown,

@@ -873,6 +873,28 @@ async fn deleting_an_account_removes_the_user_and_the_pod() {
     );
 }
 
+/// Deletion clears the cookie the way logout does (ADR 0018, control 6).
+#[tokio::test]
+async fn deleting_an_account_clears_a_host_prefixed_cookie() {
+    let h = harness().await;
+    let cookie = h.login().await;
+    let reply = h
+        .post("/account/delete", "confirm=alice", Some(&cookie))
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let removal = reply
+        .headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("__Host-brolly_session="))
+        .expect("a removal Set-Cookie")
+        .to_string();
+    assert!(removal.contains("Max-Age=0"), "{removal}");
+    assert!(removal.contains("Secure"), "{removal}");
+    assert!(removal.contains("Path=/"), "{removal}");
+}
+
 /// The footer is the other page every user reaches, so §13 is discharged there
 /// too — and it stops naming the product while it is at it.
 #[tokio::test]

@@ -15,6 +15,9 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 use tracing_subscriber::layer::SubscriberExt;
 
+/// The session cookie's name, from the one place that defines it.
+const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
+
 async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
     harness_with(false).await
 }
@@ -209,7 +212,7 @@ async fn register_alice(db: &brolly_test_support::TestDb, router: &axum::Router)
     .await;
     cookies
         .iter()
-        .find(|c| c.starts_with("brolly_session="))
+        .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
         .expect("a session cookie")
         .split(';')
         .next()
@@ -319,7 +322,9 @@ async fn a_valid_invite_registers_and_logs_in() {
         StatusCode::SEE_OTHER,
         "registration redirects on success"
     );
-    let session = cookies.iter().find(|c| c.starts_with("brolly_session="));
+    let session = cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")));
     let session = session.expect("a session cookie is set");
     assert!(
         session.contains("HttpOnly"),
@@ -673,7 +678,7 @@ async fn login_succeeds_and_sets_a_session() {
 
     let token = cookies
         .iter()
-        .find_map(|c| c.strip_prefix("brolly_session="))
+        .find_map(|c| c.strip_prefix(&format!("{SESSION_COOKIE}=")))
         .and_then(|c| c.split(';').next())
         .expect("session token");
     let user = db::user_for_session(&db.pool, token)
@@ -804,7 +809,7 @@ async fn logout_revokes_the_session_server_side() {
     .await;
     let token = cookies
         .iter()
-        .find_map(|c| c.strip_prefix("brolly_session="))
+        .find_map(|c| c.strip_prefix(&format!("{SESSION_COOKIE}=")))
         .and_then(|c| c.split(';').next())
         .unwrap()
         .to_string();
@@ -815,7 +820,7 @@ async fn logout_revokes_the_session_server_side() {
             Request::builder()
                 .method("POST")
                 .uri("/logout")
-                .header(header::COOKIE, format!("brolly_session={token}"))
+                .header(header::COOKIE, format!("{SESSION_COOKIE}={token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -840,6 +845,113 @@ async fn logout_is_not_reachable_by_get() {
         status,
         StatusCode::METHOD_NOT_ALLOWED,
         "a prefetch or cross-site <img> must not be able to log someone out"
+    );
+}
+
+/// A `__Host-` cookie can only be cleared by a `Set-Cookie` that carries the
+/// prefix's attributes (ADR 0018, control 6). `CookieJar::remove` on a bare
+/// name would emit a removal without `Secure` or `Path`, which the browser
+/// drops — the session would be revoked server-side and the cookie would
+/// stay in the browser, inert but present. The removal has to be built from
+/// the same cookie the login set.
+#[tokio::test]
+async fn logout_clears_a_host_prefixed_cookie_the_browser_will_honour() {
+    let (db, _dir, router) = harness().await;
+    db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let (_, _, cookies, _) = post(
+        &router,
+        "/login",
+        "username=alice&password=correct-horse-battery",
+    )
+    .await;
+    let session = cookies
+        .iter()
+        .find(|c| c.starts_with("__Host-brolly_session="))
+        .expect("a __Host- session cookie")
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header(header::COOKIE, &session)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let removal = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with("__Host-brolly_session="))
+        .expect("a removal Set-Cookie")
+        .to_string();
+    assert!(removal.starts_with("__Host-brolly_session=;"), "{removal}");
+    assert!(removal.contains("Max-Age=0"), "{removal}");
+    assert!(removal.contains("Secure"), "{removal}");
+    assert!(removal.contains("Path=/"), "{removal}");
+    assert!(!removal.contains("Domain="), "{removal}");
+}
+
+/// The old name authenticates nothing: a cookie minted on a member host
+/// before `0a465e0`, or one tossed by a member page, is inert (ADR 0018).
+#[tokio::test]
+async fn the_old_cookie_name_is_not_a_session() {
+    let (db, _dir, router) = harness().await;
+    let user = db::create_user(&db.pool, "alice", None, "correct-horse-battery", "member")
+        .await
+        .unwrap();
+    let token = db::create_session(&db.pool, user.id, time::Duration::hours(1), None)
+        .await
+        .unwrap();
+
+    let (status, _, location) = get_on_host(&router, "/account", "brolly.test").await;
+    assert_eq!(status, StatusCode::SEE_OTHER, "no cookie: to login");
+    assert!(location.unwrap().starts_with("/login"));
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/account")
+                .header(header::HOST, "brolly.test")
+                .header(header::COOKIE, format!("brolly_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::SEE_OTHER,
+        "a valid token under the old name is not a session"
+    );
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/account")
+                .header(header::HOST, "brolly.test")
+                .header(header::COOKIE, format!("__Host-brolly_session={token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "the same token under the new name is"
     );
 }
 
@@ -990,7 +1102,12 @@ async fn the_front_door_names_the_instance_and_lets_you_in() {
 async fn a_stale_session_cookie_falls_back_to_the_anonymous_front_door() {
     let (_db, _dir, router) = harness().await;
 
-    let (status, body, _) = get_as(&router, "/", Some("brolly_session=not-a-real-token")).await;
+    let (status, body, _) = get_as(
+        &router,
+        "/",
+        Some(&format!("{SESSION_COOKIE}=not-a-real-token")),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK, "a bad cookie must not 500");
     assert!(body.contains("name=\"password\""), "got: {body}");
@@ -1038,7 +1155,12 @@ async fn an_anonymous_visitor_still_gets_the_form() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("name=\"password\""));
 
-    let (status, _, _) = get_as(&router, "/login", Some("brolly_session=nonsense")).await;
+    let (status, _, _) = get_as(
+        &router,
+        "/login",
+        Some(&format!("{SESSION_COOKIE}=nonsense")),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::OK,

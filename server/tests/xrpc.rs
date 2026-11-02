@@ -21,6 +21,9 @@ use sha2::{Digest, Sha256};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tower::ServiceExt;
 
+/// The session cookie's name, from the one place that defines it.
+const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
+
 const BASE: &str = "brolly.test";
 
 struct Harness {
@@ -247,7 +250,7 @@ async fn a_member(h: &Harness, username: &str) -> (uuid::Uuid, String) {
     let session = db::create_session(&h.db.pool, user.id, time::Duration::hours(1), None)
         .await
         .unwrap();
-    (user.id, format!("brolly_session={session}"))
+    (user.id, format!("{SESSION_COOKIE}={session}"))
 }
 
 // --- the assertion that matters --------------------------------------------------
@@ -2005,7 +2008,7 @@ async fn changing_a_password_ends_the_atproto_sessions() {
     let session = db::create_session(&h.db.pool, user.id, time::Duration::hours(1), None)
         .await
         .unwrap();
-    let cookie = format!("brolly_session={session}");
+    let cookie = format!("{SESSION_COOKIE}={session}");
     let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
     let oauth_token = atproto_access_token(&h, &cookie, &key).await;
 
@@ -3131,7 +3134,7 @@ async fn a_registered_member(h: &Harness, username: &str) -> String {
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find(|c| c.starts_with("brolly_session"))
+        .find(|c| c.starts_with(SESSION_COOKIE))
         .map(|c| c.split(';').next().unwrap().to_string())
         .expect("a session cookie")
 }

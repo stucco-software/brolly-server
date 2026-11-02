@@ -12,7 +12,16 @@
 use crate::subject::Credential;
 
 /// Session cookie name. Shared so the server does not restate it.
-pub const SESSION_COOKIE: &str = "brolly_session";
+///
+/// `__Host-` (ADR 0018, control 6): the browser enforces that such a cookie
+/// is `Secure`, has `Path=/` and no `Domain`, and refuses to let a
+/// subdomain set one for the apex or for any other host. Without the prefix,
+/// a page on `alice.<apex>` — same-site with the apex — could toss a
+/// `Domain=<apex>` cookie of this name onto a visitor and hand them the
+/// attacker's session. The rename also leaves every cookie minted under the
+/// old name, including any minted on a member host before `0a465e0`, inert:
+/// nothing reads `brolly_session` any more.
+pub const SESSION_COOKIE: &str = "__Host-brolly_session";
 
 /// Choose a credential from what the request carried.
 ///
@@ -82,7 +91,7 @@ mod tests {
 
     #[test]
     fn dpop_outranks_bearer_and_cookie() {
-        let c = credential(Some("DPoP abc"), Some("brolly_session=xyz")).unwrap();
+        let c = credential(Some("DPoP abc"), Some("__Host-brolly_session=xyz")).unwrap();
         assert_eq!(
             c,
             Credential::Dpop {
@@ -94,7 +103,7 @@ mod tests {
 
     #[test]
     fn an_explicit_header_outranks_a_cookie() {
-        let c = credential(Some("Bearer abc"), Some("brolly_session=xyz")).unwrap();
+        let c = credential(Some("Bearer abc"), Some("__Host-brolly_session=xyz")).unwrap();
         assert_eq!(c, Credential::Bearer("abc".into()));
     }
 
@@ -112,7 +121,7 @@ mod tests {
 
     #[test]
     fn the_cookie_is_found_among_others() {
-        let c = credential(None, Some("theme=dark; brolly_session=xyz; other=1")).unwrap();
+        let c = credential(None, Some("theme=dark; __Host-brolly_session=xyz; other=1")).unwrap();
         assert_eq!(c, Credential::Session("xyz".into()));
     }
 
@@ -156,5 +165,14 @@ mod tests {
     fn a_foreign_host_is_not_a_user() {
         assert_eq!(subdomain_user("alice.example.com", "brolly.id"), None);
         assert_eq!(subdomain_user("notbrolly.id", "brolly.id"), None);
+    }
+
+    #[test]
+    fn the_old_cookie_name_is_not_a_credential() {
+        // ADR 0018: nothing reads `brolly_session` any more — a cookie minted
+        // on a member host before `0a465e0`, or tossed by a member page, is
+        // inert on the pod and the outbox as much as on the apex.
+        assert!(credential(None, Some("brolly_session=xyz")).is_none());
+        assert!(credential(None, Some("__Host-brolly_session=xyz")).is_some());
     }
 }

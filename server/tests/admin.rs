@@ -13,6 +13,9 @@ use brolly_server::{AppState, app};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+/// The session cookie's name, from the one place that defines it.
+const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
+
 async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
@@ -101,7 +104,7 @@ async fn register(router: &axum::Router, username: &str, invite: &str) -> String
     assert_eq!(status, StatusCode::SEE_OTHER, "registration failed");
     cookies
         .iter()
-        .find(|c| c.starts_with("brolly_session="))
+        .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
         .expect("a session cookie")
         .split(';')
         .next()
@@ -213,7 +216,12 @@ async fn an_anonymous_visitor_is_sent_to_log_in_rather_than_to_a_dead_end() {
 async fn a_stale_cookie_is_treated_as_anonymous_not_as_an_admin() {
     let (_db, _dir, router) = harness().await;
 
-    let (status, _) = get_as(&router, "/admin", Some("brolly_session=not-a-real-token")).await;
+    let (status, _) = get_as(
+        &router,
+        "/admin",
+        Some(&format!("{SESSION_COOKIE}=not-a-real-token")),
+    )
+    .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 }
 

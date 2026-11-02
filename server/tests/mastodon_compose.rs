@@ -22,6 +22,9 @@ use oxigraph::model::{GraphNameRef, NamedNodeRef};
 use serde_json::json;
 use tower::ServiceExt;
 
+/// The session cookie's name, from the one place that defines it.
+const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
+
 const BASE: &str = "brolly.test";
 
 struct Harness {
@@ -915,7 +918,7 @@ async fn publish_outbox(
             .method("POST")
             .uri("/outbox")
             .header(header::HOST, "alice.brolly.test")
-            .header(header::COOKIE, format!("brolly_session={session}"))
+            .header(header::COOKIE, format!("{SESSION_COOKIE}={session}"))
             .header(header::CONTENT_TYPE, "application/json")
             .body(Body::from(note.to_string()))
             .unwrap(),

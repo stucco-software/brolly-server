@@ -15,6 +15,9 @@ use brolly_server::{AppState, app};
 use http_body_util::BodyExt;
 use tower::ServiceExt;
 
+/// The session cookie's name, from the one place that defines it.
+const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
+
 const BASE: &str = "brolly.test";
 
 struct Harness {
@@ -180,7 +183,7 @@ async fn follow(h: &Harness, follower: &str, followee: &str) {
                 .header(header::CONTENT_TYPE, "application/activity+json")
                 .header(
                     header::COOKIE,
-                    format!("brolly_session={}", session_for(h, follower).await),
+                    format!("{SESSION_COOKIE}={}", session_for(h, follower).await),
                 )
                 .body(Body::from(activity.to_string()))
                 .unwrap(),
@@ -340,7 +343,7 @@ async fn the_dashboard_profile_form_does_not_unlock_an_account() {
                 .method("POST")
                 .uri("/account/profile")
                 .header(header::HOST, BASE)
-                .header(header::COOKIE, format!("brolly_session={session}"))
+                .header(header::COOKIE, format!("{SESSION_COOKIE}={session}"))
                 .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
                 .body(Body::from("display_name=Alice&bio=hello"))
                 .unwrap(),

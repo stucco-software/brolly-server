@@ -14,7 +14,6 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
-use axum_extra::extract::cookie::Cookie;
 use brolly_identity::db::{self, DbError, User};
 use brolly_identity::{routing, webid};
 use brolly_solid::oidc::store as oidc_store;
@@ -645,5 +644,9 @@ pub async fn delete_account(
 
     // Sessions cascade with the user row; clearing the cookie stops the browser
     // presenting a token that no longer resolves.
-    (jar.remove(Cookie::from(SESSION_COOKIE)), Redirect::to("/")).into_response()
+    (
+        jar.remove(crate::auth::session_cookie(String::new())),
+        Redirect::to("/"),
+    )
+        .into_response()
 }

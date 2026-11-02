@@ -207,9 +207,9 @@ not an access decision.
 
 ### H2. Credentials that don't verify are a 401, not anonymity
 
-**Scoped to the `Authorization` header.** A `brolly_session` cookie is not a
-presented credential: it is `SameSite=Lax` (`server/tests/auth_flow.rs:249`),
-so a browser sends it on any top-level navigation, and a logged-out member
+**Scoped to the `Authorization` header.** A `brolly_session` cookie (now
+`__Host-brolly_session`, ADR 0018) is not a presented credential: it is
+`SameSite=Lax` (`auth::tests::the_session_cookie_is_hardened`), so a browser sends it on any top-level navigation, and a logged-out member
 opening a public image in their own pod would be met with a challenge for a
 credential they never offered. A cookie that doesn't resolve still falls
 through to anonymous, and H1 decides. `extract::credential` already prefers the

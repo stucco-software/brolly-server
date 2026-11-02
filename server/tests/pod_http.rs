@@ -16,6 +16,9 @@ use p256::ecdsa::signature::Signer;
 use sha2::{Digest, Sha256};
 use tower::ServiceExt;
 
+/// The session cookie's name, from the one place that defines it.
+const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
+
 const HOST: &str = "alice.brolly.test";
 const BASE: &str = "https://alice.brolly.test";
 const ROOT: &str = "https://alice.brolly.test/~/";
@@ -189,7 +192,7 @@ impl Harness {
             .uri(path)
             .header(header::HOST, HOST);
         if authed {
-            builder = builder.header(header::COOKIE, format!("brolly_session={}", self.session));
+            builder = builder.header(header::COOKIE, format!("{SESSION_COOKIE}={}", self.session));
         }
         if let Some((content_type, _)) = body {
             builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -221,7 +224,7 @@ fn conditional_request(
         .uri(path)
         .header(header::HOST, HOST);
     if let Some(session) = session {
-        builder = builder.header(header::COOKIE, format!("brolly_session={session}"));
+        builder = builder.header(header::COOKIE, format!("{SESSION_COOKIE}={session}"));
     }
     if let Some((content_type, _)) = body {
         builder = builder.header(header::CONTENT_TYPE, content_type);
@@ -276,7 +279,7 @@ impl Harness {
             .method(method)
             .uri(path)
             .header(header::HOST, HOST)
-            .header(header::COOKIE, format!("brolly_session={}", self.session))
+            .header(header::COOKIE, format!("{SESSION_COOKIE}={}", self.session))
             .body(Body::from(body.to_string()))
             .unwrap();
         run(self.router.clone(), request).await
@@ -795,7 +798,7 @@ async fn a_body_between_axums_default_and_the_advertised_limit_is_accepted() {
         .method("PUT")
         .uri("/~/big.pdf")
         .header(header::HOST, HOST)
-        .header(header::COOKIE, format!("brolly_session={}", h.session))
+        .header(header::COOKIE, format!("{SESSION_COOKIE}={}", h.session))
         .header(header::CONTENT_TYPE, "application/pdf")
         .body(Body::from(bytes))
         .unwrap();
@@ -1998,7 +2001,7 @@ async fn the_owner_can_read_their_own_inbox() {
         .uri("/inbox")
         .header(header::HOST, HOST)
         .header(header::ACCEPT, "application/activity+json")
-        .header(header::COOKIE, format!("brolly_session={}", h.session))
+        .header(header::COOKIE, format!("{SESSION_COOKIE}={}", h.session))
         .body(Body::empty())
         .unwrap();
     let response = h.router.clone().oneshot(request).await.unwrap();
@@ -2174,7 +2177,7 @@ async fn send_as(
         .method(method)
         .uri(path)
         .header(header::HOST, HOST)
-        .header(header::COOKIE, format!("brolly_session={session}"));
+        .header(header::COOKIE, format!("{SESSION_COOKIE}={session}"));
     if let Some((content_type, _)) = body {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
@@ -2422,7 +2425,7 @@ async fn an_anonymous_write_is_challenged_whatever_its_body() {
     }
 }
 
-/// H2 applies only to the `Authorization` header. `brolly_session` is
+/// H2 applies only to the `Authorization` header. `__Host-brolly_session` is
 /// `SameSite=Lax`, so a browser sends it on any top-level navigation. A
 /// logged-out member opening a public image in their own pod would otherwise be
 /// challenged for a credential they never offered. The missing `error=` shows
@@ -5369,7 +5372,7 @@ async fn publish(h: &Harness, to: serde_json::Value, media: &str) {
         .method("POST")
         .uri("/outbox")
         .header(header::HOST, HOST)
-        .header(header::COOKIE, format!("brolly_session={}", h.session))
+        .header(header::COOKIE, format!("{SESSION_COOKIE}={}", h.session))
         .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(note.to_string()))
         .unwrap();

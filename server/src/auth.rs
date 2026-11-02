@@ -28,8 +28,11 @@ use serde_json::json;
 use crate::ratelimit::{ClientKey, Gate, too_many};
 use crate::{AppState, Chrome, render};
 
-/// Name of the session cookie.
-pub const SESSION_COOKIE: &str = "brolly_session";
+/// Name of the session cookie — identity's constant, so the two readers
+/// (`CookieJar` here, `extract::credential` on the pod) can never disagree
+/// on the name. See `brolly_identity::extract::SESSION_COOKIE` for why it is
+/// `__Host-`-prefixed.
+pub const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
 
 /// One input on an auth form.
 pub struct Field {
@@ -590,9 +593,10 @@ pub struct CreateAccount {
 /// exactly as there, so the API is not the way around an invite-only door.
 ///
 /// Answers `201` with the new member's username and WebID and nothing else —
-/// no session. A session here would be a cookie a cross-origin script cannot
-/// use (`SameSite=Lax`) and a bearer a signup surface has no reason to hold;
-/// the member logs in through the front door or OIDC like anyone else.
+/// no session. A session here would be a `__Host-` cookie a cross-origin
+/// script cannot use or set (`SameSite=Lax`; ADR 0018) and a bearer a signup
+/// surface has no reason to hold; the member logs in through the front door
+/// or OIDC like anyone else.
 ///
 /// Apex-only, like the OAuth surface (ADR 0009): a member's subdomain is
 /// their pod, and an instance-level endpoint does not answer there.
@@ -686,7 +690,9 @@ pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
     {
         tracing::warn!(error = %e, "session revocation failed");
     }
-    let jar = jar.remove(Cookie::from(SESSION_COOKIE));
+    // Built from the cookie login set, not from the bare name: a `__Host-`
+    // removal must carry `Secure` and `Path=/` or the browser drops it.
+    let jar = jar.remove(session_cookie(String::new()));
     (jar, Redirect::to("/")).into_response()
 }
 
@@ -707,7 +713,13 @@ pub(crate) async fn session_user(state: &AppState, jar: &CookieJar) -> Option<Us
         .filter(User::is_active)
 }
 
-fn session_cookie(token: String) -> Cookie<'static> {
+/// The session cookie, with everything the `__Host-` prefix requires and
+/// everything a session cookie should have. Also the shape of its removal:
+/// a `__Host-` cookie can only be cleared by a `Set-Cookie` that carries the
+/// prefix's attributes, so `logout` and `delete_account` build their removal
+/// from this (`CookieJar::remove` keeps the attributes of the cookie it is
+/// given and sets only the empty value, `Max-Age=0` and `Expires`).
+pub(crate) fn session_cookie(token: String) -> Cookie<'static> {
     let mut cookie = Cookie::new(SESSION_COOKIE, token);
     cookie.set_http_only(true); // unreadable from JavaScript
     cookie.set_secure(true);
@@ -915,5 +927,18 @@ mod tests {
         assert_eq!(cookie.http_only(), Some(true));
         assert_eq!(cookie.secure(), Some(true));
         assert_eq!(cookie.same_site(), Some(SameSite::Lax));
+        // ADR 0018, control 6: the `__Host-` prefix is enforced by the
+        // browser — Secure, Path=/, no Domain — and a subdomain cannot set
+        // one for the apex or for any other host. Cookie tossing from a
+        // member page ends here.
+        assert!(
+            cookie.name().starts_with("__Host-"),
+            "got {}",
+            cookie.name()
+        );
+        assert_eq!(cookie.path(), Some("/"));
+        assert_eq!(cookie.domain(), None);
+        // One name, defined once: the server's constant is identity's.
+        assert_eq!(SESSION_COOKIE, brolly_identity::extract::SESSION_COOKIE);
     }
 }
