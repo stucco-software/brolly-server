@@ -318,11 +318,13 @@ pub async fn set_quota(
     // The field is prefilled with the formatted override, so Save on an
     // untouched field posts it back. Writing it would re-stamp who set the
     // quota and when — a CLI-set value would become this admin's, today —
-    // for a change nobody made.
-    if member
-        .quota_bytes
-        .is_some_and(|b| entered == format_size(u64::try_from(b).unwrap_or(0)))
-    {
+    // for a change nobody made. A blank field on a member with no override
+    // is the same save: nothing to clear, and nothing to log as if there were.
+    let unchanged = match member.quota_bytes {
+        Some(b) => entered == format_size(u64::try_from(b).unwrap_or(0)),
+        None => entered.is_empty(),
+    };
+    if unchanged {
         return Redirect::to("/admin/users").into_response();
     }
     let quota_bytes = if entered.is_empty() {

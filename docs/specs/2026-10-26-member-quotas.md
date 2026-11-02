@@ -181,10 +181,11 @@ larger number is a meaningful quota. Negative numbers are "not a number":
 the grammar has no sign. A fraction on input is allowed so that every string
 `format_size` prints parses back: the console prefills the field with the
 formatted override, and an admin who saves a row untouched must not be
-refused a value the system itself displayed. An untouched save changes
-nothing: the console compares what came back against the displayed string,
-exactly, and on a match redirects without a write, so neither the stored
-number nor who set it and when moves. The console field, the CLI argument,
+refused a value the system itself displayed. The console compares the
+trimmed value against the displayed override, and a save that changes
+nothing — the displayed override untouched, or a blank field with no
+override — redirects without a write, so neither the stored number nor who
+set it and when moves. The console field, the CLI argument,
 the CLI's readback, the console cell and the member overview all go through
 these two, so a number reads the same everywhere it appears. The word
 `default` is not a size: the console clears on an empty field and the CLI on
@@ -253,9 +254,10 @@ Routing: the route joins the apex-only `door` group in `lib::app`, beside
 `/admin` and `/admin/users`. The same-origin check (`3a90b5a`) keys on
 `SAME_ORIGIN_FORMS`, an exact-path list; this action's path carries a
 username, so the list gains its first prefix entry — `/admin/users/` — and
-`form_post_is_guarded` matches an entry ending in `/` as a path prefix: the
-path must continue past it with a `/` and a non-empty remainder, so neither
-`/admin/users` nor `/admin/userspace` is guarded. The ui_invariants test
+`form_post_is_guarded` treats an entry ending in `/` as a prefix: a path is
+guarded by a prefix entry when it has a non-empty remainder after the entry,
+so `/admin/users/` itself, `/admin/users` and `/admin/userspace` are
+unguarded. The ui_invariants test
 that reads every `<form method="post">` out of the templates learns that an
 action containing `{{ … }}` is matched by its literal prefix against a prefix
 entry, so a templated action still has to be listed.
@@ -294,7 +296,7 @@ template's "Data stored" row (`overview.html:34`) becomes:
 ```html
 <dd>
   <meter min="0" max="{{ quota_bytes }}" value="{{ pod_bytes }}"
-         high="{{ warn_at }}" aria-label="Data stored, against the quota"></meter>
+         high="{{ warn_at }}" class="usage" aria-label="Data stored, against the quota"></meter>
   <span>{{ used }} of {{ quota }}</span>
 </dd>
 ```
@@ -321,7 +323,7 @@ describes: nothing deleted, adds refused until they are under.
 | `server/src/mastodon_api.rs` | the upload's call site |
 | `server/src/admin.rs` | `set_quota` handler; `MemberView` gains quota, provenance, usage, and the per-row `quota_error`/`quota_entered` for the 400 re-render |
 | `server/templates/admin/users.html` | the Quota column and its form |
-| `server/src/lib.rs` | the route in the door group; a prefix entry in `SAME_ORIGIN_FORMS`; `same_origin` matches prefixes |
+| `server/src/lib.rs` | the route in the door group; a prefix entry in `SAME_ORIGIN_FORMS`; `form_post_is_guarded` matches prefixes |
 | `server/tests/ui_invariants.rs` | templated form actions matched against prefix entries |
 | `server/src/bin/admin.rs` | the `quota` verb, `USAGE` |
 | `server/src/account.rs`, `server/templates/account/overview.html`, `server/static/brolly.css` | usage against quota, the meter |
@@ -329,7 +331,8 @@ describes: nothing deleted, adds refused until they are under.
 
 ## Chunks
 
-Four, one commit each, every one deployable:
+Four chunks, each with a follow-up commit where review asked for one, every
+one deployable:
 
 1. **The number.** Migration, `User.quota_bytes`, `User::quota`,
    `USER_COLUMNS`, `set_quota`, `quota_provenance`; `parse_size` and
