@@ -47,18 +47,18 @@
             </td>
             <td>
               <span class="mono">{{ member.quota }}</span>
-              {% if member.quota_is_default %}
-              <span class="hint">default</span>
+              {% if let Some(note) = member.quota_note %}
+              <mark class="chip chip-quota">{{ note }}</mark>
               {% else %}
-              <mark class="chip chip-quota">{{ member.quota_note }}</mark>
+              <span class="hint">default</span>
               {% endif %}
               <span class="hint">{{ member.usage }} used</span>
               <form method="post" action="/admin/users/{{ member.username }}/quota" class="inline-form">
-                <label class="visually-hidden" for="quota-{{ member.username }}">Quota for @{{ member.username }}</label>
-                <input id="quota-{{ member.username }}" name="quota" value="{{ member.quota_entered }}" placeholder="5G, blank for default">
+                <label class="sr-only" for="quota-{{ member.username }}">Quota for @{{ member.username }}</label>
+                <input id="quota-{{ member.username }}" name="quota" value="{{ member.quota_entered }}" placeholder="5G, blank for default"{% if member.quota_error.is_some() %} aria-invalid="true" aria-describedby="quota-{{ member.username }}-error"{% endif %}>
                 <button type="submit">Save</button>
                 {% if let Some(error) = member.quota_error %}
-                <span class="error">{{ error }}</span>
+                <span class="error" role="alert" id="quota-{{ member.username }}-error">{{ error }}</span>
                 {% endif %}
               </form>
             </td>

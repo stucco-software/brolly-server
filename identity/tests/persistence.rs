@@ -536,4 +536,7 @@ async fn the_member_list_carries_each_quota_and_who_set_it() {
     assert_eq!(row("keeper").quota_bytes, None);
     assert_eq!(row("keeper").quota_set_by, None);
     assert_eq!(row("keeper").quota_set_at, None);
+
+    assert_eq!(row("alice").quota(1 << 30), 5 << 30, "the override wins");
+    assert_eq!(row("keeper").quota(1 << 30), 1 << 30, "else the default");
 }

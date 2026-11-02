@@ -78,9 +78,10 @@ impl User {
         self.status == "active"
     }
     /// The member's quota: an admin's override if there is one, else the
-    /// instance default. The only place the two are combined. A stored
-    /// value is never negative (the column's `CHECK`); the conversion
-    /// saturates at zero regardless, so this is total.
+    /// instance default. The two are combined here and in its twin for the
+    /// list, [`UserRow::quota`], nowhere else. A stored value is never
+    /// negative (the column's `CHECK`); the conversion saturates at zero
+    /// regardless, so this is total.
     pub fn quota(&self, instance_default: u64) -> u64 {
         match self.quota_bytes {
             Some(bytes) => u64::try_from(bytes).unwrap_or(0),
@@ -629,6 +630,18 @@ pub struct UserRow {
     /// The setter's username; `None` when the CLI set it, when the admin has
     /// since been deleted, or when there is no override.
     pub quota_set_by: Option<String>,
+}
+
+impl UserRow {
+    /// The member's quota: the override if there is one, else the instance
+    /// default. The same rule as [`User::quota`], restated because a list
+    /// row is not a `User`; change one, change both.
+    pub fn quota(&self, instance_default: u64) -> u64 {
+        match self.quota_bytes {
+            Some(bytes) => u64::try_from(bytes).unwrap_or(0),
+            None => instance_default,
+        }
+    }
 }
 
 /// Every account, newest first.

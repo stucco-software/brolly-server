@@ -206,7 +206,10 @@ fn every_form_post_is_same_origin_checked() {
             }
             // A templated action — `/admin/users/{{ member.username }}/quota`
             // — is matched by its literal prefix against a prefix entry (one
-            // ending in `/`); a literal action by an exact entry.
+            // ending in `/`); a literal action by an exact entry. So a literal
+            // action under a prefix entry (`/admin/users/export`, say) takes
+            // the exact branch and fails here though the guard covers it:
+            // harmless, and the fix is to list it or template it.
             let listed = match action.split_once("{{") {
                 Some((literal, _)) => list
                     .iter()

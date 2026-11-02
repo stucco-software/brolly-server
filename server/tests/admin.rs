@@ -533,6 +533,19 @@ async fn a_bad_size_is_named_against_the_row_and_sets_nothing() {
         body.contains(r#"value="5X""#),
         "the bad value is kept: {body}"
     );
+    assert!(
+        body.contains(r#"role="alert" id="quota-alice-error""#),
+        "the error is announced: {body}"
+    );
+    assert!(
+        body.contains(r#"aria-invalid="true" aria-describedby="quota-alice-error""#),
+        "and tied to its field: {body}"
+    );
+    assert_eq!(
+        body.matches(r#"aria-invalid="true""#).count(),
+        1,
+        "only the refused row is marked: {body}"
+    );
     assert_eq!(
         db::find_by_id(&db.pool, alice)
             .await
@@ -613,4 +626,90 @@ async fn an_unknown_member_is_not_found() {
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_member_posting_a_malformed_body_is_not_found() {
+    let (db, _dir, router) = harness().await;
+    let (_keeper, alice) = an_admin_and_alice(&db, &router).await;
+    let invite = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
+    let mallory = register(&router, "mallory", &invite).await;
+
+    let (status, _, _) = post_as(&router, "/admin/users/alice/quota", "", &mallory, None).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the guard answers before the body is read"
+    );
+    let (status, _, _) = post_as(
+        &router,
+        "/admin/users/%FF/quota",
+        "quota=5G",
+        &mallory,
+        None,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "the guard answers before the path is read"
+    );
+    assert_eq!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        None
+    );
+}
+
+#[tokio::test]
+async fn an_anonymous_quota_post_is_sent_to_log_in() {
+    let (db, _dir, router) = harness().await;
+    let (_keeper, alice) = an_admin_and_alice(&db, &router).await;
+
+    let (status, _, location) =
+        post_as(&router, "/admin/users/alice/quota", "quota=5G", "", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/login?next=%2Fadmin%2Fusers"));
+    assert_eq!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .quota_bytes,
+        None
+    );
+
+    // A body the form cannot read changes nothing: the guard answers first.
+    let (status, _, location) = post_as(&router, "/admin/users/alice/quota", "", "", None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/login?next=%2Fadmin%2Fusers"));
+}
+
+#[tokio::test]
+async fn an_untouched_save_keeps_who_set_it() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, alice) = an_admin_and_alice(&db, &router).await;
+    db::set_quota(&db.pool, alice, Some(2 << 30), None)
+        .await
+        .unwrap();
+
+    let (status, _, location) = post_as(
+        &router,
+        "/admin/users/alice/quota",
+        "quota=2+GiB",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/admin/users"));
+    let rows = db::list_users(&db.pool).await.unwrap();
+    let row = rows.iter().find(|r| r.username == "alice").unwrap();
+    assert_eq!(row.quota_bytes, Some(2 << 30));
+    assert_eq!(row.quota_set_by, None, "still the CLI's, not re-stamped");
 }
