@@ -16,12 +16,12 @@ use axum::Extension;
 use axum::Form;
 use axum::Json;
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
 use axum_extra::extract::cookie::{Cookie, SameSite};
 use brolly_identity::db::{self, DbError, User};
-use brolly_identity::webid;
+use brolly_identity::{extract, webid};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -29,9 +29,10 @@ use crate::ratelimit::{ClientKey, Gate, too_many};
 use crate::{AppState, Chrome, render};
 
 /// Name of the session cookie — identity's constant, so the two readers
-/// (`CookieJar` here, `extract::credential` on the pod) can never disagree
+/// (`session_token` here, `extract::credential` on the pod) can never disagree
 /// on the name. See `brolly_identity::extract::SESSION_COOKIE` for why it is
-/// `__Host-`-prefixed.
+/// `__Host-`-prefixed, and why `CookieJar` writes this cookie but never reads
+/// it: the prefix holds only while the name is read literally.
 pub const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
 
 /// One input on an auth form.
@@ -221,10 +222,10 @@ pub struct Next {
 /// member's stale cookie falls through to the form instead of looping.
 pub async fn login_form(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Query(query): Query<Next>,
 ) -> Response {
-    if session_user(&state, &jar).await.is_some() {
+    if session_user(&state, &headers).await.is_some() {
         return Redirect::to("/account").into_response();
     }
     let action = login_action(query.next.as_deref());
@@ -307,8 +308,8 @@ pub struct RegisterForm {
 /// `GET /register`
 ///
 /// Bounced for the same reason as `login_form`.
-pub async fn register_form(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if session_user(&state, &jar).await.is_some() {
+pub async fn register_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if session_user(&state, &headers).await.is_some() {
         return Redirect::to("/account").into_response();
     }
     render(&register_page(&state, None, "", ""))
@@ -684,9 +685,9 @@ fn account_error(status: StatusCode, error: &str, description: &str) -> Response
 ///
 /// POST, not GET: a link-prefetching browser or an `<img src="/logout">` on
 /// another site must not be able to log someone out.
-pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Some(cookie) = jar.get(SESSION_COOKIE)
-        && let Err(e) = db::revoke_session(&state.pool, cookie.value()).await
+pub async fn logout(State(state): State<AppState>, headers: HeaderMap, jar: CookieJar) -> Response {
+    if let Some(token) = session_token(&headers)
+        && let Err(e) = db::revoke_session(&state.pool, &token).await
     {
         tracing::warn!(error = %e, "session revocation failed");
     }
@@ -704,13 +705,24 @@ pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
 /// A malformed, expired, or revoked cookie is indistinguishable from no cookie
 /// here — deliberately, so a stale session degrades to logged-out rather than
 /// to an error page.
-pub(crate) async fn session_user(state: &AppState, jar: &CookieJar) -> Option<User> {
-    let cookie = jar.get(SESSION_COOKIE)?;
-    db::user_for_session(&state.pool, cookie.value())
+pub(crate) async fn session_user(state: &AppState, headers: &HeaderMap) -> Option<User> {
+    let token = session_token(headers)?;
+    db::user_for_session(&state.pool, &token)
         .await
         .ok()
         .flatten()
         .filter(User::is_active)
+}
+
+/// The session token on this request, read literally: every `Cookie` field,
+/// no decoding. See `extract::session_token`.
+pub(crate) fn session_token(headers: &HeaderMap) -> Option<String> {
+    extract::session_token(
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .map(HeaderValue::as_bytes),
+    )
 }
 
 /// The session cookie, with everything the `__Host-` prefix requires and
@@ -938,7 +950,5 @@ mod tests {
         );
         assert_eq!(cookie.path(), Some("/"));
         assert_eq!(cookie.domain(), None);
-        // One name, defined once: the server's constant is identity's.
-        assert_eq!(SESSION_COOKIE, brolly_identity::extract::SESSION_COOKIE);
     }
 }

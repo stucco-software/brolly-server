@@ -893,6 +893,7 @@ async fn deleting_an_account_clears_a_host_prefixed_cookie() {
     assert!(removal.contains("Max-Age=0"), "{removal}");
     assert!(removal.contains("Secure"), "{removal}");
     assert!(removal.contains("Path=/"), "{removal}");
+    assert!(!removal.contains("Domain="), "{removal}");
 }
 
 /// The footer is the other page every user reaches, so §13 is discharged there

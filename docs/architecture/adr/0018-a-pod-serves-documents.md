@@ -100,8 +100,14 @@ Seven. The first five exist; the last two land with this change.
 6. **The session cookie is `__Host-brolly_session`.** The `__Host-` prefix
    is enforced by the browser: such a cookie must be `Secure`, `Path=/`, and
    carry no `Domain`, and a subdomain cannot set one for the apex or for any
-   other host. That closes cookie tossing. It also closes the legacy opening
-   at a stroke: the server stops reading `brolly_session` at all, so every
+   other host. That closes cookie tossing, on one condition: the server reads
+   the name literally. The browser enforces the prefix on the literal name,
+   so `__%48ost-brolly_session` is an ordinary cookie a member page can set
+   with `Domain=<apex>`, and a percent-decoding parser such as `CookieJar`
+   would read it as the session. Nothing may read this cookie through a
+   decoding parser: `extract::session_token` is the one reader, and
+   `server/tests/architecture.rs` holds the line. The rename also closes the
+   legacy opening at a stroke: the server stops reading `brolly_session` at all, so every
    cookie minted on a member host before `0a465e0` — and every tossed one —
    is inert from the deploy. Members log in again once; nothing else
    changes. The pod and the outbox keep reading the (renamed) cookie, for the
@@ -192,6 +198,11 @@ the purpose — a page is served to be rendered. The three comments are updated 
   remembered consent, `/account/export` — are reachable from a member page
   with the Lax cookie. They give no more than any cross-site top-level
   navigation gives today, and their responses cannot be read.
+- **A member page can crowd the apex with cookies.** It can still set
+  `Domain=<apex>` cookies that are oversized or malformed, so that the
+  request's cookie header is refused or the session is evicted, and a member
+  is logged out. That costs a login, not access: no cookie it can set reads as
+  a session.
 
 ## Consequences
 

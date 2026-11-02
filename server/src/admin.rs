@@ -14,9 +14,8 @@ use askama::Template;
 use axum::Form;
 use axum::extract::rejection::{FormRejection, PathRejection};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum_extra::extract::CookieJar;
 use brolly_domain::media::{format_size, parse_size};
 use brolly_identity::db::{self, DbError, User};
 use serde::Deserialize;
@@ -77,8 +76,12 @@ pub async fn bootstrap(pool: &sqlx::PgPool) -> Result<(), DbError> {
 /// **404, not 403**: 403 confirms both that the surface exists and that they
 /// found a real URL, which on an instance whose admin set is one person is a
 /// disclosure with nothing on the other side of the trade.
-async fn require_admin(state: &AppState, jar: &CookieJar, path: &str) -> Result<User, Response> {
-    match session_user(state, jar).await {
+async fn require_admin(
+    state: &AppState,
+    headers: &HeaderMap,
+    path: &str,
+) -> Result<User, Response> {
+    match session_user(state, headers).await {
         Some(user) if user.is_admin() => Ok(user),
         Some(_) => Err(not_found()),
         None => {
@@ -142,8 +145,8 @@ struct OverviewPage<'a> {
 }
 
 /// `GET /admin`
-pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(response) = require_admin(&state, &jar, "/admin").await {
+pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin(&state, &headers, "/admin").await {
         return response;
     }
 
@@ -264,8 +267,8 @@ async fn users_page<'a>(
 }
 
 /// `GET /admin/users`
-pub async fn users(State(state): State<AppState>, jar: CookieJar) -> Response {
-    if let Err(response) = require_admin(&state, &jar, "/admin/users").await {
+pub async fn users(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin(&state, &headers, "/admin/users").await {
         return response;
     }
     match users_page(&state, None).await {
@@ -293,11 +296,11 @@ pub struct QuotaForm {
 /// the route exists.
 pub async fn set_quota(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     username: Result<Path<String>, PathRejection>,
     form: Result<Form<QuotaForm>, FormRejection>,
 ) -> Response {
-    let admin = match require_admin(&state, &jar, "/admin/users").await {
+    let admin = match require_admin(&state, &headers, "/admin/users").await {
         Ok(admin) => admin,
         Err(response) => return response,
     };

@@ -6,8 +6,8 @@
 //! Solid-OIDC, ATProtocol, Mastodon and sessions — and every handler that
 //! wanted to know who was calling reimplemented the question.
 //!
-//! Deliberately takes `&str`, not an HTTP type, so it is pure and the
-//! precedence is testable without constructing a request.
+//! Deliberately takes `&str` and bytes, not an HTTP type, so it is pure and
+//! the precedence is testable without constructing a request.
 
 use crate::subject::Credential;
 
@@ -21,15 +21,45 @@ use crate::subject::Credential;
 /// attacker's session. The rename also leaves every cookie minted under the
 /// old name, including any minted on a member host before `0a465e0`, inert:
 /// nothing reads `brolly_session` any more.
+///
+/// The prefix holds only because the server reads this name literally. The
+/// browser enforces it on the literal name, so `__%48ost-brolly_session` is an
+/// ordinary cookie a member page can set with `Domain=<apex>`. Nothing may read
+/// this cookie through a decoding parser, `CookieJar` included: read it with
+/// [`session_token`].
 pub const SESSION_COOKIE: &str = "__Host-brolly_session";
+
+/// The session token a request's `Cookie` fields carry. The only cookie parser
+/// in the workspace that reads the session.
+///
+/// Takes every `Cookie` field, because a client may split them. Works on bytes,
+/// so one non-ASCII cookie beside the session doesn't lose it. Matches the name
+/// byte for byte and decodes nothing: see [`SESSION_COOKIE`] for why that is a
+/// security property rather than a simplification.
+pub fn session_token<'a>(cookie_fields: impl IntoIterator<Item = &'a [u8]>) -> Option<String> {
+    cookie_fields
+        .into_iter()
+        .flat_map(|field| field.split(|byte| *byte == b';'))
+        .filter_map(|pair| {
+            let pair = pair.trim_ascii();
+            let (name, value) = pair.split_at(pair.iter().position(|byte| *byte == b'=')?);
+            if name == SESSION_COOKIE.as_bytes() {
+                value.get(1..)
+            } else {
+                None
+            }
+        })
+        .find_map(|value| std::str::from_utf8(value).ok())
+        .map(str::to_string)
+}
 
 /// Choose a credential from what the request carried.
 ///
 /// Precedence: a proof-bound `DPoP` credential wins over a bearer token, which
 /// wins over a cookie. A caller presenting both an `Authorization` header and a
 /// session cookie is an API client in a browser, and the explicit header is the
-/// one it meant.
-pub fn credential(authorization: Option<&str>, cookie_header: Option<&str>) -> Option<Credential> {
+/// one it meant. `session` is what [`session_token`] found.
+pub fn credential(authorization: Option<&str>, session: Option<String>) -> Option<Credential> {
     if let Some(header) = authorization {
         let (scheme, value) = header.split_once(' ')?;
         let value = value.trim();
@@ -48,12 +78,7 @@ pub fn credential(authorization: Option<&str>, cookie_header: Option<&str>) -> O
         };
     }
 
-    let cookie_header = cookie_header?;
-    cookie_header
-        .split(';')
-        .filter_map(|part| part.trim().split_once('='))
-        .find(|(name, _)| *name == SESSION_COOKIE)
-        .map(|(_, value)| Credential::Session(value.to_string()))
+    session.map(Credential::Session)
 }
 
 /// Attach the DPoP proof from its own header.
@@ -91,7 +116,7 @@ mod tests {
 
     #[test]
     fn dpop_outranks_bearer_and_cookie() {
-        let c = credential(Some("DPoP abc"), Some("__Host-brolly_session=xyz")).unwrap();
+        let c = credential(Some("DPoP abc"), cookie("__Host-brolly_session=xyz")).unwrap();
         assert_eq!(
             c,
             Credential::Dpop {
@@ -103,7 +128,7 @@ mod tests {
 
     #[test]
     fn an_explicit_header_outranks_a_cookie() {
-        let c = credential(Some("Bearer abc"), Some("__Host-brolly_session=xyz")).unwrap();
+        let c = credential(Some("Bearer abc"), cookie("__Host-brolly_session=xyz")).unwrap();
         assert_eq!(c, Credential::Bearer("abc".into()));
     }
 
@@ -121,7 +146,11 @@ mod tests {
 
     #[test]
     fn the_cookie_is_found_among_others() {
-        let c = credential(None, Some("theme=dark; __Host-brolly_session=xyz; other=1")).unwrap();
+        let c = credential(
+            None,
+            cookie("theme=dark; __Host-brolly_session=xyz; other=1"),
+        )
+        .unwrap();
         assert_eq!(c, Credential::Session("xyz".into()));
     }
 
@@ -130,7 +159,7 @@ mod tests {
         assert_eq!(credential(None, None), None);
         assert_eq!(credential(Some("Basic abc"), None), None);
         assert_eq!(credential(Some("Bearer "), None), None);
-        assert_eq!(credential(None, Some("theme=dark")), None);
+        assert_eq!(credential(None, cookie("theme=dark")), None);
     }
 
     #[test]
@@ -171,8 +200,37 @@ mod tests {
     fn the_old_cookie_name_is_not_a_credential() {
         // ADR 0018: nothing reads `brolly_session` any more — a cookie minted
         // on a member host before `0a465e0`, or tossed by a member page, is
-        // inert on the pod and the outbox as much as on the apex.
-        assert!(credential(None, Some("brolly_session=xyz")).is_none());
-        assert!(credential(None, Some("__Host-brolly_session=xyz")).is_some());
+        // inert on the pod, which reads through here. The outbox reads through
+        // `session_user`: `the_outbox_takes_only_the_literal_session_cookie`
+        // in `server/tests/auth_flow.rs` pins that.
+        assert!(credential(None, cookie("brolly_session=xyz")).is_none());
+        assert!(credential(None, cookie("__Host-brolly_session=xyz")).is_some());
+    }
+
+    fn cookie(header: &str) -> Option<String> {
+        session_token([header.as_bytes()])
+    }
+
+    #[test]
+    fn the_session_token_is_found_in_any_cookie_field() {
+        let token = session_token([
+            b"theme=dark".as_slice(),
+            b"other=1; __Host-brolly_session=xyz".as_slice(),
+        ]);
+        assert_eq!(token.as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn a_non_ascii_neighbour_keeps_the_session() {
+        let field = b"x=\xc3\xa9; __Host-brolly_session=xyz; y=\xff";
+        assert_eq!(session_token([field.as_slice()]).as_deref(), Some("xyz"));
+    }
+
+    #[test]
+    fn a_percent_encoded_name_is_not_the_session() {
+        assert_eq!(
+            session_token([b"__%48ost-brolly_session=xyz".as_slice()]),
+            None
+        );
     }
 }

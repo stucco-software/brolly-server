@@ -16,7 +16,6 @@ use axum::Json;
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum_extra::extract::CookieJar;
 use brolly_identity::oauth::{Protocol, RequestShape, detect_misrouted};
 use brolly_identity::{extract, oauth as oauth_layout};
 use brolly_mastodon::oauth;
@@ -200,7 +199,6 @@ fn authorize_target(params: &AuthorizeParams) -> String {
 pub async fn authorize(
     State(state): State<AppState>,
     headers: HeaderMap,
-    jar: CookieJar,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
     if wrong_host(&state, &headers) {
@@ -273,7 +271,7 @@ pub async fn authorize(
         );
     }
 
-    let Some(user) = session_user(&state, &jar).await else {
+    let Some(user) = session_user(&state, &headers).await else {
         let next = authorize_target(&params);
         let query: String = form_urlencoded::Serializer::new(String::new())
             .append_pair("next", &next)
@@ -341,7 +339,6 @@ fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> String {
 pub async fn decide(
     State(state): State<AppState>,
     headers: HeaderMap,
-    jar: CookieJar,
     body: axum::body::Bytes,
 ) -> Response {
     if wrong_host(&state, &headers) {
@@ -352,7 +349,7 @@ pub async fn decide(
         return api_error(StatusCode::BAD_REQUEST, "Malformed form body");
     };
 
-    let Some(user) = session_user(&state, &jar).await else {
+    let Some(user) = session_user(&state, &headers).await else {
         return api_error(StatusCode::UNAUTHORIZED, "Your session has expired");
     };
 

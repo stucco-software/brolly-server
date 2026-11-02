@@ -207,6 +207,13 @@ CLI is available without a shell on the container.
 
 ## Upgrading
 
+### The session cookie rename: every member logs in again once
+
+The session cookie is now `__Host-brolly_session` (ADR 0018), and a migration
+deletes every existing session. The upgrade logs every member out once. There's
+nothing to run, and nothing else about their accounts or pods changes. Tokens
+held by apps are not sessions and keep working.
+
 ### Stage 5a (resource metadata): snapshot first, forward-only
 
 From stage 5a on, each pod records what the server knows about its resources

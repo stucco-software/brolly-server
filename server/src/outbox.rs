@@ -14,7 +14,6 @@
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum_extra::extract::CookieJar;
 use brolly_activitypub::follows;
 use brolly_activitypub::processor::{self, ProcessError};
 use brolly_domain::vocab;
@@ -190,7 +189,6 @@ fn authored(activity: &Value, base: &str) -> Result<(), Refusal> {
 pub async fn publish(
     State(state): State<AppState>,
     headers: HeaderMap,
-    jar: CookieJar,
     body: axum::body::Bytes,
 ) -> Response {
     let host = headers
@@ -201,7 +199,7 @@ pub async fn publish(
         return (StatusCode::NOT_FOUND, "no such outbox").into_response();
     };
 
-    let Some(caller) = session_user(&state, &jar).await else {
+    let Some(caller) = session_user(&state, &headers).await else {
         return (StatusCode::UNAUTHORIZED, "log in to publish").into_response();
     };
     // The outbox publishes *as* its owner, so the caller has to be them.

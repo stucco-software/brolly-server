@@ -3134,7 +3134,7 @@ async fn a_registered_member(h: &Harness, username: &str) -> String {
         .get_all(header::SET_COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
-        .find(|c| c.starts_with(SESSION_COOKIE))
+        .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
         .map(|c| c.split(';').next().unwrap().to_string())
         .expect("a session cookie")
 }

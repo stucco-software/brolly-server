@@ -369,9 +369,9 @@ pub(crate) async fn subject_for(
         Some(Ok(value)) => Some(value),
         None => None,
     };
-    let cookie = headers.get(header::COOKIE).and_then(|h| h.to_str().ok());
+    let session = crate::auth::session_token(headers);
 
-    let Some(credential) = extract::credential(authorization, cookie) else {
+    let Some(credential) = extract::credential(authorization, session) else {
         // An `Authorization` header we could not parse is still a presented
         // credential, and `extract::credential` does not fall back to the
         // cookie past it; no header at all is anonymity.

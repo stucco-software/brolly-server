@@ -232,6 +232,29 @@ fn only_identity_parses_credentials() {
     );
 }
 
+/// `CookieJar` percent-decodes cookie names; the browser enforces `__Host-`
+/// on the literal one. Reading the session through the jar answers to
+/// `__%48ost-brolly_session`, a name any member page can set with
+/// `Domain=<apex>`, and the prefix guarantees nothing (ADR 0018, control 6).
+/// The jar writes the cookie; `extract::session_token` reads it.
+#[test]
+fn the_session_cookie_is_never_read_through_a_decoding_parser() {
+    let server_src = workspace_root().join("server").join("src");
+    let offenders: Vec<_> = source_files()
+        .into_iter()
+        .filter(|p| p.starts_with(&server_src))
+        .filter(|p| {
+            std::fs::read_to_string(p).is_ok_and(|text| text.contains(".get(SESSION_COOKIE)"))
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "the session cookie read through a decoding parser in {offenders:?}. \
+         Use auth::session_token."
+    );
+}
+
 #[test]
 fn app_is_defined_only_in_the_server_crate() {
     let offenders: Vec<_> = source_files()

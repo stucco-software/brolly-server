@@ -728,6 +728,8 @@ Then the two theme checks.
 
 The decision itself: two lists, one gate; the Mastodon upload checks media-only; the tests that pinned the refusal invert; the comments that argued for it are rewritten.
 
+Precondition: the Chunk 1 follow-up that reads the session cookie literally (`extract::session_token`) must be on `main` before this chunk lands.
+
 ### Task 3.1: `ALLOWED_DOCUMENT_TYPES` and `is_storable_type`
 
 **Files:**

@@ -676,6 +676,17 @@ async fn login_succeeds_and_sets_a_session() {
     .await;
     assert_eq!(status, StatusCode::SEE_OTHER);
 
+    // The serialised header, because the browser refuses a `__Host-` cookie
+    // that lacks any of these (ADR 0018, control 6).
+    let set_cookie = cookies
+        .iter()
+        .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
+        .expect("a session cookie");
+    assert!(set_cookie.contains("Secure"), "{set_cookie}");
+    assert!(set_cookie.contains("Path=/"), "{set_cookie}");
+    assert!(set_cookie.contains("HttpOnly"), "{set_cookie}");
+    assert!(!set_cookie.contains("Domain="), "{set_cookie}");
+
     let token = cookies
         .iter()
         .find_map(|c| c.strip_prefix(&format!("{SESSION_COOKIE}=")))
@@ -952,6 +963,170 @@ async fn the_old_cookie_name_is_not_a_session() {
         response.status(),
         StatusCode::OK,
         "the same token under the new name is"
+    );
+}
+
+/// `/account` for a raw `Cookie` header, on the apex.
+async fn account_with_cookie(
+    router: &axum::Router,
+    cookie: &str,
+) -> (StatusCode, String, Option<String>) {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/account")
+                .header(header::HOST, "brolly.test")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let location = response
+        .headers()
+        .get(header::LOCATION)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    (
+        status,
+        String::from_utf8_lossy(&body).into_owned(),
+        location,
+    )
+}
+
+/// Two members and a live session each: the victim and the cookie-tosser.
+async fn alice_and_mallory(db: &brolly_test_support::TestDb) -> (String, String) {
+    let mut tokens = Vec::new();
+    for name in ["alice", "mallory"] {
+        let user = db::create_user(&db.pool, name, None, "correct-horse-battery", "member")
+            .await
+            .unwrap();
+        tokens.push(
+            db::create_session(&db.pool, user.id, time::Duration::hours(1), None)
+                .await
+                .unwrap(),
+        );
+    }
+    let mallory = tokens.pop().unwrap();
+    (tokens.pop().unwrap(), mallory)
+}
+
+/// The name a browser does not treat as `__Host-`, so a member page can set
+/// it with `Domain=<apex>`, and that a percent-decoding parser reads as the
+/// session (ADR 0018, control 6).
+const ENCODED_NAME: &str = "__%48ost-brolly_session";
+
+#[tokio::test]
+async fn a_percent_encoded_cookie_name_is_not_a_session() {
+    let (db, _dir, router) = harness().await;
+    let (alice, _) = alice_and_mallory(&db).await;
+    let (status, _, location) =
+        account_with_cookie(&router, &format!("{ENCODED_NAME}={alice}")).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert!(location.unwrap().starts_with("/login"));
+}
+
+#[tokio::test]
+async fn a_tossed_encoded_cookie_placed_last_does_not_displace_the_session() {
+    let (db, _dir, router) = harness().await;
+    let (alice, mallory) = alice_and_mallory(&db).await;
+    let cookie = format!("{SESSION_COOKIE}={alice}; {ENCODED_NAME}={mallory}");
+    let (status, body, _) = account_with_cookie(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("alice"), "{body}");
+    assert!(!body.contains("mallory"), "{body}");
+}
+
+#[tokio::test]
+async fn a_tossed_encoded_cookie_placed_first_does_not_displace_the_session() {
+    let (db, _dir, router) = harness().await;
+    let (alice, mallory) = alice_and_mallory(&db).await;
+    let cookie = format!("{ENCODED_NAME}={mallory}; {SESSION_COOKIE}={alice}");
+    let (status, body, _) = account_with_cookie(&router, &cookie).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("alice"), "{body}");
+    assert!(!body.contains("mallory"), "{body}");
+}
+
+/// Logout revokes the session the browser's real cookie names, whatever was
+/// tossed beside it: otherwise it revokes the attacker's and leaves the
+/// victim's live.
+#[tokio::test]
+async fn logout_revokes_the_real_session_beside_a_tossed_one() {
+    let (db, _dir, router) = harness().await;
+    let (alice, mallory) = alice_and_mallory(&db).await;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header(
+                    header::COOKIE,
+                    format!("{SESSION_COOKIE}={alice}; {ENCODED_NAME}={mallory}"),
+                )
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert!(
+        db::user_for_session(&db.pool, &alice)
+            .await
+            .unwrap()
+            .is_none(),
+        "alice's session must be the one revoked"
+    );
+}
+
+/// The outbox reads through `session_user`, not `extract::credential`: neither
+/// the old name nor the encoded one publishes as its member.
+#[tokio::test]
+async fn the_outbox_takes_only_the_literal_session_cookie() {
+    let (db, _dir, router) = harness().await;
+    let session = register_alice(&db, &router).await;
+    let token = session.split_once('=').unwrap().1.to_string();
+
+    let publish = |cookie: String| {
+        let router = router.clone();
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/outbox")
+                        .header(header::HOST, "alice.brolly.test")
+                        .header(header::COOKIE, cookie)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"type":"Note","content":"hello"}"#.to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+                .status()
+        }
+    };
+
+    assert_eq!(
+        publish(format!("brolly_session={token}")).await,
+        StatusCode::UNAUTHORIZED,
+        "the old name"
+    );
+    assert_eq!(
+        publish(format!("{ENCODED_NAME}={token}")).await,
+        StatusCode::UNAUTHORIZED,
+        "the encoded name"
+    );
+    assert_eq!(
+        publish(session).await,
+        StatusCode::CREATED,
+        "the same token under the literal name"
     );
 }
 

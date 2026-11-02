@@ -17,7 +17,6 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, body::Bytes};
-use axum_extra::extract::CookieJar;
 use brolly_atproto::blocks::PodBlocks;
 use brolly_atproto::firehose::{self, CommitEvent};
 use brolly_atproto::keys::SigningKey;
@@ -29,7 +28,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::auth::SESSION_COOKIE;
+use crate::auth::session_token;
 
 /// XRPC's error body.
 fn xrpc_error(status: StatusCode, error: &str, message: &str) -> Response {
@@ -168,7 +167,7 @@ struct Caller {
 ///
 /// The proof is verified against the presented token, not merely present: a
 /// bound token accepted without its proof is a bearer token wearing a costume.
-async fn caller(state: &AppState, headers: &HeaderMap, jar: &CookieJar) -> Option<Caller> {
+async fn caller(state: &AppState, headers: &HeaderMap) -> Option<Caller> {
     // The Authorization header, when there is one, carries the credential the
     // caller meant (extract's precedence): a DPoP-bound OAuth token, or the
     // legacy pair's access half.
@@ -200,8 +199,8 @@ async fn caller(state: &AppState, headers: &HeaderMap, jar: &CookieJar) -> Optio
     }
     // The cookie fallback stays last (2, D): the browser dashboard and the
     // tests, as before this grew the token arms.
-    let cookie = jar.get(SESSION_COOKIE)?;
-    let user = db::user_for_session(&state.pool, cookie.value())
+    let token = session_token(headers)?;
+    let user = db::user_for_session(&state.pool, &token)
         .await
         .ok()
         .flatten()
@@ -799,16 +798,11 @@ struct CreateRecord {
 /// network syncs, and the pod is what every other protocol reads (D7's faithful
 /// layer). A record in one and not the other is a member whose data exists for
 /// some readers and not others.
-async fn create_record(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    body: Bytes,
-) -> Response {
+async fn create_record(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     let user = caller.user;
@@ -912,16 +906,11 @@ struct PutRecord {
 /// `com.atproto.repo.putRecord`: upsert, as the lexicon defines it — absent
 /// creates, present replaces — with compare-and-set on both the record and
 /// the head when the client names either (1, B).
-async fn put_record(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    body: Bytes,
-) -> Response {
+async fn put_record(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     let user = caller.user;
@@ -992,16 +981,11 @@ struct SwapRecord {
 /// the repo knows both — the record it read and the commit it read it at —
 /// and a route that demands them cannot be sent half a compare-and-set by
 /// mistake. No retry, ever; every refusal is `InvalidSwap`.
-async fn swap_record(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    body: Bytes,
-) -> Response {
+async fn swap_record(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     let user = caller.user;
@@ -1074,16 +1058,11 @@ struct SwapCommit {
 /// This is the compare-and-set C's retry half needs to be reachable by a
 /// client that has synced the repo: it names the commit it read, and if the
 /// head has moved, `InvalidSwap` is the whole answer. No retry, ever.
-async fn swap_commit(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    body: Bytes,
-) -> Response {
+async fn swap_commit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     let user = caller.user;
@@ -1163,16 +1142,11 @@ struct ApplyWrites {
 /// revision, one signature, one event with one op per write (1, B).
 ///
 /// Atomic: any invalid op refuses the whole batch before anything is signed.
-async fn apply_writes(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    body: Bytes,
-) -> Response {
+async fn apply_writes(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     let user = caller.user;
@@ -1282,16 +1256,11 @@ struct DeleteRecord {
 }
 
 /// `com.atproto.repo.deleteRecord`
-async fn delete_record(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-    body: Bytes,
-) -> Response {
+async fn delete_record(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     let user = caller.user;
@@ -1489,15 +1458,11 @@ pub async fn create_session(
 
 /// `com.atproto.server.getSession` (2, A): the current session, for the bearer
 /// access token.
-pub async fn get_session(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-) -> Response {
+pub async fn get_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     Json(session_view(
@@ -1623,13 +1588,12 @@ fn app_password_management_forbidden() -> Response {
 pub async fn create_app_password(
     State(state): State<AppState>,
     headers: HeaderMap,
-    jar: CookieJar,
     body: Bytes,
 ) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     if !caller.kind.may_manage_app_passwords() {
@@ -1670,15 +1634,11 @@ pub async fn create_app_password(
 /// `com.atproto.server.listAppPasswords` (2, B): the list without the
 /// password — the lexicon's list schema omits the field, and the stored hash
 /// could not return one anyway.
-pub async fn list_app_passwords(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    jar: CookieJar,
-) -> Response {
+pub async fn list_app_passwords(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     if !caller.kind.may_manage_app_passwords() {
@@ -1715,13 +1675,12 @@ struct RevokeAppPasswordInput {
 pub async fn revoke_app_password(
     State(state): State<AppState>,
     headers: HeaderMap,
-    jar: CookieJar,
     body: Bytes,
 ) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let Some(caller) = caller(&state, &headers, &jar).await else {
+    let Some(caller) = caller(&state, &headers).await else {
         return auth_required();
     };
     if !caller.kind.may_manage_app_passwords() {

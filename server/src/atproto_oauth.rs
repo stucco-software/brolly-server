@@ -21,7 +21,6 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use axum_extra::extract::CookieJar;
 use brolly_atproto::oauth;
 use brolly_identity::db::{self, User};
 use brolly_identity::dpop::{self, DpopError};
@@ -318,7 +317,6 @@ pub struct AuthorizeParams {
 pub async fn authorize(
     State(state): State<AppState>,
     headers: HeaderMap,
-    jar: CookieJar,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
     if wrong_host(&state, &headers) {
@@ -356,7 +354,7 @@ pub async fn authorize(
         );
     };
 
-    let Some(user) = session_user(&state, &jar).await else {
+    let Some(user) = session_user(&state, &headers).await else {
         let next = format!(
             "/oauth/atproto/authorize?{}",
             form_urlencoded::Serializer::new(String::new())
@@ -421,7 +419,6 @@ fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> String {
 pub async fn decide(
     State(state): State<AppState>,
     headers: HeaderMap,
-    jar: CookieJar,
     body: axum::body::Bytes,
 ) -> Response {
     // Host check before body parsing — an extractor rejection would answer
@@ -431,7 +428,7 @@ pub async fn decide(
     }
     let form: Decision = serde_urlencoded::from_bytes(&body).unwrap_or_default();
 
-    let Some(user) = session_user(&state, &jar).await else {
+    let Some(user) = session_user(&state, &headers).await else {
         return oauth_error(
             StatusCode::UNAUTHORIZED,
             "access_denied",

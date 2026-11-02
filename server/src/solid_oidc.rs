@@ -22,7 +22,6 @@ use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Form, Json};
-use axum_extra::extract::CookieJar;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db::User;
@@ -290,7 +289,7 @@ impl Client {
 /// `GET /oauth/solid/authorize`
 pub async fn authorize(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Query(params): Query<AuthorizeParams>,
 ) -> Response {
     // Validate before rendering anything, and validate the client before
@@ -368,7 +367,7 @@ pub async fn authorize(
         return authorize_refusal("code_challenge_method must be S256.");
     }
 
-    let session = session_user(&state, &jar).await;
+    let session = session_user(&state, &headers).await;
 
     // `prompt=none` (spec 6, H4): the client asked not to be interacted with,
     // so both of the flow's failure modes become error redirects it can
@@ -546,10 +545,10 @@ async fn issue_and_redirect(
 /// cannot be issued.
 pub async fn decide(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Form(form): Form<Decision>,
 ) -> Response {
-    let Some(user) = session_user(&state, &jar).await else {
+    let Some(user) = session_user(&state, &headers).await else {
         return authorize_refusal("Your session has expired. Log in and try again.");
     };
 

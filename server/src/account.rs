@@ -11,7 +11,7 @@
 use askama::Template;
 use axum::Form;
 use axum::extract::State;
-use axum::http::{StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum_extra::extract::CookieJar;
 use brolly_identity::db::{self, DbError, User};
@@ -21,7 +21,6 @@ use brolly_solid::profile::{self, Profile};
 use brolly_store::resources::PodRead;
 use serde::Deserialize;
 
-use crate::auth::SESSION_COOKIE;
 use crate::ratelimit::{Gate, too_many};
 use crate::{AppState, Chrome, render};
 
@@ -62,7 +61,7 @@ struct Session {
 /// Resolve the session, or send an anonymous visitor to log in and back.
 async fn require_session(
     state: &AppState,
-    jar: &CookieJar,
+    headers: &HeaderMap,
     path: &str,
 ) -> Result<Session, Response> {
     let redirect = || {
@@ -72,14 +71,11 @@ async fn require_session(
         Redirect::to(&format!("/login?{query}")).into_response()
     };
 
-    let Some(cookie) = jar.get(SESSION_COOKIE) else {
+    let Some(token) = crate::auth::session_token(headers) else {
         return Err(redirect());
     };
-    match db::user_for_session(&state.pool, cookie.value()).await {
-        Ok(Some(user)) if user.is_active() => Ok(Session {
-            user,
-            token: cookie.value().to_string(),
-        }),
+    match db::user_for_session(&state.pool, &token).await {
+        Ok(Some(user)) if user.is_active() => Ok(Session { user, token }),
         Ok(_) => Err(redirect()),
         Err(e) => {
             tracing::error!(error = %e, "session lookup failed");
@@ -125,8 +121,8 @@ struct Overview<'a> {
 }
 
 /// `GET /account`
-pub async fn overview(State(state): State<AppState>, jar: CookieJar) -> Response {
-    let session = match require_session(&state, &jar, "/account").await {
+pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session = match require_session(&state, &headers, "/account").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -177,10 +173,10 @@ pub struct Saved {
 /// `GET /account/profile`
 pub async fn profile_form(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<Saved>,
 ) -> Response {
-    let session = match require_session(&state, &jar, "/account/profile").await {
+    let session = match require_session(&state, &headers, "/account/profile").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -209,10 +205,10 @@ pub async fn profile_form(
 /// weeks later; the read that forced it belongs to the server-agent index.
 pub async fn profile_submit(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Form(form): Form<ProfileForm>,
 ) -> Response {
-    let session = match require_session(&state, &jar, "/account/profile").await {
+    let session = match require_session(&state, &headers, "/account/profile").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -285,10 +281,10 @@ pub struct PasswordForm {
 /// `GET /account/security`
 pub async fn security(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<Saved>,
 ) -> Response {
-    let session = match require_session(&state, &jar, "/account/security").await {
+    let session = match require_session(&state, &headers, "/account/security").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -304,10 +300,10 @@ pub async fn security(
 /// is often doing it because they think another session is not theirs.
 pub async fn change_password(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Form(form): Form<PasswordForm>,
 ) -> Response {
-    let session = match require_session(&state, &jar, "/account/security").await {
+    let session = match require_session(&state, &headers, "/account/security").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -411,10 +407,10 @@ struct Apps<'a> {
 /// `GET /account/apps`
 pub async fn apps(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<Saved>,
 ) -> Response {
-    let session = match require_session(&state, &jar, "/account/apps").await {
+    let session = match require_session(&state, &headers, "/account/apps").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -446,10 +442,10 @@ pub struct RevokeForm {
 /// time from your account settings."
 pub async fn revoke_app(
     State(state): State<AppState>,
-    jar: CookieJar,
+    headers: HeaderMap,
     Form(form): Form<RevokeForm>,
 ) -> Response {
-    let session = match require_session(&state, &jar, "/account/apps").await {
+    let session = match require_session(&state, &headers, "/account/apps").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -479,8 +475,8 @@ pub async fn revoke_app(
 /// complete — and N-Quads because it is the syntax that carries named graphs,
 /// and the graphs are what make the dump re-importable rather than a pile of
 /// triples with their resource identity lost.
-pub async fn export(State(state): State<AppState>, jar: CookieJar) -> Response {
-    let session = match require_session(&state, &jar, "/account/export").await {
+pub async fn export(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session = match require_session(&state, &headers, "/account/export").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -537,8 +533,8 @@ pub struct DeleteForm {
 }
 
 /// `GET /account/delete`
-pub async fn delete_form(State(state): State<AppState>, jar: CookieJar) -> Response {
-    let session = match require_session(&state, &jar, "/account/delete").await {
+pub async fn delete_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session = match require_session(&state, &headers, "/account/delete").await {
         Ok(s) => s,
         Err(response) => return response,
     };
@@ -557,10 +553,11 @@ pub async fn delete_form(State(state): State<AppState>, jar: CookieJar) -> Respo
 /// ask for them again.
 pub async fn delete_account(
     State(state): State<AppState>,
+    headers: HeaderMap,
     jar: CookieJar,
     Form(form): Form<DeleteForm>,
 ) -> Response {
-    let session = match require_session(&state, &jar, "/account/delete").await {
+    let session = match require_session(&state, &headers, "/account/delete").await {
         Ok(s) => s,
         Err(response) => return response,
     };
