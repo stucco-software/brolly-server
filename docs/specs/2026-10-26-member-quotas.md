@@ -4,7 +4,9 @@
 <!-- The spec names a migration and functions this work creates, so not
      every path it cites resolves until it's implemented. -->
 
-**Status:** Draft, 2026-10-26. Brainstormed with the operator the same day
+**Status:** Implemented, 2026-11-02, in seven commits: `3cea01c`, `0ed2a57`,
+`30ef30a`, `41c9a7b`, `8a6a4ff`, `6e06f6e`, `a33cd8b`. Drafted 2026-10-26.
+Brainstormed with the operator the same day
 and revised the same day after one review against the tree, which found the
 console list does not go through `User` at all (H4), one `SELECT` the column
 list would have missed (H1), and three places the size grammar was looser
@@ -179,9 +181,10 @@ larger number is a meaningful quota. Negative numbers are "not a number":
 the grammar has no sign. A fraction on input is allowed so that every string
 `format_size` prints parses back: the console prefills the field with the
 formatted override, and an admin who saves a row untouched must not be
-refused a value the system itself displayed. Saving a displayed value sets
-the displayed value — within a tenth of the unit shown, and never above
-what was stored, which is the precision the display promised. The console field, the CLI argument,
+refused a value the system itself displayed. An untouched save changes
+nothing: the console compares what came back against the displayed string,
+exactly, and on a match redirects without a write, so neither the stored
+number nor who set it and when moves. The console field, the CLI argument,
 the CLI's readback, the console cell and the member overview all go through
 these two, so a number reads the same everywhere it appears. The word
 `default` is not a size: the console clears on an empty field and the CLI on
@@ -214,16 +217,18 @@ column. Each row shows:
 
 - the effective quota, formatted (`format_size`), from `UserRow.quota_bytes`
   or the instance default;
-- a chip: `default`; `set by @nikolas, 2026-10-26` when the console set it;
-  `set 2026-10-26` when the CLI did (`quota_set_by` is `NULL`) — dates ISO,
-  as the Joined column's are — all from
-  `UserRow`, no query per row;
+- provenance, as `MemberView.quota_note: Option<String>`: a chip reading
+  `set by @nikolas, 2026-10-26` when the console set it or `set 2026-10-26`
+  when the CLI did (`quota_set_by` is `NULL`), and on `None` the plain hint
+  `default` — dates ISO, as the Joined column's are — all from `UserRow`, no
+  query per row;
 - current usage, formatted, from `stores.pod_bytes` — so the admin sets a
   number against what the member holds — or the word `unknown` when the
   directory cannot be read (the overview's `unwrap_or(0)` would show a full
   pod as empty; a console that is about to set a limit should not);
-- one form: a text input named `quota` prefilled with the override formatted
-  (empty when there is none), a Save button, posting to
+- one form: a text input named `quota`, named by a `.sr-only` label and
+  prefilled with the override formatted (empty when there is none), a Save
+  button, posting to
   `POST /admin/users/{username}/quota`.
 
 The handler, `admin::set_quota`:
@@ -234,8 +239,9 @@ The handler, `admin::set_quota`:
 3. Empty (after trim) clears the override; otherwise `parse_size`. A
    `SizeError` re-renders the users page as 400 with the message against
    that row and the bad value kept in the field, and sets nothing.
-   `MemberView` gains `quota_error: Option<String>` and `quota_entered:
-   Option<String>` for that one row; the error path re-runs `list_users`
+   `MemberView` carries `quota_entered: String`, what the field shows (the
+   formatted override, empty for none, or on that one row the refused
+   value), and `quota_error: Option<String>`; the error path re-runs `list_users`
    and the usage walks, as a page load does — so a bad save walks every
    pod twice, once for the page the admin was on and once for the
    re-render. That is the cost of keeping the error against the row, and
@@ -247,7 +253,9 @@ Routing: the route joins the apex-only `door` group in `lib::app`, beside
 `/admin` and `/admin/users`. The same-origin check (`3a90b5a`) keys on
 `SAME_ORIGIN_FORMS`, an exact-path list; this action's path carries a
 username, so the list gains its first prefix entry — `/admin/users/` — and
-`same_origin` matches a prefix entry by `starts_with`. The ui_invariants test
+`form_post_is_guarded` matches an entry ending in `/` as a path prefix: the
+path must continue past it with a `/` and a non-empty remainder, so neither
+`/admin/users` nor `/admin/userspace` is guarded. The ui_invariants test
 that reads every `<form method="post">` out of the templates learns that an
 action containing `{{ … }}` is matched by its literal prefix against a prefix
 entry, so a templated action still has to be listed.
