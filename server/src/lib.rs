@@ -352,26 +352,40 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
 ///
 /// Two more ride the same layer, for the same reason:
 ///
-/// * `Content-Security-Policy: frame-ancestors 'none'`, and `X-Frame-Options:
-///   DENY` for the browsers that predate CSP 2. Nothing the instance serves
-///   may be framed. The page this protects is the consent screen — rendered
-///   inside somebody else's OAuth flow, the highest-stakes page in the product
-///   — and `SameSite=Lax` is not its defence: `alice.<apex>` is same-site with
-///   the apex, so a document on a member host could frame it with the
-///   member's own session and dress the Authorise button as something else.
-///   The media allow-list keeps such a document out today; this keeps the
-///   frame out whatever the allow-list admits tomorrow.
+/// * `Content-Security-Policy: frame-ancestors …`, and `X-Frame-Options` to
+///   match for the browsers that predate CSP 2 — **decided per host** (ADR
+///   0018). On the apex, `'none'`/`DENY`: the consent screen is there,
+///   rendered inside somebody else's OAuth flow, and `SameSite=Lax` is not
+///   its defence — `alice.<apex>` is same-site with the apex, so a document
+///   on a member host could frame it with the member's own session and dress
+///   the Authorise button as something else. This header is what keeps the
+///   frame out, and ADR 0018 lists it among the controls a pod serving
+///   documents rests on. On a member host, `'self'`/`SAMEORIGIN`: a pod page
+///   carries no authority a foreign frame could abuse, SolidOS served from
+///   the pod frames the pod's own documents for previews, and `'self'` is
+///   what protects a pod-hosted *app* — which does hold the member's tokens
+///   in that origin — from being framed by anyone else. The host test is
+///   `subdomain_user`'s, so every subdomain-shaped host gets `'self'`,
+///   `www` and unregistered names included; nothing is served there, so
+///   nothing is lost.
 /// * `Referrer-Policy: strict-origin-when-cross-origin`. A pod URL, an OAuth
 ///   `state`, a consent request token in a query — none of it belongs in
 ///   another site's access log.
 ///
-/// No further CSP directives in this stage: the allow-list (H2) excludes the
-/// scriptable types, and a script policy layered on client-typed storage is a
-/// bandage on a hole H2 already closed. Reopened if SVG is ever admitted.
+/// No further CSP directives: a member's origin holds no credential the
+/// instance issues to a browser, and a pod-hosted app's own tokens would not
+/// be protected by a policy permissive enough to run the app (ADR 0018,
+/// "What stays as it was").
 async fn security_headers(
+    State(state): State<AppState>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    let member_host = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|h| h.to_str().ok())
+        .is_some_and(|host| extract::subdomain_user(host, &state.base_domain).is_some());
     let mut response = next.run(request).await;
     // Inserted, not appended: nothing else writes these headers, so there is
     // no value to preserve, and a duplicate would be a spec violation either
@@ -381,13 +395,18 @@ async fn security_headers(
         header::X_CONTENT_TYPE_OPTIONS,
         axum::http::HeaderValue::from_static("nosniff"),
     );
+    let (frame_ancestors, frame_options) = if member_host {
+        ("frame-ancestors 'self'", "SAMEORIGIN")
+    } else {
+        ("frame-ancestors 'none'", "DENY")
+    };
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        axum::http::HeaderValue::from_static("frame-ancestors 'none'"),
+        axum::http::HeaderValue::from_static(frame_ancestors),
     );
     headers.insert(
         header::X_FRAME_OPTIONS,
-        axum::http::HeaderValue::from_static("DENY"),
+        axum::http::HeaderValue::from_static(frame_options),
     );
     headers.insert(
         header::REFERRER_POLICY,
@@ -798,11 +817,14 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             state.clone(),
             www_redirect,
         ))
-        // `nosniff`, `frame-ancestors 'none'` and the referrer policy on every
-        // response (spec 4, H4). One layer here, not per route: per-route
-        // application is how a header ends up missing on the one route that
-        // matters, and the cost of the redundant cases is zero.
-        .layer(axum::middleware::from_fn(security_headers))
+        // `nosniff`, `frame-ancestors`, per host, and the referrer policy on
+        // every response (spec 4, H4). One layer here, not per route:
+        // per-route application is how a header ends up missing on the one
+        // route that matters, and the cost of the redundant cases is zero.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            security_headers,
+        ))
         // Form posts come from our own pages or not at all.
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

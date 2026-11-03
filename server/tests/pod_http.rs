@@ -941,15 +941,15 @@ async fn a_members_own_quota_overrides_the_instance_default() {
     assert_eq!(status, StatusCode::NO_CONTENT, "a delete always runs");
 }
 
-/// Nothing served by the instance may be framed, and a referrer leaves the
-/// instance with its origin only. One layer, every response, for the same
-/// reason as `nosniff`: the consent screen — rendered inside somebody else's
-/// OAuth flow, the highest-stakes page in the product — is the one that must
-/// not be clickjackable, and per-route application is how it would end up
-/// being the one that is. `alice.<apex>` is same-site with the apex, so
-/// `SameSite=Lax` is not the defence here; this is.
+/// Framing is decided per host (ADR 0018). A member host answers
+/// `frame-ancestors 'self'`: SolidOS served from the pod frames the pod's own
+/// documents for previews, and nothing a pod page could be dressed up as
+/// carries authority anyway. The apex answers `'none'` — the consent screen
+/// is there, and `SameSite=Lax` is no defence against a same-site member
+/// page framing it; this header is (control 5). `X-Frame-Options` agrees with
+/// the CSP on both. The referrer policy is the same everywhere.
 #[tokio::test]
-async fn every_response_refuses_framing_and_limits_the_referrer() {
+async fn framing_is_self_on_a_member_host_and_none_on_the_apex() {
     let h = harness().await;
     h.send("PUT", "/~/paper.pdf", Some(("application/pdf", PDF)), true)
         .await;
@@ -957,7 +957,6 @@ async fn every_response_refuses_framing_and_limits_the_referrer() {
     for (path, expected) in [
         ("/~/paper.pdf", StatusCode::OK),
         ("/profile", StatusCode::OK),
-        ("/health", StatusCode::OK),
         ("/~/nothing-here", StatusCode::NOT_FOUND),
     ] {
         let (status, _, headers) = h.send("GET", path, None, true).await;
@@ -966,20 +965,90 @@ async fn every_response_refuses_framing_and_limits_the_referrer() {
             headers
                 .get("content-security-policy")
                 .map(|v| v.to_str().unwrap()),
-            Some("frame-ancestors 'none'"),
-            "{path}: frame-ancestors"
+            Some("frame-ancestors 'self'"),
+            "{path}: a member host"
         );
         assert_eq!(
             headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
-            Some("DENY"),
-            "{path}: X-Frame-Options, for the browsers that predate CSP 2"
+            Some("SAMEORIGIN"),
+            "{path}"
         );
         assert_eq!(
             headers.get("referrer-policy").map(|v| v.to_str().unwrap()),
             Some("strict-origin-when-cross-origin"),
-            "{path}: Referrer-Policy"
+            "{path}"
         );
     }
+
+    // The apex: the same request shape, the instance's host.
+    for path in ["/health", "/login"] {
+        let response = h
+            .router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .header(header::HOST, "brolly.test")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("content-security-policy")
+                .map(|v| v.to_str().unwrap()),
+            Some("frame-ancestors 'none'"),
+            "{path}: the apex"
+        );
+        assert_eq!(
+            headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
+            Some("DENY"),
+            "{path}"
+        );
+    }
+}
+
+/// A pod never serves a service worker (ADR 0018, control 7). The browser
+/// fetches a worker's script with `Service-Worker: script`; refusing that one
+/// fetch blocks registration, and nothing a worker could `importScripts`
+/// afterwards matters because there is no afterwards. The scope a worker
+/// could claim is its script's directory — the server never sends
+/// `Service-Worker-Allowed` — but within it, a worker intercepts every
+/// visitor's requests, persistently, which is what a grant on a subtree must
+/// not buy.
+#[tokio::test]
+async fn a_pod_refuses_to_serve_a_service_worker() {
+    let h = harness().await;
+    let (status, _, _) = h
+        .send(
+            "PUT",
+            "/~/sw.txt",
+            Some(("text/plain", "self.addEventListener")),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    // As the browser fetches it for registration: refused, whoever asks —
+    // the owner, and an anonymous caller who would otherwise get the 401.
+    // The check runs before the pod or the caller is resolved.
+    let sw = [("service-worker", "script")];
+    for (status, body, _) in [
+        h.send_if("GET", "/~/sw.txt", None, &sw).await,
+        run(
+            h.router.clone(),
+            conditional_request("GET", "/~/sw.txt", None, None, &sw),
+        )
+        .await,
+    ] {
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body.contains("service worker"), "{body}");
+    }
+    // As anything else: served.
+    let (status, _, _) = h.send("GET", "/~/sw.txt", None, true).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 // --- the settings resources (spec 6, H2) --------------------------------------

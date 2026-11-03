@@ -1320,6 +1320,18 @@ pub async fn get(
     Path(path): Path<String>,
 ) -> Response {
     let path = format!("/~/{path}");
+    // ADR 0018, control 7: a pod never serves a service worker. The browser
+    // sends this header on the one fetch that registers one; refused by
+    // shape, before the pod is resolved or the caller is looked at, because
+    // the answer does not depend on either — and a 403 here is not an
+    // existence oracle, since it is the same for every path.
+    if headers.contains_key("service-worker") {
+        return (
+            StatusCode::FORBIDDEN,
+            "a pod does not serve service workers",
+        )
+            .into_response();
+    }
     let request = match resolve(&state, &headers, &method, &uri, &path).await {
         Ok(r) => r,
         Err(response) => return response,
