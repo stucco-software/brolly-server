@@ -298,3 +298,19 @@ needs doing: they expire on their own.
     pod itself, it keeps them.
   - Mastodon attachments stay media-only: an HTML or SVG file can live in
     a pod but cannot be attached to a post.
+  - **Before deploying this, check one thing in every browser you
+    support.** The protection against a member page planting a session
+    cookie on the apex rests on browsers refusing *nameless* `__Host-`
+    cookies, and the server cannot check that for them. Over HTTPS, on a
+    real member subdomain of the instance, open the browser console and run
+
+    ```js
+    document.cookie = "=__Host-brolly_session=x; Domain=<apex>; Path=/; Secure"
+    ```
+
+    then load the apex and look at the request's `Cookie` header in the
+    network panel: it must not carry `__Host-brolly_session=x` or a bare
+    `x`. Do it in Chrome, Safari and Firefox. If any of them sends it, do
+    not deploy this version — tell whoever maintains the instance which
+    browser and version. (ADR 0018, control 6; Chrome 156 was checked only
+    over `http://`, which does not isolate this rule.)

@@ -237,3 +237,13 @@ the purpose — a page is served to be rendered. The three comments are updated 
 - Spec 4's H2 row carries a note pointing here.
 - Reopened if any of the seven controls is loosened: the decision rests on
   all of them.
+- **Recorded, not fixed (2026-11-03):** an attachment in a note a member
+  posts to `/outbox` carries the `mediaType` the member wrote; nothing
+  resolves it against the pod's recorded type. With federation off (ADR
+  0016) the only audience is the member's own client, which renders it in
+  an `<img>`, where SVG runs no script. **When federation is enabled**,
+  attachments in outbox notes that point into the member's own pod are to be
+  resolved against the pod's recorded type, as compose does (`e67eb7e`) —
+  that is the point at which the claim starts reaching other servers.
+- The operator's browser check for control 6 is in `docs/deploying.md`,
+  "Before pointing a live domain at it".

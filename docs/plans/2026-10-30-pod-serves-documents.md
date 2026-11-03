@@ -1,5 +1,13 @@
 # A Pod Serves Documents — Implementation Plan
 
+**Status:** Implemented, 2026-11-03: `b4959d9`, `425d968` and `901b21f`
+(chunk 1 and its two follow-ups — the second committed by the operator with
+their theme work), `767af0a` (chunk 2), `c5bc2d6` (chunk 3), `5d870aa` and
+`e67eb7e` (follow-ups). Every chunk passed spec and quality review; the
+final quality review approved the code across `b4959d9..e67eb7e`. Before
+deploying, the operator's browser check in `docs/deploying.md` (ADR 0018,
+control 6) is still to be done.
+
 <!-- doc-paths: skip -->
 <!-- The plan names tests and functions it creates, so not every path it
      cites resolves until it's implemented. -->
