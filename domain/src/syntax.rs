@@ -131,9 +131,10 @@ impl WriteFormat {
 /// Strip parameters: `text/turtle; charset=utf-8` → `text/turtle`.
 /// The bare media type from a header value: `image/png; charset=x` → `image/png`.
 ///
-/// Public because LDP-NR records the type it was given, and storing the
-/// parameters would make `image/png` and `image/png; name=x` different types
-/// for the same bytes.
+/// Public because the media lists match on it, and storing the parameters
+/// would make `image/png` and `image/png; name=x` different types for the
+/// same bytes. LDP-NR records this plus a textual type's `charset`
+/// ([`crate::media::recorded_type`]).
 pub fn media_type_of(header: &str) -> &str {
     header.split(';').next().unwrap_or(header).trim()
 }

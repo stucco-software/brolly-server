@@ -118,12 +118,13 @@ pub enum LdpError {
         incoming: String,
     },
     /// A binary whose content type is on neither of the server's allow-lists
-    /// (media, documents — ADR 0018) (415, spec 4, H2). Not [`LdpError::Syntax`]
-    /// and not [`LdpError::NotRdf`]: the type is syntactically fine, this
-    /// server just doesn't store it. Carries the parameter-stripped incoming type; the body names it
-    /// and lists the allowed ones, so a client can tell what would have been
-    /// accepted. Produced after the WAC check, so only a caller who may write
-    /// learns what the server stores.
+    /// — media, documents (ADR 0018) — answered 415 (spec 4, H2). Not
+    /// [`LdpError::Syntax`] and not [`LdpError::NotRdf`]: the type is
+    /// syntactically fine, this server just doesn't store it. Carries the
+    /// parameter-stripped incoming type; the body names it and lists the
+    /// allowed ones, so a client can tell what would have been accepted.
+    /// Produced after the WAC check, so only a caller who may write learns
+    /// what the server stores.
     ContentTypeNotAllowed(String),
 }
 
@@ -660,10 +661,11 @@ impl Body {
 /// rather than stored as a blob (ADR 0007): storing it defers the parse rather
 /// than avoiding it, and the two live `quick-xml` advisories are reachable
 /// either way. A binary is stored only if its content type is on one of the
-/// two allow-lists (ADR 0018; spec 4, H2), checked **before** its bytes reach the disk: a
-/// refusal that wrote first would leave an orphan for the sweep. Parameters
-/// are stripped first (`syntax::media_type_of`): `image/png; charset=utf-8`
-/// is `image/png`.
+/// two allow-lists (ADR 0018; spec 4, H2), checked **before** its bytes reach
+/// the disk: a refusal that wrote first would leave an orphan for the sweep.
+/// Parameters are stripped first (`syntax::media_type_of`): `image/png;
+/// charset=utf-8` is `image/png`. A textual type is recorded with its
+/// `charset`, and no other parameter (`media::recorded_type`).
 pub fn prepare(
     blobs: Option<&BlobStore>,
     body: &[u8],
@@ -688,7 +690,8 @@ pub fn prepare(
     }
     Ok(Body::Binary(BlobMeta {
         digest: blob_store(blobs)?.put(body)?,
-        media_type: media_type.to_string(),
+        // Matched bare, recorded with a textual type's charset (ADR 0018).
+        media_type: media::recorded_type(content_type),
         byte_size: u64::try_from(body.len()).unwrap_or(u64::MAX),
     }))
 }

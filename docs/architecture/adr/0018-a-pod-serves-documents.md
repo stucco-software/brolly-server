@@ -67,8 +67,9 @@ change, because the decision rests on them being closed.
 
 ```
 text/html, text/css, text/javascript, application/javascript,
-application/json, image/svg+xml, image/x-icon,
-font/woff2, font/woff, font/ttf,
+application/json, application/manifest+json,
+image/svg+xml, image/x-icon, image/vnd.microsoft.icon,
+font/woff2, font/woff, font/ttf, font/otf,
 application/xml, text/xml, application/rss+xml, application/atom+xml
 ```
 
@@ -109,20 +110,25 @@ Seven. The first five exist; the last two land with this change.
    `server/tests/architecture.rs` holds the line. The guarantee also depends
    on the browser refusing nameless `__Host-` cookies: one sends
    `=__Host-brolly_session=x` as a bare value, which the server can't tell
-   from the real cookie. Chrome 156 was tested over `http://`, setting the
-   cookie with `document.cookie` rather than an HTTPS `Set-Cookie`, and
-   refuses them; Safari and
-   Firefox are to be checked before Chunk 3. A compliant browser can't send
-   the name twice, so `session_token` answers no session if it appears more
-   than once, which fails closed. The rename also closes the
-   legacy opening at a stroke: the server stops reading `brolly_session` at all, so every
-   cookie minted on a member host before `0a465e0` — and every tossed one —
-   is inert from the deploy. Members log in again once; nothing else
-   changes. The pod and the outbox keep reading the (renamed) cookie, for the
-   non-browser clients and tests that present it: a browser never sends the
-   apex's `__Host-` cookie to a member host, and a member-host script can set
-   a `__Host-` cookie only for its own host, carrying only a token it already
-   holds — which authenticates the attacker, not the member. (An
+   from the real cookie. What has been tested is narrow: Chrome 156, over
+   `http://`, setting the cookie with `document.cookie`, refused it — and
+   an insecure context may be the whole reason, since a `__Host-` cookie
+   needs `Secure` whatever its name, so that run says nothing about the
+   nameless-cookie rule itself. **Before deploying, the operator checks it
+   over HTTPS**: a page on a real member subdomain sets
+   `=__Host-brolly_session=x; Domain=<apex>; Path=/; Secure`, in Chrome,
+   Safari and Firefox, and the apex must not receive it. A compliant
+   browser can't send the name twice, so `session_token` answers no
+   session if it appears more than once, which fails closed. The rename
+   also closes the legacy opening at a stroke: the server stops reading
+   `brolly_session` at all, so every cookie minted on a member host before
+   `0a465e0` — and every tossed one — is inert from the deploy. Members
+   log in again once; nothing else changes. The pod and the outbox keep
+   reading the (renamed) cookie, for the non-browser clients and tests that
+   present it: a browser never sends the apex's `__Host-` cookie to a member
+   host, and a member-host script can set a `__Host-` cookie only for its
+   own host, carrying only a token it already holds — which authenticates
+   the attacker, not the member. (An
    `Authorization` header still wins over the cookie, so a planted cookie
    cannot override a Solid app's DPoP credential. The residual: a planted
    page can set that cookie for its own host, after which every

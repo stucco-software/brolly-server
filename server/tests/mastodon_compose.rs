@@ -657,6 +657,77 @@ async fn an_unknown_media_id_is_refused_rather_than_dropped() {
     assert!(reply.json()["error"].as_str().is_some());
 }
 
+/// An attachment is media however it got there (ADR 0018). A media id is an
+/// encoding, not a capability: a member can Solid-`PUT` a document at a
+/// note-shaped path under `/~/media/`, encode its id, and name it in a
+/// status. The pod stores the SVG — it is a document — but compose must not
+/// attach it, or it federates as `image/svg+xml`. It is not found, as for any
+/// id that names no media.
+#[tokio::test]
+async fn a_document_in_the_media_folder_is_not_an_attachment() {
+    let h = harness().await;
+    let (alice, token) = a_member(&h, "alice").await;
+    let session = a_session(&h, alice).await;
+    let local_id = brolly_mastodon::status_id::mint_note_id();
+
+    let put = send(
+        &h,
+        Request::builder()
+            .method("PUT")
+            .uri(format!("/~/media/{local_id}"))
+            .header(header::HOST, "alice.brolly.test")
+            .header(header::COOKIE, format!("{SESSION_COOKIE}={session}"))
+            .header(header::CONTENT_TYPE, "image/svg+xml")
+            .body(Body::from("<svg xmlns='http://www.w3.org/2000/svg'/>"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        put.status,
+        StatusCode::CREATED,
+        "the pod stores it: {}",
+        put.body
+    );
+
+    let media_id = brolly_mastodon::status_id::encode(&local_id, alice).unwrap();
+    let reply = post_form(
+        &h,
+        "/api/v1/statuses",
+        &format!("status=look&media_ids[]={media_id}"),
+        &token,
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "{}",
+        reply.body
+    );
+    assert!(
+        reply.body.contains("Media attachment not found"),
+        "{}",
+        reply.body
+    );
+
+    // Nor does the media API describe it as one.
+    let described = send(
+        &h,
+        Request::builder()
+            .uri(format!("/api/v1/media/{media_id}"))
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        described.status,
+        StatusCode::NOT_FOUND,
+        "{}",
+        described.body
+    );
+}
+
 #[tokio::test]
 async fn a_post_with_only_an_image_is_allowed() {
     let h = harness().await;

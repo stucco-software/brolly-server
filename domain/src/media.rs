@@ -17,9 +17,8 @@
 /// lists in the body: the type is syntactically fine, this server just
 /// doesn't store it. Before any list, a member-typed `text/html` on the
 /// member's own origin was stored XSS: the bytes were served back with the
-/// type the uploader chose, on the origin that holds the member's session —
-/// which held while the member's origin carried the member's session, and no
-/// longer does (ADR 0018).
+/// type the uploader chose, on the origin that then held the member's
+/// session. It holds none now (ADR 0018).
 ///
 /// **`text/html` and `image/svg+xml` are not here — they are on
 /// [`ALLOWED_DOCUMENT_TYPES`].** This list is what a Mastodon *attachment*
@@ -65,11 +64,14 @@ pub const ALLOWED_DOCUMENT_TYPES: &[&str] = &[
     "text/javascript",
     "application/javascript",
     "application/json",
+    "application/manifest+json",
     "image/svg+xml",
     "image/x-icon",
+    "image/vnd.microsoft.icon",
     "font/woff2",
     "font/woff",
     "font/ttf",
+    "font/otf",
     "application/xml",
     "text/xml",
     "application/rss+xml",
@@ -247,6 +249,48 @@ pub fn is_storable_type(media_type: &str) -> bool {
     is_allowed_media_type(media_type) || ALLOWED_DOCUMENT_TYPES.contains(&media_type)
 }
 
+/// The type a binary is recorded and served with, from the `Content-Type` it
+/// was sent with: the bare type, plus `; charset=…` when the type is textual
+/// and one was sent (ADR 0018). A page's charset is part of what it is — a
+/// non-ASCII page without `<meta charset>` garbles without it. Only
+/// `charset`, lowercased and unquoted; every other parameter is dropped, so
+/// `image/png` and `image/png; name=x` stay one type for the same bytes. A
+/// value that is not a plain charset name is dropped rather than echoed.
+pub fn recorded_type(content_type: &str) -> String {
+    let bare = crate::syntax::media_type_of(content_type);
+    let charset = is_textual(bare)
+        .then(|| {
+            content_type.split(';').skip(1).find_map(|parameter| {
+                let (name, value) = parameter.split_once('=')?;
+                name.trim()
+                    .eq_ignore_ascii_case("charset")
+                    .then(|| value.trim().trim_matches('"').to_ascii_lowercase())
+            })
+        })
+        .flatten()
+        .filter(|value| {
+            !value.is_empty()
+                && value
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.:+".contains(&b))
+        });
+    match charset {
+        Some(charset) => format!("{bare}; charset={charset}"),
+        None => bare.to_string(),
+    }
+}
+
+/// True for a type whose bytes are text, so a charset means something.
+fn is_textual(bare: &str) -> bool {
+    bare.starts_with("text/")
+        || bare.ends_with("+xml")
+        || bare.ends_with("+json")
+        || matches!(
+            bare,
+            "application/json" | "application/xml" | "application/javascript"
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -292,11 +336,14 @@ mod tests {
                 "text/javascript",
                 "application/javascript",
                 "application/json",
+                "application/manifest+json",
                 "image/svg+xml",
                 "image/x-icon",
+                "image/vnd.microsoft.icon",
                 "font/woff2",
                 "font/woff",
                 "font/ttf",
+                "font/otf",
                 "application/xml",
                 "text/xml",
                 "application/rss+xml",
@@ -333,6 +380,36 @@ mod tests {
                 !ALLOWED_MEDIA_TYPES.contains(document),
                 "{document} is on both"
             );
+        }
+    }
+
+    #[test]
+    fn a_textual_type_is_recorded_with_its_charset_and_nothing_else() {
+        for (sent, recorded) in [
+            ("text/html; charset=utf-8", "text/html; charset=utf-8"),
+            ("text/html;charset=UTF-8", "text/html; charset=utf-8"),
+            (
+                "text/css; Charset=\"UTF-8\"; foo=bar",
+                "text/css; charset=utf-8",
+            ),
+            (
+                "image/svg+xml; charset=utf-8",
+                "image/svg+xml; charset=utf-8",
+            ),
+            (
+                "application/json; charset=utf-8",
+                "application/json; charset=utf-8",
+            ),
+            ("text/html", "text/html"),
+            ("text/html; foo=bar", "text/html"),
+            // A binary has no charset to keep.
+            ("image/png; charset=utf-8", "image/png"),
+            ("image/png; foo=bar", "image/png"),
+            // A value that is not a charset name is dropped, not echoed.
+            ("text/html; charset=\"utf 8\"", "text/html"),
+            ("text/html; charset=", "text/html"),
+        ] {
+            assert_eq!(recorded_type(sent), recorded, "{sent}");
         }
     }
 

@@ -787,6 +787,35 @@ async fn a_content_type_with_parameters_is_matched_by_its_bare_type() {
     assert_eq!(headers[header::CONTENT_TYPE], "image/png");
 }
 
+/// A page's charset is part of what it is (ADR 0018): a non-ASCII page
+/// without `<meta charset>` garbles when the server forgets the one it was
+/// sent with. The list is matched on the bare type; a textual type keeps its
+/// `charset`, lowercased, and nothing else. A binary keeps no parameter.
+#[tokio::test]
+async fn a_textual_document_keeps_its_charset_and_nothing_else() {
+    let h = harness().await;
+    for (path, sent, served) in [
+        (
+            "/~/index.html",
+            "text/html; charset=utf-8",
+            "text/html; charset=utf-8",
+        ),
+        (
+            "/~/site.css",
+            "text/css; Charset=\"UTF-8\"; foo=bar",
+            "text/css; charset=utf-8",
+        ),
+        ("/~/pixel.png", "image/png; foo=bar", "image/png"),
+        ("/~/plain.png", "image/png; charset=utf-8", "image/png"),
+    ] {
+        let (status, body, _) = h.send("PUT", path, Some((sent, "bytes")), true).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {body}");
+        let (status, _, headers) = h.send("GET", path, None, true).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(headers[header::CONTENT_TYPE], served, "{path}");
+    }
+}
+
 #[tokio::test]
 async fn an_upload_over_the_limit_is_axums_own_413() {
     // H3 (spec 4): the limit is enforced by `DefaultBodyLimit`, so the 413 is

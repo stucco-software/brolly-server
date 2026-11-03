@@ -287,9 +287,14 @@ needs doing: they expire on their own.
   and stylesheets on their own subdomain, and a page there can look like
   anything — the instance's login form included. It cannot *be* the
   instance: a session is only minted on the apex, a form only accepted
-  from it. Two things follow for an operator. The session cookie is
-  `__Host-brolly_session`, so every member is logged out once at this
-  upgrade. And a grant on any folder of a pod is script on that pod's
-  whole origin: a member who lets someone else write anywhere in their pod
-  has let them read whatever a pod-hosted app keeps in the browser for
-  that origin.
+  from it. What follows for an operator:
+  - A grant on any folder of a pod is script on that pod's whole origin: a
+    member who lets someone else write anywhere in their pod has let them
+    read whatever a pod-hosted app keeps in the browser for that origin.
+  - A pod refuses to serve a service worker, so a pod-hosted app cannot
+    register one.
+  - A member host answers `frame-ancestors 'self'`, so SolidOS hosted on
+    another origin loses its HTML and PDF preview iframes; served from the
+    pod itself, it keeps them.
+  - Mastodon attachments stay media-only: an HTML or SVG file can live in
+    a pod but cannot be attached to a post.

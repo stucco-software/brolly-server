@@ -576,7 +576,7 @@ pub async fn upload_media(
         return error(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             &format!(
-                "{bare_type} is not a media type this server stores; the types it stores are: {}",
+                "{bare_type} is not a type an attachment may be; attachments may be: {}",
                 brolly_domain::media::ALLOWED_MEDIA_TYPES.join(", ")
             ),
         );
@@ -680,25 +680,43 @@ fn alt_text(pod: &impl PodRead, iri: &str) -> Option<String> {
     brolly_store::collection::literal_in(pod, iri, ALT_TEXT, &format!("{iri}.meta"))
 }
 
+/// True when a stored binary's type is one an attachment may be. The
+/// recorded type may carry a `charset`, so the bare type is what is matched.
+fn is_attachment_type(recorded: &str) -> bool {
+    brolly_domain::media::is_allowed_media_type(brolly_domain::syntax::media_type_of(recorded))
+}
+
 /// What the Mastodon API shows of an upload.
 struct Media {
     media_type: String,
     description: Option<String>,
 }
 
-/// The upload at `iri`, or `None` if there's no binary there.
+/// The upload at `iri`, or `None` if there's no media there.
 ///
 /// One snapshot. The media type comes from the pod's resource metadata, which
 /// the server records and no client write reaches. Only the alt text is read
 /// from the upload's `.meta` — its description, the member's to write
 /// (spec 5d, H6).
+///
+/// A binary whose type is not media is no upload (ADR 0018): a media id is an
+/// encoding, not a capability, so a member can Solid-`PUT` a document at a
+/// note-shaped path under `/~/media/` and name it. Compose and the media API
+/// resolve through here, and `update_media` asks the same question
+/// ([`is_attachment_type`]) before it writes alt text, so an attachment is
+/// media however it got there.
 fn media(pod: &Pod, iri: &str) -> Result<Option<Media>, StoreError> {
     pod.read(|r| {
         let Some(blob) = r.meta(iri)?.and_then(|meta| meta.blob) else {
             return Ok(None);
         };
+        if !is_attachment_type(&blob.media_type) {
+            return Ok(None);
+        }
         Ok(Some(Media {
-            media_type: blob.media_type,
+            // Bare: an attachment's type is what federates, and a charset
+            // is the pod's business, not the post's.
+            media_type: brolly_domain::syntax::media_type_of(&blob.media_type).to_string(),
             description: alt_text(r, iri),
         }))
     })
@@ -751,7 +769,8 @@ pub async fn update_media(
     // was there and changes the version, like any other edit.
     if let Some(text) = update.description.as_deref() {
         let appended = pod.write(|w| {
-            if w.meta(&iri)?.and_then(|meta| meta.blob).is_none() {
+            let upload = w.meta(&iri)?.and_then(|meta| meta.blob);
+            if !upload.is_some_and(|blob| is_attachment_type(&blob.media_type)) {
                 return Ok(false);
             }
             w.set_description(&iri, &[alt_text_quad(&iri, text)])?;
