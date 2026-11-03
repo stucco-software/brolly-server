@@ -573,10 +573,9 @@ async fn upload_typed(h: &Harness, token: &str, content_type: &str, file: &str) 
 
 #[tokio::test]
 async fn an_off_list_upload_is_a_415_whose_body_lists_the_allowed_ones() {
-    // H2 (spec 4), through the Mastodon surface: `upload_media` goes through
-    // the same `ldp::prepare` choke point as a Solid PUT, so the one list
-    // governs both — and the 415 is this API's own error shape, with the list
-    // in it, not a 500 from a stringified error.
+    // ADR 0018: the pod stores `text/html`, an attachment may not be it.
+    // `upload_media` checks the media list before the pod's gate, and the 415
+    // is this API's own error shape, with the list in it.
     let h = harness().await;
     let (_, token) = a_member(&h, "alice").await;
 

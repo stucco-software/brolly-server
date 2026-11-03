@@ -117,10 +117,10 @@ pub enum LdpError {
         recorded: Kind,
         incoming: String,
     },
-    /// A binary whose content type is not on the server's media allow-list
-    /// (415, spec 4, H2). Not [`LdpError::Syntax`] and not [`LdpError::NotRdf`]:
-    /// the type is syntactically fine, this server just doesn't store it as
-    /// media. Carries the parameter-stripped incoming type; the body names it
+    /// A binary whose content type is on neither of the server's allow-lists
+    /// (media, documents — ADR 0018) (415, spec 4, H2). Not [`LdpError::Syntax`]
+    /// and not [`LdpError::NotRdf`]: the type is syntactically fine, this
+    /// server just doesn't store it. Carries the parameter-stripped incoming type; the body names it
     /// and lists the allowed ones, so a client can tell what would have been
     /// accepted. Produced after the WAC check, so only a caller who may write
     /// learns what the server stores.
@@ -176,9 +176,10 @@ impl std::fmt::Display for LdpError {
             ),
             LdpError::ContentTypeNotAllowed(media_type) => write!(
                 f,
-                "this server stores media by allow-list, and {media_type} is not \
-                 on it; the types it stores are: {}",
-                media::ALLOWED_MEDIA_TYPES.join(", ")
+                "this server stores media and documents by allow-list, and {media_type} is \
+                 not on either; the media it stores are: {}; the documents: {}",
+                media::ALLOWED_MEDIA_TYPES.join(", "),
+                media::ALLOWED_DOCUMENT_TYPES.join(", ")
             ),
         }
     }
@@ -658,8 +659,8 @@ impl Body {
 /// disk I/O. Content addressing makes this idempotent. RDF/XML is refused
 /// rather than stored as a blob (ADR 0007): storing it defers the parse rather
 /// than avoiding it, and the two live `quick-xml` advisories are reachable
-/// either way. A binary is stored only if its content type is on the media
-/// allow-list (spec 4, H2), checked **before** its bytes reach the disk: a
+/// either way. A binary is stored only if its content type is on one of the
+/// two allow-lists (ADR 0018; spec 4, H2), checked **before** its bytes reach the disk: a
 /// refusal that wrote first would leave an orphan for the sweep. Parameters
 /// are stripped first (`syntax::media_type_of`): `image/png; charset=utf-8`
 /// is `image/png`.
@@ -677,10 +678,12 @@ pub fn prepare(
     }
     // The one choke point every protocol's binary passes through (spec 4,
     // H2): Solid PUT/POST and Mastodon's `upload_media` all land here, so the
-    // list is enforced once for all of them. `image/svg+xml` is not an
-    // omission — see `media::ALLOWED_MEDIA_TYPES`.
+    // lists are enforced once for all of them. Both lists (ADR 0018): media,
+    // and the documents a web site is made of. The Mastodon upload checks
+    // the media list on its own before it gets here, so an attachment stays
+    // an attachment.
     let media_type = syntax::media_type_of(content_type);
-    if !media::is_allowed_media_type(media_type) {
+    if !media::is_storable_type(media_type) {
         return Err(LdpError::ContentTypeNotAllowed(media_type.to_string()));
     }
     Ok(Body::Binary(BlobMeta {

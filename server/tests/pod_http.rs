@@ -695,46 +695,74 @@ async fn rdf_xml_is_refused_over_http_rather_than_stored_as_a_blob() {
 
 #[tokio::test]
 async fn an_off_list_content_type_is_a_415_whose_body_lists_the_allowed_ones() {
-    // H2 (spec 4): the exact defect this closes — a member PUTs `text/html`
-    // with their own credentials and the bytes come back served as `text/html`
-    // from the member's own origin, which is stored XSS. The 415's body
-    // carries the list, because a client that gets a bare 415 has nothing to
-    // act on.
-    let h = harness().await;
-    let (status, body, _) = h
-        .send("PUT", "/~/page.html", Some(("text/html", "<html>")), true)
-        .await;
-    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
-    assert!(
-        body.contains("text/html"),
-        "must name what was sent: {body}"
-    );
-    for allowed in ["image/png", "application/pdf", "application/zip"] {
-        assert!(body.contains(allowed), "must list {allowed}: {body}");
-    }
-
-    // Nothing was recorded, and nothing is servable.
-    let (status, _, _) = h.send("GET", "/~/page.html", None, true).await;
-    assert_eq!(status, StatusCode::NOT_FOUND);
-}
-
-#[tokio::test]
-async fn an_svg_is_refused_like_any_other_off_list_type() {
-    // The one absence that is a decision rather than an omission (spec 4,
-    // H2): SVG is script, and a member-hosted SVG on the member's origin is
-    // stored XSS with the pod's cookies in scope. This test exists so that
-    // reopening the question means deleting it.
+    // H2 (spec 4): a type on neither list is refused, and the 415's body
+    // carries both lists, because a client that gets a bare 415 has nothing
+    // to act on.
     let h = harness().await;
     let (status, body, _) = h
         .send(
             "PUT",
-            "/~/icon.svg",
-            Some(("image/svg+xml", "<svg onload=alert(1) />")),
+            "/~/run.sh",
+            Some(("application/x-sh", "#!/bin/sh")),
             true,
         )
         .await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "{body}");
-    assert!(body.contains("image/svg+xml"), "{body}");
+    assert!(
+        body.contains("application/x-sh"),
+        "must name what was sent: {body}"
+    );
+    for allowed in ["image/png", "application/pdf", "text/html", "image/svg+xml"] {
+        assert!(body.contains(allowed), "must list {allowed}: {body}");
+    }
+
+    // Nothing was recorded, and nothing is servable.
+    let (status, _, _) = h.send("GET", "/~/run.sh", None, true).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+/// ADR 0018 reversed spec 4's one deliberate absence — this is the test the
+/// spec said reopening the question would mean deleting, inverted. A pod
+/// stores the document types a web site is made of and serves them as typed,
+/// with `nosniff`, from the member's origin. What made that safe is the
+/// seven controls the ADR names, each with a test of its own; this one pins
+/// only that the documents are served.
+#[tokio::test]
+async fn an_svg_and_an_html_page_are_served_as_typed() {
+    let h = harness().await;
+    for (path, body, media_type) in [
+        (
+            "/~/icon.svg",
+            "<svg xmlns='http://www.w3.org/2000/svg'/>",
+            "image/svg+xml",
+        ),
+        (
+            "/~/index.html",
+            "<!doctype html><title>alice</title>",
+            "text/html",
+        ),
+        ("/~/site.css", "body{margin:0}", "text/css"),
+        ("/~/app.js", "console.log(1)", "text/javascript"),
+    ] {
+        let (status, reply, _) = h.send("PUT", path, Some((media_type, body)), true).await;
+        assert_eq!(status, StatusCode::CREATED, "{path}: {reply}");
+
+        let (status, served, headers) = h.send("GET", path, None, true).await;
+        assert_eq!(status, StatusCode::OK, "{path}");
+        assert_eq!(served, body, "{path}: the bytes as sent");
+        assert_eq!(
+            headers.get("content-type").map(|v| v.to_str().unwrap()),
+            Some(media_type),
+            "{path}: served as typed"
+        );
+        assert_eq!(
+            headers
+                .get("x-content-type-options")
+                .map(|v| v.to_str().unwrap()),
+            Some("nosniff"),
+            "{path}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -567,6 +567,20 @@ pub async fn upload_media(
             "Validation failed: File can't be blank",
         );
     };
+    // An attachment is media (ADR 0018, "Two lists, one gate"): the pod's
+    // gate stores documents too, so this is the one path that checks the
+    // media list on its own, before it. The same 415 the gate used to give,
+    // naming what was sent and what an attachment may be.
+    let bare_type = brolly_domain::syntax::media_type_of(&media_type);
+    if !brolly_domain::media::is_allowed_media_type(bare_type) {
+        return error(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            &format!(
+                "{bare_type} is not a media type this server stores; the types it stores are: {}",
+                brolly_domain::media::ALLOWED_MEDIA_TYPES.join(", ")
+            ),
+        );
+    }
     // The pod's quota, the same one a Solid write is held to: same pod,
     // same disk, whichever protocol wrote.
     if !crate::pod::within_quota(&state, &user, bytes.len()) {
@@ -591,8 +605,8 @@ pub async fn upload_media(
     // text commit in one write, so a client never reads back an upload without
     // the description it was sent with. The multipart awaits are all behind
     // us, so nothing here holds the lock across one. `prepare` is the same
-    // choke point Solid PUTs pass through, so the allow-list (spec 4, H2) is
-    // enforced for this route by the one check, not a second one here.
+    // choke point Solid PUTs pass through; the media-only check above is this
+    // route's own, because the gate stores documents too (ADR 0018).
     let store_upload = || -> Result<(), brolly_solid::ldp::LdpError> {
         let body = brolly_solid::ldp::prepare(blobs.as_ref(), &bytes, &media_type)?;
         pod.write(|w| {
@@ -628,7 +642,7 @@ pub async fn upload_media(
         // The allow-list refusal is the client's to fix, not ours to log: the
         // 415's body is the error's own Display, which carries the list (spec
         // 4, H2) — the same answer the LDP surface gives, in this API's own
-        // error shape.
+        // error shape. A backstop; the media check above answers first.
         if let e @ brolly_solid::ldp::LdpError::ContentTypeNotAllowed(_) = &e {
             return error(StatusCode::UNSUPPORTED_MEDIA_TYPE, &e.to_string());
         }

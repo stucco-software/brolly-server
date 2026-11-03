@@ -375,10 +375,9 @@ fn rdf_xml_is_still_refused_rather_than_stored_as_a_blob() {
     );
 }
 
-/// H2 (spec 4): a binary is stored only if its content type is on the list,
-/// and the refusal carries the list. `text/html` is the type this exists for:
-/// before the list, a member PUT it with their own credentials and it came
-/// back served from their own origin — stored XSS.
+/// A type on neither list (ADR 0018) is refused before its bytes reach the
+/// disk, naming both lists; nothing is recorded and no orphan is left for the
+/// sweep.
 #[test]
 fn an_off_list_binary_is_refused_with_the_list_and_leaves_no_bytes_behind() {
     let pod = pod();
@@ -386,10 +385,10 @@ fn an_off_list_binary_is_refused_with_the_list_and_leaves_no_bytes_behind() {
         &pod.store,
         Some(&pod.blobs),
         BASE,
-        "/~/page.html",
+        "/~/run.sh",
         &alice(),
-        b"<html>alert(1)</html>",
-        "text/html",
+        b"#!/bin/sh",
+        "application/x-sh",
         ROOT,
     )
     .unwrap_err();
@@ -397,41 +396,62 @@ fn an_off_list_binary_is_refused_with_the_list_and_leaves_no_bytes_behind() {
     let LdpError::ContentTypeNotAllowed(media_type) = &err else {
         panic!("got {err:?}");
     };
-    assert_eq!(media_type, "text/html");
+    assert_eq!(media_type, "application/x-sh");
     let said = err.to_string();
-    assert!(said.contains("text/html"), "{said}");
-    for allowed in ["image/png", "application/pdf", "application/zip"] {
+    assert!(said.contains("application/x-sh"), "{said}");
+    for allowed in [
+        "image/png",
+        "application/pdf",
+        "application/zip",
+        "text/html",
+    ] {
         assert!(said.contains(allowed), "must list {allowed}: {said}");
     }
 
     // Nothing was recorded, and — because the check precedes the blob write —
     // nothing was written for the sweep to find.
-    assert!(meta(&pod.store, &format!("{ROOT}page.html")).is_none());
+    assert!(meta(&pod.store, &format!("{ROOT}run.sh")).is_none());
     assert!(pod.blobs.orphans(&[]).unwrap().is_empty());
 }
 
-/// The one absence that is a decision rather than an omission (spec 4, H2):
-/// SVG is script, and a member-hosted SVG on the member's origin is stored
-/// XSS. When SVG is wanted it wants its own serving rules, and that is a
-/// recorded decision to reopen — this test is what reopening has to delete.
+/// ADR 0018 reversed spec 4's one deliberate absence: a pod stores the
+/// document types a web site is made of. An SVG and an HTML page land as
+/// binaries with their own types — the type the reader will be served, and
+/// `nosniff` keeps the browser from second-guessing it.
 #[test]
-fn an_svg_is_refused_like_any_other_off_list_type() {
+fn a_document_is_stored_with_its_type() {
     let pod = pod();
-    let err = ldp::put(
-        &pod.store,
-        Some(&pod.blobs),
-        BASE,
-        "/~/icon.svg",
-        &alice(),
-        b"<svg onload=alert(1) />",
-        "image/svg+xml",
-        ROOT,
-    )
-    .unwrap_err();
-    assert!(
-        matches!(err, LdpError::ContentTypeNotAllowed(ref t) if t == "image/svg+xml"),
-        "got {err:?}"
-    );
+    for (path, body, media_type) in [
+        (
+            "/~/icon.svg",
+            &b"<svg xmlns='http://www.w3.org/2000/svg'/>"[..],
+            "image/svg+xml",
+        ),
+        (
+            "/~/index.html",
+            &b"<!doctype html><title>alice</title>"[..],
+            "text/html",
+        ),
+        ("/~/site.css", &b"body{margin:0}"[..], "text/css"),
+    ] {
+        ldp::put(
+            &pod.store,
+            Some(&pod.blobs),
+            BASE,
+            path,
+            &alice(),
+            body,
+            media_type,
+            ROOT,
+        )
+        .unwrap_or_else(|e| panic!("{path}: {e:?}"));
+        let recorded = meta(&pod.store, &format!("{ROOT}{}", &path[3..])).expect("recorded");
+        assert_eq!(
+            recorded.blob.as_ref().map(|b| b.media_type.as_str()),
+            Some(media_type),
+            "{path}"
+        );
+    }
 }
 
 /// H2 (spec 4): parameters are stripped before the list is consulted, and the

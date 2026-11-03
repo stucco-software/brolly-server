@@ -283,3 +283,13 @@ needs doing: they expire on their own.
   block in `server/static/brolly.css` names the files.
 - **There is no email path.** Password reset is not wired to anything, so an
   account whose password is lost needs `brolly-admin` and a database.
+- **A pod serves documents** (ADR 0018). A member can host HTML, scripts
+  and stylesheets on their own subdomain, and a page there can look like
+  anything — the instance's login form included. It cannot *be* the
+  instance: a session is only minted on the apex, a form only accepted
+  from it. Two things follow for an operator. The session cookie is
+  `__Host-brolly_session`, so every member is logged out once at this
+  upgrade. And a grant on any folder of a pod is script on that pod's
+  whole origin: a member who lets someone else write anywhere in their pod
+  has let them read whatever a pod-hosted app keeps in the browser for
+  that origin.

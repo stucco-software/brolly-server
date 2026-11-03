@@ -1,27 +1,31 @@
 //! The media gate: what this server stores, and how much of it (spec 4).
 //!
-//! One allow-list and one size limit, both enforced at the single choke point
-//! every protocol's binary already passes through (`ldp::prepare`) and both
-//! advertised by the Mastodon instance configuration — the stage's premise is
-//! that an advertised contract nothing keeps is a bug, and the two tests here
-//! and in `brolly-mastodon`'s instance module are what keep the three from
-//! drifting apart silently.
+//! Two allow-lists — media, and the documents a web site is made of (ADR
+//! 0018) — and one size limit, all enforced at the single choke point every
+//! protocol's binary already passes through (`ldp::prepare`). The media list
+//! and the limit are advertised by the Mastodon instance configuration, and
+//! the media list has a second check at the Mastodon upload, so an attachment
+//! stays media. The stage's premise is that an advertised contract nothing
+//! keeps is a bug, and the tests here and in `brolly-mastodon`'s instance
+//! module are what keep them from drifting apart silently.
 
 /// The content types this server stores as media (spec 4, H2).
 ///
 /// A binary is stored only if its content type — parameters stripped, as
-/// [`crate::syntax::media_type_of`] produces — is on this list. Anything else
-/// is a 415 with this list in the body: the type is syntactically fine, this
-/// server just doesn't store it as media. Before the list, a member-typed
-/// `text/html` on the member's own origin was stored XSS: the bytes were
-/// served back with the type the uploader chose, on the origin that holds the
-/// member's session.
+/// [`crate::syntax::media_type_of`] produces — is on this list or on
+/// [`ALLOWED_DOCUMENT_TYPES`] (ADR 0018). Anything else is a 415 with both
+/// lists in the body: the type is syntactically fine, this server just
+/// doesn't store it. Before any list, a member-typed `text/html` on the
+/// member's own origin was stored XSS: the bytes were served back with the
+/// type the uploader chose, on the origin that holds the member's session —
+/// which held while the member's origin carried the member's session, and no
+/// longer does (ADR 0018).
 ///
-/// **`image/svg+xml` is deliberately absent.** SVG is script; a member-hosted
-/// SVG on the member's origin, rendered by any browser that follows the type,
-/// is stored XSS with the pod's cookies in scope. When SVG is wanted, it wants
-/// its own serving rules (`Content-Disposition`, CSP), and that is a recorded
-/// decision to reopen, not a default to slip in.
+/// **`text/html` and `image/svg+xml` are not here — they are on
+/// [`ALLOWED_DOCUMENT_TYPES`].** This list is what a Mastodon *attachment*
+/// may be; the pod stores both lists (ADR 0018). Spec 4 kept the two off
+/// every list while a member's origin held the member's session; it holds
+/// none now, and the decision is reversed on the record.
 ///
 /// The six RDF syntaxes and ADR 0007's `rdf+xml` refusal are upstream of this
 /// list and unchanged: a parseable RDF type never reaches the binary branch,
@@ -48,6 +52,28 @@ pub const ALLOWED_MEDIA_TYPES: &[&str] = &[
     "text/markdown",
     "text/csv",
     "application/octet-stream",
+];
+
+/// The document types a web site is made of (ADR 0018): what a pod stores
+/// and serves as typed, beyond media. Kept apart from
+/// [`ALLOWED_MEDIA_TYPES`] so that a Mastodon upload — which checks the
+/// media list before the pod's gate — cannot become an HTML upload. No
+/// `application/wasm`: it needs script to run and nobody has asked.
+pub const ALLOWED_DOCUMENT_TYPES: &[&str] = &[
+    "text/html",
+    "text/css",
+    "text/javascript",
+    "application/javascript",
+    "application/json",
+    "image/svg+xml",
+    "image/x-icon",
+    "font/woff2",
+    "font/woff",
+    "font/ttf",
+    "application/xml",
+    "text/xml",
+    "application/rss+xml",
+    "application/atom+xml",
 ];
 
 /// The upload limit this server enforces, and the one it advertises (spec 4,
@@ -207,12 +233,18 @@ pub fn format_size(bytes: u64) -> String {
     format!("{bytes} B")
 }
 
-/// True when `media_type` — a bare, parameter-stripped type — is one this
-/// server stores as media. The stripping is the caller's
+/// True when `media_type` — a bare, parameter-stripped type — is one a
+/// Mastodon attachment may be. The stripping is the caller's
 /// ([`crate::syntax::media_type_of`]): `image/png; charset=utf-8` is
 /// `image/png`.
 pub fn is_allowed_media_type(media_type: &str) -> bool {
     ALLOWED_MEDIA_TYPES.contains(&media_type)
+}
+
+/// True when the pod stores `media_type` as a binary: media or a document
+/// (ADR 0018). The one question `ldp::prepare` asks.
+pub fn is_storable_type(media_type: &str) -> bool {
+    is_allowed_media_type(media_type) || ALLOWED_DOCUMENT_TYPES.contains(&media_type)
 }
 
 #[cfg(test)]
@@ -250,13 +282,58 @@ mod tests {
     }
 
     #[test]
-    fn svg_is_absent_and_stays_absent() {
-        // The one absence that is a decision rather than an omission (spec 4,
-        // H2): SVG is script, and a member-hosted SVG on the member's origin
-        // is stored XSS. Reopening it wants serving rules, not a list edit.
-        assert!(!is_allowed_media_type("image/svg+xml"));
-        assert!(is_allowed_media_type("image/png"));
-        assert!(!is_allowed_media_type("text/html"));
+    fn the_document_list_is_what_the_adr_names() {
+        // ADR 0018's block, in its order.
+        assert_eq!(
+            ALLOWED_DOCUMENT_TYPES,
+            &[
+                "text/html",
+                "text/css",
+                "text/javascript",
+                "application/javascript",
+                "application/json",
+                "image/svg+xml",
+                "image/x-icon",
+                "font/woff2",
+                "font/woff",
+                "font/ttf",
+                "application/xml",
+                "text/xml",
+                "application/rss+xml",
+                "application/atom+xml",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_document_is_storable_but_is_not_media() {
+        // Two lists, one gate (ADR 0018): the pod stores both; a Mastodon
+        // attachment is media only. SVG and HTML are the two the old list
+        // kept out by decision, and the decision is reversed here, on the
+        // record.
+        for document in [
+            "text/html",
+            "image/svg+xml",
+            "text/css",
+            "application/rss+xml",
+        ] {
+            assert!(is_storable_type(document), "{document}");
+            assert!(!is_allowed_media_type(document), "{document}");
+        }
+        for medium in ["image/png", "application/pdf", "text/plain"] {
+            assert!(is_storable_type(medium), "{medium}");
+            assert!(is_allowed_media_type(medium), "{medium}");
+        }
+        for neither in ["application/x-sh", "application/rdf+xml", "text/turtle"] {
+            assert!(!is_storable_type(neither), "{neither}");
+        }
+        // The two lists do not overlap: a type is one thing or the other.
+        for document in ALLOWED_DOCUMENT_TYPES {
+            assert!(
+                !ALLOWED_MEDIA_TYPES.contains(document),
+                "{document} is on both"
+            );
+        }
     }
 
     #[test]

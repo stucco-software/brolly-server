@@ -744,9 +744,10 @@ pub(crate) fn ldp_error(error: LdpError, authenticated: bool, apex: &str) -> Res
         )
             .into_response(),
         // 415 with the list in the body (spec 4, H2): the type is syntactically
-        // fine, this server just doesn't store it as media, and the body is
-        // the error's own Display so the list has one source. Produced after
-        // the WAC check, so only a caller who may write learns the list.
+        // fine, this server stores it neither as media nor as a document,
+        // and the body is the error's own Display so the list has one
+        // source. Produced after the WAC check, so only a caller who may
+        // write learns the list.
         error @ LdpError::ContentTypeNotAllowed(_) => {
             (StatusCode::UNSUPPORTED_MEDIA_TYPE, error.to_string()).into_response()
         }
