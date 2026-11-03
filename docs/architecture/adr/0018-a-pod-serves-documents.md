@@ -106,7 +106,13 @@ Seven. The first five exist; the last two land with this change.
    with `Domain=<apex>`, and a percent-decoding parser such as `CookieJar`
    would read it as the session. Nothing may read this cookie through a
    decoding parser: `extract::session_token` is the one reader, and
-   `server/tests/architecture.rs` holds the line. The rename also closes the
+   `server/tests/architecture.rs` holds the line. The guarantee also depends
+   on the browser refusing nameless `__Host-` cookies: one sends
+   `=__Host-brolly_session=x` as a bare value, which the server can't tell
+   from the real cookie. Chrome 156 was tested and refuses them; Safari and
+   Firefox are to be checked before Chunk 3. A compliant browser can't send
+   the name twice, so `session_token` answers no session if it appears more
+   than once, which fails closed. The rename also closes the
    legacy opening at a stroke: the server stops reading `brolly_session` at all, so every
    cookie minted on a member host before `0a465e0` — and every tossed one —
    is inert from the deploy. Members log in again once; nothing else
@@ -128,8 +134,9 @@ Seven. The first five exist; the last two land with this change.
    `remove` emits neither `Secure` nor `Path`, so the browser would drop the
    removal and logout would silently leave the cookie behind (inert, since
    the session is revoked server-side, but there). `/logout` and
-   `/account/delete` build the removal from `session_cookie(String::new())`
-   with `Max-Age=0`, and a test reads the removal header back.
+   `/account/delete` emit `auth::session_removal` unconditionally, built from
+   `session_cookie` with `Max-Age=0`, since `remove` also emits nothing for a
+   cookie the jar didn't parse. A test reads the removal header back.
 7. **A pod never serves a service worker.** A request carrying
    `Service-Worker: script` to `/~/{*path}` (`pod::get`; the root is a
    container, served as RDF) is refused (403, "a pod does not serve service
@@ -198,11 +205,11 @@ the purpose — a page is served to be rendered. The three comments are updated 
   remembered consent, `/account/export` — are reachable from a member page
   with the Lax cookie. They give no more than any cross-site top-level
   navigation gives today, and their responses cannot be read.
-- **A member page can crowd the apex with cookies.** It can still set
-  `Domain=<apex>` cookies that are oversized or malformed, so that the
-  request's cookie header is refused or the session is evicted, and a member
-  is logged out. That costs a login, not access: no cookie it can set reads as
-  a session.
+- A member page can set enough `Domain=<apex>` cookies that requests are
+  refused, or that the session is evicted. Eviction costs a login. Refusal
+  locks that browser out of the instance, login included, until the cookies
+  expire or are cleared. Neither grants access, provided the browser rejects
+  nameless `__Host-` cookies.
 
 ## Consequences
 

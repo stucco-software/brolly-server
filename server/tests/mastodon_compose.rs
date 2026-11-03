@@ -65,6 +65,7 @@ async fn harness_sized(max_upload_bytes: usize, pod_quota_bytes: u64) -> Harness
             source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
             terms_url: None,
             privacy_url: None,
+            theme_css: false,
             public_registration: false,
             limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
             www_redirect: None,

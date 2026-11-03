@@ -28,9 +28,9 @@ use serde_json::json;
 use crate::ratelimit::{ClientKey, Gate, too_many};
 use crate::{AppState, Chrome, render};
 
-/// Name of the session cookie — identity's constant, so the two readers
-/// (`session_token` here, `extract::credential` on the pod) can never disagree
-/// on the name. See `brolly_identity::extract::SESSION_COOKIE` for why it is
+/// Name of the session cookie — identity's constant, so the writer here and
+/// the one reader, `extract::session_token`, can never disagree on the name.
+/// See `brolly_identity::extract::SESSION_COOKIE` for why it is
 /// `__Host-`-prefixed, and why `CookieJar` writes this cookie but never reads
 /// it: the prefix holds only while the name is read literally.
 pub const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
@@ -691,10 +691,7 @@ pub async fn logout(State(state): State<AppState>, headers: HeaderMap, jar: Cook
     {
         tracing::warn!(error = %e, "session revocation failed");
     }
-    // Built from the cookie login set, not from the bare name: a `__Host-`
-    // removal must carry `Secure` and `Path=/` or the browser drops it.
-    let jar = jar.remove(session_cookie(String::new()));
-    (jar, Redirect::to("/")).into_response()
+    (jar.add(session_removal()), Redirect::to("/")).into_response()
 }
 
 /// The signed-in member, if there is one.
@@ -726,17 +723,24 @@ pub(crate) fn session_token(headers: &HeaderMap) -> Option<String> {
 }
 
 /// The session cookie, with everything the `__Host-` prefix requires and
-/// everything a session cookie should have. Also the shape of its removal:
-/// a `__Host-` cookie can only be cleared by a `Set-Cookie` that carries the
-/// prefix's attributes, so `logout` and `delete_account` build their removal
-/// from this (`CookieJar::remove` keeps the attributes of the cookie it is
-/// given and sets only the empty value, `Max-Age=0` and `Expires`).
-pub(crate) fn session_cookie(token: String) -> Cookie<'static> {
+/// everything a session cookie should have.
+fn session_cookie(token: String) -> Cookie<'static> {
     let mut cookie = Cookie::new(SESSION_COOKIE, token);
     cookie.set_http_only(true); // unreadable from JavaScript
     cookie.set_secure(true);
     cookie.set_same_site(SameSite::Lax); // survives a top-level navigation back
     cookie.set_path("/");
+    cookie
+}
+
+/// The `Set-Cookie` that clears the session cookie. A `__Host-` cookie can only
+/// be cleared by one that carries the prefix's attributes, so it is built from
+/// the cookie login set. `logout` and `delete_account` `add` it rather than
+/// `CookieJar::remove`, which emits nothing for a name the jar didn't parse,
+/// and the jar drops a whole `Cookie` field for one non-ASCII neighbour.
+pub(crate) fn session_removal() -> Cookie<'static> {
+    let mut cookie = session_cookie(String::new());
+    cookie.make_removal();
     cookie
 }
 
@@ -950,5 +954,24 @@ mod tests {
         );
         assert_eq!(cookie.path(), Some("/"));
         assert_eq!(cookie.domain(), None);
+    }
+
+    #[test]
+    fn the_removal_needs_no_cookie_in_the_jar() {
+        // An empty jar is what `CookieJar` sees beside a non-ASCII neighbour.
+        let response = (CookieJar::new().add(session_removal()), "").into_response();
+        let removal = response
+            .headers()
+            .get(header::SET_COOKIE)
+            .and_then(|v| v.to_str().ok())
+            .expect("a removal Set-Cookie");
+        assert!(
+            removal.starts_with(&format!("{SESSION_COOKIE}=;")),
+            "{removal}"
+        );
+        assert!(removal.contains("Max-Age=0"), "{removal}");
+        assert!(removal.contains("Secure"), "{removal}");
+        assert!(removal.contains("Path=/"), "{removal}");
+        assert!(!removal.contains("Domain="), "{removal}");
     }
 }

@@ -36,8 +36,14 @@ pub const SESSION_COOKIE: &str = "__Host-brolly_session";
 /// so one non-ASCII cookie beside the session doesn't lose it. Matches the name
 /// byte for byte and decodes nothing: see [`SESSION_COOKIE`] for why that is a
 /// security property rather than a simplification.
+///
+/// The name appearing twice is no session at all. A compliant browser can't
+/// send it twice: the prefix pins the cookie to one host and one path. A
+/// browser that accepted a nameless cookie sends its value bare, as
+/// `__Host-brolly_session=x`, indistinguishable from the real one, so a second
+/// occurrence fails closed rather than picking a winner.
 pub fn session_token<'a>(cookie_fields: impl IntoIterator<Item = &'a [u8]>) -> Option<String> {
-    cookie_fields
+    let mut values = cookie_fields
         .into_iter()
         .flat_map(|field| field.split(|byte| *byte == b';'))
         .filter_map(|pair| {
@@ -48,9 +54,12 @@ pub fn session_token<'a>(cookie_fields: impl IntoIterator<Item = &'a [u8]>) -> O
             } else {
                 None
             }
-        })
-        .find_map(|value| std::str::from_utf8(value).ok())
-        .map(str::to_string)
+        });
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    std::str::from_utf8(value).ok().map(str::to_string)
 }
 
 /// Choose a credential from what the request carried.
@@ -230,6 +239,23 @@ mod tests {
     fn a_percent_encoded_name_is_not_the_session() {
         assert_eq!(
             session_token([b"__%48ost-brolly_session=xyz".as_slice()]),
+            None
+        );
+    }
+
+    #[test]
+    fn the_name_twice_is_no_session() {
+        // A compliant browser can't send it twice, so a second one is a
+        // nameless `__Host-` cookie, or worse. Fail closed.
+        assert_eq!(
+            cookie("__Host-brolly_session=a; __Host-brolly_session=b"),
+            None
+        );
+        assert_eq!(
+            session_token([
+                b"__Host-brolly_session=a".as_slice(),
+                b"other=1; __Host-brolly_session=a".as_slice(),
+            ]),
             None
         );
     }

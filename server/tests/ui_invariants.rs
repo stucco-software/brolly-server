@@ -242,6 +242,37 @@ fn every_form_post_is_same_origin_checked() {
     }
 }
 
+/**
+ * `theme.css` is linked only when the deployment ships one.
+ *
+ * The file is a deployment's override — COPYed into the static dir by a
+ * derived image, never part of the default deployment (the one-stylesheet
+ * invariant above fails if one lands in this repo's static dir) — so the
+ * link has to stay conditional. An unconditional link is a 404 on every
+ * page of every default deployment, and browsers swallow a missing
+ * stylesheet without complaint: the loudest symptom is an access-log line
+ * nobody greps.
+ */
+#[test]
+fn the_theme_override_is_linked_only_when_shipped() {
+    let templates = workspace_root().join("server/templates");
+
+    for name in ["base.html", "profile.html"] {
+        let text = std::fs::read_to_string(templates.join(name)).expect("read template");
+        let references: Vec<&str> = text.lines().filter(|l| l.contains("theme.css")).collect();
+        assert_eq!(
+            references.len(),
+            1,
+            "{name} must reference theme.css exactly once, found {references:?}"
+        );
+        assert!(
+            references[0].contains("{% if chrome.theme_css %}"),
+            "{name}: the theme.css link must stay inside the \
+             {{% if chrome.theme_css %}} conditional"
+        );
+    }
+}
+
 #[test]
 fn components_use_tokens_not_literal_colors() {
     // Literal colours belong in batklubb.config.js, which generates tokens.css.

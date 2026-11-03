@@ -47,6 +47,7 @@ async fn harness_as(
         source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
         terms_url: None,
         privacy_url: None,
+        theme_css: false,
         public_registration,
         limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
         www_redirect: www_redirect.map(str::to_string),
@@ -1080,6 +1081,61 @@ async fn logout_revokes_the_real_session_beside_a_tossed_one() {
             .unwrap()
             .is_none(),
         "alice's session must be the one revoked"
+    );
+}
+
+/// The jar drops a whole `Cookie` field over one non-ASCII neighbour. The
+/// reader doesn't, and the removal doesn't depend on what the jar saw.
+#[tokio::test]
+async fn a_non_ascii_neighbour_keeps_the_session_and_logout_still_clears_it() {
+    let (db, _dir, router) = harness().await;
+    let (alice, _) = alice_and_mallory(&db).await;
+    let mut raw = b"x=\xff; ".to_vec();
+    raw.extend_from_slice(format!("{SESSION_COOKIE}={alice}").as_bytes());
+    let cookie = axum::http::HeaderValue::from_bytes(&raw).unwrap();
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/account")
+                .header(header::HOST, "brolly.test")
+                .header(header::COOKIE, cookie.clone())
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/logout")
+                .header(header::COOKIE, cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let removal = response
+        .headers()
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .find(|c| c.starts_with(&format!("{SESSION_COOKIE}=")))
+        .expect("a removal Set-Cookie");
+    assert!(removal.contains("Max-Age=0"), "{removal}");
+    assert!(removal.contains("Secure"), "{removal}");
+    assert!(removal.contains("Path=/"), "{removal}");
+    assert!(
+        db::user_for_session(&db.pool, &alice)
+            .await
+            .unwrap()
+            .is_none()
     );
 }
 

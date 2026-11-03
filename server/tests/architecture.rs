@@ -239,12 +239,19 @@ fn only_identity_parses_credentials() {
 /// The jar writes the cookie; `extract::session_token` reads it.
 #[test]
 fn the_session_cookie_is_never_read_through_a_decoding_parser() {
+    const READS: [&str; 3] = [".get(SESSION_COOKIE)", "jar.get(", "jar.iter("];
+    const WRITERS: [&str; 2] = ["auth.rs", "account.rs"];
+
     let server_src = workspace_root().join("server").join("src");
     let offenders: Vec<_> = source_files()
         .into_iter()
         .filter(|p| p.starts_with(&server_src))
         .filter(|p| {
-            std::fs::read_to_string(p).is_ok_and(|text| text.contains(".get(SESSION_COOKIE)"))
+            let Ok(text) = std::fs::read_to_string(p) else {
+                return false;
+            };
+            READS.iter().any(|read| text.contains(read))
+                || (text.contains("CookieJar") && !WRITERS.iter().any(|w| p.ends_with(w)))
         })
         .collect();
 

@@ -641,9 +641,5 @@ pub async fn delete_account(
 
     // Sessions cascade with the user row; clearing the cookie stops the browser
     // presenting a token that no longer resolves.
-    (
-        jar.remove(crate::auth::session_cookie(String::new())),
-        Redirect::to("/"),
-    )
-        .into_response()
+    (jar.add(crate::auth::session_removal()), Redirect::to("/")).into_response()
 }

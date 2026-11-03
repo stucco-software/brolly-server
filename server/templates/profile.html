@@ -12,6 +12,8 @@
   <title>@{{ username }} — {{ chrome.instance_name }}</title>
   <link rel="stylesheet" href="https://{{ chrome.instance_name }}/static/tokens.css">
   <link rel="stylesheet" href="https://{{ chrome.instance_name }}/static/brolly.css">
+  {# The deployment's theme override, if it ships one — see base.html. #}
+  {% if chrome.theme_css %}<link rel="stylesheet" href="https://{{ chrome.instance_name }}/static/theme.css">{% endif %}
   {# The same document a client parses. `alternate` rather than `describedby`:
      it is this resource in another syntax, not a description of it. #}
   <link rel="alternate" type="text/turtle" href="{{ webid }}">

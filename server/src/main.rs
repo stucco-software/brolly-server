@@ -112,6 +112,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         privacy_url: std::env::var("BROLLY_PRIVACY_URL")
             .ok()
             .filter(|s| !s.is_empty()),
+        // A deployment's theme override, if it ships one: `theme.css` in the
+        // static dir, COPYed in by a derived image. `is_file`, not `exists`:
+        // a botched bind mount creates a *directory* at the target, and a
+        // deployment that thinks it is themed rendering unthemed is a
+        // confusing failure — loud here, with the path, like a bad
+        // BROLLY_WWW_REDIRECT.
+        theme_css: {
+            let path = std::path::Path::new(&static_dir).join("theme.css");
+            if path.exists() && !path.is_file() {
+                tracing::error!(
+                    path = %path.display(),
+                    "theme.css exists but is not a regular file"
+                );
+                return Err("theme.css exists but is not a regular file".into());
+            }
+            path.is_file()
+        },
         // Off by default: an open registration door is a public deployment's
         // decision, not a private community's default. Read here with the rest
         // of the door's config; the form and the account-creation API both

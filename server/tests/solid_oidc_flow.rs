@@ -49,6 +49,7 @@ async fn harness_with(
         source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
         terms_url: None,
         privacy_url: None,
+        theme_css: false,
         public_registration: false,
         limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
         www_redirect: None,
@@ -971,6 +972,7 @@ async fn our_own_profile_is_not_a_client_id_document() {
         source_url: brolly_server::SOURCE_URL_DEFAULT.to_string(),
         terms_url: None,
         privacy_url: None,
+        theme_css: false,
         public_registration: false,
         limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
         www_redirect: None,
@@ -1144,6 +1146,33 @@ async fn prompt_none_without_a_session_is_an_error_redirect_not_a_login_page() {
         "state must return with the error, or the client cannot correlate it"
     );
     assert!(!params.contains_key("code"));
+}
+
+#[tokio::test]
+async fn prompt_none_with_only_the_old_cookie_name_is_login_required() {
+    // ADR 0018: a live token under `brolly_session` is no session, so the
+    // silent path answers as it does for nobody at all.
+    let harness = harness().await;
+    let client_id = register(&harness).await;
+    let (_, challenge) = pkce();
+    let session = a_logged_in_member(&harness).await;
+    let (_, token) = session.split_once('=').expect("name=value");
+
+    let reply = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid",
+            &challenge,
+            Some("none"),
+        ),
+        Some(&format!("brolly_session={token}")),
+    )
+    .await;
+
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    assert_eq!(reply.redirect_params()["error"], "login_required");
 }
 
 #[tokio::test]

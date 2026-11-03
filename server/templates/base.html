@@ -6,6 +6,9 @@
   <title>{% block title %}{{ chrome.instance_name }}{% endblock %}</title>
   <link rel="stylesheet" href="/static/tokens.css">
   <link rel="stylesheet" href="/static/brolly.css">
+  {# The deployment's theme override, linked only when the deployment ships
+     one — see Chrome. Last, so it wins the cascade at equal specificity. #}
+  {% if chrome.theme_css %}<link rel="stylesheet" href="/static/theme.css">{% endif %}
   <link rel="icon" type="image/png" sizes="96x96" href="/static/favicon/favicon-96x96.png">
   <link rel="shortcut icon" href="/static/favicon/favicon.ico">
   <link rel="apple-touch-icon" sizes="180x180" href="/static/favicon/apple-touch-icon.png">

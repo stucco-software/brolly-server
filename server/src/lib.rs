@@ -56,6 +56,16 @@ pub struct AppState {
     pub source_url: String,
     pub terms_url: Option<String>,
     pub privacy_url: Option<String>,
+    /// Whether this deployment ships a theme override: `theme.css` in the
+    /// static dir, `COPY`ed in by a derived image.
+    ///
+    /// A bool rather than a path because nothing is decided per request —
+    /// `ServeDir` already serves whatever is in the static dir — so the pages
+    /// only need to know whether to link it. Detected once at startup, and
+    /// loudly: a `theme.css` that exists but is not a regular file (a botched
+    /// bind mount creates a *directory* at the target) is a startup failure
+    /// with the path in the log, not a silently unthemed deployment.
+    pub theme_css: bool,
     /// Whether this instance lets anyone register, or only invite-holders.
     ///
     /// `BROLLY_PUBLIC_REGISTRATION`, read once at startup. The default is the
@@ -200,7 +210,7 @@ pub const SOURCE_URL_DEFAULT: &str = "https://www.brolly.id";
 
 /// What every page's chrome renders, regardless of which page it is.
 ///
-/// One field on every page struct rather than five, because `base.html`'s
+/// One field on every page struct rather than six, because `base.html`'s
 /// footer renders the fine print and Askama type-checks an `{% include %}`
 /// against the *including* struct. The upside of the indirection is that a new
 /// page cannot compile without it.
@@ -210,6 +220,9 @@ pub struct Chrome<'a> {
     pub source_url: &'a str,
     pub terms_url: Option<&'a str>,
     pub privacy_url: Option<&'a str>,
+    /// Whether to link the deployment's `theme.css` override. See
+    /// [`AppState::theme_css`].
+    pub theme_css: bool,
 }
 
 impl AppState {
@@ -220,6 +233,7 @@ impl AppState {
             source_url: &self.source_url,
             terms_url: self.terms_url.as_deref(),
             privacy_url: self.privacy_url.as_deref(),
+            theme_css: self.theme_css,
         }
     }
 }
