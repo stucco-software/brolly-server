@@ -109,7 +109,9 @@ Seven. The first five exist; the last two land with this change.
    `server/tests/architecture.rs` holds the line. The guarantee also depends
    on the browser refusing nameless `__Host-` cookies: one sends
    `=__Host-brolly_session=x` as a bare value, which the server can't tell
-   from the real cookie. Chrome 156 was tested and refuses them; Safari and
+   from the real cookie. Chrome 156 was tested over `http://`, setting the
+   cookie with `document.cookie` rather than an HTTPS `Set-Cookie`, and
+   refuses them; Safari and
    Firefox are to be checked before Chunk 3. A compliant browser can't send
    the name twice, so `session_token` answers no session if it appears more
    than once, which fails closed. The rename also closes the

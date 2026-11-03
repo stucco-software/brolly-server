@@ -1008,32 +1008,48 @@ async fn framing_is_self_on_a_member_host_and_none_on_the_apex() {
         );
     }
 
-    // The apex: the same request shape, the instance's host.
-    for path in ["/health", "/login"] {
+    // The apex: the same request shape, the instance's host — the pages that
+    // render (so the header is on a real answer, not an error), the consent
+    // screen's route whatever it answers without a client, and the apex
+    // spelled as a browser may send it, in capitals and with a port.
+    for (host, path, expected) in [
+        ("brolly.test", "/health", Some(StatusCode::OK)),
+        ("brolly.test", "/login", Some(StatusCode::OK)),
+        ("brolly.test", "/oauth/solid/authorize", None),
+        ("BROLLY.TEST:3000", "/health", None),
+    ] {
         let response = h
             .router
             .clone()
             .oneshot(
                 Request::builder()
                     .uri(path)
-                    .header(header::HOST, "brolly.test")
+                    .header(header::HOST, host)
                     .body(Body::empty())
                     .unwrap(),
             )
             .await
             .unwrap();
+        if let Some(expected) = expected {
+            assert_eq!(response.status(), expected, "{host}{path}");
+        }
         let headers = response.headers();
         assert_eq!(
             headers
                 .get("content-security-policy")
                 .map(|v| v.to_str().unwrap()),
             Some("frame-ancestors 'none'"),
-            "{path}: the apex"
+            "{host}{path}: the apex"
         );
         assert_eq!(
             headers.get("x-frame-options").map(|v| v.to_str().unwrap()),
             Some("DENY"),
-            "{path}"
+            "{host}{path}"
+        );
+        assert_eq!(
+            headers.get("referrer-policy").map(|v| v.to_str().unwrap()),
+            Some("strict-origin-when-cross-origin"),
+            "{host}{path}"
         );
     }
 }
@@ -1077,6 +1093,33 @@ async fn a_pod_refuses_to_serve_a_service_worker() {
     // As anything else: served.
     let (status, _, _) = h.send("GET", "/~/sw.txt", None, true).await;
     assert_eq!(status, StatusCode::OK);
+}
+
+/// The same refusal for a real worker script (ADR 0018, control 7). A pod
+/// stores `text/javascript` now, so the only thing between a member's script
+/// and a registered worker is the `Service-Worker` header check: with it the
+/// fetch is refused, without it the same bytes are served as typed.
+#[tokio::test]
+async fn a_pod_refuses_a_javascript_file_as_a_service_worker() {
+    let h = harness().await;
+    let script = "self.addEventListener('fetch', () => {})";
+    let (status, body, _) = h
+        .send("PUT", "/~/sw.js", Some(("text/javascript", script)), true)
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let (status, body, _) = h
+        .send_if("GET", "/~/sw.js", None, &[("service-worker", "script")])
+        .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+
+    let (status, served, headers) = h.send("GET", "/~/sw.js", None, true).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(served, script);
+    assert_eq!(
+        headers.get("content-type").map(|v| v.to_str().unwrap()),
+        Some("text/javascript")
+    );
 }
 
 // --- the settings resources (spec 6, H2) --------------------------------------

@@ -560,11 +560,13 @@ pub fn parse_www_redirect(value: &str) -> Result<String, String> {
 /// Send the `www` host wherever the deployment pointed it (`BROLLY_WWW_REDIRECT`).
 ///
 /// Routing is by path, so without this the `www` host matches the apex's
-/// routes — login and register render, while the host-checked surfaces (the
-/// OAuth sub-router, the pods) answer 404 — a broken half-apex under a name
-/// no member can own (`www` is reserved). Configured, every request to the
-/// host is sent to the configured base with its path and query intact, so a
-/// deep link to `www.{base}/pricing` lands on the target's `/pricing`.
+/// routes — the unchecked ones (`/health` and `/static` among them) answer,
+/// while the host-checked surfaces (the door, the dashboard and the console
+/// since `0a465e0`, the OAuth sub-router, the pods) answer 404 — a broken
+/// half-apex under a name no member can own (`www` is reserved). Configured,
+/// every request to the host is sent to the configured base with its path
+/// and query intact, so a deep link to `www.{base}/pricing` lands on the
+/// target's `/pricing`.
 ///
 /// **308, and everything redirects, not just `GET`.** The `www` host is not
 /// a surface this server serves — it is an alias for one that lives elsewhere

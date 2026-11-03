@@ -1157,22 +1157,34 @@ async fn prompt_none_with_only_the_old_cookie_name_is_login_required() {
     let (_, challenge) = pkce();
     let session = a_logged_in_member(&harness).await;
     let (_, token) = session.split_once('=').expect("name=value");
+    let query = authorize_query(
+        &client_id,
+        REDIRECT,
+        "openid webid",
+        &challenge,
+        Some("none"),
+    );
 
-    let reply = get(
-        &harness,
-        &authorize_query(
-            &client_id,
-            REDIRECT,
-            "openid webid",
-            &challenge,
-            Some("none"),
-        ),
-        Some(&format!("brolly_session={token}")),
-    )
-    .await;
-
+    let reply = get(&harness, &query, Some(&format!("brolly_session={token}"))).await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     assert_eq!(reply.redirect_params()["error"], "login_required");
+
+    // The control: the same token under the real name is a session, so the
+    // answer above is the name's doing, not the token's. With no consent
+    // remembered, the silent path says so.
+    let reply = get(
+        &harness,
+        &query,
+        Some(&format!(
+            "{}={token}",
+            brolly_identity::extract::SESSION_COOKIE
+        )),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+    let params = reply.redirect_params();
+    assert_ne!(params["error"], "login_required", "{params:?}");
+    assert_eq!(params["error"], "consent_required", "{params:?}");
 }
 
 #[tokio::test]

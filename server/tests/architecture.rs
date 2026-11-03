@@ -239,10 +239,19 @@ fn only_identity_parses_credentials() {
 /// The jar writes the cookie; `extract::session_token` reads it.
 #[test]
 fn the_session_cookie_is_never_read_through_a_decoding_parser() {
-    const READS: [&str; 3] = [".get(SESSION_COOKIE)", "jar.get(", "jar.iter("];
-    const WRITERS: [&str; 2] = ["auth.rs", "account.rs"];
-
+    // `parse_encoded` is the `cookie` crate's own decoding parser, reachable
+    // without the jar.
+    const READS: [&str; 4] = [
+        ".get(SESSION_COOKIE)",
+        "jar.get(",
+        "jar.iter(",
+        "parse_encoded",
+    ];
+    // By full path: a file named `auth.rs` anywhere else under `src/` is not
+    // a writer.
     let server_src = workspace_root().join("server").join("src");
+    let writers = [server_src.join("auth.rs"), server_src.join("account.rs")];
+
     let offenders: Vec<_> = source_files()
         .into_iter()
         .filter(|p| p.starts_with(&server_src))
@@ -251,7 +260,7 @@ fn the_session_cookie_is_never_read_through_a_decoding_parser() {
                 return false;
             };
             READS.iter().any(|read| text.contains(read))
-                || (text.contains("CookieJar") && !WRITERS.iter().any(|w| p.ends_with(w)))
+                || (text.contains("CookieJar") && !writers.contains(p))
         })
         .collect();
 
