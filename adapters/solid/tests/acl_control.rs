@@ -787,12 +787,14 @@ fn a_composer_shaped_acl_governs_the_resource_alone() {
 }
 
 #[test]
-fn an_audience_only_acl_locks_the_author_out() {
-    // The hole the author grant closes: an ACL with the audience's grant and
-    // no author grant leaves the author — who holds Read, Write and Control
-    // on the whole pod through the root's `acl:default` — with nothing on
-    // their own resource. The audience reads; the author cannot even fix the
-    // ACL, because Control went with the exclusion.
+fn an_audience_only_acl_no_longer_locks_the_author_out() {
+    // The hole the author grant was written to close: an ACL with the
+    // audience's grant and no author grant gives the author — by WAC alone —
+    // Read as one `foaf:Agent` among many, and nothing else, not even the
+    // Control to fix it. The owner bypass (ADR 0019) closes it a second
+    // time, beneath the composer: the member holds every mode on their own
+    // pod whatever the ACL says. The composer still writes the author grant;
+    // it is what the ACL says to every client that reads it.
     let (_m, _d, store) = pod();
     let medium = format!("{ROOT}medium");
     store
@@ -803,45 +805,62 @@ fn an_audience_only_acl_locks_the_author_out() {
         })
         .unwrap();
 
-    // The audience reads, anonymously even.
-    assert!(
+    // The audience reads, anonymously even, and only reads.
+    assert_eq!(
         ldp::granted_modes(
             &store.read_store(),
             BASE,
             "/~/medium",
             &Subject::anonymous()
-        )
-        .contains(&AccessMode::Read),
-        "the public audience does not read"
-    );
-    // The author: Read as one foaf:Agent among many, and nothing else — not
-    // Write, not Control.
-    let granted = ldp::granted_modes(&store.read_store(), BASE, "/~/medium", &alice());
-    assert_eq!(
-        granted,
-        vec![AccessMode::Read],
-        "the author kept more than Read"
-    );
-    assert!(matches!(
-        ldp::put(
-            &store,
-            None,
-            BASE,
-            "/~/medium",
-            &alice(),
-            NOTE,
-            "text/turtle",
-            ROOT,
         ),
-        Err(LdpError::Denied)
-    ));
+        vec![AccessMode::Read]
+    );
+    // The author holds all four, on the resource and on its ACL, and uses
+    // them: a write, then the repair.
+    for path in ["/~/medium", "/~/medium.acl"] {
+        assert_eq!(
+            ldp::granted_modes(&store.read_store(), BASE, path, &alice()),
+            ALL,
+            "{path}: the owner is short a mode"
+        );
+    }
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/medium",
+        &alice(),
+        NOTE,
+        "text/turtle",
+        ROOT,
+    )
+    .expect("the owner writes their own medium");
+    let repair = format!(
+        "@prefix acl: <{ACL}> .\n\
+         <#owner> acl:agent <{ALICE}> ; acl:accessTo <{medium}> ;\n\
+           acl:mode acl:Read, acl:Write, acl:Control .\n"
+    );
+    ldp::put(
+        &store,
+        None,
+        BASE,
+        "/~/medium.acl",
+        &alice(),
+        repair.as_bytes(),
+        "text/turtle",
+        ROOT,
+    )
+    .expect("the owner repairs the ACL");
+
+    // Another member is held to the ACL, whatever the owner holds.
+    assert!(ldp::granted_modes(&store.read_store(), BASE, "/~/medium", &bob()).is_empty());
     assert!(matches!(
         ldp::put(
             &store,
             None,
             BASE,
             "/~/medium.acl",
-            &alice(),
+            &bob(),
             b"",
             "text/turtle",
             ROOT,

@@ -10,7 +10,17 @@
 /// Per-user subdomains make the subdomain the identity prefix, so this reads as
 /// a natural WebID rather than a path under a shared host.
 pub fn webid(username: &str, base_domain: &str) -> String {
-    format!("https://{username}.{base_domain}/profile#me")
+    webid_at(&format!("https://{username}.{base_domain}"))
+}
+
+/// The WebID of the pod at `origin` — `https://<user>.<base>`, no trailing
+/// slash, the `base` every LDP operation is handed.
+///
+/// [`webid`] is this with the origin spelled out, so the two cannot drift:
+/// the owner bypass (ADR 0019) compares a subject's WebID against this, and
+/// a subject's WebID was minted by [`webid`].
+pub fn webid_at(origin: &str) -> String {
+    format!("{origin}/profile#me")
 }
 
 /// The document containing the WebID — also the named graph holding its triples.

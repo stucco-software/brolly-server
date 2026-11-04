@@ -1327,3 +1327,99 @@ async fn a_remote_read_challenged(
     )
     .await
 }
+
+// --- the owner bypass is local-only (ADR 0019) ----------------------------------
+
+/// The owner has every mode on their own pod whatever the ACLs say (ADR
+/// 0019), and "owner" means a subject *this instance* authenticated. A
+/// token another issuer signed is a remote subject whatever WebID it names,
+/// so it holds exactly what WAC gives that WebID and nothing more.
+///
+/// In production a foreign issuer can't speak for a local WebID at all: our
+/// profiles name only this instance as `solid:oidcIssuer`, so the binding
+/// refuses. The stub here names the foreign issuer for Alice's WebID on
+/// purpose — the binding is the first wall, and this test pins the second,
+/// so that a binding regression could never become an owner bypass.
+#[tokio::test]
+async fn a_remote_subject_naming_the_owners_webid_is_not_the_owner() {
+    let alice = format!("{POD}/profile#me");
+    let mut discovery = Counting::<RemoteDiscovery>::default();
+    discovery.answers.insert(
+        format!("{ISSUER}/.well-known/openid-configuration"),
+        discovery_document(ISSUER, JWKS_URI),
+    );
+    let mut jwks = Counting::<RemoteJwks>::default();
+    jwks.answers
+        .insert(JWKS_URI.to_string(), key_set(&issuer_key(), ISSUER_KID));
+    let webids = StaticDocuments::default().with(&alice, profile_naming(&alice, ISSUER));
+    let harness = harness_with((Arc::new(discovery), Arc::new(jwks), Arc::new(webids))).await;
+
+    // The lockout ACL (ADR 0019's motivating case): the world reads, the
+    // owner is not named. WAC grants Alice's WebID Read through
+    // `foaf:Agent`, and nothing else.
+    let g = format!("{ROOT}.acl");
+    let public = format!("{g}#public");
+    let lockout = [
+        t(&g, &public, &format!("{ACL}default"), ROOT),
+        t(&g, &public, &format!("{ACL}accessTo"), ROOT),
+        t(&g, &public, &format!("{ACL}mode"), &format!("{ACL}Read")),
+        t(
+            &g,
+            &public,
+            &format!("{ACL}agentClass"),
+            "http://xmlns.com/foaf/0.1/Agent",
+        ),
+    ];
+    harness
+        .pod
+        .write(|w| w.put(&g, Content::Auxiliary(&lockout)))
+        .unwrap();
+
+    let client = client_key();
+    let token = signed_by(
+        &issuer_key(),
+        ISSUER_KID,
+        remote_claims(ISSUER, &alice, &jkt_of(&client)),
+    );
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let request = |method: &str, body: Option<&str>| {
+        let mut builder = Request::builder()
+            .method(method)
+            .uri("/~/note")
+            .header(header::HOST, POD_HOST)
+            .header(header::AUTHORIZATION, format!("DPoP {token}"))
+            .header("DPoP", dpop_proof(&client, method, NOTE, Some(&ath)));
+        if body.is_some() {
+            builder = builder.header(header::CONTENT_TYPE, "text/turtle");
+        }
+        builder
+            .body(body.map_or(Body::empty(), |b| Body::from(b.to_string())))
+            .unwrap()
+    };
+
+    // Authenticated — the read works and reports Read alone, so the refusal
+    // below is WAC's and not the credential's.
+    let response = harness
+        .router
+        .clone()
+        .oneshot(request("GET", None))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["wac-allow"],
+        "user=\"read\", public=\"read\"",
+        "a remote subject is reported what WAC gives it, not the owner's modes"
+    );
+
+    let (status, body) = send(
+        &harness,
+        request("PUT", Some("<> <https://example.org/title> \"remote\" .")),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "a remote subject naming the owner's WebID gained the owner's access: {body}"
+    );
+}

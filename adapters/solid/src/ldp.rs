@@ -33,6 +33,7 @@ use brolly_domain::media;
 use brolly_domain::syntax::{self, ReadFormat, SyntaxError};
 use brolly_domain::vocab;
 use brolly_identity::Subject;
+use brolly_identity::routing::USER_STORAGE_ROOT;
 use brolly_store::resources::{
     self, BlobMeta, Content, Kind, Pod, PodRead, PodWrite, ResourceMeta, ResourceRead,
 };
@@ -371,7 +372,34 @@ pub fn meta_iri(target: &str) -> String {
     format!("{target}.meta")
 }
 
+/// Is `subject` the owner of the pod at `base`, asking about something in its
+/// storage? (ADR 0019.)
+///
+/// **The one place the owner bypass is decided.** [`check`] and
+/// [`granted_modes`] are the only two functions that evaluate WAC — every
+/// surface that decides access to pod content goes through one of them: the
+/// LDP operations here, `OPTIONS` and `WAC-Allow` via [`describe_in`], the
+/// profile page's depiction check, Mastodon's media upload (`put_in`). Both
+/// ask this first, so no surface can grant the owner a mode another refuses,
+/// or report one it would then refuse.
+///
+/// `base` is the pod's origin, which every caller derives from the host the
+/// pod was resolved from, so "the pod's own WebID" is the WebID of the pod
+/// being written to, not of whoever is asking. The path must be inside the
+/// storage root: that is the whole of what the bypass covers — every
+/// resource, container, `.acl` and `.meta` under `/~/` — and nothing outside
+/// it is evaluated here anyway.
+fn owner(base: &str, path: &str, subject: &Subject) -> bool {
+    path.starts_with(USER_STORAGE_ROOT) && subject.owns(base)
+}
+
 /// Resolve and evaluate the ACL governing `resource`.
+///
+/// **The pod's owner holds every mode first** ([`owner`], ADR 0019): before
+/// either remap below and before any ACL is read. An ACL can no longer lock
+/// the member out of their own storage, nor out of the `Control` it takes to
+/// repair it. A pod whose ACLs can't be evaluated answers the owner too,
+/// which is the one caller who can mend it.
 ///
 /// An ACL resource is the exception (stage 0, A2). Whatever mode is asked for,
 /// it needs `acl:Control` on the resource it [`governed`]s, from that
@@ -392,6 +420,9 @@ fn check(
     subject: &Subject,
     mode: AccessMode,
 ) -> Result<bool, LdpError> {
+    if owner(base, path, subject) {
+        return Ok(true);
+    }
     // Two remaps, never composed (spec 5d, H2): a path ending in both
     // suffixes is answered 404 before authorization (H1), so the arms never
     // meet on a target that can exist.
@@ -422,6 +453,12 @@ fn check(
 /// On a `.meta` it is the modes on the resource described (spec 5d, H2),
 /// which is also the truthful answer for the `.meta` itself: it is
 /// authorized by exactly those modes.
+///
+/// The pod's owner holds all four everywhere in their storage ([`owner`],
+/// ADR 0019), and this reports it, because [`check`] grants it: `WAC-Allow`,
+/// `Allow` and `OPTIONS` advertise exactly what the next request will be
+/// allowed. The anonymous probe for `public=` is never the owner, so it
+/// still describes the ACL.
 pub fn granted_modes(
     store: &impl PodRead,
     base: &str,
@@ -434,6 +471,10 @@ pub fn granted_modes(
         AccessMode::Append,
         AccessMode::Control,
     ];
+
+    if owner(base, path, subject) {
+        return ALL.to_vec();
+    }
 
     if governed(path).is_some() {
         return match check(store, base, path, subject, AccessMode::Control) {
@@ -1716,7 +1757,7 @@ pub fn accepted_write_types() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{acl_iri, check, describes, governed, meta_iri};
+    use super::{acl_iri, check, describes, governed, granted_modes, meta_iri, owner};
     use brolly_authz::AccessMode;
     use brolly_identity::{Scope, Subject, Via};
     use brolly_store::StoreManager;
@@ -1889,6 +1930,85 @@ mod tests {
             Scope::parse("webid"),
             Via::SolidDpop,
         )
+    }
+
+    /// ADR 0019: the owner holds every mode on everything in their storage,
+    /// under a root ACL that names them nowhere — the lockout, at its worst.
+    /// The same pod answers everyone else by WAC alone, so the bypass is the
+    /// owner's and nobody else's.
+    #[test]
+    fn the_owner_holds_every_mode_whatever_the_acl_says() {
+        const ALL: [AccessMode; 4] = [
+            AccessMode::Read,
+            AccessMode::Write,
+            AccessMode::Append,
+            AccessMode::Control,
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = StoreManager::open(dir.path(), 1, 60).unwrap();
+        let pod = mgr.pod(uuid::Uuid::new_v4()).unwrap();
+        let g = format!("{ROOT}.acl");
+        let public = format!("{g}#public");
+        let world_reads = vec![
+            quad(&g, &public, &format!("{ACL}default"), ROOT),
+            quad(&g, &public, &format!("{ACL}accessTo"), ROOT),
+            quad(&g, &public, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            quad(
+                &g,
+                &public,
+                &format!("{ACL}agentClass"),
+                "http://xmlns.com/foaf/0.1/Agent",
+            ),
+        ];
+        pod.write(|w| {
+            w.create_root(ROOT)?;
+            w.put(&g, Content::Auxiliary(&world_reads))
+        })
+        .unwrap();
+        let r = pod.read_store();
+        let remote_alice = Subject::remote(
+            "https://alice.brolly.id/profile#me".into(),
+            Scope::parse("webid"),
+            Via::SolidDpop,
+        );
+
+        for path in [
+            "/~/",
+            "/~/.acl",
+            "/~/sites/",
+            "/~/sites/.acl",
+            "/~/sites/index.html",
+            "/~/sites/index.html.acl",
+            "/~/sites/index.html.meta",
+        ] {
+            assert_eq!(granted_modes(&r, BASE, path, &alice()), ALL, "{path}");
+            for mode in ALL {
+                assert!(
+                    check(&r, BASE, path, &alice(), mode).unwrap(),
+                    "{path} {mode:?}"
+                );
+            }
+            // Everyone else: exactly WAC. The world's Read, or nothing on
+            // an ACL, which needs Control.
+            let wac = if governed(path).is_some() {
+                vec![]
+            } else {
+                vec![AccessMode::Read]
+            };
+            for other in [bob(), remote_alice.clone(), Subject::anonymous()] {
+                assert_eq!(
+                    granted_modes(&r, BASE, path, &other),
+                    wac,
+                    "{path} {other:?}"
+                );
+                assert!(!check(&r, BASE, path, &other, AccessMode::Write).unwrap());
+            }
+        }
+
+        // Alice owns her pod, not Bob's, and only its storage.
+        assert!(owner(BASE, "/~/x", &alice()));
+        assert!(!owner("https://bob.brolly.id", "/~/x", &alice()));
+        assert!(!owner(BASE, "/profile", &alice()));
     }
 
     /// H2 (spec 5d): a `.meta` needs the same mode on the resource it

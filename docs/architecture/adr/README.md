@@ -49,6 +49,7 @@ Keep them to a screen or two.
 | [0016](0016-the-federation-switch-is-activitypub-only.md) | The federation switch is ActivityPub-only | Accepted |
 | [0017](0017-read-access-follows-the-publication.md) | Read access follows the publication | Accepted |
 | [0018](0018-a-pod-serves-documents.md) | A pod serves documents | Accepted |
+| [0019](0019-the-owner-always-has-full-access.md) | The owner always has full access | Accepted |
 
 ## When to write one
 

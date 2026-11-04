@@ -136,6 +136,38 @@ impl Subject {
         }
     }
 
+    /// Is this subject the owner of the pod at `pod_origin`
+    /// (`https://<user>.<base>`, the `base` LDP is handed)?
+    ///
+    /// The owner always holds every mode on every resource in their own pod,
+    /// whatever its ACLs say (ADR 0019). WAC alone has no such rule, so one
+    /// `.acl` that forgets the member locks them out of their own storage and
+    /// — since repairing it needs Control — keeps them out.
+    ///
+    /// **Two conditions, both required.**
+    ///
+    /// * `user_id` is `Some`: this instance authenticated the caller — a
+    ///   session, our own Solid-OIDC token, a Mastodon token, ATProto.
+    ///   [`Subject::remote`] has `None`, so a token another issuer signed is
+    ///   never the owner, *even when it names a local WebID*. The issuer
+    ///   binding already refuses that token (our profiles name only this
+    ///   instance as `solid:oidcIssuer`); this is the wall behind it, so a
+    ///   binding regression degrades to "WAC decides", not to full control.
+    /// * The WebID is exactly the pod's own, derived from the origin the same
+    ///   way [`crate::webid::webid`] derives it. A string match on an IRI the
+    ///   server minted, not a parse: near misses (another fragment, a nested
+    ///   subdomain, `http:`) are not the owner.
+    ///
+    /// A service-auth subject has no WebID and so owns nothing, whatever its
+    /// `user_id`.
+    pub fn owns(&self, pod_origin: &str) -> bool {
+        self.user_id.is_some()
+            && self
+                .webid
+                .as_deref()
+                .is_some_and(|webid| webid == crate::webid::webid_at(pod_origin))
+    }
+
     /// The authz agent for this subject.
     ///
     /// A subject with no WebID is anonymous *for authorization purposes* even if
@@ -207,6 +239,86 @@ mod tests {
             brolly_authz::Agent::Authenticated(webid),
             "the WebID is what WAC matches"
         );
+    }
+
+    /// The owner bypass's predicate (ADR 0019). Alice's pod lives at
+    /// `https://alice.brolly.id`; its owner is a subject this instance
+    /// authenticated *as* `https://alice.brolly.id/profile#me`.
+    #[test]
+    fn the_owner_is_a_local_subject_with_the_pods_own_webid() {
+        let pod = "https://alice.brolly.id";
+        let alice = crate::webid::webid("alice", "brolly.id");
+        for via in [
+            Via::Session,
+            Via::SolidDpop,
+            Via::MastodonBearer,
+            Via::AtprotoDpop,
+        ] {
+            let local = Subject::local(
+                Uuid::new_v4(),
+                "did:plc:alice".into(),
+                alice.clone(),
+                Scope::parse("webid"),
+                via,
+            );
+            assert!(local.owns(pod), "{via:?}: alice owns her own pod");
+            assert!(
+                !local.owns("https://bob.brolly.id"),
+                "{via:?}: and nobody else's"
+            );
+        }
+    }
+
+    #[test]
+    fn a_remote_subject_never_owns_a_pod_even_naming_its_webid() {
+        // `user_id: None` is a subject this instance did not authenticate.
+        // The issuer binding already refuses a foreign token for a local
+        // WebID; this is the wall behind it.
+        let remote = Subject::remote(
+            crate::webid::webid("alice", "brolly.id"),
+            Scope::parse("webid"),
+            Via::SolidDpop,
+        );
+        assert!(!remote.owns("https://alice.brolly.id"));
+    }
+
+    #[test]
+    fn nobody_and_a_server_own_nothing() {
+        assert!(!Subject::anonymous().owns("https://alice.brolly.id"));
+        let service = Subject {
+            user_id: Some(Uuid::new_v4()),
+            did: Some("did:plc:alice".into()),
+            webid: None,
+            scope: Scope::default(),
+            via: Via::ServiceAuth,
+        };
+        assert!(!service.owns("https://alice.brolly.id"));
+    }
+
+    #[test]
+    fn ownership_is_an_exact_webid_match() {
+        let as_webid = |webid: &str| {
+            Subject::local(
+                Uuid::new_v4(),
+                "did:plc:x".into(),
+                webid.into(),
+                Scope::parse("webid"),
+                Via::Session,
+            )
+        };
+        let pod = "https://alice.brolly.id";
+        for near_miss in [
+            "https://alice.brolly.id/profile",
+            "https://alice.brolly.id/profile#you",
+            "https://evil.alice.brolly.id/profile#me",
+            "http://alice.brolly.id/profile#me",
+            "https://alice.brolly.id.evil/profile#me",
+        ] {
+            assert!(!as_webid(near_miss).owns(pod), "{near_miss}");
+        }
+        // A pod origin with a trailing slash names no pod: `base` never has
+        // one, and a predicate that tolerated it would be guessing.
+        assert!(!as_webid("https://alice.brolly.id/profile#me").owns("https://alice.brolly.id/"));
     }
 
     #[test]

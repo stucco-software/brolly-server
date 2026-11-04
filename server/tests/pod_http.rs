@@ -4668,12 +4668,12 @@ async fn wac_allow_names_what_the_public_holds() {
         .await;
     make_public(&h, "open");
 
-    // The harness's root ACL grants Alice Read and Write, and Write satisfies
-    // Append (`AccessMode::satisfying`), so she holds three modes on both.
+    // Alice is the pod's owner, so she holds all four modes whatever the ACL
+    // says (ADR 0019); `public=` is the ACL's own answer for the world.
     let (status, _, headers) = h.send("GET", "/~/note", None, true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        headers["wac-allow"], "user=\"read write append\", public=\"\"",
+        headers["wac-allow"], "user=\"read write append control\", public=\"\"",
         "a private resource still reports an empty public group"
     );
 
@@ -4681,7 +4681,7 @@ async fn wac_allow_names_what_the_public_holds() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         headers["wac-allow"],
-        "user=\"read write append\", public=\"read\""
+        "user=\"read write append control\", public=\"read\""
     );
 
     // And HEAD carries it too (WAC §6's MUST), and OPTIONS, which now makes
@@ -4690,7 +4690,7 @@ async fn wac_allow_names_what_the_public_holds() {
         let (status, _, headers) = h.send(method, "/~/open", None, true).await;
         assert!(status.is_success(), "{method}: {status}");
         assert_eq!(
-            headers["wac-allow"], "user=\"read write append\", public=\"read\"",
+            headers["wac-allow"], "user=\"read write append control\", public=\"read\"",
             "{method}"
         );
     }
@@ -5673,4 +5673,166 @@ async fn a_followers_only_medium_stays_unreadable_by_a_follower_gained_later() {
         StatusCode::FORBIDDEN,
         "a follower gained later reads a post that predates them"
     );
+}
+
+// --- the owner always has full access (ADR 0019) ----------------------------------
+
+/// The production lockout, reproduced: a folder made public by an `.acl`
+/// that names the world and forgets the member. `acl:default` carries it to
+/// everything inside, and nothing in it mentions Alice, so by WAC alone she
+/// can read her own site like any stranger and do nothing else — not even
+/// repair the ACL, which needs Control.
+///
+/// `/~/sites/` is created first, through the root ACL's Write, so the
+/// container exists for the `WAC-Allow` and `OPTIONS` checks.
+async fn lock_the_owner_out_of_sites(h: &Harness) {
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/sites/before.ttl",
+            Some(("text/turtle", NOTE)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    let sites = format!("{ROOT}sites/");
+    let g = format!("{sites}.acl");
+    let public = format!("{g}#public");
+    set_acl(
+        h,
+        &g,
+        &[
+            t(&g, &public, &format!("{ACL}accessTo"), &sites),
+            t(&g, &public, &format!("{ACL}default"), &sites),
+            t(&g, &public, &format!("{ACL}mode"), &format!("{ACL}Read")),
+            t(&g, &public, &format!("{ACL}agentClass"), EVERYONE),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn the_owner_writes_under_an_acl_that_leaves_them_out() {
+    let h = harness().await;
+    lock_the_owner_out_of_sites(&h).await;
+
+    let page = "<!doctype html><title>stucco works</title>";
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/sites/stucco-works/index.html",
+            Some(("text/html", page)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // A path whose intermediate containers don't exist yet: creating them
+    // is the owner's too.
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/sites/deep/er/still/note.ttl",
+            Some(("text/turtle", NOTE)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+
+    // And replacing what is there.
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/sites/before.ttl",
+            Some(("text/turtle", NOTE)),
+            true,
+        )
+        .await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+#[tokio::test]
+async fn the_owner_reads_and_repairs_an_acl_that_leaves_them_out() {
+    let h = harness().await;
+    lock_the_owner_out_of_sites(&h).await;
+
+    let (status, body, _) = h.send("GET", "/~/sites/.acl", None, true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let sites = format!("{ROOT}sites/");
+    let repaired = format!(
+        "@prefix acl: <{ACL}> .\n\
+         <#owner> acl:agent <{BASE}/profile#me> ; acl:accessTo <{sites}> ; acl:default <{sites}> ;\n\
+           acl:mode acl:Read, acl:Write, acl:Control .\n\
+         <#public> acl:agentClass <{EVERYONE}> ; acl:accessTo <{sites}> ; acl:default <{sites}> ;\n\
+           acl:mode acl:Read .\n"
+    );
+    let (status, body, _) = h
+        .send(
+            "PUT",
+            "/~/sites/.acl",
+            Some(("text/turtle", &repaired)),
+            true,
+        )
+        .await;
+    assert!(status.is_success(), "{status}: {body}");
+
+    let g = format!("{sites}.acl");
+    let pod = h.stores.pod(h.user).unwrap();
+    assert!(
+        holds(
+            &pod,
+            &t(
+                &g,
+                &format!("{g}#owner"),
+                &format!("{ACL}mode"),
+                &format!("{ACL}Control"),
+            ),
+        ),
+        "the repair did not land"
+    );
+}
+
+#[tokio::test]
+async fn wac_allow_reports_the_owners_full_access_truthfully() {
+    let h = harness().await;
+    lock_the_owner_out_of_sites(&h).await;
+
+    for method in ["GET", "HEAD", "OPTIONS"] {
+        let (status, _, headers) = h.send(method, "/~/sites/", None, true).await;
+        assert!(status.is_success(), "{method}: {status}");
+        assert_eq!(
+            headers["wac-allow"], "user=\"read write append control\", public=\"read\"",
+            "{method}: `public=` still describes the anonymous caller"
+        );
+    }
+
+    // `Allow` follows the modes: a container the owner may write takes POST,
+    // PUT, PATCH and DELETE from them.
+    let (_, _, headers) = h.send("OPTIONS", "/~/sites/", None, true).await;
+    let allow = header_of(&headers, "allow");
+    for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        assert!(allow.contains(method), "{method} missing from {allow}");
+    }
+}
+
+#[tokio::test]
+async fn nobody_else_gains_from_the_owners_access() {
+    let h = harness().await;
+    lock_the_owner_out_of_sites(&h).await;
+    let bob = member_session(&h, "bob").await;
+
+    let page = Some(("text/html", "<!doctype html><title>not bob's</title>"));
+    let (status, _, _) = send_as(&h, &bob, "PUT", "/~/sites/bob.html", page).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "bob is not the owner");
+    let (status, _, _) = send_as(&h, &bob, "GET", "/~/sites/.acl", None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "nor does he control it");
+    let (_, _, headers) = send_as(&h, &bob, "GET", "/~/sites/", None).await;
+    assert_eq!(
+        headers["wac-allow"], "user=\"read\", public=\"read\"",
+        "bob holds what the ACL gives him and nothing more"
+    );
+
+    let (status, _, _) = h.send("PUT", "/~/sites/anon.html", page, false).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
