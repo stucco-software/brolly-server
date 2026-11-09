@@ -677,14 +677,7 @@ async fn revoking_an_app_stops_it_refreshing() {
     let client_id = an_authorised_app(&h, &cookie, "Notes App").await;
 
     let reply = h
-        .post(
-            "/account/apps",
-            &format!(
-                "client_id={}",
-                form_urlencoded::byte_serialize(client_id.as_bytes()).collect::<String>()
-            ),
-            Some(&cookie),
-        )
+        .post("/account/apps", "app=Notes+App", Some(&cookie))
         .await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
 
@@ -700,6 +693,46 @@ async fn revoking_an_app_stops_it_refreshing() {
 
     let reply = h.get("/account/apps", Some(&cookie)).await;
     assert!(!reply.body.contains("Notes App"), "and delist the app");
+}
+
+/// An application that has registered more than once — dynamic registration
+/// mints a fresh client_id each time — is one row on the dashboard, and the
+/// button withdraws every token every registration holds.
+#[tokio::test]
+async fn an_app_with_many_registrations_is_one_row_and_one_revoke() {
+    let h = harness().await;
+    let cookie = h.login().await;
+    let first = an_authorised_app(&h, &cookie, "Notes App").await;
+    let second = an_authorised_app(&h, &cookie, "Notes App").await;
+
+    let reply = h.get("/account/apps", Some(&cookie)).await;
+    // Once as the row's name, once as the form value beside its button.
+    assert_eq!(
+        reply.body.matches("Notes App").count(),
+        2,
+        "the dashboard must roll the registrations into one row: {}",
+        reply.body
+    );
+
+    let reply = h
+        .post("/account/apps", "app=Notes+App", Some(&cookie))
+        .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER);
+
+    for client_id in [first, second] {
+        let live: (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM solid_refresh_tokens
+             WHERE client_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(&client_id)
+        .fetch_one(&h.db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            live.0, 0,
+            "revocation must reach every registration's tokens ({client_id})"
+        );
+    }
 }
 
 #[tokio::test]
@@ -736,15 +769,8 @@ async fn one_member_cannot_revoke_anothers_app() {
         .unwrap()
         .to_string();
 
-    h.post(
-        "/account/apps",
-        &format!(
-            "client_id={}",
-            form_urlencoded::byte_serialize(client_id.as_bytes()).collect::<String>()
-        ),
-        Some(&mallory),
-    )
-    .await;
+    h.post("/account/apps", "app=Notes+App", Some(&mallory))
+        .await;
 
     let live: (i64,) = sqlx::query_as(
         "SELECT count(*) FROM solid_refresh_tokens
@@ -919,17 +945,10 @@ async fn the_authenticated_footer_carries_the_source_link() {
 async fn revoking_an_app_says_so() {
     let h = harness().await;
     let cookie = h.login().await;
-    let client_id = an_authorised_app(&h, &cookie, "Notes App").await;
+    an_authorised_app(&h, &cookie, "Notes App").await;
 
     let reply = h
-        .post(
-            "/account/apps",
-            &format!(
-                "client_id={}",
-                form_urlencoded::byte_serialize(client_id.as_bytes()).collect::<String>()
-            ),
-            Some(&cookie),
-        )
+        .post("/account/apps", "app=Notes+App", Some(&cookie))
         .await;
     assert_eq!(reply.status, StatusCode::SEE_OTHER);
     assert_eq!(reply.location.as_deref(), Some("/account/apps?saved=true"));

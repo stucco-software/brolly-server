@@ -22,11 +22,11 @@
         <li class="app">
           <div class="app-identity">
             <strong>{{ app.client_name.as_deref().unwrap_or("An application") }}</strong>
-            <span class="mono app-id">{{ app.client_id }}</span>
-            <span class="hint">Granted: {{ app.scope }}</span>
+            {% if app.client_name.is_none() %}<span class="mono app-id">{{ app.key }}</span>{% endif %}
+            <span class="hint">Granted: {{ app.scopes() }}</span>
           </div>
           <form method="post" action="/account/apps">
-            <input type="hidden" name="client_id" value="{{ app.client_id }}">
+            <input type="hidden" name="app" value="{{ app.key }}">
             <button type="submit" class="button">Revoke</button>
           </form>
         </li>

@@ -433,10 +433,13 @@ pub async fn apps(
 
 #[derive(Deserialize)]
 pub struct RevokeForm {
-    client_id: String,
+    /// What `apps_for_user` listed: the application's name or, when it has
+    /// none, its client_id.
+    app: String,
 }
 
-/// `POST /account/apps` — withdraw one app's access.
+/// `POST /account/apps` — withdraw an application's access: every token it
+/// holds, across every registration it has made.
 ///
 /// This is the promise the consent screen makes: "you can revoke this at any
 /// time from your account settings."
@@ -450,11 +453,11 @@ pub async fn revoke_app(
         Err(response) => return response,
     };
 
-    // Scoped by user *and* client, so a member cannot revoke anyone else's
-    // grant to an app they happen to share.
-    match oidc_store::revoke_app_for_user(&state.pool, session.user.id, &form.client_id).await {
+    // Scoped by user *and* application, so a member cannot revoke anyone
+    // else's grant to an app they happen to share.
+    match oidc_store::revoke_app_for_user(&state.pool, session.user.id, &form.app).await {
         Ok(revoked) => {
-            tracing::info!(user = %session.user.id, client = %form.client_id, revoked, "app access withdrawn");
+            tracing::info!(user = %session.user.id, app = %form.app, revoked, "app access withdrawn");
             // Withdrawing an application's access to your pod is a security
             // action, and without the parameter the page comes back looking
             // almost the same — the row is simply gone.

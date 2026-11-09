@@ -360,6 +360,117 @@ async fn withdrawing_a_grant_revokes_every_refresh_token_for_that_user() {
     );
 }
 
+/// The dashboard lists applications, not registrations and not tokens:
+/// however many times an application has registered — and however many
+/// tokens, in however many scopes, those registrations hold — it is one row,
+/// and one withdrawal ends all of it.
+#[tokio::test]
+async fn the_dashboard_rolls_an_application_up_however_many_grants_it_holds() {
+    let (_db, pool) = fresh().await;
+    let alice = a_user(&pool, "alice").await;
+    let one = store::register_client(&pool, Some("Notes App"), &["https://one.example/cb".into()])
+        .await
+        .expect("register")
+        .client_id;
+    let two = store::register_client(&pool, Some("Notes App"), &["https://two.example/cb".into()])
+        .await
+        .expect("register")
+        .client_id;
+    let other = a_client(&pool).await; // "Test App", a different application
+
+    for (client, scope) in [
+        (&one, "openid webid"),
+        (&one, "webid openid"),
+        (&two, "openid"),
+    ] {
+        store::issue_refresh(
+            &pool,
+            client,
+            alice,
+            "webid-a",
+            scope,
+            None,
+            &store::Lineage::fresh(),
+        )
+        .await
+        .expect("issue");
+    }
+    store::issue_refresh(
+        &pool,
+        &other,
+        alice,
+        "webid-a",
+        "openid",
+        None,
+        &store::Lineage::fresh(),
+    )
+    .await
+    .expect("issue");
+
+    let apps = store::apps_for_user(&pool, alice).await.expect("list");
+    assert_eq!(
+        apps.iter().map(|a| a.key.as_str()).collect::<Vec<_>>(),
+        vec!["Notes App", "Test App"],
+        "one row per application, not per registration or token"
+    );
+    let notes = &apps[0];
+    assert_eq!(
+        notes.scopes(),
+        "openid webid",
+        "the row carries the union of its live tokens' scopes, orderlessly"
+    );
+
+    // One withdrawal ends every registration's tokens, and only that
+    // application's.
+    let revoked = store::revoke_app_for_user(&pool, alice, "Notes App")
+        .await
+        .expect("revoke");
+    assert_eq!(revoked, 3, "every token of every registration");
+    let remaining: (i64,) =
+        sqlx::query_as("SELECT count(*) FROM solid_refresh_tokens WHERE revoked_at IS NULL")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+    assert_eq!(remaining.0, 1, "another application's grant survives");
+}
+
+/// A document client's client_id is the URL of its document, and it has no
+/// row in `solid_clients` (spec 6, H3) — so the join that lists and revokes
+/// grants must be a LEFT one, or a document client's grant would be neither
+/// visible nor withdrawable.
+#[tokio::test]
+async fn a_document_clients_grant_is_listed_and_revokable_by_its_url() {
+    let (_db, pool) = fresh().await;
+    let alice = a_user(&pool, "alice").await;
+    let url = "https://penny.example/id";
+
+    store::issue_refresh(
+        &pool,
+        url,
+        alice,
+        "webid-a",
+        "openid webid",
+        None,
+        &store::Lineage::fresh(),
+    )
+    .await
+    .expect("issue");
+
+    let apps = store::apps_for_user(&pool, alice).await.expect("list");
+    assert_eq!(
+        apps.iter()
+            .map(|a| (a.key.as_str(), a.client_name.is_none()))
+            .collect::<Vec<_>>(),
+        vec![(url, true)],
+        "a document client is listed by its URL, shown as unnamed"
+    );
+
+    let revoked = store::revoke_app_for_user(&pool, alice, url)
+        .await
+        .expect("revoke");
+    assert_eq!(revoked, 1, "and withdrawn by it");
+}
+
 #[tokio::test]
 async fn deleting_a_user_takes_their_grants_with_them() {
     // D2's delete story is `rm -rf` on the pod; the operational tables have to

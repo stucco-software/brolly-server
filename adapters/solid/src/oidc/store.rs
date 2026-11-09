@@ -323,48 +323,94 @@ pub async fn revoke_all_for_user(pool: &PgPool, user_id: Uuid) -> Result<u64, Db
     Ok(result.rows_affected())
 }
 
-/// An app a member has authorised, as the dashboard lists it.
+/// An application a member has authorised, rolled up to one row however
+/// many registrations or tokens it holds.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct AuthorisedApp {
-    pub client_id: String,
+    /// The application's identity, as the dashboard shows it and revocation
+    /// targets it: the client's registered name where it has one, otherwise
+    /// its client_id — a document client's URL, or an unnamed registration's
+    /// `urn:uuid:`.
+    pub key: String,
+    /// The client's registered name, if any. `None` means `key` is a
+    /// client_id, shown as the row's identifier instead.
     pub client_name: Option<String>,
-    pub scope: String,
+    /// The distinct scope strings among the application's live tokens.
+    pub scope_strings: Vec<String>,
 }
 
-/// Apps holding a live grant for this user.
+impl AuthorisedApp {
+    /// Everything the application can still do: the union of its live
+    /// tokens' scopes, deduplicated and sorted — so the same scopes granted
+    /// in different orders read as one.
+    pub fn scopes(&self) -> String {
+        let mut all: Vec<&str> = self
+            .scope_strings
+            .iter()
+            .flat_map(|s| s.split_whitespace())
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all.join(" ")
+    }
+}
+
+/// The applications a member has granted access to, one row each.
 ///
-/// A grant is "live" when it still has an unexpired, unrevoked refresh token:
-/// that is what an app can actually still use, so it is what the member should
-/// see. One row per client, not per token, because rotation means a long-lived
-/// grant has issued many.
+/// A grant is "live" when it still has an unexpired, unrevoked refresh
+/// token: that is what an app can actually still use, so it is what the
+/// member should see.
+///
+/// One row per *application*, not per client or per token. Rotation means a
+/// long-lived grant has issued many tokens, and dynamic registration mints a
+/// fresh client_id per registration, so both are folded into the identity
+/// the member knows the application by: its registered name, or its
+/// client_id when it has none. That a document client has no row in
+/// `solid_clients` — its client_id *is* its document (spec 6, H3) — is why
+/// the join is a LEFT one: an inner join would leave it invisible, and a
+/// grant the member can neither see nor revoke is neither.
 pub async fn apps_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<AuthorisedApp>, DbError> {
     Ok(sqlx::query_as::<_, AuthorisedApp>(
-        "SELECT DISTINCT c.client_id, c.client_name, r.scope
+        "SELECT COALESCE(c.client_name, r.client_id) AS key,
+                MIN(c.client_name) AS client_name,
+                array_agg(DISTINCT r.scope) AS scope_strings
            FROM solid_refresh_tokens r
-           JOIN solid_clients c ON c.client_id = r.client_id
+           LEFT JOIN solid_clients c ON c.client_id = r.client_id
           WHERE r.user_id = $1 AND r.revoked_at IS NULL AND r.expires_at > now()
-          ORDER BY c.client_name NULLS LAST",
+          GROUP BY key
+          ORDER BY client_name NULLS LAST, key",
     )
     .bind(user_id)
     .fetch_all(pool)
     .await?)
 }
 
-/// Withdraw one app's access for one member.
+/// Withdraw an application's access for one member: every live token it
+/// holds, across every registration it has made.
 ///
-/// Scoped by both, so a member revoking an app cannot touch anyone else's
-/// grant to it.
-pub async fn revoke_app_for_user(
-    pool: &PgPool,
-    user_id: Uuid,
-    client_id: &str,
-) -> Result<u64, DbError> {
+/// `app` is what [`apps_for_user`] listed — the application's name or, when
+/// it has none, its client_id — so the button revokes exactly the row the
+/// member saw. Scoped by member too, so revoking an application cannot
+/// touch anyone else's grant to it.
+///
+/// The subquery mirrors the listing's join deliberately: the same expression
+/// decides what a row is called, so a row and its revoke button can never
+/// disagree about what they name — and an inner join here would leave a
+/// document client unrevokable, exactly as it would leave it invisible.
+pub async fn revoke_app_for_user(pool: &PgPool, user_id: Uuid, app: &str) -> Result<u64, DbError> {
     let result = sqlx::query(
-        "UPDATE solid_refresh_tokens SET revoked_at = now()
-         WHERE user_id = $1 AND client_id = $2 AND revoked_at IS NULL",
+        "UPDATE solid_refresh_tokens AS r
+            SET revoked_at = now()
+           FROM (
+                SELECT t.token_hash, COALESCE(c.client_name, t.client_id) AS key
+                  FROM solid_refresh_tokens t
+                  LEFT JOIN solid_clients c ON c.client_id = t.client_id
+                 WHERE t.user_id = $1 AND t.revoked_at IS NULL
+           ) live
+          WHERE r.token_hash = live.token_hash AND live.key = $2",
     )
     .bind(user_id)
-    .bind(client_id)
+    .bind(app)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
