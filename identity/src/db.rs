@@ -162,7 +162,7 @@ pub async fn create_user(
 
     let sql = format!(
         "INSERT INTO users (id, username, email, password_hash, role)
-         VALUES ($1, $2, $3, $4, $5)
+         VALUES ($1, $2, lower($3), $4, $5)
          RETURNING {}",
         user_columns("")
     );
@@ -223,8 +223,13 @@ pub fn dummy_verify(password: &str) {
 
 /// Find a member by email — the last identifier form `createSession` accepts
 /// (stage 2, A), after the DID forms and the handle.
+///
+/// Any case: emails are stored lowercased (migration `identity_lowercase_email`).
 pub async fn find_by_email(pool: &PgPool, email: &str) -> Result<Option<User>, DbError> {
-    let sql = format!("SELECT {} FROM users WHERE email = $1", user_columns(""));
+    let sql = format!(
+        "SELECT {} FROM users WHERE email = lower($1)",
+        user_columns("")
+    );
     Ok(sqlx::query_as::<_, User>(&sql)
         .bind(email)
         .fetch_optional(pool)

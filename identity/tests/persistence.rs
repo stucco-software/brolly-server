@@ -540,3 +540,55 @@ async fn the_member_list_carries_each_quota_and_who_set_it() {
     assert_eq!(row("alice").quota(1 << 30), 5 << 30, "the override wins");
     assert_eq!(row("keeper").quota(1 << 30), 1 << 30, "else the default");
 }
+
+/// One address in any case: stored lowercased, found in any case, and a
+/// second account cannot take it by changing the case.
+#[tokio::test]
+async fn an_email_is_one_address_in_any_case() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(
+        &pool,
+        "alice",
+        Some("Alice@Example.ORG"),
+        "correct-horse-battery",
+        "member",
+    )
+    .await
+    .unwrap();
+    assert_eq!(alice.email.as_deref(), Some("alice@example.org"));
+
+    let found = db::find_by_email(&pool, "ALICE@example.org")
+        .await
+        .unwrap()
+        .expect("found in another case");
+    assert_eq!(found.id, alice.id);
+
+    let second = db::create_user(
+        &pool,
+        "bob",
+        Some("alice@EXAMPLE.org"),
+        "correct-horse-battery",
+        "member",
+    )
+    .await;
+    assert!(matches!(second, Err(DbError::EmailTaken)), "got {second:?}");
+}
+
+/// The database holds the rule, not just the Rust that writes today.
+#[tokio::test]
+async fn the_database_refuses_a_mixed_case_email() {
+    let (_db, pool) = fresh().await;
+    let refused = sqlx::query(
+        "INSERT INTO users (id, username, email, password_hash, role)
+         VALUES ($1, 'carol', 'Carol@example.org', 'x', 'member')",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    let error = refused.expect_err("a mixed-case email was stored");
+    // Refused by the rule, not by something else wrong with the row.
+    assert!(
+        error.to_string().contains("users_email_lowercase"),
+        "refused for another reason: {error}"
+    );
+}
