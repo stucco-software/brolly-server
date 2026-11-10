@@ -147,6 +147,18 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
 
 // --- profile ----------------------------------------------------------------
 
+/// The front end's account page, when it owns the profile and the account's
+/// end (`BROLLY_ACCOUNT_HOME`). Checked before the session: the front end
+/// has its own login, and a member sent there signed out is still where they
+/// should be.
+fn handed_off(state: &AppState) -> Option<Response> {
+    state
+        .front_end
+        .account_home
+        .as_deref()
+        .map(|home| Redirect::to(home).into_response())
+}
+
 #[derive(Template)]
 #[template(path = "account/profile.html")]
 struct ProfilePage<'a> {
@@ -176,6 +188,9 @@ pub async fn profile_form(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<Saved>,
 ) -> Response {
+    if let Some(response) = handed_off(&state) {
+        return response;
+    }
     let session = match require_session(&state, &headers, "/account/profile").await {
         Ok(s) => s,
         Err(response) => return response,
@@ -208,6 +223,9 @@ pub async fn profile_submit(
     headers: HeaderMap,
     Form(form): Form<ProfileForm>,
 ) -> Response {
+    if let Some(response) = handed_off(&state) {
+        return response;
+    }
     let session = match require_session(&state, &headers, "/account/profile").await {
         Ok(s) => s,
         Err(response) => return response,
@@ -537,6 +555,9 @@ pub struct DeleteForm {
 
 /// `GET /account/delete`
 pub async fn delete_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(response) = handed_off(&state) {
+        return response;
+    }
     let session = match require_session(&state, &headers, "/account/delete").await {
         Ok(s) => s,
         Err(response) => return response,
@@ -560,6 +581,9 @@ pub async fn delete_account(
     jar: CookieJar,
     Form(form): Form<DeleteForm>,
 ) -> Response {
+    if let Some(response) = handed_off(&state) {
+        return response;
+    }
     let session = match require_session(&state, &headers, "/account/delete").await {
         Ok(s) => s,
         Err(response) => return response,

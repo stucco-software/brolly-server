@@ -49,6 +49,7 @@ async fn harness_as(
         privacy_url: None,
         theme_css: false,
         public_registration,
+        front_end: brolly_server::FrontEnd::default(),
         limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
         www_redirect: www_redirect.map(str::to_string),
         max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,

@@ -66,6 +66,9 @@ repository heads, the PLC log.
 | `BROLLY_PLC_SUBMIT` | no | off | `1` publishes `did:plc` operations to the real directory. |
 | `BROLLY_PUBLIC_REGISTRATION` | no | off | `1` opens registration to anyone, on both the `/register` form and the `POST /api/accounts` API. Off, an instance is invite-only. |
 | `BROLLY_WWW_REDIRECT` | no | — | Where `www.{base_domain}` goes: an absolute URL (a path prefix is allowed), and every request to the `www` host is sent there with its path and query. Unset, `www` is untouched. |
+| `BROLLY_HOME_URL` | no | — | An app in front of the instance: the apex `/` redirects there instead of showing the login form. `/login` still renders. |
+| `BROLLY_SIGNUP_URL` | no | — | `/register` redirects there, and the public `POST /api/accounts` is not mounted, whatever `BROLLY_PUBLIC_REGISTRATION` says. Accounts come from the service API. |
+| `BROLLY_ACCOUNT_HOME` | no | — | `/account/profile` and `/account/delete` redirect there. |
 | `RUST_LOG` | no | `info` | JSON on stdout. |
 
 ### `BROLLY_BASE_DOMAIN` is effectively permanent
@@ -113,6 +116,20 @@ the apex itself and `www` becomes a full alias of the instance's public
 surface. The value is validated at startup (an absolute `http`/`https` URL,
 no query, no fragment); a typo is a refusal to boot with the value in the
 log, not a broken redirect.
+
+### An app in front: `BROLLY_HOME_URL`, `BROLLY_SIGNUP_URL`, `BROLLY_ACCOUNT_HOME`
+
+For a deployment whose public face is another app — StuccoID in front of
+`id.stucco.software`. Each variable hands one of brolly's pages to that app;
+unset, brolly serves the page itself. brolly keeps login, consent, security,
+connected apps and export. Each value must be an absolute `http(s)` URL, or
+the server refuses to start.
+
+Set `BROLLY_SIGNUP_URL` only once the front end can create accounts through
+the service API (`BROLLY_SERVICE_TOKEN`), or nobody can sign up. On a new
+instance, register the first admin with the bootstrap invite *before*
+setting it: once it is set, `/register` redirects and the public
+`POST /api/accounts` is gone, so the invite has nowhere to be redeemed.
 
 ### `BROLLY_PLC_SUBMIT`
 

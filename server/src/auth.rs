@@ -232,6 +232,22 @@ pub async fn login_form(
     render(&login_page(&state, None, "", &action))
 }
 
+/// `GET /` on the apex.
+///
+/// With a front end (`BROLLY_HOME_URL`) the homepage is the front end's, so a
+/// visitor — and anyone logging out, or finishing an account deletion, both of
+/// which land here — is sent there. Without one, `/` is the login form.
+pub async fn home(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    query: Query<Next>,
+) -> Response {
+    if let Some(home) = state.front_end.home.as_deref() {
+        return Redirect::to(home).into_response();
+    }
+    login_form(State(state), headers, query).await
+}
+
 #[derive(Deserialize)]
 pub struct LoginForm {
     username: String,
@@ -309,6 +325,9 @@ pub struct RegisterForm {
 ///
 /// Bounced for the same reason as `login_form`.
 pub async fn register_form(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Some(signup) = state.front_end.signup.as_deref() {
+        return Redirect::to(signup).into_response();
+    }
     if session_user(&state, &headers).await.is_some() {
         return Redirect::to("/account").into_response();
     }
@@ -486,6 +505,10 @@ pub async fn register_submit(
     jar: CookieJar,
     Form(form): Form<RegisterForm>,
 ) -> Response {
+    // A delegated door creates nobody here; the post goes where the form is.
+    if let Some(signup) = state.front_end.signup.as_deref() {
+        return Redirect::to(signup).into_response();
+    }
     // One gate for both creation surfaces: an account is the most expensive
     // thing an anonymous caller can have the instance make.
     if let Err(wait) = state.limiter.check(Gate::Signup, &client) {

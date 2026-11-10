@@ -95,6 +95,8 @@ pub struct AppState {
     /// exists only because nothing claimed the name. Setting the variable
     /// claims it.
     pub www_redirect: Option<String>,
+    /// The app in front of this instance, if there is one. See [`FrontEnd`].
+    pub front_end: FrontEnd,
     /// The one upload limit (spec 4, H3): the `DefaultBodyLimit` on the pod
     /// and media routes. Instance state rather than a constant at the route,
     /// because `BROLLY_MAX_UPLOAD_BYTES` overrides it — read once in `main`,
@@ -557,6 +559,47 @@ pub fn parse_www_redirect(value: &str) -> Result<String, String> {
     Ok(base)
 }
 
+/// Another app in front of this instance: StuccoID in front of
+/// `id.stucco.software`, a marketing site in front of a pod provider.
+///
+/// Each URL hands one of brolly's own pages to that app. Unset, brolly serves
+/// the page itself, so a deployment with no front end is unchanged. Read once
+/// in `main` and validated there, like `BROLLY_WWW_REDIRECT`: a typo is a
+/// startup failure with the value in the log.
+#[derive(Clone, Debug, Default)]
+pub struct FrontEnd {
+    /// `BROLLY_HOME_URL`: where the apex `/` sends a visitor instead of
+    /// rendering the login form. `/login` still renders, because every OAuth
+    /// flow sends people there.
+    pub home: Option<String>,
+    /// `BROLLY_SIGNUP_URL`: where `/register` sends a visitor. Set, accounts
+    /// are created by the front end alone: the public `POST /api/accounts` is
+    /// not mounted, whatever `BROLLY_PUBLIC_REGISTRATION` says.
+    pub signup: Option<String>,
+    /// `BROLLY_ACCOUNT_HOME`: where `/account/profile` and `/account/delete`
+    /// send a member. The front end owns the profile and the account's end.
+    pub account_home: Option<String>,
+}
+
+/// Validate a front-end URL: absolute, `http` or `https`, with a host.
+/// Returned as the URL parser normalizes it.
+///
+/// Unlike [`parse_www_redirect`] nothing is appended to it, so a query is
+/// allowed and kept.
+pub fn parse_front_end_url(value: &str) -> Result<String, String> {
+    let url = url::Url::parse(value).map_err(|e| format!("not a URL: {e}"))?;
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(format!(
+            "scheme must be http or https, not {}",
+            url.scheme()
+        ));
+    }
+    if url.host_str().is_none() {
+        return Err("no host".into());
+    }
+    Ok(url.to_string())
+}
+
 /// Send the `www` host wherever the deployment pointed it (`BROLLY_WWW_REDIRECT`).
 ///
 /// Routing is by path, so without this the `www` host matches the apex's
@@ -641,13 +684,19 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
     // Account creation as an API, for a signup surface on another origin. The
     // same `apex_only` guard for the same reason as the OAuth surface: a
     // member's subdomain is their pod, and an instance-level endpoint does not
-    // answer there (ADR 0009).
-    let accounts = Router::new()
-        .route("/api/accounts", post(auth::create_account))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            solid_oidc::apex_only,
-        ));
+    // answer there (ADR 0009). Not mounted at all when a front end owns
+    // signup (`BROLLY_SIGNUP_URL`): it creates accounts through the service
+    // API, and a second public door would create accounts it never sees.
+    let accounts = if state.front_end.signup.is_some() {
+        Router::new()
+    } else {
+        Router::new()
+            .route("/api/accounts", post(auth::create_account))
+            .layer(axum::middleware::from_fn_with_state(
+                state.clone(),
+                solid_oidc::apex_only,
+            ))
+    };
 
     // The instance's own pages — the door, the member dashboard, the admin
     // console — and nothing of a member's. A member's subdomain is their pod
@@ -699,13 +748,14 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         ));
 
     Router::new()
-        // `/` and `/login` are one template on two routes. Collapsing them
+        // `/` is the login form, or the front end's homepage when there is
+        // one (`auth::home`); `/login` is always the form. Collapsing them
         // would mean re-pointing five redirects that target the login form
         // (account.rs, solid_oidc.rs, mastodon_oauth.rs, atproto_oauth.rs,
         // admin.rs) — the fiddliest flows in the workspace.
         .route(
             "/",
-            get(auth::login_form).layer(axum::middleware::from_fn_with_state(
+            get(auth::home).layer(axum::middleware::from_fn_with_state(
                 state.clone(),
                 solid_oidc::apex_only,
             )),
@@ -881,5 +931,43 @@ mod same_origin_tests {
             "a prefix is a path prefix"
         );
         assert!(!form_post_is_guarded("/oauth/solid/token"));
+    }
+}
+
+#[cfg(test)]
+mod front_end_tests {
+    use super::*;
+
+    #[test]
+    fn a_front_end_url_is_an_absolute_http_url() {
+        assert_eq!(
+            parse_front_end_url("https://stuccoid.stucco.software/account/create"),
+            Ok("https://stuccoid.stucco.software/account/create".to_string())
+        );
+        assert_eq!(
+            parse_front_end_url("http://localhost:5173/"),
+            Ok("http://localhost:5173/".to_string())
+        );
+        // A bare origin gains the slash every browser would send anyway.
+        assert_eq!(
+            parse_front_end_url("https://stuccoid.stucco.software"),
+            Ok("https://stuccoid.stucco.software/".to_string())
+        );
+    }
+
+    #[test]
+    fn what_is_not_a_front_end_url_is_refused() {
+        assert!(parse_front_end_url("").is_err());
+        assert!(parse_front_end_url("/account/create").is_err());
+        assert!(parse_front_end_url("ftp://example.org/").is_err());
+        assert!(parse_front_end_url("mailto:someone@example.org").is_err());
+    }
+
+    #[test]
+    fn the_default_front_end_is_brolly_itself() {
+        let front_end = FrontEnd::default();
+        assert!(front_end.home.is_none());
+        assert!(front_end.signup.is_none());
+        assert!(front_end.account_home.is_none());
     }
 }

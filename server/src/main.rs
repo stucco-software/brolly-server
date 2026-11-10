@@ -153,6 +153,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             Err(_) => None,
         },
+        // The app in front of this instance, if any. Each URL validated here,
+        // so a typo stops the start with the value in the log.
+        front_end: brolly_server::FrontEnd {
+            home: front_end_url("BROLLY_HOME_URL")?,
+            signup: front_end_url("BROLLY_SIGNUP_URL")?,
+            account_home: front_end_url("BROLLY_ACCOUNT_HOME")?,
+        },
         max_upload_bytes,
         pod_quota_bytes,
         stores: std::sync::Arc::new(stores),
@@ -217,4 +224,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
     Ok(())
+}
+
+/// One of the front end's URLs: unset or empty is `None`; set and unusable
+/// stops the start.
+fn front_end_url(name: &str) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Ok(value) = std::env::var(name) else {
+        return Ok(None);
+    };
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    match brolly_server::parse_front_end_url(value.trim()) {
+        Ok(url) => Ok(Some(url)),
+        Err(reason) => {
+            tracing::error!(variable = name, value = %value, reason = %reason, "not a usable front-end URL");
+            Err(reason.into())
+        }
+    }
 }
