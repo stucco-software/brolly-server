@@ -19,6 +19,7 @@ fn fronted() -> FrontEnd {
         home: Some(HOME.into()),
         signup: Some(SIGNUP.into()),
         account_home: Some(ACCOUNT_HOME.into()),
+        ..FrontEnd::default()
     }
 }
 

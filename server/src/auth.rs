@@ -359,6 +359,10 @@ pub(crate) enum Admission<'a> {
     /// The `/register` form or the public `POST /api/accounts`: the
     /// deployment's invite policy applies (`BROLLY_PUBLIC_REGISTRATION`).
     Door { invite: Option<&'a str> },
+    /// The front end, through the service API. It holds the service token,
+    /// which is a stronger credential than any invite, and it runs its own
+    /// door; every member it creates is a plain member.
+    Service,
 }
 
 /// Create a member and everything their account is: the row, the pod with its
@@ -379,6 +383,8 @@ pub(crate) enum Admission<'a> {
 /// registrations cannot both claim the last use; the one race left is two
 /// registrations of the same free name at once, where the unique constraint
 /// refuses the second after its invite was spent.
+///
+/// The service API admits without an invite (`Admission::Service`).
 pub(crate) async fn create_member(
     state: &AppState,
     username: &str,
@@ -415,17 +421,19 @@ pub(crate) async fn create_member(
     // and the redeemer is a member; the bootstrap invite an empty instance
     // mints for itself grants admin, which is the only way a first admin
     // exists at all (`admin::bootstrap`).
-    let Admission::Door { invite } = admission;
-    let role = match (state.public_registration, invite) {
-        // Private and no invite: the door does not open.
-        (false, None) => return Err(RegistrationError::InviteInvalid),
-        // A presented invite is redeemed under either policy.
-        (_, Some(code)) => match db::redeem_invite(&state.pool, code).await {
-            Ok(granted) => granted.unwrap_or_else(|| crate::admin::MEMBER.to_string()),
-            Err(_) => return Err(RegistrationError::InviteInvalid),
+    let role = match admission {
+        Admission::Service => crate::admin::MEMBER.to_string(),
+        Admission::Door { invite } => match (state.public_registration, invite) {
+            // Private and no invite: the door does not open.
+            (false, None) => return Err(RegistrationError::InviteInvalid),
+            // A presented invite is redeemed under either policy.
+            (_, Some(code)) => match db::redeem_invite(&state.pool, code).await {
+                Ok(granted) => granted.unwrap_or_else(|| crate::admin::MEMBER.to_string()),
+                Err(_) => return Err(RegistrationError::InviteInvalid),
+            },
+            // Public and no invite: a plain member.
+            (true, None) => crate::admin::MEMBER.to_string(),
         },
-        // Public and no invite: a plain member.
-        (true, None) => crate::admin::MEMBER.to_string(),
     };
 
     match db::create_user(&state.pool, username, email, password, &role).await {

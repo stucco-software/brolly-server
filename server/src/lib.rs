@@ -23,6 +23,7 @@ pub mod atproto_oauth;
 pub mod auth;
 pub mod client_metadata;
 pub mod consent;
+pub mod internal_api;
 pub mod mastodon_api;
 pub mod mastodon_oauth;
 pub mod outbox;
@@ -579,6 +580,9 @@ pub struct FrontEnd {
     /// `BROLLY_ACCOUNT_HOME`: where `/account/profile` and `/account/delete`
     /// send a member. The front end owns the profile and the account's end.
     pub account_home: Option<String>,
+    /// `BROLLY_SERVICE_TOKEN`, hashed (`db::hash_secret`): the front end's
+    /// credential for the service API. Unset, the API is not mounted.
+    pub service_token_hash: Option<String>,
 }
 
 /// Validate a front-end URL: absolute, `http` or `https`, with a host.
@@ -696,6 +700,14 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
                 state.clone(),
                 solid_oidc::apex_only,
             ))
+    };
+
+    // The service API, for the app in front of the instance (`FrontEnd`).
+    // Not mounted without a token: an unconfigured instance has no such API.
+    let internal = if state.front_end.service_token_hash.is_some() {
+        internal_api::routes(state.clone())
+    } else {
+        Router::new()
     };
 
     // The instance's own pages — the door, the member dashboard, the admin
@@ -829,6 +841,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .merge(atproto_oauth::routes())
         .merge(oauth)
         .merge(accounts)
+        .merge(internal)
         // Pod storage (ADR 0010). The catch-all lives INSIDE /~/, so it cannot
         // shadow a protocol endpoint — that is the whole point of the prefix.
         // The upload limit (spec 4, H3) is the method router's own layer, so
@@ -969,5 +982,6 @@ mod front_end_tests {
         assert!(front_end.home.is_none());
         assert!(front_end.signup.is_none());
         assert!(front_end.account_home.is_none());
+        assert!(front_end.service_token_hash.is_none());
     }
 }

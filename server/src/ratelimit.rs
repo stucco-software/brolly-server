@@ -34,6 +34,10 @@ pub enum Gate {
     Signup,
     /// `POST /account/security`, keyed by member.
     PasswordChange,
+    /// `POST /internal/v1/accounts/{username}/verify-password`, keyed by
+    /// username: ten attempts per fifteen minutes, so the front end's delete
+    /// page cannot be used to guess a member's password.
+    ServicePassword,
 }
 
 impl Gate {
@@ -42,6 +46,7 @@ impl Gate {
             Gate::Login => 10,
             Gate::Signup => 5,
             Gate::PasswordChange => 5,
+            Gate::ServicePassword => 10,
         }
     }
 
@@ -50,6 +55,8 @@ impl Gate {
             Gate::Login => Duration::from_secs(30),
             Gate::Signup => Duration::from_secs(10 * 60),
             Gate::PasswordChange => Duration::from_secs(60),
+            // One every 90 s refills ten in fifteen minutes.
+            Gate::ServicePassword => Duration::from_secs(90),
         }
     }
 }

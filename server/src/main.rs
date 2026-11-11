@@ -159,6 +159,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             home: front_end_url("BROLLY_HOME_URL")?,
             signup: front_end_url("BROLLY_SIGNUP_URL")?,
             account_home: front_end_url("BROLLY_ACCOUNT_HOME")?,
+            service_token_hash: service_token_hash()?,
         },
         max_upload_bytes,
         pod_quota_bytes,
@@ -242,4 +243,22 @@ fn front_end_url(name: &str) -> Result<Option<String>, Box<dyn std::error::Error
             Err(reason.into())
         }
     }
+}
+
+/// `BROLLY_SERVICE_TOKEN`, hashed for comparison. A short token stops the
+/// start: it guards account creation and deletion, so it must not be
+/// guessable. `openssl rand -hex 32` makes a good one.
+fn service_token_hash() -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let Ok(token) = std::env::var("BROLLY_SERVICE_TOKEN") else {
+        return Ok(None);
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Ok(None);
+    }
+    if token.len() < 32 {
+        tracing::error!("BROLLY_SERVICE_TOKEN is shorter than 32 characters");
+        return Err("BROLLY_SERVICE_TOKEN is shorter than 32 characters".into());
+    }
+    Ok(Some(brolly_identity::db::hash_secret(token)))
 }

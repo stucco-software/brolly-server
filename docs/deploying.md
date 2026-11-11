@@ -69,6 +69,7 @@ repository heads, the PLC log.
 | `BROLLY_HOME_URL` | no | — | An app in front of the instance: the apex `/` redirects there instead of showing the login form. `/login` still renders. |
 | `BROLLY_SIGNUP_URL` | no | — | `/register` redirects there, and the public `POST /api/accounts` is not mounted, whatever `BROLLY_PUBLIC_REGISTRATION` says. Accounts come from the service API. |
 | `BROLLY_ACCOUNT_HOME` | no | — | `/account/profile` and `/account/delete` redirect there. |
+| `BROLLY_SERVICE_TOKEN` | no | — | Mounts the service API under `/internal/v1/` for an app in front of the instance. At least 32 characters (`openssl rand -hex 32`); shorter stops the start. |
 | `RUST_LOG` | no | `info` | JSON on stdout. |
 
 ### `BROLLY_BASE_DOMAIN` is effectively permanent
@@ -131,6 +132,31 @@ instance, register the first admin with the bootstrap invite *before*
 setting it: once it is set, `/register` redirects and the public
 `POST /api/accounts` is gone, so the invite has nowhere to be redeemed.
 
+#### The service API
+
+With `BROLLY_SERVICE_TOKEN` set, the front end runs the account lifecycle
+under `/internal/v1/` on the apex. Every call carries
+`Authorization: Bearer <token>`; without the right token it answers
+`401 {"error": "unauthorized"}`. On a member's subdomain, or with no token
+configured, the API does not exist (`404`).
+
+| Method | Path | Body | Success | Errors |
+|---|---|---|---|---|
+| `POST` | `/accounts` | `{username, email, password}` | `201 {username, email, webId, storage}` | `409 {error: "username_taken" \| "email_taken"}`, `422 {error: "validation", field, reason}` |
+| `GET` | `/usernames/{username}` | — | `200 {available: true}` or `{available: false, reason: "reserved" \| "invalid" \| "taken"}` | — |
+| `GET` | `/accounts?webId=` | — | `200 {username, email, webId, storage}` | `404` |
+| `POST` | `/accounts/{username}/verify-password` | `{password}` | `204` | `401`; `429` past 10 attempts per username per 15 min |
+| `DELETE` | `/accounts/{username}` | — | `204` | `404` |
+
+A body that is not readable JSON with the expected fields answers
+`422 {error: "validation", field: "body", reason}`. Accounts the service
+creates need no invite, whatever `BROLLY_PUBLIC_REGISTRATION` says.
+
+```
+curl -H "Authorization: Bearer $BROLLY_SERVICE_TOKEN" \
+  https://your-domain/internal/v1/usernames/alice
+```
+
 ### `BROLLY_PLC_SUBMIT`
 
 Leave it off until the instance is reachable at its real hostname. Identities
@@ -151,10 +177,13 @@ in memory, per instance:
 | `POST /login` | the caller's address **and**, separately, the username | 10, then 30 s |
 | `POST /register`, `POST /api/accounts` | the caller's address | 5, then 10 min |
 | `POST /account/security` (password change) | the member | 5, then 60 s |
+| `POST /internal/v1/accounts/{username}/verify-password` | the username | 10, then 90 s |
 
 A refused attempt is a `429` with `Retry-After` in seconds. The username gate
 is what makes rotating addresses worthless against one account; the address
-gate is what makes one address worthless against many.
+gate is what makes one address worthless against many. The service API's
+account creation is not gated: its caller holds the service token and sends
+every signup from the same few addresses.
 
 **The caller's address is the rightmost `X-Forwarded-For` entry** when the
 header is present — the one the proxy in front of the deployment appended —
