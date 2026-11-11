@@ -572,9 +572,8 @@ pub async fn delete_form(State(state): State<AppState>, headers: HeaderMap) -> R
 
 /// `POST /account/delete`
 ///
-/// The pod goes first. If the user row went first and the `rm -rf` then failed,
-/// the bytes would be left with nothing pointing at them and no account able to
-/// ask for them again.
+/// The deletion itself is `provision::delete_account`, shared with the
+/// service API.
 pub async fn delete_account(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -604,67 +603,12 @@ pub async fn delete_account(
             .into_response();
     }
 
-    if let Err(e) = state.stores.delete_pod(session.user.id) {
-        tracing::error!(error = %e, user = %session.user.id, "deleting the pod failed");
-        return server_error();
-    }
-
-    // The user row and the `#account` event land in one transaction (1, E):
-    // an event for a deletion that did not happen makes a relay drop a live
-    // repo, and a deletion without its event leaves the network serving a
-    // deleted one. The pod is already gone either way — `rm -rf` is not
-    // transactional — so the transaction covers what can be covered.
-    //
-    // Only a member with a DID announces: an account that never finished
-    // provisioning has no identity the network ever learned, and an event a
-    // consumer cannot resolve is noise.
-    let mut tx = match state.pool.begin().await {
-        Ok(tx) => tx,
-        Err(e) => {
-            tracing::error!(error = %e, user = %session.user.id, "the deletion could not begin");
-            return server_error();
-        }
-    };
-    if let Err(e) = sqlx::query("DELETE FROM users WHERE id = $1")
-        .bind(session.user.id)
-        .execute(&mut *tx)
+    if crate::provision::delete_account(&state.pool, &state.stores, &state.commits, &session.user)
         .await
+        .is_err()
     {
-        tracing::error!(error = %e, user = %session.user.id, "deleting the user failed");
         return server_error();
     }
-    let account_event = match session.user.did_plc.as_deref() {
-        Some(did) => {
-            match brolly_atproto::firehose::record_account(&mut tx, did, false, Some("deleted"))
-                .await
-            {
-                Ok(event) => Some(event),
-                Err(e) => {
-                    tracing::error!(
-                        error = %e,
-                        user = %session.user.id,
-                        "recording the deletion's firehose event failed"
-                    );
-                    return server_error();
-                }
-            }
-        }
-        None => None,
-    };
-    if let Err(e) = tx.commit().await {
-        tracing::error!(error = %e, user = %session.user.id, "the deletion could not commit");
-        return server_error();
-    }
-    if let Some(event) = account_event {
-        // The fast path (1, G): the transactional notify that rode the deletion
-        // above is what the shared listener turns into a rebroadcast, so this
-        // send is latency, not correctness. `send` fails only when nobody is
-        // listening, which is normal.
-        let _ = state
-            .commits
-            .send(brolly_atproto::firehose::Event::Account(event));
-    }
-    tracing::info!(user = %session.user.id, "account deleted");
 
     // Sessions cascade with the user row; clearing the cookie stops the browser
     // presenting a token that no longer resolves.

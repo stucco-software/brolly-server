@@ -354,6 +354,13 @@ pub(crate) enum RegistrationError {
     ServerError,
 }
 
+/// How a would-be member came in, which decides whether an invite is needed.
+pub(crate) enum Admission<'a> {
+    /// The `/register` form or the public `POST /api/accounts`: the
+    /// deployment's invite policy applies (`BROLLY_PUBLIC_REGISTRATION`).
+    Door { invite: Option<&'a str> },
+}
+
 /// Create a member and everything their account is: the row, the pod with its
 /// storage root and ACL, and the ATProtocol identity.
 ///
@@ -372,12 +379,12 @@ pub(crate) enum RegistrationError {
 /// registrations cannot both claim the last use; the one race left is two
 /// registrations of the same free name at once, where the unique constraint
 /// refuses the second after its invite was spent.
-async fn create_member(
+pub(crate) async fn create_member(
     state: &AppState,
     username: &str,
     email: Option<&str>,
     password: &str,
-    invite: Option<&str>,
+    admission: Admission<'_>,
 ) -> Result<User, RegistrationError> {
     if let Err(message) = validate_username(username) {
         return Err(RegistrationError::Username(message.to_string()));
@@ -408,6 +415,7 @@ async fn create_member(
     // and the redeemer is a member; the bootstrap invite an empty instance
     // mints for itself grants admin, which is the only way a first admin
     // exists at all (`admin::bootstrap`).
+    let Admission::Door { invite } = admission;
     let role = match (state.public_registration, invite) {
         // Private and no invite: the door does not open.
         (false, None) => return Err(RegistrationError::InviteInvalid),
@@ -516,7 +524,14 @@ pub async fn register_submit(
     }
     let email = (!form.email.trim().is_empty()).then(|| form.email.trim());
     let invite = (!form.invite.trim().is_empty()).then(|| form.invite.trim());
-    let member = create_member(&state, &form.username, email, &form.password, invite).await;
+    let member = create_member(
+        &state,
+        &form.username,
+        email,
+        &form.password,
+        Admission::Door { invite },
+    )
+    .await;
 
     let user = match member {
         Ok(user) => user,
@@ -643,7 +658,15 @@ pub async fn create_account(
         .map(str::trim)
         .filter(|i| !i.is_empty());
 
-    match create_member(&state, &request.username, email, &request.password, invite).await {
+    match create_member(
+        &state,
+        &request.username,
+        email,
+        &request.password,
+        Admission::Door { invite },
+    )
+    .await
+    {
         Ok(user) => (
             StatusCode::CREATED,
             Json(json!({
@@ -767,70 +790,76 @@ pub(crate) fn session_removal() -> Cookie<'static> {
     cookie
 }
 
+// A username is a subdomain, so the reservation is routing and
+// convention, not taste: names that would shadow the instance's own
+// hosts or read as official; the labels mail and DNS conventions give
+// meaning to under a wildcard (`mta-sts` publishes a mail policy for the
+// whole domain, `autoconfig`/`autodiscover` tell mail clients where to
+// send a password, `wpad` configures proxies); and the names a browser
+// or a person would take for infrastructure rather than a member.
+const RESERVED_USERNAMES: &[&str] = &[
+    // The instance's own
+    "admin",
+    "root",
+    "api",
+    "oauth",
+    "www",
+    "brolly",
+    "login",
+    "register",
+    "account",
+    "accounts",
+    "auth",
+    "id",
+    "app",
+    "apps",
+    "status",
+    "help",
+    "docs",
+    "support",
+    "abuse",
+    "security",
+    // Mail
+    "mail",
+    "smtp",
+    "imap",
+    "pop",
+    "pop3",
+    "webmail",
+    "mta-sts",
+    "autoconfig",
+    "autodiscover",
+    "postmaster",
+    "hostmaster",
+    "webmaster",
+    "noreply",
+    "no-reply",
+    // DNS, proxies, the host itself
+    "ns",
+    "ns1",
+    "ns2",
+    "dns",
+    "wpad",
+    "isatap",
+    "localhost",
+    "broadcasthost",
+    // Static assets
+    "static",
+    "assets",
+    "cdn",
+    "media",
+    "files",
+];
+
+/// Whether `username` is one nobody may take. The username check in the
+/// service API answers `reserved` rather than `invalid` for these.
+pub(crate) fn is_reserved_username(username: &str) -> bool {
+    RESERVED_USERNAMES.contains(&username)
+}
+
 /// Usernames become subdomains and WebIDs, so the rules are stricter than a
 /// display name's — see `identity::webid`.
-fn validate_username(username: &str) -> Result<(), &'static str> {
-    // A username is a subdomain, so the reservation is routing and
-    // convention, not taste: names that would shadow the instance's own
-    // hosts or read as official; the labels mail and DNS conventions give
-    // meaning to under a wildcard (`mta-sts` publishes a mail policy for the
-    // whole domain, `autoconfig`/`autodiscover` tell mail clients where to
-    // send a password, `wpad` configures proxies); and the names a browser
-    // or a person would take for infrastructure rather than a member.
-    const RESERVED: &[&str] = &[
-        // The instance's own
-        "admin",
-        "root",
-        "api",
-        "oauth",
-        "www",
-        "brolly",
-        "login",
-        "register",
-        "account",
-        "accounts",
-        "auth",
-        "id",
-        "app",
-        "apps",
-        "status",
-        "help",
-        "docs",
-        "support",
-        "abuse",
-        "security",
-        // Mail
-        "mail",
-        "smtp",
-        "imap",
-        "pop",
-        "pop3",
-        "webmail",
-        "mta-sts",
-        "autoconfig",
-        "autodiscover",
-        "postmaster",
-        "hostmaster",
-        "webmaster",
-        "noreply",
-        "no-reply",
-        // DNS, proxies, the host itself
-        "ns",
-        "ns1",
-        "ns2",
-        "dns",
-        "wpad",
-        "isatap",
-        "localhost",
-        "broadcasthost",
-        // Static assets
-        "static",
-        "assets",
-        "cdn",
-        "media",
-        "files",
-    ];
-
+pub(crate) fn validate_username(username: &str) -> Result<(), &'static str> {
     if username.len() < 2 || username.len() > 32 {
         return Err("Usernames are 2 to 32 characters.");
     }
@@ -851,7 +880,7 @@ fn validate_username(username: &str) -> Result<(), &'static str> {
     if username.starts_with("xn--") {
         return Err("Usernames cannot start with xn--.");
     }
-    if RESERVED.contains(&username) {
+    if is_reserved_username(username) {
         return Err("That username is reserved.");
     }
     Ok(())

@@ -209,3 +209,85 @@ pub async fn atproto_identity(
         identity_event,
     })
 }
+
+/// Deleting a member failed. What failed is already in the log.
+#[derive(Debug)]
+pub struct DeletionFailed;
+
+/// Delete a member and everything their account is: the pod, the user row
+/// (sessions and tokens cascade with it) and, for a member with a DID, the
+/// `#account` event that tells the network.
+///
+/// The pod goes first. If the user row went first and the `rm -rf` then
+/// failed, the bytes would be left with nothing pointing at them and no
+/// account able to ask for them again.
+///
+/// Shared by the dashboard's delete page and the service API's
+/// `DELETE /internal/v1/accounts/{username}`.
+pub async fn delete_account(
+    pool: &PgPool,
+    stores: &brolly_store::StoreManager,
+    commits: &tokio::sync::broadcast::Sender<brolly_atproto::firehose::Event>,
+    user: &db::User,
+) -> Result<(), DeletionFailed> {
+    if let Err(e) = stores.delete_pod(user.id) {
+        tracing::error!(error = %e, user = %user.id, "deleting the pod failed");
+        return Err(DeletionFailed);
+    }
+
+    // The user row and the `#account` event land in one transaction (1, E):
+    // an event for a deletion that did not happen makes a relay drop a live
+    // repo, and a deletion without its event leaves the network serving a
+    // deleted one. The pod is already gone either way — `rm -rf` is not
+    // transactional — so the transaction covers what can be covered.
+    //
+    // Only a member with a DID announces: an account that never finished
+    // provisioning has no identity the network ever learned, and an event a
+    // consumer cannot resolve is noise.
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(e) => {
+            tracing::error!(error = %e, user = %user.id, "the deletion could not begin");
+            return Err(DeletionFailed);
+        }
+    };
+    if let Err(e) = sqlx::query("DELETE FROM users WHERE id = $1")
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await
+    {
+        tracing::error!(error = %e, user = %user.id, "deleting the user failed");
+        return Err(DeletionFailed);
+    }
+    let account_event = match user.did_plc.as_deref() {
+        Some(did) => {
+            match brolly_atproto::firehose::record_account(&mut tx, did, false, Some("deleted"))
+                .await
+            {
+                Ok(event) => Some(event),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        user = %user.id,
+                        "recording the deletion's firehose event failed"
+                    );
+                    return Err(DeletionFailed);
+                }
+            }
+        }
+        None => None,
+    };
+    if let Err(e) = tx.commit().await {
+        tracing::error!(error = %e, user = %user.id, "the deletion could not commit");
+        return Err(DeletionFailed);
+    }
+    if let Some(event) = account_event {
+        // The fast path (1, G): the transactional notify that rode the deletion
+        // above is what the shared listener turns into a rebroadcast, so this
+        // send is latency, not correctness. `send` fails only when nobody is
+        // listening, which is normal.
+        let _ = commits.send(brolly_atproto::firehose::Event::Account(event));
+    }
+    tracing::info!(user = %user.id, "account deleted");
+    Ok(())
+}
