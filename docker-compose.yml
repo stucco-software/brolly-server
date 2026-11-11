@@ -54,6 +54,15 @@ services:
       # test identities to the real directory. Identities are still minted
       # locally and wait in `brolly-admin plc-retry` (ADR 0016).
       BROLLY_PLC_SUBMIT: "0"
+      # An app in front of the instance (StuccoID), off by default. See
+      # "An app in front" in docs/deploying.md. The service token mounts
+      # /internal/v1/ and must be 32+ characters (`openssl rand -hex 32`);
+      # the URLs must be absolute. Claim the instance with the bootstrap
+      # invite *before* setting BROLLY_SIGNUP_URL: it closes /register.
+      # BROLLY_SERVICE_TOKEN: "replace-with-openssl-rand-hex-32-output"
+      # BROLLY_HOME_URL: "http://localhost:5173/"
+      # BROLLY_SIGNUP_URL: "http://localhost:5173/account/create"
+      # BROLLY_ACCOUNT_HOME: "http://localhost:5173/profile"
     volumes:
       - brolly-data:/var/lib/brolly
     depends_on:
