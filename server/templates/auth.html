@@ -30,6 +30,7 @@
       <p class="error" role="alert">{{ message }}</p>
       {% endif %}
 
+      {% if !fields.is_empty() %}
       <form method="post" action="{{ action }}" class="stack-form">
         {% for field in fields %}
         <div class="field">
@@ -46,6 +47,7 @@
         {% endfor %}
         <button type="submit" class="button button-primary">{{ submit }}</button>
       </form>
+      {% endif %}
 
       {% if let Some(link) = alternate %}
       <p class="auth-alt">{{ link.prefix }} <a href="{{ link.href }}">{{ link.text }}</a></p>

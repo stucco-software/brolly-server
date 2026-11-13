@@ -68,6 +68,9 @@ impl Field {
             autocomplete: Some(autocomplete),
         }
     }
+    fn new_password(name: &'static str, label: &'static str) -> Self {
+        Self::password(name, label, "new-password")
+    }
     fn optional_email(name: &'static str, label: &'static str) -> Self {
         Self {
             name,
@@ -1034,4 +1037,151 @@ mod tests {
         assert!(removal.contains("Path=/"), "{removal}");
         assert!(!removal.contains("Domain="), "{removal}");
     }
+}
+
+// --- password reset ----------------------------------------------------------
+
+#[derive(Deserialize, Default)]
+pub struct ResetLink {
+    #[serde(default)]
+    token: String,
+}
+
+#[derive(Deserialize)]
+pub struct ResetForm {
+    new_password: String,
+    confirm_password: String,
+}
+
+/// The reset page: the form for a live link, or the news that it is dead.
+fn reset_page<'a>(
+    state: &'a AppState,
+    action: &'a str,
+    heading: Option<&'a str>,
+    error: Option<&'a str>,
+) -> AuthPage<'a> {
+    match heading {
+        Some(heading) => AuthPage {
+            chrome: state.chrome(),
+            heading,
+            intro: Some("At least 12 characters. Setting it signs you out everywhere."),
+            error,
+            action,
+            submit: "Set password",
+            fields: vec![
+                Field::new_password("new_password", "New password"),
+                Field::new_password("confirm_password", "New password, again"),
+            ],
+            alternate: None,
+        },
+        None => AuthPage {
+            chrome: state.chrome(),
+            heading: "This link has expired",
+            intro: Some(
+                "A reset link works once, for an hour. Ask for a new one where you asked for this one.",
+            ),
+            error: None,
+            action,
+            submit: "",
+            fields: vec![],
+            alternate: Some(Alternate {
+                prefix: "Remembered it?",
+                href: "/login",
+                text: "Log in",
+            }),
+        },
+    }
+}
+
+/// `GET /reset?token=` — the link a front end emailed (spec piece 4).
+pub async fn reset_form(State(state): State<AppState>, Query(link): Query<ResetLink>) -> Response {
+    let user = match db::password_reset_user(&state.pool, &link.token).await {
+        Ok(user) => user,
+        Err(e) => {
+            tracing::error!(error = %e, "reset link lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let action = reset_action(&link.token);
+    match user {
+        Some(user) => {
+            let heading = reset_heading(&user.username);
+            render(&reset_page(&state, &action, Some(&heading), None))
+        }
+        None => (
+            StatusCode::GONE,
+            render(&reset_page(&state, &action, None, None)),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /reset?token=` — set the password, end every session, and send the
+/// member to log in again: on the front end's account page when there is
+/// one (`BROLLY_ACCOUNT_HOME`), else on `/login`.
+pub async fn reset_submit(
+    State(state): State<AppState>,
+    Query(link): Query<ResetLink>,
+    Form(form): Form<ResetForm>,
+) -> Response {
+    let action = reset_action(&link.token);
+    let user = match db::password_reset_user(&state.pool, &link.token).await {
+        Ok(Some(user)) => user,
+        Ok(None) => {
+            return (
+                StatusCode::GONE,
+                render(&reset_page(&state, &action, None, None)),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "reset link lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let heading = reset_heading(&user.username);
+    let refuse = |message: &'static str| {
+        (
+            StatusCode::BAD_REQUEST,
+            render(&reset_page(&state, &action, Some(&heading), Some(message))),
+        )
+            .into_response()
+    };
+    if form.new_password.chars().count() < 12 {
+        return refuse("Use at least 12 characters. Length beats punctuation.");
+    }
+    if form.new_password != form.confirm_password {
+        return refuse("Those two passwords don't match.");
+    }
+    match db::redeem_password_reset(&state.pool, &link.token, &form.new_password).await {
+        Ok(Some(user_id)) => {
+            crate::account::end_sessions(&state, user_id, None).await;
+            tracing::info!(user = %user_id, "password set from a reset link");
+            let next = state.front_end.account_home.as_deref().unwrap_or("/login");
+            Redirect::to(next).into_response()
+        }
+        // Used or expired between the lookup and now.
+        Ok(None) => (
+            StatusCode::GONE,
+            render(&reset_page(&state, &action, None, None)),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "setting a password from a reset link failed");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// The form posts back to its own URL, token included.
+fn reset_action(token: &str) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("token", token);
+    format!("/reset?{}", query.finish())
+}
+
+/// The live page names whose password it is, so a member with two accounts
+/// knows which one the link is for.
+fn reset_heading(username: &str) -> String {
+    format!("Choose a new password for {username}")
 }

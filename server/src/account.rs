@@ -312,6 +312,32 @@ pub async fn security(
     render(&security_page(&state, None, sessions, query.saved))
 }
 
+/// End a member's sessions everywhere: the browser (all of them, or all but
+/// `keep`), the Solid apps, the Mastodon clients, and ATProto's OAuth and
+/// legacy sessions. A failure is logged and the rest still run: half the
+/// sessions ended beats none.
+pub(crate) async fn end_sessions(state: &AppState, user_id: uuid::Uuid, keep: Option<&str>) {
+    let browser = match keep {
+        Some(token) => db::revoke_other_sessions(&state.pool, user_id, token).await,
+        None => db::revoke_all_sessions(&state.pool, user_id).await,
+    };
+    if let Err(e) = browser {
+        tracing::error!(error = %e, "revoking browser sessions failed");
+    }
+    if let Err(e) = brolly_atproto::oauth::revoke_all_for_user(&state.pool, user_id).await {
+        tracing::error!(error = %e, "revoking ATProto OAuth tokens failed");
+    }
+    if let Err(e) = brolly_atproto::legacy::revoke_all_for_user(&state.pool, user_id).await {
+        tracing::error!(error = %e, "revoking ATProto legacy sessions failed");
+    }
+    if let Err(e) = oidc_store::revoke_all_for_user(&state.pool, user_id).await {
+        tracing::error!(error = %e, "revoking Solid app grants failed");
+    }
+    if let Err(e) = brolly_mastodon::oauth::revoke_all_for_user(&state.pool, user_id).await {
+        tracing::error!(error = %e, "revoking Mastodon client tokens failed");
+    }
+}
+
 /// `POST /account/security` — change password.
 ///
 /// Succeeding also ends every *other* session: someone changing their password
@@ -361,37 +387,9 @@ pub async fn change_password(
     .await
     {
         Ok(()) => {
-            if let Err(e) =
-                db::revoke_other_sessions(&state.pool, session.user.id, &session.token).await
-            {
-                tracing::error!(error = %e, "revoking other sessions failed after a password change");
-            }
-            // The ATProtocol sessions end too (2, G) — OAuth and legacy, both
-            // tables. The member asked to end other sessions, and before this
-            // only the browser ones ended; `oauth::revoke_all_for_user` existed
-            // with no caller at all.
-            if let Err(e) =
-                brolly_atproto::oauth::revoke_all_for_user(&state.pool, session.user.id).await
-            {
-                tracing::error!(error = %e, "revoking ATProto OAuth tokens failed after a password change");
-            }
-            if let Err(e) =
-                brolly_atproto::legacy::revoke_all_for_user(&state.pool, session.user.id).await
-            {
-                tracing::error!(error = %e, "revoking ATProto legacy sessions failed after a password change");
-            }
-            // And the Solid apps and the Mastodon clients: a refresh token or
-            // a bearer is a session that outlives any browser, and the page
-            // promises the others have ended. Both functions existed with no
-            // caller here.
-            if let Err(e) = oidc_store::revoke_all_for_user(&state.pool, session.user.id).await {
-                tracing::error!(error = %e, "revoking Solid app grants failed after a password change");
-            }
-            if let Err(e) =
-                brolly_mastodon::oauth::revoke_all_for_user(&state.pool, session.user.id).await
-            {
-                tracing::error!(error = %e, "revoking Mastodon client tokens failed after a password change");
-            }
+            // The member asked to end their other sessions: every protocol's,
+            // not only the browser's (2, G).
+            end_sessions(&state, session.user.id, Some(&session.token)).await;
             Redirect::to("/account/security?saved=true").into_response()
         }
         Err(DbError::BadCredentials) => (

@@ -231,6 +231,7 @@ fn every_form_post_is_same_origin_checked() {
     for dynamic in [
         "/login",
         "/register",
+        "/reset",
         "/oauth/solid/authorize",
         "/oauth/authorize",
         "/oauth/atproto/authorize",

@@ -432,6 +432,7 @@ async fn security_headers(
 pub const SAME_ORIGIN_FORMS: &[&str] = &[
     "/login",
     "/register",
+    "/reset",
     "/logout",
     "/account/profile",
     "/account/security",
@@ -729,6 +730,9 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             "/register",
             get(auth::register_form).post(auth::register_submit),
         )
+        // A reset link a front end emailed (spec piece 4). On the door
+        // because it is the door: no session, a form, and the apex only.
+        .route("/reset", get(auth::reset_form).post(auth::reset_submit))
         // POST so a prefetch or a cross-site <img> cannot log someone out.
         .route("/logout", post(auth::logout))
         // The member dashboard (plan §4.4).
