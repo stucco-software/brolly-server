@@ -307,9 +307,9 @@ fn verifying_key(jwk: &PublicJwk) -> Result<VerifyingKey, DpopError> {
 
 /// Verify a DPoP proof against the request it arrived on.
 ///
-/// `access_token` is `Some` for resource requests, where the proof must carry a
-/// matching `ath`, and `None` at the token endpoint, where there is no token to
-/// bind to yet.
+/// `access_token` is `Some` for resource requests, where an `ath` the proof
+/// carries must match it (a proof without one is accepted), and `None` at the
+/// token endpoint, where there is no token to bind to yet.
 ///
 /// Passing every check here doesn't make the proof usable yet. It has not been
 /// checked for replay, so it comes back [`Unspent`].
@@ -378,11 +378,17 @@ pub fn verify(
         return Err(DpopError::Expired);
     }
 
+    // An `ath` that is there must match the token. One that is absent is
+    // accepted, as the reference Solid server does: Inrupt's client library,
+    // which most Solid apps use, never sends it. What `ath` would add is
+    // already held by the rest: the proof names one method and one URL, is
+    // spent on first use (`jti`), and must be signed by the token's key.
     match (access_token, claims.ath.as_deref()) {
-        (Some(token), Some(ath)) if ath == access_token_hash(token) => {}
-        (Some(_), _) => return Err(DpopError::TokenBindingFailed),
+        (Some(token), Some(ath)) if ath != access_token_hash(token) => {
+            return Err(DpopError::TokenBindingFailed);
+        }
         // A proof at the token endpoint carries no ath, which is correct.
-        (None, _) => {}
+        _ => {}
     }
 
     let jkt = thumbprint(&header.jwk);
@@ -515,12 +521,12 @@ mod tests {
     }
 
     #[test]
-    fn a_resource_proof_without_ath_is_refused() {
+    fn a_resource_proof_without_ath_is_accepted() {
+        // Inrupt's client library, which most Solid apps use, sends no ath
+        // (3.x through 5.x), and the reference server checks it only when it
+        // is present. Requiring it locked every one of those apps out.
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
-        assert_eq!(
-            verify(&proof, "GET", URL, Some("access-token"), 1000).err(),
-            Some(DpopError::TokenBindingFailed)
-        );
+        assert!(verify(&proof, "GET", URL, Some("access-token"), 1000).is_ok());
     }
 
     #[test]

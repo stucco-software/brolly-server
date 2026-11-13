@@ -503,9 +503,10 @@ async fn a_proof_for_another_request_is_not_accepted() {
 }
 
 #[tokio::test]
-async fn a_proof_without_the_token_hash_is_not_accepted() {
-    // `ath` is what stops a proof minted for the token endpoint being replayed
-    // against a resource.
+async fn a_proof_without_the_token_hash_is_accepted() {
+    // Inrupt's client library sends no `ath`, and the reference server checks
+    // it only when present. A token-endpoint proof still cannot be replayed
+    // here: `htm` and `htu` name the token endpoint, and the `jti` is spent.
     let harness = harness().await;
     let key = client_key();
     let token = access_token(&harness, &key).await;
@@ -517,9 +518,7 @@ async fn a_proof_without_the_token_hash_is_not_accepted() {
     )
     .await;
 
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    // A missing `ath` is the proof's fault, not the token's.
-    assert!(challenge.contains(INVALID_PROOF), "got: {challenge}");
+    assert_eq!(status, StatusCode::OK, "got: {challenge}");
 }
 
 #[tokio::test]
