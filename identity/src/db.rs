@@ -502,6 +502,103 @@ pub async fn revoke_other_sessions(
     Ok(result.rows_affected())
 }
 
+/// End every session the user has, the requester's included: a password set
+/// from a reset link means the old one may be known to someone else.
+pub async fn revoke_all_sessions(pool: &PgPool, user_id: Uuid) -> Result<u64, DbError> {
+    let result = sqlx::query("DELETE FROM sessions WHERE user_id = $1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+// --- password resets --------------------------------------------------------
+
+/// Mint a reset link's token for a member, unless one was minted within
+/// `cooldown`: `None` then, and the caller answers as for an unknown email.
+/// Returns the plaintext token and its expiry; only the hash is stored.
+///
+/// Check and insert are one statement, so two requests at once cannot both
+/// pass the cooldown.
+pub async fn issue_password_reset(
+    pool: &PgPool,
+    user_id: Uuid,
+    ttl: time::Duration,
+    cooldown: time::Duration,
+) -> Result<Option<(String, time::OffsetDateTime)>, DbError> {
+    let token = generate_secret();
+    let now = time::OffsetDateTime::now_utc();
+    let expires_at = now + ttl;
+    let inserted = sqlx::query(
+        "INSERT INTO password_resets (token_hash, user_id, created_at, expires_at)
+         SELECT $1, $2, $3, $4
+         WHERE NOT EXISTS (
+             SELECT 1 FROM password_resets WHERE user_id = $2 AND created_at > $5
+         )",
+    )
+    .bind(hash_secret(&token))
+    .bind(user_id)
+    .bind(now)
+    .bind(expires_at)
+    .bind(now - cooldown)
+    .execute(pool)
+    .await?;
+    Ok((inserted.rows_affected() == 1).then_some((token, expires_at)))
+}
+
+/// The active member a live reset link belongs to, if it is one.
+pub async fn password_reset_user(pool: &PgPool, token: &str) -> Result<Option<User>, DbError> {
+    let sql = format!(
+        "SELECT {} FROM password_resets r JOIN users u ON u.id = r.user_id
+         WHERE r.token_hash = $1 AND r.used_at IS NULL AND r.expires_at > now()
+           AND u.status = 'active'",
+        user_columns("u.")
+    );
+    Ok(sqlx::query_as::<_, User>(&sql)
+        .bind(hash_secret(token))
+        .fetch_optional(pool)
+        .await?)
+}
+
+/// Set a new password through a live link. Uses up this link and every other
+/// link the member has, in the same transaction as the password. `None` when
+/// the link is not live (used, expired, unknown, or the member is disabled).
+/// The caller ends the member's sessions.
+pub async fn redeem_password_reset(
+    pool: &PgPool,
+    token: &str,
+    new_password: &str,
+) -> Result<Option<Uuid>, DbError> {
+    let hash = hash_password(new_password)?;
+    let mut tx = pool.begin().await?;
+    let claimed: Option<(Uuid,)> = sqlx::query_as(
+        "UPDATE password_resets r SET used_at = now()
+         FROM users u
+         WHERE r.token_hash = $1 AND r.used_at IS NULL AND r.expires_at > now()
+           AND u.id = r.user_id AND u.status = 'active'
+         RETURNING r.user_id",
+    )
+    .bind(hash_secret(token))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some((user_id,)) = claimed else {
+        return Ok(None);
+    };
+    sqlx::query("UPDATE users SET password_hash = $2 WHERE id = $1")
+        .bind(user_id)
+        .bind(hash)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "UPDATE password_resets SET used_at = now() WHERE user_id = $1 AND used_at IS NULL",
+    )
+    .bind(user_id)
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(user_id))
+}
+
 /// Delete a user outright.
 ///
 /// Sessions, invites, keys and OAuth grants cascade. The pod is a separate

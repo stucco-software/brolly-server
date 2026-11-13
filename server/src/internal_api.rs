@@ -28,6 +28,10 @@ use crate::auth::{
 };
 use crate::ratelimit::{Gate, too_many};
 
+/// How long a reset link works, and how soon another can be minted.
+const RESET_TTL: time::Duration = time::Duration::hours(1);
+const RESET_COOLDOWN: time::Duration = time::Duration::minutes(5);
+
 /// The routes, guarded. Mounted by `app()` only when a token is configured.
 pub fn routes(state: AppState) -> Router<AppState> {
     Router::new()
@@ -44,6 +48,7 @@ pub fn routes(state: AppState) -> Router<AppState> {
             "/internal/v1/usernames/{username}",
             get(username_availability),
         )
+        .route("/internal/v1/password-resets", post(issue_password_reset))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_service,
@@ -282,5 +287,60 @@ async fn delete_account(State(state): State<AppState>, Path(username): Path<Stri
     {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(_) => server_error(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ResetRequest {
+    email: String,
+}
+
+/// `POST /internal/v1/password-resets`
+///
+/// The front end emails the link; brolly sends no mail (spec D5). An unknown
+/// or disabled email and a request inside the cooldown both answer `204`, so
+/// the answer never says which addresses have accounts and the front end's
+/// form cannot flood an inbox.
+async fn issue_password_reset(
+    State(state): State<AppState>,
+    body: Result<Json<ResetRequest>, JsonRejection>,
+) -> Response {
+    let body = match body {
+        Ok(Json(body)) => body,
+        Err(rejection) => return unreadable(rejection),
+    };
+    let user = match db::find_by_email(&state.pool, body.email.trim()).await {
+        Ok(Some(user)) if user.status == "active" => user,
+        Ok(_) => return StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "email lookup failed for a password reset");
+            return server_error();
+        }
+    };
+    match db::issue_password_reset(&state.pool, user.id, RESET_TTL, RESET_COOLDOWN).await {
+        Ok(Some((token, expires_at))) => {
+            let mut reset_url =
+                match url::Url::parse(&format!("https://{}/reset", state.base_domain)) {
+                    Ok(url) => url,
+                    Err(e) => {
+                        tracing::error!(error = %e, "the reset URL does not parse");
+                        return server_error();
+                    }
+                };
+            reset_url.query_pairs_mut().append_pair("token", &token);
+            let expires_at = expires_at
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default();
+            (
+                StatusCode::CREATED,
+                Json(json!({ "resetUrl": reset_url.as_str(), "expiresAt": expires_at })),
+            )
+                .into_response()
+        }
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, user = %user.id, "minting a reset link failed");
+            server_error()
+        }
     }
 }

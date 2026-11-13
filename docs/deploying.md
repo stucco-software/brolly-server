@@ -147,6 +147,12 @@ configured, the API does not exist (`404`).
 | `GET` | `/accounts?webId=` | — | `200 {username, email, webId, storage}` | `404` |
 | `POST` | `/accounts/{username}/verify-password` | `{password}` | `204` | `401`; `429` past 10 attempts per username per 15 min |
 | `DELETE` | `/accounts/{username}` | — | `204` | `404` |
+| `POST` | `/password-resets` | `{email}` | `201 {resetUrl, expiresAt}`, or `204` for an unknown email or within five minutes of the last link | — |
+
+A reset link works once, for an hour, on `/reset` on the apex. brolly sends
+no mail; the front end emails the link. Setting a password ends every session
+the member has, and the page then sends them to `BROLLY_ACCOUNT_HOME` (or
+`/login`).
 
 A body that is not readable JSON with the expected fields answers
 `422 {error: "validation", field: "body", reason}`. Accounts the service

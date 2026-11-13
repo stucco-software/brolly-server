@@ -442,3 +442,59 @@ async fn a_deleted_account_is_gone() {
     let (_, _, body) = send(&router, call("GET", "/internal/v1/usernames/alice", None)).await;
     assert_eq!(json(&body), serde_json::json!({"available": true}));
 }
+
+#[tokio::test]
+async fn a_reset_link_is_minted_for_a_member_and_nobody_else() {
+    let (_db, _dir, router) = harness(Some(TOKEN)).await;
+    send(
+        &router,
+        call("POST", "/internal/v1/accounts", Some(alice())),
+    )
+    .await;
+
+    // Any case: emails are one address.
+    let (status, _, body) = send(
+        &router,
+        call(
+            "POST",
+            "/internal/v1/password-resets",
+            Some(r#"{"email":"Alice@Example.org"}"#),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "got: {body}");
+    let body = json(&body);
+    let url = body["resetUrl"].as_str().expect("resetUrl");
+    assert!(url.starts_with("https://brolly.test/reset?token="), "{url}");
+    assert!(
+        url.len() > "https://brolly.test/reset?token=".len() + 32,
+        "{url}"
+    );
+    assert!(
+        body["expiresAt"].as_str().is_some_and(|t| t.contains('T')),
+        "{body}"
+    );
+
+    // Inside the cooldown, and for nobody: the same empty answer.
+    for email in ["alice@example.org", "nobody@example.org"] {
+        let (status, _, body) = send(
+            &router,
+            call(
+                "POST",
+                "/internal/v1/password-resets",
+                Some(&format!(r#"{{"email":"{email}"}}"#)),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{email}: {body}");
+        assert!(body.is_empty(), "{email}: {body}");
+    }
+
+    let (status, _, body) = send(
+        &router,
+        call("POST", "/internal/v1/password-resets", Some(r#"{}"#)),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(json(&body)["field"], "body");
+}

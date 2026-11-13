@@ -592,3 +592,179 @@ async fn the_database_refuses_a_mixed_case_email() {
         "refused for another reason: {error}"
     );
 }
+
+const HOUR: time::Duration = time::Duration::hours(1);
+const COOLDOWN: time::Duration = time::Duration::minutes(5);
+
+/// A link sets the password once, and only once.
+#[tokio::test]
+async fn a_reset_link_sets_the_password_once() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(
+        &pool,
+        "alice",
+        Some("alice@example.org"),
+        "old-password-1234",
+        "member",
+    )
+    .await
+    .unwrap();
+
+    let (token, expires_at) = db::issue_password_reset(&pool, alice.id, HOUR, COOLDOWN)
+        .await
+        .unwrap()
+        .expect("issued");
+    assert!(expires_at > time::OffsetDateTime::now_utc());
+    assert_eq!(
+        db::password_reset_user(&pool, &token)
+            .await
+            .unwrap()
+            .map(|u| u.id),
+        Some(alice.id)
+    );
+
+    assert_eq!(
+        db::redeem_password_reset(&pool, &token, "new-password-5678")
+            .await
+            .unwrap(),
+        Some(alice.id)
+    );
+    db::authenticate(&pool, "alice", "new-password-5678")
+        .await
+        .unwrap();
+    assert!(matches!(
+        db::authenticate(&pool, "alice", "old-password-1234").await,
+        Err(DbError::BadCredentials)
+    ));
+
+    // Used: it shows nobody and redeems nothing.
+    assert!(
+        db::password_reset_user(&pool, &token)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db::redeem_password_reset(&pool, &token, "third-password-90")
+            .await
+            .unwrap(),
+        None
+    );
+    db::authenticate(&pool, "alice", "new-password-5678")
+        .await
+        .unwrap();
+}
+
+/// One live link per cooldown, so a form cannot flood an inbox.
+#[tokio::test]
+async fn a_second_link_waits_for_the_cooldown() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(
+        &pool,
+        "alice",
+        Some("alice@example.org"),
+        "old-password-1234",
+        "member",
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        db::issue_password_reset(&pool, alice.id, HOUR, COOLDOWN)
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db::issue_password_reset(&pool, alice.id, HOUR, COOLDOWN)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    // A zero cooldown is the clock having moved on.
+    assert!(
+        db::issue_password_reset(&pool, alice.id, HOUR, time::Duration::ZERO)
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// An expired link is dead; redeeming one link kills the others.
+#[tokio::test]
+async fn expired_and_superseded_links_are_dead() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(
+        &pool,
+        "alice",
+        Some("alice@example.org"),
+        "old-password-1234",
+        "member",
+    )
+    .await
+    .unwrap();
+
+    let (expired, _) = db::issue_password_reset(&pool, alice.id, -HOUR, time::Duration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        db::password_reset_user(&pool, &expired)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        db::redeem_password_reset(&pool, &expired, "new-password-5678")
+            .await
+            .unwrap(),
+        None
+    );
+
+    let (first, _) = db::issue_password_reset(&pool, alice.id, HOUR, time::Duration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    let (second, _) = db::issue_password_reset(&pool, alice.id, HOUR, time::Duration::ZERO)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        db::redeem_password_reset(&pool, &second, "new-password-5678")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    assert!(
+        db::password_reset_user(&pool, &first)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    assert!(
+        db::password_reset_user(&pool, "not-a-token")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// Every browser session ends, not all but one.
+#[tokio::test]
+async fn every_session_can_be_ended() {
+    let (_db, pool) = fresh().await;
+    let alice = db::create_user(&pool, "alice", None, "old-password-1234", "member")
+        .await
+        .unwrap();
+    let one = db::create_session(&pool, alice.id, time::Duration::days(1), None)
+        .await
+        .unwrap();
+    let two = db::create_session(&pool, alice.id, time::Duration::days(1), None)
+        .await
+        .unwrap();
+
+    assert_eq!(db::revoke_all_sessions(&pool, alice.id).await.unwrap(), 2);
+    assert!(db::user_for_session(&pool, &one).await.unwrap().is_none());
+    assert!(db::user_for_session(&pool, &two).await.unwrap().is_none());
+}
