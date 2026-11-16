@@ -323,6 +323,154 @@ pub async fn revoke_all_for_user(pool: &PgPool, user_id: Uuid) -> Result<u64, Db
     Ok(result.rows_affected())
 }
 
+// --- WebID links and client credentials (ADR 0020) --------------------------
+//
+// The CSS model for non-interactive agents: an account links a WebID — one
+// this instance typically does not host, whose own document names this
+// issuer — and id/secret pairs are minted against the link. A
+// `client_credentials` token names the linked WebID, so a customer pod's
+// access control answers to it exactly. The link's proof (the dereference
+// of the WebID's `solid:oidcIssuer`) is the server layer's to gather — it is
+// a network round trip — so what lives here is the write and the lookup.
+
+/// What linking a WebID came to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Linked {
+    /// Recorded now.
+    Now,
+    /// Already linked, to this same account. Re-running an operator command
+    /// is not an error.
+    Already,
+    /// Linked to another account. One WebID, one account: the link is the
+    /// WebID's delegation of its identity, and moving it is the owner's act,
+    /// not a side effect of an operator command run against another handle.
+    AnotherAccount,
+}
+
+/// Link a WebID to an account. The WebID's own document has already named
+/// this issuer — that check is `brolly_server::solid_oidc::link_webid`'s;
+/// this is the write it follows.
+///
+/// Looked up before it is written, so the two cases an operator re-run hits
+/// — this account's own link, and another account's — answer without a
+/// write. The insert still takes the conflict into itself (`DO NOTHING`),
+/// so a link that appears between the read and the write is classified by
+/// one more read, never lost and never moved.
+pub async fn link_webid(pool: &PgPool, user_id: Uuid, webid: &str) -> Result<Linked, DbError> {
+    if let Some(owner) = webid_link_owner(pool, webid).await? {
+        return Ok(linked_with(user_id, owner));
+    }
+    let inserted = sqlx::query(
+        "INSERT INTO solid_webid_links (webid, user_id) VALUES ($1, $2)
+         ON CONFLICT (webid) DO NOTHING",
+    )
+    .bind(webid)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    if inserted.rows_affected() > 0 {
+        return Ok(Linked::Now);
+    }
+    // Another account linked it between the read and the write.
+    Ok(linked_with(
+        user_id,
+        webid_link_owner(pool, webid).await?.unwrap_or(user_id),
+    ))
+}
+
+/// Which account a WebID is linked to, if any. The operator path's good
+/// error before a write: minting credentials for an unlinked WebID is
+/// refused by the schema too, but by then the message is a constraint's
+/// name rather than an instruction.
+pub async fn webid_link_owner(pool: &PgPool, webid: &str) -> Result<Option<Uuid>, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT user_id FROM solid_webid_links WHERE webid = $1")
+            .bind(webid)
+            .fetch_optional(pool)
+            .await?,
+    )
+}
+
+fn linked_with(user_id: Uuid, owner: Uuid) -> Linked {
+    if owner == user_id {
+        Linked::Already
+    } else {
+        Linked::AnotherAccount
+    }
+}
+
+/// Unlink a WebID — and, by cascade, retire every credential minted for it:
+/// the unlink is this WebID's kill switch, not just a bookkeeping delete.
+/// Scoped to the account, so one member cannot unlink another's WebID.
+/// Whether a link was removed.
+pub async fn unlink_webid(pool: &PgPool, user_id: Uuid, webid: &str) -> Result<bool, DbError> {
+    let removed = sqlx::query("DELETE FROM solid_webid_links WHERE webid = $1 AND user_id = $2")
+        .bind(webid)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(removed.rows_affected() > 0)
+}
+
+/// Every WebID linked to an account.
+pub async fn webids_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, DbError> {
+    Ok(
+        sqlx::query_scalar("SELECT webid FROM solid_webid_links WHERE user_id = $1 ORDER BY webid")
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?,
+    )
+}
+
+/// Mint a client_credentials id/secret pair naming a linked WebID (RFC 6749
+/// §4.4). Returns both; only the hash is stored. The foreign key to the
+/// link is the backstop: minting for a WebID nobody linked is refused by
+/// the schema, not by a check that can drift.
+pub async fn issue_client_credentials(
+    pool: &PgPool,
+    webid: &str,
+) -> Result<(String, String), DbError> {
+    let credential_id = generate_secret();
+    let secret = generate_secret();
+    sqlx::query(
+        "INSERT INTO solid_client_credentials (credential_id, secret_hash, webid)
+         VALUES ($1, $2, $3)",
+    )
+    .bind(&credential_id)
+    .bind(hash_secret(&secret))
+    .bind(webid)
+    .execute(pool)
+    .await?;
+    Ok((credential_id, secret))
+}
+
+/// What a verified id/secret pair names: the linked WebID its tokens carry,
+/// or `None` when the pair is unknown, the secret is wrong, the credential
+/// is revoked, or the WebID's link is gone.
+///
+/// The id and the hash of the secret are one lookup — the shape
+/// [`redeem_code`][super::store::redeem_code] established — so an unknown id
+/// and a wrong secret are the same statement to the database and the same
+/// answer to the caller: no oracle for which ids exist. The comparison is
+/// over hashes (SHA-256 of a 256-bit random secret), never over a stored
+/// secret. `last_used_at` rides the same write, so a grant is also the
+/// record that the credential was used.
+pub async fn client_credentials_webid(
+    pool: &PgPool,
+    credential_id: &str,
+    secret: &str,
+) -> Result<Option<String>, DbError> {
+    Ok(sqlx::query_scalar(
+        "UPDATE solid_client_credentials SET last_used_at = now()
+         WHERE credential_id = $1 AND secret_hash = $2 AND revoked_at IS NULL
+         RETURNING webid",
+    )
+    .bind(credential_id)
+    .bind(hash_secret(secret))
+    .fetch_optional(pool)
+    .await?)
+}
+
 /// An application a member has authorised, rolled up to one row however
 /// many registrations or tokens it holds.
 #[derive(Debug, Clone, sqlx::FromRow)]

@@ -73,9 +73,22 @@ impl WebIdDocument {
     /// of identity cannot be verified — and a local WebID is one that can
     /// never name a foreign issuer, since H1 makes that triple
     /// server-authoritative and this instance writes its own apex there.
+    ///
+    /// An apex issuer is written both ways — `https://id.example` and
+    /// `https://id.example/` — and both spellings mean the same issuer: we
+    /// mint the bare origin, and a hand-written WebID document carries the
+    /// slash as often as not. The comparison is therefore over the
+    /// slash-trimmed values rather than the raw strings, so a document's
+    /// spelling convention cannot decide whether a token verifies.
     pub fn names(&self, issuer: &str) -> bool {
-        self.issuers.iter().any(|named| named == issuer)
+        self.issuers.iter().any(|named| same_issuer(named, issuer))
     }
+}
+
+/// Are these the same issuer, ignoring how many trailing slashes it was
+/// written with?
+fn same_issuer(named: &str, issuer: &str) -> bool {
+    named.trim_end_matches('/') == issuer.trim_end_matches('/')
 }
 
 /// Parse the profile document at `webid` (spec 6, H5): the content-type check
@@ -202,6 +215,18 @@ mod tests {
         assert!(document.names("https://one.example"));
         assert!(document.names("https://two.example"));
         assert!(!document.names(ISSUER));
+    }
+
+    #[test]
+    fn the_apex_issuer_slash_is_a_spelling_not_an_identity() {
+        // We mint the bare origin (`https://id.example`); a hand-written
+        // WebID document carries the slash as often as not. Both spellings
+        // name the same issuer, and which one a document chose cannot decide
+        // whether a token verifies or a link is recorded.
+        let document = parsed(&format!("<{WEBID}> <{SOLID}> <{ISSUER}/> ."));
+        assert!(document.names(ISSUER));
+        let bare = parsed(&format!("<{WEBID}> <{SOLID}> <{ISSUER}> ."));
+        assert!(bare.names(&format!("{ISSUER}/")));
     }
 
     #[test]

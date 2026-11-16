@@ -75,6 +75,99 @@ pub fn pod(pod: &Pod, username: &str, base_domain: &str) -> Result<(), StoreErro
     })
 }
 
+// --- accounts ---------------------------------------------------------------
+
+/// Why creating an account's substance failed. The web signup path maps
+/// these onto its own error (the member sees one answer); the operator CLI
+/// reports them directly, because the operator can act on the difference.
+#[derive(Debug)]
+pub enum AccountError {
+    /// The handle or the email is already somebody's.
+    UsernameTaken,
+    EmailTaken,
+    /// The database refused or failed. When this lands after the row did,
+    /// the account is half-built — a member with no pod or no ATProtocol
+    /// identity — and `whoami` shows which; the operator finishes by hand or
+    /// deletes the row and starts over.
+    Db(DbError),
+    /// The pod's storage root or ACL could not be written. The row is in;
+    /// the account cannot write to its pod until an operator intervenes.
+    Pod(StoreError),
+}
+
+impl std::fmt::Display for AccountError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AccountError::UsernameTaken => f.write_str("that handle is already a member's"),
+            AccountError::EmailTaken => f.write_str("that email is already a member's"),
+            AccountError::Db(e) => write!(f, "the database refused the account: {e}"),
+            AccountError::Pod(e) => write!(f, "the pod could not be provisioned: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for AccountError {}
+
+/// Create the account — the row, the pod with its storage root and ACL, the
+/// ATProtocol identity — which is to say: everything every signup gets,
+/// after whatever door the caller came through. Shared by the web signup
+/// path, the service API, and the operator CLI (`brolly-admin
+/// agent-account`), so "what an account is" has one definition.
+///
+/// The firehose event rides the return rather than a broadcast: the shared
+/// listener (1, G) delivers it to any attached consumer from the log, and a
+/// caller holding a channel — the signup path — sends it as the fast path. A
+/// caller without one, like the CLI, just returns it to nobody.
+pub async fn account(
+    pool: &PgPool,
+    stores: &brolly_store::StoreManager,
+    username: &str,
+    email: Option<&str>,
+    password: &str,
+    role: &str,
+    base_domain: &str,
+    plc_client: Option<&reqwest::Client>,
+) -> Result<(db::User, Option<brolly_atproto::firehose::IdentityEvent>), AccountError> {
+    let user = db::create_user(pool, username, email, password, role)
+        .await
+        .map_err(|e| match e {
+            DbError::UsernameTaken => AccountError::UsernameTaken,
+            DbError::EmailTaken => AccountError::EmailTaken,
+            e => AccountError::Db(e),
+        })?;
+
+    // Give them a pod they can write to. WAC grants nothing by default, so
+    // without this the first write any new member attempts is refused — and
+    // the pod looks fine from the outside.
+    let opened = stores.pod(user.id).map_err(|e| {
+        tracing::error!(error = %e, user = %user.id, "pod unavailable at provisioning");
+        AccountError::Pod(e)
+    })?;
+    if let Err(e) = pod(&opened, username, base_domain) {
+        tracing::error!(error = %e, user = %user.id, "pod provisioning failed");
+        return Err(AccountError::Pod(e));
+    }
+
+    // An ATProtocol identity, in the same breath — the same reasoning as the
+    // signup path: an account that works in three protocols and not the
+    // fourth reads as a bug in the fourth.
+    let identity =
+        match atproto_identity(pool, stores, user.id, username, base_domain, plc_client).await {
+            Ok(identity) => identity,
+            Err(e) => {
+                tracing::error!(error = %e, user = %user.id, "atproto provisioning failed");
+                return Err(AccountError::Db(e));
+            }
+        };
+    tracing::info!(
+        user = %user.id,
+        did = %identity.did,
+        plc_registered = identity.plc_registered,
+        "account provisioned"
+    );
+    Ok((user, identity.identity_event))
+}
+
 // --- ATProtocol identity ---------------------------------------------------
 
 /// What provisioning produced, so a caller can log or return it.

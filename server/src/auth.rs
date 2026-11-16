@@ -439,74 +439,43 @@ pub(crate) async fn create_member(
         },
     };
 
-    match db::create_user(&state.pool, username, email, password, &role).await {
-        Ok(user) => {
-            // Give them a pod they can write to. WAC grants nothing by
-            // default, so without this the first write any new member attempts
-            // is refused — and the pod looks fine from the outside.
-            match state.stores.pod(user.id) {
-                Ok(pod) => {
-                    if let Err(e) = crate::provision::pod(&pod, &user.username, &state.base_domain)
-                    {
-                        tracing::error!(error = %e, user = %user.id, "pod provisioning failed");
-                        return Err(RegistrationError::ServerError);
-                    }
-                }
-                Err(e) => {
-                    tracing::error!(error = %e, user = %user.id, "pod unavailable at registration");
-                    return Err(RegistrationError::ServerError);
-                }
-            }
-
-            // An ATProtocol identity, in the same breath. Deferring it to
-            // "first use" means the first XRPC write is what discovers there is
-            // no key, no DID and no repository — and an account that works in
-            // three protocols and not the fourth reads as a bug in the fourth.
-            match crate::provision::atproto_identity(
-                &state.pool,
-                &state.stores,
-                user.id,
-                &user.username,
-                &state.base_domain,
-                state.plc_client.as_ref(),
-            )
-            .await
-            {
-                Ok(identity) => {
-                    // The identity event rides the live channel too, so a
-                    // consumer attached at signup learns the did↔handle pairing
-                    // from the stream instead of a poll (1, E). Durable
-                    // consumers read it from the log, and the shared listener
-                    // guarantees the delivery regardless of who wrote (1, G) —
-                    // this send is the fast path that spares the notify round
-                    // trip. `send` fails only when nobody is listening, which
-                    // is normal.
-                    if let Some(event) = identity.identity_event {
-                        let _ = state
-                            .commits
-                            .send(brolly_atproto::firehose::Event::Identity(event));
-                    }
-                    tracing::info!(
-                        user = %user.id,
-                        did = %identity.did,
-                        plc_registered = identity.plc_registered,
-                        "atproto identity provisioned"
-                    )
-                }
-                Err(e) => {
-                    // Local provisioning failing is a real failure — the
-                    // account would be permanently half-built. Network failure
-                    // is not, and is handled inside as `plc_registered: false`.
-                    tracing::error!(error = %e, user = %user.id, "atproto provisioning failed");
-                    return Err(RegistrationError::ServerError);
-                }
+    // The substance — row, pod, ATProtocol identity — is one function, shared
+    // with the operator CLI, so "what an account is" has one definition. The
+    // failures it reports are this path's to translate: the member sees one
+    // answer, not the database's.
+    match crate::provision::account(
+        &state.pool,
+        &state.stores,
+        username,
+        email,
+        password,
+        &role,
+        &state.base_domain,
+        state.plc_client.as_ref(),
+    )
+    .await
+    {
+        Ok((user, event)) => {
+            // The identity event rides the live channel too, so a consumer
+            // attached at signup learns the did↔handle pairing from the stream
+            // instead of a poll (1, E). Durable consumers read it from the
+            // log, and the shared listener guarantees the delivery regardless
+            // of who wrote (1, G) — this send is the fast path that spares the
+            // notify round trip. `send` fails only when nobody is listening,
+            // which is normal.
+            if let Some(event) = event {
+                let _ = state
+                    .commits
+                    .send(brolly_atproto::firehose::Event::Identity(event));
             }
             Ok(user)
         }
-        Err(DbError::UsernameTaken) => Err(RegistrationError::UsernameTaken),
-        Err(DbError::EmailTaken) => Err(RegistrationError::EmailTaken),
+        Err(crate::provision::AccountError::UsernameTaken) => Err(RegistrationError::UsernameTaken),
+        Err(crate::provision::AccountError::EmailTaken) => Err(RegistrationError::EmailTaken),
         Err(e) => {
-            tracing::error!(error = %e, "registration failed");
+            // The substance's own logging has the detail; the member gets one
+            // answer.
+            tracing::error!(error = %e, username, "registration failed");
             Err(RegistrationError::ServerError)
         }
     }
@@ -863,14 +832,16 @@ const RESERVED_USERNAMES: &[&str] = &[
 ];
 
 /// Whether `username` is one nobody may take. The username check in the
-/// service API answers `reserved` rather than `invalid` for these.
-pub(crate) fn is_reserved_username(username: &str) -> bool {
+/// service API answers `reserved` rather than `invalid` for these; the
+/// operator CLI refuses them too, because a reserved handle would shadow a
+/// host the instance needs.
+pub fn is_reserved_username(username: &str) -> bool {
     RESERVED_USERNAMES.contains(&username)
 }
 
 /// Usernames become subdomains and WebIDs, so the rules are stricter than a
 /// display name's — see `identity::webid`.
-pub(crate) fn validate_username(username: &str) -> Result<(), &'static str> {
+pub fn validate_username(username: &str) -> Result<(), &'static str> {
     if username.len() < 2 || username.len() > 32 {
         return Err("Usernames are 2 to 32 characters.");
     }

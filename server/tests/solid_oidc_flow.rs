@@ -2164,3 +2164,558 @@ async fn a_token_endpoint_proof_is_good_for_one_request() {
     let rotated = send(&harness, token_request(refresh_body(), &fresh)).await;
     assert_eq!(rotated.status, StatusCode::OK, "refresh: {}", rotated.body);
 }
+
+// --- client_credentials: the agent grant (ADR 0020) -------------------------
+
+/// The agent the collector authenticates as — a WebID this instance does
+/// not host, whose own document names this issuer.
+const AGENT_WEBID: &str = "https://pushbroom.co/agent#it";
+
+/// A member with a linked WebID, and a credential pair minted for it.
+/// Linking's own proof — the dereference of the WebID's `solid:oidcIssuer`
+/// — is `link_webid`'s to gather and the link tests' to cover; this is the
+/// write it licenses.
+async fn a_linked_credential(harness: &Harness, webid: &str) -> (uuid::Uuid, String, String) {
+    let user = db::create_user(
+        &harness._db.pool,
+        "pushbroom",
+        None,
+        "correct-horse-battery-staple",
+        "member",
+    )
+    .await
+    .expect("agent account");
+    brolly_solid::oidc::store::link_webid(&harness._db.pool, user.id, webid)
+        .await
+        .expect("link");
+    let (id, secret) =
+        brolly_solid::oidc::store::issue_client_credentials(&harness._db.pool, webid)
+            .await
+            .expect("credentials");
+    (user.id, id, secret)
+}
+
+/// The collector's exact wire shape (ADR 0020): discovery for the endpoint,
+/// then `Authorization: Basic base64(urlencode(id):urlencode(secret))`, a
+/// DPoP proof over POST/htu, and `grant_type=client_credentials&scope=webid`.
+async fn client_credentials_request(
+    harness: &Harness,
+    id: &str,
+    secret: &str,
+    scope: Option<&str>,
+    dpop: bool,
+) -> Reply {
+    // What the collector does first, and what any client does: read the
+    // token endpoint out of the discovery document rather than guessing it.
+    let discovery = get(harness, "/.well-known/openid-configuration", None).await;
+    assert_eq!(discovery.status, StatusCode::OK);
+    let token_endpoint = discovery.json()["token_endpoint"]
+        .as_str()
+        .expect("token_endpoint")
+        .to_string();
+    assert_eq!(token_endpoint, format!("https://{BASE}/oauth/solid/token"));
+
+    let key = client_key();
+    let basic = {
+        use base64::Engine;
+        base64::engine::general_purpose::STANDARD.encode(format!(
+            "{}:{}",
+            urlencode(id),
+            urlencode(secret)
+        ))
+    };
+    let mut body = form_urlencoded::Serializer::new(String::new());
+    body.append_pair("grant_type", "client_credentials");
+    if let Some(scope) = scope {
+        body.append_pair("scope", scope);
+    }
+    let mut request = builder("POST", "/oauth/solid/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::AUTHORIZATION, format!("Basic {basic}"));
+    if dpop {
+        request = request.header("DPoP", dpop_proof(&key, "POST", &token_endpoint, None));
+    }
+    send(harness, request.body(Body::from(body.finish())).unwrap()).await
+}
+
+#[tokio::test]
+async fn the_collectors_request_yields_a_token_naming_the_linked_webid() {
+    let harness = harness().await;
+    let (_, id, secret) = a_linked_credential(&harness, AGENT_WEBID).await;
+
+    let reply = client_credentials_request(&harness, &id, &secret, Some("webid"), true).await;
+    assert_eq!(reply.status, StatusCode::OK, "token: {}", reply.body);
+    let tokens = reply.json();
+
+    let access = tokens["access_token"].as_str().expect("an access token");
+    assert_eq!(tokens["token_type"], "DPoP");
+    let expires_in = tokens["expires_in"].as_i64().expect("expires_in");
+    assert!(expires_in >= 300, "a short-lived token, not a standing one");
+    assert_eq!(tokens["scope"], "webid");
+    // RFC 6749 §4.4.3: no refresh token on this grant — the credential is
+    // the renewal. And no ID token: there is no session behind it.
+    assert!(tokens.get("refresh_token").is_none());
+    assert!(tokens.get("id_token").is_none());
+
+    // The claims the collector checks and the pods verify. The payload is
+    // decoded without verification here — that is the collector's posture —
+    // but the signature is checked below against the published key.
+    let claims: serde_json::Value = serde_json::from_slice(
+        &B64.decode(access.split('.').nth(1).expect("three segments"))
+            .expect("payload"),
+    )
+    .expect("claims");
+    assert_eq!(
+        claims["webid"], AGENT_WEBID,
+        "the token names the linked WebID"
+    );
+    assert_eq!(claims["sub"], AGENT_WEBID);
+    assert_eq!(claims["iss"], format!("https://{BASE}"));
+    assert_eq!(claims["aud"], "solid");
+    let key = client_key();
+    assert_eq!(
+        claims["cnf"]["jkt"],
+        thumbprint(&key),
+        "bound to the proof's key"
+    );
+    assert!(
+        claims["exp"]
+            .as_i64()
+            .is_some_and(|exp| exp > claims["iat"].as_i64().unwrap_or(0))
+    );
+
+    // The signature, against the key the JWKS endpoint publishes — the
+    // check a customer pod runs on every request carrying this token.
+    let jwks = get(&harness, "/oauth/solid/jwks", None).await;
+    let jwk = &jwks.json()["keys"][0];
+    let x = B64.decode(jwk["x"].as_str().expect("x")).expect("x bytes");
+    let y = B64.decode(jwk["y"].as_str().expect("y")).expect("y bytes");
+    let mut sec1 = Vec::with_capacity(65);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    let verify = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).expect("the published key");
+    let signed = access.rsplit_once('.').expect("signature").0;
+    let signature_bytes = B64
+        .decode(access.rsplit_once('.').expect("signature").1)
+        .expect("signature bytes");
+    let signature = p256::ecdsa::Signature::from_slice(&signature_bytes).expect("signature");
+    use p256::ecdsa::signature::Verifier;
+    verify
+        .verify(signed.as_bytes(), &signature)
+        .expect("signed by the published key");
+}
+
+#[tokio::test]
+async fn an_absent_scope_still_names_the_webid() {
+    // CSS clients send `scope=webid`; a client that sends nothing gets the
+    // same token, because there is nothing else this grant is for.
+    let harness = harness().await;
+    let (_, id, secret) = a_linked_credential(&harness, AGENT_WEBID).await;
+
+    let reply = client_credentials_request(&harness, &id, &secret, None, true).await;
+    assert_eq!(reply.status, StatusCode::OK, "token: {}", reply.body);
+    assert_eq!(reply.json()["scope"], "webid");
+}
+
+#[tokio::test]
+async fn a_scope_beyond_webid_is_refused() {
+    // `openid` would promise an ID token and `offline_access` a refresh
+    // token, and this grant delivers neither (RFC 6749 §4.4.3) — so neither
+    // is accepted.
+    let harness = harness().await;
+    let (_, id, secret) = a_linked_credential(&harness, AGENT_WEBID).await;
+
+    for scope in ["openid", "offline_access", "webid profile"] {
+        let reply = client_credentials_request(&harness, &id, &secret, Some(scope), true).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "scope={scope} should be refused: {}",
+            reply.body
+        );
+        assert_eq!(reply.json()["error"], "invalid_scope");
+    }
+}
+
+#[tokio::test]
+async fn an_unknown_credential_is_refused() {
+    let harness = harness().await;
+    a_linked_credential(&harness, AGENT_WEBID).await;
+
+    let reply = client_credentials_request(
+        &harness,
+        "an-id-nobody-minted",
+        "and-a-secret-nobody-holds",
+        Some("webid"),
+        true,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+    // The scheme it attempted owes it a challenge (RFC 7617 §2).
+    assert!(reply.location.is_none());
+}
+
+#[tokio::test]
+async fn a_wrong_secret_is_refused() {
+    // The id is real and the secret is wrong: the same 401, byte for byte,
+    // as an unknown id — the endpoint is not an oracle for which ids exist.
+    let harness = harness().await;
+    let (_, id, _) = a_linked_credential(&harness, AGENT_WEBID).await;
+
+    let reply =
+        client_credentials_request(&harness, &id, "the-wrong-secret", Some("webid"), true).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn client_credentials_without_a_dpop_proof_is_refused() {
+    let harness = harness().await;
+    let (_, id, secret) = a_linked_credential(&harness, AGENT_WEBID).await;
+
+    let reply = client_credentials_request(&harness, &id, &secret, Some("webid"), false).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_dpop_proof");
+}
+
+#[tokio::test]
+async fn an_unlinked_webid_is_refused() {
+    // The kill switch, from the outside: unlink the WebID and the pair —
+    // right id, right secret — stops working, because the credential went
+    // with the link.
+    let harness = harness().await;
+    let (user_id, id, secret) = a_linked_credential(&harness, AGENT_WEBID).await;
+    brolly_solid::oidc::store::unlink_webid(&harness._db.pool, user_id, AGENT_WEBID)
+        .await
+        .expect("unlink");
+
+    let reply = client_credentials_request(&harness, &id, &secret, Some("webid"), true).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn discovery_advertises_the_agent_grant() {
+    let harness = harness().await;
+    let doc = get(&harness, "/.well-known/openid-configuration", None)
+        .await
+        .json();
+
+    let grants = doc["grant_types_supported"].as_array().expect("grants");
+    assert!(
+        grants.iter().any(|g| g == "client_credentials"),
+        "the agent grant must be advertised: {grants:?}"
+    );
+    let methods = doc["token_endpoint_auth_methods_supported"]
+        .as_array()
+        .expect("auth methods");
+    assert!(
+        methods.iter().any(|m| m == "client_secret_basic"),
+        "Basic must be advertised for the minted pairs: {methods:?}"
+    );
+    assert!(
+        methods.iter().any(|m| m == "none"),
+        "the public clients keep their method: {methods:?}"
+    );
+}
+
+// --- linking (ADR 0020) ------------------------------------------------------
+
+/// A fixed set of WebID documents, keyed by WebID — the stand-in for the
+/// production fetcher, so the checks around the dereference are tested
+/// without the network.
+fn documents_of(
+    answers: &[(&str, &str)],
+) -> brolly_server::client_metadata::StaticDocuments<brolly_solid::webid_documents::WebIdDocument> {
+    let mut documents = brolly_server::client_metadata::StaticDocuments::default();
+    for (webid, issuer) in answers {
+        let url = url::Url::parse(webid).expect("a WebID");
+        let turtle = format!(
+            "@prefix solid: <http://www.w3.org/ns/solid/terms#>.\n\
+             <{webid}> solid:oidcIssuer <{issuer}> ."
+        );
+        let document = brolly_solid::webid_documents::parse(&url, "text/turtle", turtle.as_bytes())
+            .expect("a document");
+        documents = documents.with(webid, document);
+    }
+    documents
+}
+
+async fn an_account(harness: &Harness, handle: &str) -> db::User {
+    db::create_user(
+        &harness._db.pool,
+        handle,
+        None,
+        "correct-horse-battery-staple",
+        "member",
+    )
+    .await
+    .expect("account")
+}
+
+#[tokio::test]
+async fn linking_requires_the_webids_own_document_to_name_this_issuer() {
+    let harness = harness().await;
+    let user = an_account(&harness, "keeper").await;
+
+    // The slash is the spelling convention of hand-written WebID documents;
+    // we mint the bare origin. Both name this issuer.
+    let naming = documents_of(&[(AGENT_WEBID, &format!("https://{BASE}/"))]);
+    let linked =
+        brolly_server::solid_oidc::link_webid(&naming, &harness._db.pool, BASE, &user, AGENT_WEBID)
+            .await;
+    assert_eq!(
+        linked.expect("linked"),
+        brolly_solid::oidc::store::Linked::Now
+    );
+
+    // A document that names another issuer does not link.
+    let elsewhere = documents_of(&[("https://elsewhere.co/agent#it", "https://idp.example")]);
+    let refused = brolly_server::solid_oidc::link_webid(
+        &elsewhere,
+        &harness._db.pool,
+        BASE,
+        &user,
+        "https://elsewhere.co/agent#it",
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(brolly_server::solid_oidc::LinkError::NotOurIssuer)
+    ));
+
+    // A WebID whose document cannot be dereferenced does not link.
+    let nothing = documents_of(&[]);
+    let unreachable = brolly_server::solid_oidc::link_webid(
+        &nothing,
+        &harness._db.pool,
+        BASE,
+        &user,
+        "https://gone.co/agent#it",
+    )
+    .await;
+    assert!(matches!(
+        unreachable,
+        Err(brolly_server::solid_oidc::LinkError::Dereference(_))
+    ));
+}
+
+#[tokio::test]
+async fn a_webid_this_instance_hosts_cannot_be_linked() {
+    // The escalation the local check exists for: a hosted WebID's issuer
+    // triple is written by this instance, so the dereference would always
+    // pass — linking one would let an account mint tokens naming another's
+    // identity. The instance's own WebID is nobody's to link either.
+    let harness = harness().await;
+    let user = an_account(&harness, "keeper").await;
+    let everything_passes = documents_of(&[]);
+
+    for webid in [
+        format!("https://alice.{BASE}/profile#me"),
+        format!("https://{BASE}/profile#me"),
+    ] {
+        let refused = brolly_server::solid_oidc::link_webid(
+            &everything_passes,
+            &harness._db.pool,
+            BASE,
+            &user,
+            &webid,
+        )
+        .await;
+        assert!(
+            matches!(
+                refused,
+                Err(brolly_server::solid_oidc::LinkError::LocalWebid)
+            ),
+            "{webid} is hosted here; it cannot be linked"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_webid_that_is_not_https_cannot_be_linked() {
+    let harness = harness().await;
+    let user = an_account(&harness, "keeper").await;
+    let everything_passes = documents_of(&[]);
+
+    let refused = brolly_server::solid_oidc::link_webid(
+        &everything_passes,
+        &harness._db.pool,
+        BASE,
+        &user,
+        "http://pushbroom.co/agent#it",
+    )
+    .await;
+    assert!(matches!(
+        refused,
+        Err(brolly_server::solid_oidc::LinkError::NotAnHttpsUrl)
+    ));
+}
+
+#[tokio::test]
+async fn a_webid_linked_to_one_account_cannot_be_linked_to_another() {
+    let harness = harness().await;
+    let keeper = an_account(&harness, "keeper").await;
+    let rival = an_account(&harness, "rival").await;
+    let naming = documents_of(&[(AGENT_WEBID, &format!("https://{BASE}"))]);
+
+    let linked = brolly_server::solid_oidc::link_webid(
+        &naming,
+        &harness._db.pool,
+        BASE,
+        &keeper,
+        AGENT_WEBID,
+    )
+    .await
+    .expect("linked");
+    assert_eq!(linked, brolly_solid::oidc::store::Linked::Now);
+
+    let refused = brolly_server::solid_oidc::link_webid(
+        &naming,
+        &harness._db.pool,
+        BASE,
+        &rival,
+        AGENT_WEBID,
+    )
+    .await
+    .expect("no error — a refusal");
+    assert_eq!(refused, brolly_solid::oidc::store::Linked::AnotherAccount);
+
+    // And the same account re-linking is a no-op, not an error: operators
+    // re-run commands.
+    let again = brolly_server::solid_oidc::link_webid(
+        &naming,
+        &harness._db.pool,
+        BASE,
+        &keeper,
+        AGENT_WEBID,
+    )
+    .await
+    .expect("linked again");
+    assert_eq!(again, brolly_solid::oidc::store::Linked::Already);
+}
+
+// --- the operator path (ADR 0020) -------------------------------------------
+
+/// Run `brolly-admin` against the harness's own database and stores, and
+/// return (exit success, stdout, stderr) — the operator's terminal, from a
+/// test. `CARGO_BIN_EXE_` is set for every binary the package builds, so
+/// this runs the real CLI, not a reconstruction of it.
+async fn run_admin(
+    harness: &Harness,
+    dir: &std::path::Path,
+    args: &[&str],
+) -> (bool, String, String) {
+    let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_brolly-admin"))
+        .env("DATABASE_URL", &harness._db.url)
+        .env("BROLLY_BASE_DOMAIN", BASE)
+        .env("BROLLY_DATA_DIR", dir)
+        .args(args)
+        .output()
+        .await
+        .expect("run brolly-admin");
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+        String::from_utf8_lossy(&output.stderr).to_string(),
+    )
+}
+
+#[tokio::test]
+async fn the_operator_path_provisions_a_working_credential() {
+    // Definition of the whole feature, as the operator runs it: create the
+    // reserved-handle account, link the WebID, mint the pair, exchange it.
+    // The link step runs the same `link_webid` the CLI's `link-webid` calls
+    // — its production fetcher is the transport the fetch tests cover —
+    // because the fetch itself refuses loopback, and a test is loopback.
+    let harness = harness().await;
+    let dir = tempfile::tempdir().expect("stores");
+
+    // 1. The account, with the handle the front end's reserved list keeps
+    //    out of signup and the service API. The password is generated and
+    //    printed once, alone on stdout.
+    let (ok, stdout, stderr) = run_admin(
+        &harness,
+        dir.path(),
+        &[
+            "agent-account",
+            "pushbroom",
+            "--email",
+            "pushbroom@stucco.software",
+        ],
+    )
+    .await;
+    assert!(ok, "agent-account failed: {stderr}");
+    let password = stdout.trim();
+    assert!(
+        password.len() >= 12,
+        "a generated password, not a token gesture"
+    );
+    let user = db::find_by_username(&harness._db.pool, "pushbroom")
+        .await
+        .expect("lookup")
+        .expect("the account exists");
+    assert_eq!(user.email.as_deref(), Some("pushbroom@stucco.software"));
+
+    // 2. The link. The WebID's document names this issuer — the slash
+    //    spelling, as the live one does.
+    let naming = documents_of(&[(AGENT_WEBID, &format!("https://{BASE}/"))]);
+    let linked =
+        brolly_server::solid_oidc::link_webid(&naming, &harness._db.pool, BASE, &user, AGENT_WEBID)
+            .await
+            .expect("linked");
+    assert_eq!(linked, brolly_solid::oidc::store::Linked::Now);
+
+    // And the CLI lists it.
+    let (ok, stdout, stderr) = run_admin(&harness, dir.path(), &["webids", "pushbroom"]).await;
+    assert!(ok, "webids failed: {stderr}");
+    assert_eq!(stdout.trim(), AGENT_WEBID);
+
+    // 3. The pair: id on the first line, secret on the second, nothing else
+    //    on stdout, so the operator can pipe the two apart.
+    let (ok, stdout, stderr) =
+        run_admin(&harness, dir.path(), &["agent-credentials", AGENT_WEBID]).await;
+    assert!(ok, "agent-credentials failed: {stderr}");
+    let mut lines = stdout.lines();
+    let id = lines.next().expect("the id").trim().to_string();
+    let secret = lines.next().expect("the secret").trim().to_string();
+    assert!(
+        lines.next().is_none(),
+        "stdout is the pair and nothing else"
+    );
+    assert!(!id.is_empty() && !secret.is_empty());
+    assert!(
+        !stderr.contains(&secret),
+        "the secret never rides a log line"
+    );
+
+    // 4. The exchange — the collector's exact request, over the real router.
+    let reply = client_credentials_request(&harness, &id, &secret, Some("webid"), true).await;
+    assert_eq!(reply.status, StatusCode::OK, "token: {}", reply.body);
+    let claims: serde_json::Value = serde_json::from_slice(
+        &B64.decode(
+            reply.json()["access_token"]
+                .as_str()
+                .expect("an access token")
+                .split('.')
+                .nth(1)
+                .expect("payload"),
+        )
+        .expect("decoded"),
+    )
+    .expect("claims");
+    assert_eq!(claims["webid"], AGENT_WEBID);
+
+    // And the kill switch, also as the operator runs it.
+    let (ok, _, stderr) = run_admin(
+        &harness,
+        dir.path(),
+        &["unlink-webid", "pushbroom", AGENT_WEBID],
+    )
+    .await;
+    assert!(ok, "unlink-webid failed: {stderr}");
+    let reply = client_credentials_request(&harness, &id, &secret, Some("webid"), true).await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+}

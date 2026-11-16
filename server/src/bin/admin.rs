@@ -23,6 +23,11 @@ USAGE:
     brolly-admin blob-sweep [--apply]
     brolly-admin whoami <username>
     brolly-admin quota <username> [<size>|default]
+    brolly-admin agent-account <handle> [--email <address>]
+    brolly-admin link-webid <handle> <webid>
+    brolly-admin unlink-webid <handle> <webid>
+    brolly-admin webids <handle>
+    brolly-admin agent-credentials <webid>
 
 COMMANDS:
     invite       Mint an invite code and print it. The code is shown once;
@@ -30,7 +35,7 @@ COMMANDS:
                  creates an admin, which is how an instance is handed over
                  without also handing over the database password.
     promote      Make a member an admin.
-    demote      Make an admin an ordinary member. Refuses the last one.
+    demote       Make an admin an ordinary member. Refuses the last one.
     plc-retry    Submit PLC operations the directory has not accepted yet.
                  Safe to re-run — already-submitted operations are skipped.
     blob-sweep   Report every pod blob no resource record names, and remove
@@ -42,11 +47,38 @@ COMMANDS:
                  or 1.5G (binary units; plain digits are bytes), or the
                  word default to clear the override. The instance default
                  is BROLLY_POD_QUOTA_BYTES, read here as the server reads it.
+    agent-account
+                 Create a service account — the same substance every
+                 signup gets (row, pod, ATProtocol identity), through the
+                 same door the CLI is: no invite, and the reserved list the
+                 front end enforces does not apply, though the instance's
+                 own (admin, www, ...) still does. The password is generated
+                 and printed to stdout once; only its hash is stored.
+                 This is step 1 of the agent path (ADR 0020).
+    link-webid   Link a WebID to an account (ADR 0020): the WebID's own
+                 document must name this issuer in solid:oidcIssuer — it is
+                 dereferenced from the live WebID, so a stale local copy
+                 proves nothing. Step 2 of the agent path. Re-running against
+                 the same account is a no-op; a WebID linked to another
+                 account is refused.
+    unlink-webid Remove a WebID's link — and with it every credential minted
+                 for it. The kill switch for a compromised agent WebID.
+    webids       List the WebIDs linked to an account.
+    agent-credentials
+                 Mint a client_credentials id/secret pair for a linked
+                 WebID (ADR 0020) and print both to stdout, the id on the
+                 first line and the secret on the second. This is the only
+                 time the secret is shown; only its hash is stored. Step 3
+                 of the agent path. A pair stays valid until the WebID is
+                 unlinked; minting does not retire earlier pairs.
 
 ENVIRONMENT:
     DATABASE_URL            required
     BROLLY_BASE_DOMAIN      defaults to brolly.test
-    BROLLY_DATA_DIR         blob-sweep only; defaults to data, as the server does
+    BROLLY_DATA_DIR         blob-sweep and agent-account; defaults to data,
+                            as the server does. agent-account opens the
+                            stores the way the server does — run it with the
+                            server STOPPED on a single-host deployment.
     BROLLY_POD_QUOTA_BYTES  quota only; the instance default, as the server reads it
 ";
 
@@ -98,6 +130,11 @@ async fn main() -> ExitCode {
         "blob-sweep" => blob_sweep(&pool, &args).await,
         "whoami" => whoami(&pool, &base_domain, &args).await,
         "quota" => quota(&pool, &args).await,
+        "agent-account" => agent_account(&pool, &base_domain, &args).await,
+        "link-webid" => link_webid(&pool, &base_domain, &args).await,
+        "unlink-webid" => unlink_webid(&pool, &args).await,
+        "webids" => webids(&pool, &args).await,
+        "agent-credentials" => agent_credentials(&pool, &args).await,
         other => {
             eprintln!("unknown command: {other}\n\n{USAGE}");
             ExitCode::FAILURE
@@ -554,4 +591,229 @@ async fn whoami(pool: &sqlx::PgPool, base_domain: &str, args: &[String]) -> Exit
     }
 
     ExitCode::SUCCESS
+}
+
+// --- the agent path (ADR 0020) ----------------------------------------------
+//
+// Three commands, in the order the operator runs them: the account, the
+// link, the credentials. Each is separately re-runnable where that is safe
+// (the account is not — a handle is somebody's the moment it exists), so a
+// half-finished provisioning is finished by running the remaining steps,
+// not by starting over.
+
+/// A member looked up by handle, or the exit code for not finding one.
+async fn member(pool: &sqlx::PgPool, handle: &str) -> Result<brolly_identity::db::User, ExitCode> {
+    match brolly_identity::db::find_by_username(pool, handle).await {
+        Ok(Some(user)) => Ok(user),
+        Ok(None) => {
+            eprintln!("no such member: {handle}");
+            Err(ExitCode::FAILURE)
+        }
+        Err(e) => {
+            eprintln!("lookup failed: {e}");
+            Err(ExitCode::FAILURE)
+        }
+    }
+}
+
+/// `agent-account <handle> [--email <address>]` — the account an agent's
+/// WebID links to. The password is generated, never chosen: it exists so
+/// the row is a real account (a pod, a quota, an identity), and it is
+/// printed once, to stdout, for the operator to pipe somewhere and lose.
+async fn agent_account(pool: &sqlx::PgPool, base_domain: &str, args: &[String]) -> ExitCode {
+    let Some(handle) = args.get(1).filter(|h| !h.starts_with('-')) else {
+        eprintln!("usage: brolly-admin agent-account <handle> [--email <address>]");
+        return ExitCode::FAILURE;
+    };
+    if let Err(reason) = brolly_server::auth::validate_username(handle) {
+        eprintln!("{handle}: {reason}");
+        return ExitCode::FAILURE;
+    }
+    let email = flag(args, "--email");
+    let expected = if email.is_some() { 4 } else { 2 };
+    if email.as_deref().is_some_and(str::is_empty) || args.len() != expected {
+        eprintln!("usage: brolly-admin agent-account <handle> [--email <address>]");
+        return ExitCode::FAILURE;
+    }
+
+    let data_dir = std::env::var("BROLLY_DATA_DIR").unwrap_or_else(|_| "data".to_string());
+    let stores = match brolly_store::StoreManager::open(&data_dir, 4, 60) {
+        Ok(stores) => stores,
+        Err(e) => {
+            eprintln!("could not open the stores under {data_dir}: {e}");
+            eprintln!("is the server running? it holds the stores' locks; stop it first");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 32 bytes of entropy, hex: a password nobody types and nothing
+    // remembers, which is the right kind for an account no human signs in
+    // to. Printed to stdout alone, so it can be piped; everything else
+    // goes to stderr.
+    let password = brolly_identity::db::generate_secret();
+    match brolly_server::provision::account(
+        pool,
+        &stores,
+        handle,
+        email.as_deref(),
+        &password,
+        brolly_server::admin::MEMBER,
+        base_domain,
+        None,
+    )
+    .await
+    {
+        Ok((user, _)) => {
+            println!("{password}");
+            eprintln!(
+                "account created: {handle}{} — a pod, an ATProtocol identity, and this \
+                 generated password",
+                email
+                    .as_deref()
+                    .map(|e| format!(" <{e}>"))
+                    .unwrap_or_default()
+            );
+            eprintln!("this is the only time the password is shown; only its hash is stored");
+            eprintln!(
+                "webid      {}",
+                brolly_identity::webid::webid(&user.username, base_domain)
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not create the account: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `link-webid <handle> <webid>` — the WebID's own document must name this
+/// issuer, dereferenced live.
+async fn link_webid(pool: &sqlx::PgPool, base_domain: &str, args: &[String]) -> ExitCode {
+    let (Some(handle), Some(webid)) = (args.get(1), args.get(2)) else {
+        eprintln!("usage: brolly-admin link-webid <handle> <webid>");
+        return ExitCode::FAILURE;
+    };
+    let Ok(user) = member(pool, handle).await else {
+        return ExitCode::FAILURE;
+    };
+
+    // The production fetcher: HTTPS from public addresses, cached per
+    // WebID — the same transport the server verifies foreign tokens with.
+    let lookup = match brolly_server::client_metadata::Fetcher::<
+        brolly_solid::webid_documents::WebIdDocument,
+    >::new()
+    {
+        Ok(fetcher) => fetcher,
+        Err(e) => {
+            eprintln!("could not build the fetcher: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    match brolly_server::solid_oidc::link_webid(&lookup, pool, base_domain, &user, webid).await {
+        Ok(brolly_solid::oidc::store::Linked::Now) => {
+            println!("{handle}\t{webid}");
+            eprintln!("linked; run `agent-credentials {webid}` to mint a pair");
+            ExitCode::SUCCESS
+        }
+        Ok(brolly_solid::oidc::store::Linked::Already) => {
+            println!("{handle}\t{webid}");
+            eprintln!("already linked to {handle}; nothing to do");
+            ExitCode::SUCCESS
+        }
+        Ok(brolly_solid::oidc::store::Linked::AnotherAccount) => {
+            eprintln!("{webid} is linked to another account; unlink it there first");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("could not link {webid}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `unlink-webid <handle> <webid>` — the kill switch: the link goes, and
+/// every credential minted for the WebID goes with it.
+async fn unlink_webid(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
+    let (Some(handle), Some(webid)) = (args.get(1), args.get(2)) else {
+        eprintln!("usage: brolly-admin unlink-webid <handle> <webid>");
+        return ExitCode::FAILURE;
+    };
+    let Ok(user) = member(pool, handle).await else {
+        return ExitCode::FAILURE;
+    };
+    match brolly_solid::oidc::store::unlink_webid(pool, user.id, webid).await {
+        Ok(true) => {
+            println!("{handle}\t{webid}");
+            eprintln!("unlinked; every credential minted for this WebID is retired");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => {
+            eprintln!("{webid} is not linked to {handle}");
+            ExitCode::FAILURE
+        }
+        Err(e) => {
+            eprintln!("could not unlink {webid}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `webids <handle>` — the links, one per line.
+async fn webids(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
+    let Some(handle) = args.get(1) else {
+        eprintln!("usage: brolly-admin webids <handle>");
+        return ExitCode::FAILURE;
+    };
+    let Ok(user) = member(pool, handle).await else {
+        return ExitCode::FAILURE;
+    };
+    match brolly_solid::oidc::store::webids_for_user(pool, user.id).await {
+        Ok(webids) => {
+            for webid in webids {
+                println!("{webid}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not list the links: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// `agent-credentials <webid>` — mint a pair, print the id then the secret,
+/// each alone on its line, so `read` can take them apart again.
+async fn agent_credentials(pool: &sqlx::PgPool, args: &[String]) -> ExitCode {
+    let Some(webid) = args.get(1) else {
+        eprintln!("usage: brolly-admin agent-credentials <webid>");
+        return ExitCode::FAILURE;
+    };
+    // The good error before the write: minting for an unlinked WebID is
+    // refused by the schema too, but by then the message is a constraint's
+    // name rather than an instruction.
+    match brolly_solid::oidc::store::webid_link_owner(pool, webid).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            eprintln!("{webid} is not linked; run `link-webid` first");
+            return ExitCode::FAILURE;
+        }
+        Err(e) => {
+            eprintln!("could not look up the link: {e}");
+            return ExitCode::FAILURE;
+        }
+    }
+    match brolly_solid::oidc::store::issue_client_credentials(pool, webid).await {
+        Ok((id, secret)) => {
+            println!("{id}");
+            println!("{secret}");
+            eprintln!("credentials minted for {webid}");
+            eprintln!("this is the only time the secret is shown; only its hash is stored");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("could not mint credentials: {e}");
+            ExitCode::FAILURE
+        }
+    }
 }

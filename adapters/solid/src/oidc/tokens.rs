@@ -510,11 +510,16 @@ pub fn discovery_document(issuer: &str) -> serde_json::Value {
         "registration_endpoint": endpoint("register"),
         "jwks_uri": endpoint("jwks"),
         "response_types_supported": ["code"],
-        "grant_types_supported": ["authorization_code", "refresh_token"],
+        // `client_credentials` is the agent grant (ADR 0020): an id/secret
+        // pair minted against a linked WebID, no browser, no redirect.
+        "grant_types_supported": ["authorization_code", "refresh_token", "client_credentials"],
         "subject_types_supported": ["public"],
         "id_token_signing_alg_values_supported": ["ES256"],
         "dpop_signing_alg_values_supported": ["ES256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        // `none` for the public clients the register endpoint admits;
+        // `client_secret_basic` for the client_credentials pairs an operator
+        // mints (ADR 0020) — the browser apps still cannot keep a secret.
+        "token_endpoint_auth_methods_supported": ["none", "client_secret_basic"],
         // PKCE is required by Solid-OIDC, and S256 is the only method we accept.
         "code_challenge_methods_supported": ["S256"],
         "scopes_supported": ["openid", "webid", "offline_access"],
@@ -797,10 +802,15 @@ mod tests {
         let doc = discovery_document(ISSUER);
         assert_eq!(doc["code_challenge_methods_supported"], json!(["S256"]));
         assert_eq!(doc["dpop_signing_alg_values_supported"], json!(["ES256"]));
-        // Public clients only: a browser app cannot keep a secret.
+        // Public clients for the interactive grants; `client_secret_basic`
+        // for the client_credentials pairs an operator mints (ADR 0020).
         assert_eq!(
             doc["token_endpoint_auth_methods_supported"],
-            json!(["none"])
+            json!(["none", "client_secret_basic"])
+        );
+        assert_eq!(
+            doc["grant_types_supported"],
+            json!(["authorization_code", "refresh_token", "client_credentials"])
         );
     }
 

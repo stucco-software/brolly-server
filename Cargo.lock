@@ -924,6 +924,7 @@ dependencies = [
  "oxigraph",
  "oxrdf",
  "p256 0.14.0",
+ "percent-encoding",
  "rcgen",
  "reqwest",
  "rs-car-sync",

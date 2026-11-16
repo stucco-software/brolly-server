@@ -17,24 +17,34 @@
 //!   error redirects are the deny path's error redirect — `error`, then
 //!   `state` — and its silent success is the allow path's issuance, code for
 //!   code, so a client cannot tell a silent answer from an interactive one.
+//! * **`client_credentials` is the agent grant** (ADR 0020). An id/secret pair
+//!   an operator minted against a WebID linked to an account, exchanged over
+//!   `Authorization: Basic` for a DPoP-bound access token naming the linked
+//!   WebID — the CSS model, for collectors and other non-interactive agents
+//!   that no browser ever signs in. Linking a WebID is
+//!   [`link_webid`]'s — operator-run, and refused unless the WebID's own
+//!   document names this issuer.
 
 use axum::extract::{Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::{Form, Json};
 use base64::Engine;
-use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use base64::engine::general_purpose::{STANDARD as B64_STANDARD, URL_SAFE_NO_PAD as B64};
 use brolly_identity::db::User;
 use brolly_identity::oauth::Protocol;
 use brolly_identity::{extract, webid};
 use brolly_solid::client_documents::{ClientIdDocument, allows_redirect};
 use brolly_solid::oidc::{dpop, store, tokens};
+use brolly_solid::webid_documents::{InvalidWebIdDocument, WebIdDocument};
+use percent_encoding::percent_decode_str;
 use serde::Deserialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use url::Url;
 
 use crate::auth::session_user;
+use crate::client_metadata::ClientLookup;
 use crate::{AppState, consent};
 
 /// How long a member has to answer the consent screen.
@@ -620,6 +630,9 @@ pub struct TokenRequest {
     client_id: Option<String>,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
+    /// `client_credentials` sends it (RFC 6749 §3.3); the interactive grants
+    /// carry their scope from the authorize request instead.
+    scope: Option<String>,
 }
 
 /// `POST /oauth/solid/token`
@@ -675,6 +688,7 @@ pub async fn token(
     match request.grant_type.as_str() {
         "authorization_code" => authorization_code_grant(&state, request, &jkt).await,
         "refresh_token" => refresh_token_grant(&state, request, &jkt).await,
+        "client_credentials" => client_credentials_grant(&state, &headers, request, &jkt).await,
         other => oauth_error(
             StatusCode::BAD_REQUEST,
             "unsupported_grant_type",
@@ -929,6 +943,206 @@ async fn refresh_token_grant(state: &AppState, request: TokenRequest, jkt: &str)
         None,
         replacement,
     )
+}
+
+// --- client_credentials: the agent grant (ADR 0020) -------------------------
+
+/// The one scope this grant mints: `webid`, the scope that makes a Solid
+/// access token name its agent. A request may send it explicitly (CSS
+/// clients do); a request that sends nothing gets it anyway. Anything else —
+/// `openid`, `offline_access` — is refused rather than half-honoured: this
+/// grant issues no ID token and no refresh token (RFC 6749 §4.4.3), so a
+/// scope it cannot deliver is not accepted.
+const AGENT_SCOPE: &str = "webid";
+
+/// `Authorization: Basic` (RFC 7617), with the id and secret percent-encoded
+/// before they are joined (RFC 6749 §2.3.1) — the shape every OAuth client
+/// library sends and the collector sends by hand. `None` for a missing or
+/// malformed header: the caller refuses, without distinguishing the causes.
+fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)> {
+    let value = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
+    let encoded = value.strip_prefix("Basic ")?;
+    let joined = B64_STANDARD
+        .decode(encoded.as_bytes())
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())?;
+    let (id, secret) = joined.split_once(':')?;
+    Some((percent_decoded(id), percent_decoded(secret)))
+}
+
+/// One half of a Basic credential, percent-decoded. A value that is not
+/// UTF-8 after decoding is not a credential we minted (ours are hex), so it
+/// is passed through to fail the lookup rather than refused here: the
+/// answer is the same, and the shape of the statement is one.
+fn percent_decoded(half: &str) -> String {
+    percent_decode_str(half)
+        .decode_utf8()
+        .map(|decoded| decoded.into_owned())
+        .unwrap_or_else(|_| half.to_string())
+}
+
+/// An `invalid_client` refusal (RFC 6749 §5.2) — 401, because the client
+/// attempted the `Authorization` header (§5.2), with the challenge the
+/// scheme it attempted owes it (RFC 7617 §2). Deliberately without a
+/// `DPoP-Nonce`: a client that reads one is invited to retry, and this
+/// refusal is not retryable — the credentials are wrong, not the proof.
+fn invalid_client(description: &str) -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        [
+            (header::WWW_AUTHENTICATE, "Basic realm=\"brolly\""),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::PRAGMA, "no-cache"),
+        ],
+        Json(json!({"error": "invalid_client", "error_description": description})),
+    )
+        .into_response()
+}
+
+async fn client_credentials_grant(
+    state: &AppState,
+    headers: &HeaderMap,
+    request: TokenRequest,
+    jkt: &str,
+) -> Response {
+    let Some((credential_id, secret)) = basic_credentials(headers) else {
+        return invalid_client("client_credentials requires Basic authentication");
+    };
+
+    // The id and the secret's hash are one lookup, so an unknown id and a
+    // wrong secret are one statement and one answer — no oracle for which
+    // ids exist. Nothing is spent by a refusal: the DPoP proof above was
+    // spent, and a refused credential costs its owner nothing.
+    let webid = match store::client_credentials_webid(&state.pool, &credential_id, &secret).await {
+        Ok(Some(webid)) => webid,
+        Ok(None) => {
+            tracing::warn!(credential = %credential_id, "client_credentials refused");
+            return invalid_client("unknown credentials");
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "client_credentials lookup failed");
+            return oauth_error(StatusCode::INTERNAL_SERVER_ERROR, "server_error", "failed");
+        }
+    };
+
+    let scope = match request.scope.as_deref().map(str::trim) {
+        None | Some(AGENT_SCOPE) => AGENT_SCOPE,
+        Some(_) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_scope",
+                "this grant issues webid tokens only",
+            );
+        }
+    };
+
+    // No ID token, no refresh token (RFC 6749 §4.4.3): the response carries
+    // the access token, and the credential is itself the renewal.
+    token_response(state, &webid, &credential_id, scope, jkt, None, None)
+}
+
+// --- WebID links (ADR 0020) --------------------------------------------------
+//
+// The other half of the agent grant: before a credential can be minted for
+// a WebID, the WebID must be linked to an account, and before it is linked,
+// it must vouch for this issuer — `solid:oidcIssuer`, dereferenced from the
+// WebID's own document, the same binding the remote verification path
+// (spec 6, H5) reads on every foreign token. Linking is the operator's act
+// (`brolly-admin link-webid`): there is no HTTP surface, because there is
+// no session an agent WebID could log in with — that being the whole reason
+// the grant exists.
+
+/// Why a WebID was not linked to an account.
+#[derive(Debug)]
+pub enum LinkError {
+    /// Not a URL, or not an `https` one: the dereference rides the same
+    /// hardened, HTTPS-only transport a Client ID Document does.
+    NotAnHttpsUrl,
+    /// A WebID this instance hosts — a member's, or the instance's own.
+    /// These are their owners' by construction: their profile documents are
+    /// server-authoritative here, so the issuer check would pass for
+    /// anybody's, and linking one would let an account mint tokens naming
+    /// another's identity. Refused outright.
+    LocalWebid,
+    /// The WebID's document could not be dereferenced or parsed.
+    Dereference(crate::client_metadata::LookupError<InvalidWebIdDocument>),
+    /// The document does not name this issuer: the WebID does not vouch for
+    /// this instance, so this instance does not mint tokens for it.
+    NotOurIssuer,
+    /// The database read or write failed.
+    Db(brolly_identity::db::DbError),
+}
+
+impl std::fmt::Display for LinkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LinkError::NotAnHttpsUrl => f.write_str("a WebID is an https URL; this is not one"),
+            LinkError::LocalWebid => f.write_str(
+                "this WebID is one this instance hosts, and is its owner's by \
+                 construction; it cannot be linked to another account",
+            ),
+            LinkError::Dereference(e) => {
+                write!(f, "the WebID's document could not be read: {e}")
+            }
+            LinkError::NotOurIssuer => f.write_str(
+                "the WebID's document does not name this issuer; add \
+                 solid:oidcIssuer to it first",
+            ),
+            LinkError::Db(e) => write!(f, "the link could not be recorded: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for LinkError {}
+
+impl From<brolly_identity::db::DbError> for LinkError {
+    fn from(e: brolly_identity::db::DbError) -> Self {
+        LinkError::Db(e)
+    }
+}
+
+/// Link a WebID to a member's account, after the WebID vouches for this
+/// issuer (ADR 0020).
+///
+/// The checks, in order — cheapest first, and every refusal before the
+/// write:
+///
+/// 1. The WebID is an `https` URL.
+/// 2. It is not one this instance hosts. A hosted WebID's issuer triple is
+///    written by this instance, so it always names this issuer — the check
+///    that follows would prove nothing, and the link would be an escalation.
+/// 3. The WebID's own document, dereferenced, names this issuer in
+///    `solid:oidcIssuer` — the WebID's own assertion, read from the WebID,
+///    exactly as the remote verification path reads it on every foreign
+///    token.
+/// 4. The link is recorded, one WebID to one account.
+///
+/// The caller owns the `lookup` — the operator CLI passes the production
+/// fetcher; a test passes a fixed set of documents — so the network half of
+/// the check is testable without reaching the network.
+pub async fn link_webid(
+    lookup: &dyn ClientLookup<Document = WebIdDocument, Invalid = InvalidWebIdDocument>,
+    pool: &sqlx::PgPool,
+    base_domain: &str,
+    user: &User,
+    webid: &str,
+) -> Result<store::Linked, LinkError> {
+    let url = Url::parse(webid).map_err(|_| LinkError::NotAnHttpsUrl)?;
+    if url.scheme() != "https" {
+        return Err(LinkError::NotAnHttpsUrl);
+    }
+    if webid::local_username(webid, base_domain).is_some()
+        || webid == webid::instance_webid(base_domain)
+    {
+        return Err(LinkError::LocalWebid);
+    }
+
+    let document = lookup.fetch(&url).await.map_err(LinkError::Dereference)?;
+    if !document.names(&format!("https://{base_domain}")) {
+        return Err(LinkError::NotOurIssuer);
+    }
+
+    Ok(store::link_webid(pool, user.id, webid).await?)
 }
 
 #[cfg(test)]
