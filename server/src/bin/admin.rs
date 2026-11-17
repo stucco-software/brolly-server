@@ -54,7 +54,9 @@ COMMANDS:
                  front end enforces does not apply, though the instance's
                  own (admin, www, ...) still does. The password is generated
                  and printed to stdout once; only its hash is stored.
-                 This is step 1 of the agent path (ADR 0020).
+                 Step 1 of the agent path. The admin console's Agents page
+                 runs the same steps in-process, server up (ADR 0021) —
+                 these commands are the scriptable path.
     link-webid   Link a WebID to an account (ADR 0020): the WebID's own
                  document must name this issuer in solid:oidcIssuer — it is
                  dereferenced from the live WebID, so a stale local copy
@@ -78,7 +80,10 @@ ENVIRONMENT:
     BROLLY_DATA_DIR         blob-sweep and agent-account; defaults to data,
                             as the server does. agent-account opens the
                             stores the way the server does — run it with the
-                            server STOPPED on a single-host deployment.
+                            server STOPPED on a single-host deployment, or
+                            use the console's Agents page instead, which
+                            runs the same path in-process with the server
+                            up.
     BROLLY_POD_QUOTA_BYTES  quota only; the instance default, as the server reads it
 ";
 

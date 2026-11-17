@@ -1,6 +1,9 @@
 # 0020 — client_credentials for linked WebIDs
 
-**Status:** Accepted (2026-11-16)
+**Status:** Accepted (2026-11-16). Decision 3 (linking as a CLI-only
+operator act) is superseded by
+[0021](0021-agent-provisioning-lives-in-the-admin-console.md); the linking
+*verification* it describes is unchanged.
 
 ## Context
 

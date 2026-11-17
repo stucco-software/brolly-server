@@ -51,6 +51,7 @@ Keep them to a screen or two.
 | [0018](0018-a-pod-serves-documents.md) | A pod serves documents | Accepted |
 | [0019](0019-the-owner-always-has-full-access.md) | The owner always has full access | Accepted |
 | [0020](0020-client-credentials-for-linked-webids.md) | `client_credentials` for linked WebIDs — the CSS agent model | Accepted |
+| [0021](0021-agent-provisioning-lives-in-the-admin-console.md) | Agent provisioning lives in the admin console | Accepted |
 
 ## When to write one
 

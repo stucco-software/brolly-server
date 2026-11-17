@@ -412,6 +412,33 @@ pub async fn unlink_webid(pool: &PgPool, user_id: Uuid, webid: &str) -> Result<b
     Ok(removed.rows_affected() > 0)
 }
 
+/// One linked WebID, as the admin console lists it: whose account it names,
+/// how many credential pairs still answer for it, and when one last did.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct AgentLink {
+    pub webid: String,
+    pub username: String,
+    pub linked_at: OffsetDateTime,
+    pub credentials: i64,
+    pub last_used_at: Option<OffsetDateTime>,
+}
+
+/// Every link on the instance, newest first — the console's Agents page.
+pub async fn agent_links(pool: &PgPool) -> Result<Vec<AgentLink>, DbError> {
+    Ok(sqlx::query_as::<_, AgentLink>(
+        "SELECT l.webid, u.username, l.created_at AS linked_at, \
+         count(c.credential_id) FILTER (WHERE c.revoked_at IS NULL) AS credentials, \
+         max(c.last_used_at) AS last_used_at \
+         FROM solid_webid_links l \
+         JOIN users u ON u.id = l.user_id \
+         LEFT JOIN solid_client_credentials c ON c.webid = l.webid \
+         GROUP BY l.webid, u.username, l.created_at \
+         ORDER BY l.created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
 /// Every WebID linked to an account.
 pub async fn webids_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<String>, DbError> {
     Ok(

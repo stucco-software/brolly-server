@@ -1,0 +1,102 @@
+{% extends "base.html" %}
+
+{% block title %}Agents — {{ chrome.instance_name }}{% endblock %}
+
+{% block nav %}{% include "admin/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="dashboard dashboard-wide">
+    <h1>Agents</h1>
+    {% include "admin/_tabs.html" %}
+    <section class="dashboard-card dashboard-card-wide">
+      <p class="lede">WebIDs linked to accounts on this instance, minting
+        <span class="mono">client_credentials</span> tokens while the server runs. A WebID links
+        only if its own document names this issuer in
+        <span class="mono">solid:oidcIssuer</span>; unlinking retires every pair minted for it.</p>
+
+      {% if let Some(password) = password %}
+      <p class="notice" role="status">Account created. This generated password is shown once;
+        only its hash is stored. <span class="mono">{{ password }}</span></p>
+      {% endif %}
+      {% if let Some(pair) = pair %}
+      <p class="notice" role="status">Credentials minted. This secret is shown once; only its
+        hash is stored. id <span class="mono">{{ pair.0 }}</span> secret
+        <span class="mono">{{ pair.1 }}</span></p>
+      {% endif %}
+
+      <table class="table">
+        <thead>
+          <tr>
+            <th scope="col">WebID</th>
+            <th scope="col">Account</th>
+            <th scope="col">Linked</th>
+            <th scope="col">Pairs</th>
+            <th scope="col">Last used</th>
+            <th scope="col"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for link in links %}
+          <tr>
+            <th scope="row"><span class="mono">{{ link.webid }}</span></th>
+            <td>@{{ link.username }}</td>
+            <td>{{ link.linked }}</td>
+            <td>{{ link.credentials }}</td>
+            <td>{{ link.last_used }}</td>
+            <td>
+              <form method="post" action="/admin/agents/unlink" class="inline-form">
+                <label class="sr-only" for="unlink-{{ loop.index }}">Unlink {{ link.webid }}</label>
+                <input type="hidden" name="webid" value="{{ link.webid }}">
+                <button type="submit">Unlink</button>
+              </form>
+            </td>
+          </tr>
+          {% endfor %}
+          {% if links.is_empty() %}
+          <tr><td colspan="6"><span class="hint">No linked WebIDs yet.</span></td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+
+      {% if let Some(error) = error %}
+      <p class="error" role="alert">{{ error }}</p>
+      {% endif %}
+
+      <div class="stack-form">
+        <form method="post" action="/admin/agents/account">
+          <div class="field">
+            <label for="account-handle">Create a service account — handle</label>
+            <input id="account-handle" name="handle" value="{{ handle_entered }}" placeholder="handle" required>
+          </div>
+          <div class="field">
+            <label for="account-email">Create a service account — email (optional)</label>
+            <input id="account-email" name="email" type="email" placeholder="agent@example.org">
+          </div>
+          <button type="submit">Create account</button>
+        </form>
+
+        <form method="post" action="/admin/agents/link">
+          <div class="field">
+            <label for="link-handle">Link a WebID — account handle</label>
+            <input id="link-handle" name="handle" value="{{ handle_entered }}" placeholder="handle" required>
+          </div>
+          <div class="field">
+            <label for="link-webid">Link a WebID — the WebID</label>
+            <input id="link-webid" name="webid" value="{{ webid_entered }}" placeholder="https://agent.example/profile#it" required>
+          </div>
+          <button type="submit">Link</button>
+        </form>
+
+        <form method="post" action="/admin/agents/credentials">
+          <div class="field">
+            <label for="mint-webid">Mint credentials — linked WebID</label>
+            <input id="mint-webid" name="webid" value="{{ webid_entered }}" placeholder="https://agent.example/profile#it" required>
+          </div>
+          <button type="submit">Mint</button>
+        </form>
+      </div>
+    </section>
+  </div>
+</div>
+{% endblock %}

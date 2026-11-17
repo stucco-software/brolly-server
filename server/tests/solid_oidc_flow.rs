@@ -35,6 +35,29 @@ async fn harness_with(
             >,
     >,
 ) -> Harness {
+    harness_with_webids(
+        solid_clients,
+        std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
+    )
+    .await
+}
+
+/// [`harness_with`], with the WebID document lookup the console's link action
+/// dereferences — the stand-in for the production fetcher.
+async fn harness_with_webids(
+    solid_clients: std::sync::Arc<
+        dyn brolly_server::client_metadata::ClientLookup<
+                Document = brolly_solid::client_documents::ClientIdDocument,
+                Invalid = brolly_solid::client_documents::InvalidDocument,
+            >,
+    >,
+    webid_documents: std::sync::Arc<
+        dyn brolly_server::client_metadata::ClientLookup<
+                Document = brolly_solid::webid_documents::WebIdDocument,
+                Invalid = brolly_solid::webid_documents::InvalidWebIdDocument,
+            >,
+    >,
+) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -78,9 +101,7 @@ async fn harness_with(
             brolly_server::client_metadata::StaticDocuments::default(),
         ),
         issuer_jwks: std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
-        webid_documents: std::sync::Arc::new(
-            brolly_server::client_metadata::StaticDocuments::default(),
-        ),
+        webid_documents,
     };
     let router = app(state, "server/static");
     Harness {
@@ -2595,6 +2616,268 @@ async fn a_webid_linked_to_one_account_cannot_be_linked_to_another() {
     .await
     .expect("linked again");
     assert_eq!(again, brolly_solid::oidc::store::Linked::Already);
+}
+
+// --- the console path (ADR 0021) --------------------------------------------
+
+/// An admin's session cookie, through the real login form.
+async fn an_admin_session(harness: &Harness) -> String {
+    db::create_user(
+        &harness._db.pool,
+        "keeper",
+        None,
+        "correct-horse-battery-staple",
+        "admin",
+    )
+    .await
+    .expect("admin");
+    post_form(
+        harness,
+        "/login",
+        "username=keeper&password=correct-horse-battery-staple",
+        None,
+    )
+    .await
+    .cookies
+    .first()
+    .expect("a session cookie")
+    .split(';')
+    .next()
+    .unwrap()
+    .to_string()
+}
+
+#[tokio::test]
+async fn the_console_provisions_a_working_credential_while_the_server_runs() {
+    // The panel answer to "do we have to stop the server?" — no. The server
+    // holds the stores' locks and the dereference and the mint all happen
+    // in-process: an admin with a browser runs the whole path, and the pair
+    // it mints works at the token endpoint.
+    let naming = documents_of(&[(AGENT_WEBID, &format!("https://{BASE}/"))]);
+    let harness = harness_with_webids(
+        std::sync::Arc::new(brolly_server::client_metadata::StaticClientDocuments::default()),
+        std::sync::Arc::new(naming),
+    )
+    .await;
+    let admin = an_admin_session(&harness).await;
+
+    // 1. The account, through the reserved-handle door the panel is. The
+    //    password rides the response once.
+    let reply = post_form(
+        &harness,
+        "/admin/agents/account",
+        "handle=pushbroom&email=pushbroom%40stucco.software",
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "account: {}", reply.body);
+    assert!(reply.body.contains("shown once"), "the warning is the UI");
+    let user = db::find_by_username(&harness._db.pool, "pushbroom")
+        .await
+        .expect("lookup")
+        .expect("the account exists");
+    assert_eq!(user.email.as_deref(), Some("pushbroom@stucco.software"));
+
+    // A reload shows nothing: the page is a plain GET, and the password
+    // lives in no store.
+    let reloaded = get(&harness, "/admin/agents", Some(&admin)).await;
+    assert_eq!(reloaded.status, StatusCode::OK);
+    assert!(
+        !reloaded.body.contains("shown once"),
+        "no secret on a plain load"
+    );
+
+    // 2. The link — the server's own dereference of the WebID document.
+    let reply = post_form(
+        &harness,
+        "/admin/agents/link",
+        &format!("handle=pushbroom&webid={}", urlencode(AGENT_WEBID)),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "link: {}", reply.body);
+    assert!(
+        reply
+            .location
+            .as_deref()
+            .is_some_and(|l| l.contains("/admin/agents"))
+    );
+
+    // The listing names it.
+    let page = get(&harness, "/admin/agents", Some(&admin)).await;
+    assert!(
+        page.body.contains(AGENT_WEBID),
+        "the listing shows the link"
+    );
+
+    // 3. The pair, shown once on the response.
+    let reply = post_form(
+        &harness,
+        "/admin/agents/credentials",
+        &format!("webid={}", urlencode(AGENT_WEBID)),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "mint: {}", reply.body);
+    let (id, secret) = the_pair(&reply.body);
+    assert!(
+        !id.is_empty() && !secret.is_empty(),
+        "the pair is the page: {}",
+        reply.body
+    );
+
+    // 4. The exchange — the collector's request, with the panel-minted pair.
+    let reply = client_credentials_request(&harness, &id, &secret, Some("webid"), true).await;
+    assert_eq!(reply.status, StatusCode::OK, "token: {}", reply.body);
+    let claims: serde_json::Value = serde_json::from_slice(
+        &B64.decode(
+            reply.json()["access_token"]
+                .as_str()
+                .expect("an access token")
+                .split('.')
+                .nth(1)
+                .expect("payload"),
+        )
+        .expect("decoded"),
+    )
+    .expect("claims");
+    assert_eq!(claims["webid"], AGENT_WEBID);
+}
+
+/// The id and the secret off the minted-pair page: the two
+/// `<span class="mono">` values of the minted notice, in order. The prose
+/// around them says "secret" before the secret does, so the pair is read as
+/// a pair, not by label.
+fn the_pair(page: &str) -> (String, String) {
+    let notice = &page[page.find("Credentials minted.").expect("the notice")..];
+    let value = |from: &str| {
+        let opened = &from[from.find("mono").expect("the class")..];
+        let opened = &opened[opened.find('>').expect("the opening tag") + 1..];
+        opened
+            .split("</span>")
+            .next()
+            .unwrap_or_default()
+            .to_string()
+    };
+    let id = value(notice);
+    let after_id = &notice[notice.find(&id).expect("the id") + id.len()..];
+    (id.clone(), value(after_id))
+}
+
+#[tokio::test]
+async fn the_console_refuses_a_link_the_webid_does_not_vouch_for() {
+    // The panel cannot be talked into skipping the dereference: a WebID
+    // whose document names another issuer is refused with the reason
+    // against the form, and no link is written.
+    let elsewhere = documents_of(&[(AGENT_WEBID, "https://idp.example")]);
+    let harness = harness_with_webids(
+        std::sync::Arc::new(brolly_server::client_metadata::StaticClientDocuments::default()),
+        std::sync::Arc::new(elsewhere),
+    )
+    .await;
+    let admin = an_admin_session(&harness).await;
+    db::create_user(
+        &harness._db.pool,
+        "pushbroom",
+        None,
+        "correct-horse-battery-staple",
+        "member",
+    )
+    .await
+    .expect("account");
+
+    let reply = post_form(
+        &harness,
+        "/admin/agents/link",
+        &format!("handle=pushbroom&webid={}", urlencode(AGENT_WEBID)),
+        Some(&admin),
+    )
+    .await;
+    assert_eq!(
+        reply.status,
+        StatusCode::BAD_REQUEST,
+        "link: {}",
+        reply.body
+    );
+    assert!(reply.body.contains("does not name this issuer"));
+    // The submitted WebID is kept against the form, the quota form's shape.
+    assert!(reply.body.contains(AGENT_WEBID));
+    assert!(
+        brolly_solid::oidc::store::webid_link_owner(&harness._db.pool, AGENT_WEBID)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "no link was written"
+    );
+}
+
+#[tokio::test]
+async fn the_console_is_not_a_member_surface() {
+    // The guard is the feature: a member gets the console's 404 on every
+    // agent path, GET and POST alike, and an anonymous visitor the login
+    // redirect.
+    let harness = harness().await;
+    db::create_user(
+        &harness._db.pool,
+        "alice",
+        None,
+        "correct-horse-battery-staple",
+        "member",
+    )
+    .await
+    .expect("member");
+    let member = post_form(
+        &harness,
+        "/login",
+        "username=alice&password=correct-horse-battery-staple",
+        None,
+    )
+    .await
+    .cookies
+    .first()
+    .expect("a session cookie")
+    .split(';')
+    .next()
+    .unwrap()
+    .to_string();
+
+    let page = get(&harness, "/admin/agents", Some(&member)).await;
+    assert_eq!(page.status, StatusCode::NOT_FOUND);
+    for path in [
+        "/admin/agents/account",
+        "/admin/agents/link",
+        "/admin/agents/unlink",
+        "/admin/agents/credentials",
+    ] {
+        let reply = post_form(&harness, path, "handle=x&webid=y&email=", Some(&member)).await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "POST {path}");
+    }
+    let anonymous = get(&harness, "/admin/agents", None).await;
+    assert_eq!(anonymous.status, StatusCode::SEE_OTHER);
+    assert!(anonymous.location.is_some_and(|l| l.contains("/login")));
+}
+
+#[tokio::test]
+async fn a_cross_origin_agent_post_is_refused() {
+    // The same-origin guard covers the console's new writes (lib.rs's
+    // `SAME_ORIGIN_FORMS`), exactly as it covers the quota form.
+    let harness = harness().await;
+    let admin = an_admin_session(&harness).await;
+
+    let reply = send(
+        &harness,
+        builder("POST", "/admin/agents/link")
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::ORIGIN, "https://elsewhere.example")
+            .header(header::COOKIE, &admin)
+            .body(Body::from(format!(
+                "handle=pushbroom&webid={}",
+                urlencode(AGENT_WEBID)
+            )))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.body);
 }
 
 // --- the operator path (ADR 0020) -------------------------------------------

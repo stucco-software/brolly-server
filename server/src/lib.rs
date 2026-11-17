@@ -445,6 +445,12 @@ pub const SAME_ORIGIN_FORMS: &[&str] = &[
     // An entry ending in `/` is a prefix: the console's per-member actions
     // carry the username in the path.
     "/admin/users/",
+    // The console's agent provisioning (ADR 0021): account, link, unlink,
+    // mint — all admin-gated writes.
+    "/admin/agents/account",
+    "/admin/agents/link",
+    "/admin/agents/unlink",
+    "/admin/agents/credentials",
 ];
 
 /// Is `path` one the same-origin rule guards? An entry ending in `/` is a
@@ -758,6 +764,11 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .route("/admin", get(admin::overview))
         .route("/admin/users", get(admin::users))
         .route("/admin/users/{username}/quota", post(admin::set_quota))
+        .route("/admin/agents", get(admin::agents))
+        .route("/admin/agents/account", post(admin::agent_account))
+        .route("/admin/agents/link", post(admin::agent_link))
+        .route("/admin/agents/unlink", post(admin::agent_unlink))
+        .route("/admin/agents/credentials", post(admin::agent_credentials))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             solid_oidc::apex_only,

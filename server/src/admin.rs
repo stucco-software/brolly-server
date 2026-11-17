@@ -21,6 +21,7 @@ use brolly_identity::db::{self, DbError, User};
 use serde::Deserialize;
 
 use crate::auth::session_user;
+use crate::solid_oidc;
 use crate::{AppState, Chrome, render};
 
 /// The role an invite or a user carries to reach this console.
@@ -115,14 +116,18 @@ pub struct Tab {
 }
 
 fn tabs(current: &str) -> Vec<Tab> {
-    [("/admin", "Overview"), ("/admin/users", "Members")]
-        .into_iter()
-        .map(|(href, label)| Tab {
-            href,
-            label,
-            current: href == current,
-        })
-        .collect()
+    [
+        ("/admin", "Overview"),
+        ("/admin/users", "Members"),
+        ("/admin/agents", "Agents"),
+    ]
+    .into_iter()
+    .map(|(href, label)| Tab {
+        href,
+        label,
+        current: href == current,
+    })
+    .collect()
 }
 
 // --- overview ----------------------------------------------------------------
@@ -362,4 +367,340 @@ pub async fn set_quota(
         "quota set"
     );
     Redirect::to("/admin/users").into_response()
+}
+
+// --- agents (ADR 0021) -------------------------------------------------------
+//
+// The provisioning surface for non-interactive agents (ADR 0020's model):
+// create the account, link the WebID, mint the id/secret pair — all while
+// the server runs, because the server is the one process that already holds
+// the stores' locks. The CLI keeps the same steps for scripting; this is the
+// page for the operator with a browser.
+//
+// The security posture is the quota form's: every POST is admin-gated by
+// [`require_admin`], same-origin-guarded (`SAME_ORIGIN_FORMS`), and a refusal
+// re-renders as a 400 with the submitted values kept. The two secrets this
+// page can show — a generated account password, a minted credential secret —
+// are rendered exactly once, on the POST's own response, with `no-store`; a
+// refresh re-submits and gets an error or a fresh pair, never the old one
+// again.
+
+/// What an admin submitted to one of the agent forms and why it was refused,
+/// so the re-render keeps the values against the right form.
+struct RefusedAgent {
+    handle: String,
+    webid: String,
+    error: String,
+}
+
+impl RefusedAgent {
+    fn new(handle: &str, webid: &str, error: impl Into<String>) -> Self {
+        Self {
+            handle: handle.to_string(),
+            webid: webid.to_string(),
+            error: error.into(),
+        }
+    }
+}
+
+/// One row of the links table, ready to render.
+struct AgentView {
+    webid: String,
+    username: String,
+    linked: String,
+    credentials: i64,
+    last_used: String,
+}
+
+#[derive(Template)]
+#[template(path = "admin/agents.html")]
+struct AgentsPage<'a> {
+    chrome: Chrome<'a>,
+    tabs: Vec<Tab>,
+    links: Vec<AgentView>,
+    /// A just-created account's password, shown once.
+    password: Option<String>,
+    /// A just-minted pair, shown once.
+    pair: Option<(String, String)>,
+    /// What the operator submitted and which form refused it, with why.
+    handle_entered: String,
+    webid_entered: String,
+    error: Option<String>,
+}
+
+/// The page, assembled. `Outcome` carries what a POST just produced; a plain
+/// load passes `None`s.
+async fn agents_page(
+    state: &AppState,
+    password: Option<String>,
+    pair: Option<(String, String)>,
+    refused: Option<RefusedAgent>,
+) -> Result<AgentsPage<'_>, ()> {
+    let links = brolly_solid::oidc::store::agent_links(&state.pool)
+        .await
+        .map_err(|e| {
+            tracing::error!(error = %e, "agent link list failed");
+        })?;
+    let links = links
+        .into_iter()
+        .map(|link| AgentView {
+            webid: link.webid,
+            username: link.username,
+            linked: link.linked_at.date().to_string(),
+            credentials: link.credentials,
+            last_used: link
+                .last_used_at
+                .map_or_else(|| "never".to_string(), |at| at.date().to_string()),
+        })
+        .collect();
+    let (handle_entered, webid_entered, error) = match refused {
+        Some(refused) => (refused.handle, refused.webid, Some(refused.error)),
+        None => (String::new(), String::new(), None),
+    };
+    Ok(AgentsPage {
+        chrome: state.chrome(),
+        tabs: tabs("/admin/agents"),
+        links,
+        password,
+        pair,
+        handle_entered,
+        webid_entered,
+        error,
+    })
+}
+
+/// A rendered page that must never be cached anywhere — the two secrets this
+/// page can show exist in exactly one response.
+fn uncached(page: AgentsPage<'_>, status: StatusCode) -> Response {
+    (
+        status,
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
+        render(&page),
+    )
+        .into_response()
+}
+
+/// `GET /admin/agents`
+pub async fn agents(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin(&state, &headers, "/admin/agents").await {
+        return response;
+    }
+    match agents_page(&state, None, None, None).await {
+        Ok(page) => render(&page),
+        Err(()) => server_error(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct AccountForm {
+    handle: String,
+    email: String,
+}
+
+/// `POST /admin/agents/account` — create the service account, with a
+/// generated password shown once. The same substance every signup gets
+/// (`provision::account`), through the operator's door: no invite, and the
+/// front end's reserved list does not apply — the instance's own
+/// (`admin`, `www`, ...) still does, because a reserved handle would shadow
+/// a host.
+pub async fn agent_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Result<Form<AccountForm>, FormRejection>,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/agents").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let Ok(Form(form)) = form else {
+        return (StatusCode::BAD_REQUEST, "malformed request").into_response();
+    };
+    let handle = form.handle.trim();
+    let email = form.email.trim();
+    let email = (!email.is_empty()).then_some(email);
+
+    if let Err(reason) = crate::auth::validate_username(handle) {
+        return refused(&state, handle, "", reason).await;
+    }
+    let password = db::generate_secret();
+    match crate::provision::account(
+        &state.pool,
+        &state.stores,
+        handle,
+        email,
+        &password,
+        MEMBER,
+        &state.base_domain,
+        state.plc_client.as_ref(),
+    )
+    .await
+    {
+        Ok((_user, event)) => {
+            if let Some(event) = event {
+                let _ = state
+                    .commits
+                    .send(brolly_atproto::firehose::Event::Identity(event));
+            }
+            tracing::info!(admin = %admin.username, handle, "service account created from the console");
+            match agents_page(&state, Some(password), None, None).await {
+                Ok(page) => uncached(page, StatusCode::OK),
+                Err(()) => server_error(),
+            }
+        }
+        Err(e) => refused(&state, handle, "", &e.to_string()).await,
+    }
+}
+
+#[derive(Deserialize)]
+pub struct LinkForm {
+    handle: String,
+    webid: String,
+}
+
+/// `POST /admin/agents/link` — link a WebID to an account, after the WebID's
+/// own document names this issuer. The dereference is the server's
+/// production fetch (`state.webid_documents`, the same transport and cache
+/// the remote verification path reads), so the console and the CLI cannot
+/// disagree about what the WebID says.
+pub async fn agent_link(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Result<Form<LinkForm>, FormRejection>,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/agents").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let Ok(Form(form)) = form else {
+        return (StatusCode::BAD_REQUEST, "malformed request").into_response();
+    };
+    let handle = form.handle.trim();
+    let webid = form.webid.trim();
+
+    let user = match db::find_by_username(&state.pool, handle).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return refused(&state, handle, webid, "no such member").await,
+        Err(e) => {
+            tracing::error!(error = %e, "member lookup failed");
+            return server_error();
+        }
+    };
+    match solid_oidc::link_webid(
+        state.webid_documents.as_ref(),
+        &state.pool,
+        &state.base_domain,
+        &user,
+        webid,
+    )
+    .await
+    {
+        Ok(_) => {
+            tracing::info!(
+                admin = %admin.username,
+                member = %user.username,
+                webid,
+                "webid linked from the console"
+            );
+            Redirect::to("/admin/agents").into_response()
+        }
+        Err(e) => refused(&state, handle, webid, &e.to_string()).await,
+    }
+}
+
+/// The quota form's refusal shape, for the agent forms: a 400 re-render with
+/// the submitted values kept against the form they came from.
+async fn refused(state: &AppState, handle: &str, webid: &str, error: &str) -> Response {
+    match agents_page(
+        state,
+        None,
+        None,
+        Some(RefusedAgent::new(handle, webid, error)),
+    )
+    .await
+    {
+        Ok(page) => uncached(page, StatusCode::BAD_REQUEST),
+        Err(()) => server_error(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct WebidForm {
+    webid: String,
+}
+
+/// `POST /admin/agents/unlink` — the kill switch: the link goes, and every
+/// credential minted for the WebID goes with it.
+pub async fn agent_unlink(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Result<Form<WebidForm>, FormRejection>,
+) -> Response {
+    if let Err(response) = require_admin(&state, &headers, "/admin/agents").await {
+        return response;
+    }
+    let Ok(Form(form)) = form else {
+        return (StatusCode::BAD_REQUEST, "malformed request").into_response();
+    };
+    let webid = form.webid.trim();
+
+    // The link's own owner performs the unlink, so the store's scoping holds;
+    // the admin is the hand, the owner is the row.
+    let owner = brolly_solid::oidc::store::webid_link_owner(&state.pool, webid).await;
+    let removed = match owner {
+        Ok(Some(owner)) => brolly_solid::oidc::store::unlink_webid(&state.pool, owner, webid).await,
+        Ok(None) => Ok(false),
+        Err(e) => Err(e),
+    };
+    match removed {
+        Ok(true) => Redirect::to("/admin/agents").into_response(),
+        Ok(false) => {
+            match agents_page(
+                &state,
+                None,
+                None,
+                Some(RefusedAgent::new("", webid, "that WebID is not linked")),
+            )
+            .await
+            {
+                Ok(page) => uncached(page, StatusCode::BAD_REQUEST),
+                Err(()) => server_error(),
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "unlink failed");
+            server_error()
+        }
+    }
+}
+
+/// `POST /admin/agents/credentials` — mint a pair for a linked WebID and
+/// show it once: the id and the secret, on this response, `no-store`.
+pub async fn agent_credentials(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Result<Form<WebidForm>, FormRejection>,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/agents").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let Ok(Form(form)) = form else {
+        return (StatusCode::BAD_REQUEST, "malformed request").into_response();
+    };
+    let webid = form.webid.trim();
+
+    match brolly_solid::oidc::store::issue_client_credentials(&state.pool, webid).await {
+        Ok((id, secret)) => {
+            // The id is public; the secret never rides a log line.
+            tracing::info!(admin = %admin.username, webid, credential = %id, "credentials minted from the console");
+            match agents_page(&state, None, Some((id, secret)), None).await {
+                Ok(page) => uncached(page, StatusCode::OK),
+                Err(()) => server_error(),
+            }
+        }
+        Err(e) => refused(&state, "", webid, &format!("{e} — is the WebID linked?")).await,
+    }
 }
