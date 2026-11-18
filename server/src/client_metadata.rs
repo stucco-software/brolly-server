@@ -22,7 +22,7 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use brolly_atproto::client_metadata::{
-    ClientError, ClientId, ClientMetadata, loopback_metadata, parse_client_id, validate,
+    ClientError, ClientId, ClientJwks, ClientMetadata, loopback_metadata, parse_client_id, validate,
 };
 use brolly_solid::client_documents::{self, ClientIdDocument, InvalidDocument};
 use brolly_solid::oidc::tokens::{InvalidDiscovery, InvalidJwks, RemoteDiscovery, RemoteJwks};
@@ -100,6 +100,24 @@ pub async fn lookup_client(
     }
 }
 
+/// The metadata for a parsed `client_id`, fetched past the cache (stage 2,
+/// F).
+///
+/// The confidential refresh path's re-fetch: a session is revoked if its key
+/// has left the client's JWKS, and that check must read the wire, not a
+/// cached answer — the same cache-bypassing fetch [`ClientLookup::refetch`]
+/// exists for on the Solid side (spec 6, H5, a key rotation). A loopback
+/// client is always public, so the branch never carries a key set with it.
+pub async fn refetch_client(
+    clients: &dyn ClientLookup<Document = ClientMetadata, Invalid = ClientError>,
+    id: &ClientId,
+) -> Result<ClientMetadata, LookupError<ClientError>> {
+    match id {
+        ClientId::Loopback(_) => Ok(loopback_metadata(id)),
+        ClientId::Discoverable(url) => clients.refetch(url).await,
+    }
+}
+
 /// What one protocol's fetch does with the bytes it gets back: the `Accept`
 /// header, the content-type check, and the parse (spec 6, H3). Everything
 /// downstream of the bytes — the ATProto fetcher's `application/json` and
@@ -132,6 +150,20 @@ impl Document for ClientMetadata {
 
     fn parse(url: &Url, content_type: &str, body: &[u8]) -> Result<Self, ClientError> {
         validate(&ClientId::Discoverable(url.clone()), content_type, body)
+    }
+}
+
+/// A confidential ATProto client's key set (stage 2, F): the document a
+/// `jwks_uri` names, asked for as JSON like the metadata itself.
+impl Document for ClientJwks {
+    type Invalid = ClientError;
+
+    fn accept() -> &'static str {
+        "application/json"
+    }
+
+    fn parse(_url: &Url, content_type: &str, body: &[u8]) -> Result<Self, ClientError> {
+        ClientJwks::parse(content_type, body)
     }
 }
 

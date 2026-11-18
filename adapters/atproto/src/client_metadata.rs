@@ -12,6 +12,7 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+use brolly_identity::dpop::{self, PublicJwk};
 use serde::Deserialize;
 use url::{Host, Url};
 
@@ -44,6 +45,94 @@ pub enum ApplicationType {
     Native,
 }
 
+/// How a client authenticates at the token endpoint (stage 2, F).
+///
+/// The profile allows exactly two: `none` (a public client) and
+/// `private_key_jwt` (a confidential client), the second accepted only with a
+/// key set to verify its assertions against.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClientAuth {
+    /// `none`, or the field absent: a public client, with no credentials.
+    Public,
+    /// `private_key_jwt`: a confidential client. Its assertions are signed by
+    /// a key in the set its metadata names — inline (`jwks`) or fetched
+    /// (`jwks_uri`, https only) — and never both, per the client-metadata
+    /// spec. A set may be empty: that is what removing every key looks like
+    /// from the server's side, and a refresh must see it rather than a parse
+    /// error (the kill switch).
+    Confidential {
+        jwks: Option<ClientJwks>,
+        jwks_uri: Option<String>,
+    },
+}
+
+impl ClientAuth {
+    pub fn is_confidential(&self) -> bool {
+        matches!(self, ClientAuth::Confidential { .. })
+    }
+}
+
+/// A confidential client's key set (stage 2, F): the `jwks` its metadata
+/// carries inline, or the document its `jwks_uri` serves.
+///
+/// Every key is an EC P-256 key usable for ES256 — the one algorithm the
+/// profile requires — so the set a document declares is exactly the set an
+/// assertion may be signed by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientJwks {
+    keys: Vec<dpop::PublicJwk>,
+}
+
+impl ClientJwks {
+    /// Parse the document a `jwks_uri` serves (stage 2, F): JSON, and every
+    /// key an EC P-256 key.
+    pub fn parse(content_type: &str, body: &[u8]) -> Result<Self, ClientError> {
+        let media_type = content_type.split(';').next().unwrap_or_default().trim();
+        if !media_type.eq_ignore_ascii_case("application/json") {
+            return Err(ClientError::InvalidMetadata(
+                "a client's key set must be served as application/json",
+            ));
+        }
+        let value: serde_json::Value = serde_json::from_slice(body)
+            .map_err(|_| ClientError::InvalidMetadata("a client's key set is not JSON"))?;
+        Self::from_value(&value)
+    }
+
+    /// The keys in a `jwks` value: every one an EC P-256 key usable for
+    /// ES256, or the metadata is refused — a key of any other kind is a key
+    /// no assertion of this profile can be signed by, and a set that carries
+    /// one is a set its client has not read the profile for.
+    pub fn from_value(value: &serde_json::Value) -> Result<Self, ClientError> {
+        let Some(keys) = value.get("keys").and_then(|keys| keys.as_array()) else {
+            return Err(ClientError::InvalidMetadata("jwks must carry a keys array"));
+        };
+        let mut parsed = Vec::new();
+        for key in keys {
+            let jwk: dpop::PublicJwk = serde_json::from_value(key.clone()).map_err(|_| {
+                ClientError::InvalidMetadata("every key in jwks must be an EC P-256 key")
+            })?;
+            if verifying_key(&jwk).is_none() {
+                return Err(ClientError::InvalidMetadata(
+                    "every key in jwks must be an EC P-256 key",
+                ));
+            }
+            parsed.push(jwk);
+        }
+        Ok(Self { keys: parsed })
+    }
+
+    pub fn keys(&self) -> &[dpop::PublicJwk] {
+        &self.keys
+    }
+
+    /// Whether the key with this thumbprint is still in the set — the
+    /// refresh path's question (stage 2, F): a key that has left is a session
+    /// to revoke.
+    pub fn contains(&self, jkt: &str) -> bool {
+        self.keys.iter().any(|key| dpop::thumbprint(key) == jkt)
+    }
+}
+
 /// Client metadata that has passed [`validate`], or been derived by
 /// [`loopback_metadata`].
 ///
@@ -55,7 +144,7 @@ pub struct ClientMetadata {
     client_id: String,
     redirect_uris: Vec<String>,
     scope: String,
-    token_endpoint_auth_method: String,
+    client_auth: ClientAuth,
     dpop_bound_access_tokens: bool,
     application_type: ApplicationType,
     /// Loopback redirects match with the port ignored. Only ever true for
@@ -73,8 +162,8 @@ impl ClientMetadata {
     pub fn scope(&self) -> &str {
         &self.scope
     }
-    pub fn token_endpoint_auth_method(&self) -> &str {
-        &self.token_endpoint_auth_method
+    pub fn client_auth(&self) -> &ClientAuth {
+        &self.client_auth
     }
     pub fn dpop_bound_access_tokens(&self) -> bool {
         self.dpop_bound_access_tokens
@@ -92,9 +181,6 @@ impl ClientMetadata {
 pub enum ClientError {
     InvalidClientId(&'static str),
     InvalidMetadata(&'static str),
-    /// `private_key_jwt`. Accepting it without verifying the client assertion
-    /// would be worse than refusing it (S6); stage 2.
-    ConfidentialUnsupported,
     RedirectUriNotAllowed,
     ScopeNotAllowed(&'static str),
 }
@@ -104,9 +190,6 @@ impl std::fmt::Display for ClientError {
         match self {
             ClientError::InvalidClientId(rule) => f.write_str(rule),
             ClientError::InvalidMetadata(rule) => write!(f, "client metadata is invalid: {rule}"),
-            ClientError::ConfidentialUnsupported => {
-                f.write_str("confidential clients (private_key_jwt) are not supported yet")
-            }
             ClientError::RedirectUriNotAllowed => {
                 f.write_str("redirect_uri is not one the client's metadata declares")
             }
@@ -237,7 +320,7 @@ pub fn loopback_metadata(id: &ClientId) -> ClientMetadata {
             client_id: id.url().as_str().to_owned(),
             redirect_uris: Vec::new(),
             scope: String::new(),
-            token_endpoint_auth_method: "none".to_owned(),
+            client_auth: ClientAuth::Public,
             dpop_bound_access_tokens: true,
             application_type: ApplicationType::Native,
             loopback: false,
@@ -259,7 +342,7 @@ pub fn loopback_metadata(id: &ClientId) -> ClientMetadata {
         client_id: url.as_str().to_owned(),
         redirect_uris,
         scope: scope.unwrap_or_else(|| "atproto".to_owned()),
-        token_endpoint_auth_method: "none".to_owned(),
+        client_auth: ClientAuth::Public,
         dpop_bound_access_tokens: true,
         application_type: ApplicationType::Native,
         loopback: true,
@@ -282,6 +365,11 @@ struct Document {
     dpop_bound_access_tokens: Option<bool>,
     token_endpoint_auth_method: Option<String>,
     application_type: Option<String>,
+    /// The key set a confidential client's assertions are signed by, inline
+    /// (stage 2, F). `jwks_uri` is the fetched alternative; the two are
+    /// mutually exclusive.
+    jwks: Option<serde_json::Value>,
+    jwks_uri: Option<String>,
 }
 
 /// Check a fetched metadata document against the `client_id` it was fetched
@@ -342,17 +430,45 @@ pub fn validate(
     if !scope.split(' ').any(|s| s == "atproto") {
         return Err(ClientError::InvalidMetadata("scope must include atproto"));
     }
-    // "token_endpoint_auth_method ... none (public client) or private_key_jwt
-    // (confidential client)"
-    match doc.token_endpoint_auth_method.as_deref() {
-        None | Some("none") => {}
-        Some("private_key_jwt") => return Err(ClientError::ConfidentialUnsupported),
-        Some(_) => {
+    // "jwks" and "jwks_uri" are mutually exclusive (stage 2, F), per the
+    // client-metadata spec — never both. `jwks_uri` is https only: it is
+    // fetched through the same hardened transport as the metadata itself.
+    let (jwks, jwks_uri) = match (&doc.jwks, doc.jwks_uri.as_deref()) {
+        (Some(_), Some(_)) => {
             return Err(ClientError::InvalidMetadata(
-                "token_endpoint_auth_method must be none",
+                "client metadata must not carry both jwks and jwks_uri",
             ));
         }
-    }
+        (Some(jwks), None) => (Some(ClientJwks::from_value(jwks)?), None),
+        (None, Some(uri)) => {
+            if !is_https(uri) {
+                return Err(ClientError::InvalidMetadata(
+                    "jwks_uri must be an https URL",
+                ));
+            }
+            (None, Some(uri.to_owned()))
+        }
+        (None, None) => (None, None),
+    };
+    // "token_endpoint_auth_method ... none (public client) or private_key_jwt
+    // (confidential client)" — the confidential one only with a key set to
+    // verify its assertions against (stage 2, F).
+    let client_auth = match doc.token_endpoint_auth_method.as_deref() {
+        None | Some("none") => ClientAuth::Public,
+        Some("private_key_jwt") => match (&jwks, &jwks_uri) {
+            (Some(_), _) | (_, Some(_)) => ClientAuth::Confidential { jwks, jwks_uri },
+            _ => {
+                return Err(ClientError::InvalidMetadata(
+                    "private_key_jwt requires jwks or jwks_uri",
+                ));
+            }
+        },
+        Some(_) => {
+            return Err(ClientError::InvalidMetadata(
+                "token_endpoint_auth_method must be none or private_key_jwt",
+            ));
+        }
+    };
     // "application_type (string, optional): must be one of web or native,
     // with web as the default if not specified"
     let application_type = match doc.application_type.as_deref() {
@@ -405,11 +521,36 @@ pub fn validate(
         client_id: url.as_str().to_owned(),
         redirect_uris: doc.redirect_uris,
         scope,
-        token_endpoint_auth_method: "none".to_owned(),
+        client_auth,
         dpop_bound_access_tokens: true,
         application_type,
         loopback: false,
     })
+}
+
+/// The P-256 verifying key a JWK names, or `None` if it does not name one —
+/// not an EC P-256 key, or not a point on the curve. Client authentication
+/// (stage 2, F) is ES256, so this is the one shape a key can usefully have.
+pub(crate) fn verifying_key(jwk: &PublicJwk) -> Option<p256::ecdsa::VerifyingKey> {
+    use base64::Engine;
+    if jwk.kty != "EC" || jwk.crv != "P-256" {
+        return None;
+    }
+    let x = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(jwk.x.as_bytes())
+        .ok()?;
+    let y = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(jwk.y.as_bytes())
+        .ok()?;
+    if x.len() != 32 || y.len() != 32 {
+        return None;
+    }
+    // SEC1 uncompressed: 0x04 || x || y.
+    let mut sec1 = Vec::with_capacity(65);
+    sec1.push(0x04);
+    sec1.extend_from_slice(&x);
+    sec1.extend_from_slice(&y);
+    p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).ok()
 }
 
 /// Does this `https` URI spell out port 443? Only the authority is examined,
@@ -571,7 +712,7 @@ mod tests {
     }
 
     /// Refused as invalid metadata, for the rule named by `rule`.
-    fn refused_for(result: Result<ClientMetadata, ClientError>, rule: &str) {
+    fn refused_for<T: std::fmt::Debug>(result: Result<T, ClientError>, rule: &str) {
         match result {
             Err(ClientError::InvalidMetadata(message)) => assert!(
                 message.contains(rule),
@@ -685,7 +826,7 @@ mod tests {
             ["http://127.0.0.1/".to_string(), "http://[::1]/".to_string()]
         );
         assert_eq!(meta.scope(), "atproto");
-        assert_eq!(meta.token_endpoint_auth_method(), "none");
+        assert_eq!(meta.client_auth(), &ClientAuth::Public);
         assert!(meta.dpop_bound_access_tokens());
         assert_eq!(meta.application_type(), ApplicationType::Native);
     }
@@ -847,16 +988,104 @@ mod tests {
         assert!(validating(&without(web_document(), "token_endpoint_auth_method")).is_ok());
     }
 
+    // --- confidential clients (stage 2, F) ---------------------------------
+
+    /// A key set a confidential client could publish, from a key it could
+    /// hold — so the assertions the flow tests sign really are its.
+    fn jwks() -> Value {
+        use base64::Engine;
+        let key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let sec1 = key.verifying_key().to_sec1_bytes();
+        json!({
+            "keys": [{
+                "kty": "EC", "crv": "P-256",
+                "x": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sec1[1..33]),
+                "y": base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sec1[33..65]),
+            }]
+        })
+    }
+
     #[test]
-    fn private_key_jwt_is_refused_as_confidential() {
-        assert_eq!(
+    fn private_key_jwt_with_jwks_or_jwks_uri_is_accepted() {
+        // Stage 0 refused `private_key_jwt` rather than accept an unverified
+        // assertion (S6); stage 2 verifies it (F).
+        let inline = validating(&with(
+            with(web_document(), "jwks", jwks()),
+            "token_endpoint_auth_method",
+            json!("private_key_jwt"),
+        ))
+        .unwrap();
+        assert!(inline.client_auth().is_confidential());
+
+        let fetched = validating(&with(
+            with(
+                web_document(),
+                "jwks_uri",
+                json!("https://app.example/jwks.json"),
+            ),
+            "token_endpoint_auth_method",
+            json!("private_key_jwt"),
+        ))
+        .unwrap();
+        assert!(fetched.client_auth().is_confidential());
+    }
+
+    #[test]
+    fn private_key_jwt_without_a_key_set_is_refused() {
+        refused_for(
             validating(&with(
                 web_document(),
                 "token_endpoint_auth_method",
-                json!("private_key_jwt")
+                json!("private_key_jwt"),
             )),
-            Err(ClientError::ConfidentialUnsupported)
+            "private_key_jwt requires",
         );
+    }
+
+    #[test]
+    fn jwks_and_jwks_uri_are_mutually_exclusive() {
+        // "Either jwks or jwks_uri, never both", per the client-metadata
+        // spec — two key sets is one too many to agree on.
+        refused_for(
+            validating(&with(
+                with(web_document(), "jwks", jwks()),
+                "jwks_uri",
+                json!("https://app.example/jwks.json"),
+            )),
+            "both jwks and jwks_uri",
+        );
+    }
+
+    #[test]
+    fn jwks_keys_must_be_ec_p256() {
+        // ES256 is the one algorithm the profile requires, so a key of any
+        // other kind is one no assertion of this profile can be signed by.
+        refused_for(
+            validating(&with(
+                web_document(),
+                "jwks",
+                json!({"keys": [{"kty": "RSA", "n": "...", "e": "AQAB"}]}),
+            )),
+            "EC P-256",
+        );
+    }
+
+    #[test]
+    fn jwks_uri_must_be_https() {
+        // Fetched through the same hardened transport as the metadata
+        // itself, which is https only.
+        refused_for(
+            validating(&with(
+                web_document(),
+                "jwks_uri",
+                json!("http://app.example/jwks.json"),
+            )),
+            "jwks_uri must be an https URL",
+        );
+    }
+
+    #[test]
+    fn other_auth_methods_are_refused() {
         refused_for(
             validating(&with(
                 web_document(),
@@ -865,6 +1094,39 @@ mod tests {
             )),
             "token_endpoint_auth_method",
         );
+    }
+
+    #[test]
+    fn a_key_set_is_ec_p256_only_and_may_be_empty() {
+        // The parse behind both the inline `jwks` and a `jwks_uri` fetch, so
+        // the two cannot disagree about what a key set is. A key of another
+        // kind is refused — the set a document declares is exactly the set an
+        // assertion may be signed by.
+        use base64::Engine;
+        let key = p256::ecdsa::SigningKey::from_slice(&[7u8; 32]).unwrap();
+        let sec1 = key.verifying_key().to_sec1_bytes();
+        let x = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sec1[1..33]);
+        let y = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&sec1[33..65]);
+        refused_for(
+            ClientJwks::parse(
+                "application/json",
+                json!({
+                    "keys": [
+                        {"kty": "EC", "crv": "P-256", "x": x, "y": y},
+                        {"kty": "OKP", "crv": "Ed25519", "x": "..."},
+                    ]
+                })
+                .to_string()
+                .as_bytes(),
+            ),
+            "EC P-256",
+        );
+        // An empty set parses: that is what removing every key looks like,
+        // and a refresh must see it rather than a parse error — the kill
+        // switch would otherwise read as a broken document.
+        let empty = ClientJwks::parse("application/json", b"{\"keys\": []}").unwrap();
+        assert!(empty.keys().is_empty());
+        assert!(!empty.contains("any-thumbprint-at-all"));
     }
 
     #[test]

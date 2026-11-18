@@ -31,6 +31,10 @@ ipld-core = "0.4"
 serde_bytes = "0.11"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The EC P-256 half of client authentication (stage 2, F): the keys a
+# confidential client's JWKS names, verified for its ES256 assertions. The
+# same copy identity's DPoP verifier uses.
+p256 = { version = "0.14.0", features = ["ecdsa"] }
 # client_id and redirect_uri checks are URL-structural (host kind, port,
 # userinfo, origin); string prefixes are how is_valid_client_id went wrong.
 url = "2.5.8"

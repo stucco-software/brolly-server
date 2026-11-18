@@ -92,6 +92,7 @@ async fn harness_with_webids(
         commits: tokio::sync::broadcast::channel(64).0,
         plc_client: None,
         clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
+        client_jwks: std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
         // Where Client ID Documents come from (spec 6, H3): a fixed,
         // validated set here, as the ATProto side's `StaticClients` does.
         solid_clients,
@@ -1015,6 +1016,7 @@ async fn our_own_profile_is_not_a_client_id_document() {
         commits: tokio::sync::broadcast::channel(64).0,
         plc_client: None,
         clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
+        client_jwks: std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
         solid_clients: std::sync::Arc::new(
             brolly_server::client_metadata::StaticClientDocuments::default(),
         ),

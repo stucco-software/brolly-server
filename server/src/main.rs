@@ -186,6 +186,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         clients: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<
             brolly_atproto::client_metadata::ClientMetadata,
         >::new()?),
+        // A confidential client's key set (stage 2, F): the document a
+        // `jwks_uri` names, on the same hardened transport as the metadata.
+        client_jwks: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<
+            brolly_atproto::client_metadata::ClientJwks,
+        >::new()?),
         // Solid-OIDC clients with a Client ID Document are identified by the
         // document itself (spec 6, H3): the same hardened transport, asking
         // for RDF instead of JSON.

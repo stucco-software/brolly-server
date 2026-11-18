@@ -164,6 +164,16 @@ pub struct AppState {
                 Invalid = brolly_atproto::client_metadata::ClientError,
             >,
     >,
+    /// Where a confidential ATProto client's key set comes from (stage 2, F)
+    /// — the document a `jwks_uri` names, fetched through the same hardened
+    /// transport as `clients`, cached per URI. A trait object for the same
+    /// reason.
+    pub client_jwks: std::sync::Arc<
+        dyn client_metadata::ClientLookup<
+                Document = brolly_atproto::client_metadata::ClientJwks,
+                Invalid = brolly_atproto::client_metadata::ClientError,
+            >,
+    >,
     /// Where Solid-OIDC Client ID Documents come from (spec 6, H3).
     ///
     /// The same transport as `clients`, parameterized for RDF: an `https://`

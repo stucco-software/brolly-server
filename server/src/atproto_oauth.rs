@@ -29,10 +29,13 @@ use brolly_identity::oauth::Protocol;
 use serde::Deserialize;
 use serde_json::json;
 
-use brolly_atproto::client_metadata::{ClientError, ClientId, check_request, parse_client_id};
+use brolly_atproto::client_assertion;
+use brolly_atproto::client_metadata::{
+    ClientAuth, ClientError, ClientId, ClientJwks, ClientMetadata, check_request, parse_client_id,
+};
 
 use crate::auth::session_user;
-use crate::client_metadata::{LookupError, lookup_client};
+use crate::client_metadata::{LookupError, lookup_client, refetch_client};
 use crate::{AppState, consent};
 use url::Url;
 
@@ -167,9 +170,7 @@ fn client_refusal(e: &ClientError) -> Response {
     let code = match e {
         ClientError::RedirectUriNotAllowed => "invalid_request",
         ClientError::ScopeNotAllowed(_) => "invalid_scope",
-        ClientError::InvalidClientId(_)
-        | ClientError::InvalidMetadata(_)
-        | ClientError::ConfidentialUnsupported => "invalid_client",
+        ClientError::InvalidClientId(_) | ClientError::InvalidMetadata(_) => "invalid_client",
     };
     oauth_error(StatusCode::BAD_REQUEST, code, &e.to_string())
 }
@@ -193,6 +194,203 @@ fn app_name(client_id: &str) -> Option<String> {
         ClientId::Discoverable(url) => url.host_str().map(str::to_owned),
         ClientId::Loopback(_) => Some("localhost (development)".to_owned()),
     }
+}
+
+// --- confidential clients (stage 2, F) --------------------------------------------
+
+/// Whether a request carries any client-assertion field. A public client's
+/// request carries none — one that does is refused, because an assertion is a
+/// credential only a confidential client can have verified.
+fn carries_assertion(assertion_type: Option<&str>, assertion: Option<&str>) -> bool {
+    assertion_type.is_some() || assertion.is_some()
+}
+
+/// A confidential session's client authentication at the token endpoint
+/// (stage 2, F): the same kind of assertion, and the same key — a different
+/// key is a different client instance, answered `invalid_grant`.
+async fn token_authentication(
+    state: &AppState,
+    client_id: &str,
+    bound_jkt: &str,
+    assertion_type: Option<&str>,
+    assertion: Option<&str>,
+    bypass_cache: bool,
+) -> Result<(), Response> {
+    let jwks = confidential_keys(state, client_id, bypass_cache).await?;
+    bound_assertion(state, &jwks, bound_jkt, assertion_type, assertion).await
+}
+
+/// The assertion a confidential client must carry: the jwt-bearer type and
+/// the JWT itself. `None` is a refusal — a confidential client that does not
+/// authenticate is not one.
+fn required_assertion<'a>(
+    assertion_type: Option<&str>,
+    assertion: Option<&'a str>,
+) -> Option<&'a str> {
+    match (assertion_type, assertion) {
+        (Some(t), Some(a)) if t == client_assertion::ASSERTION_TYPE => Some(a),
+        _ => None,
+    }
+}
+
+/// The wire answer to a missing or malformed client assertion (stage 2, F).
+fn missing_assertion() -> Response {
+    oauth_error(
+        StatusCode::BAD_REQUEST,
+        "invalid_client",
+        "a confidential client must carry client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer and a client_assertion",
+    )
+}
+
+/// A confidential client's key set: the inline `jwks` its metadata carries,
+/// or the document its `jwks_uri` serves — through the same hardened fetch
+/// (https only, public addresses only). `bypass_cache` is the refresh case
+/// (stage 2, F): a key removed from a `jwks_uri` document must be noticed on
+/// the very next refresh, not when the cache happens to expire.
+async fn client_keys(
+    state: &AppState,
+    metadata: &ClientMetadata,
+    bypass_cache: bool,
+) -> Result<ClientJwks, Response> {
+    let refusal =
+        |description: &str| oauth_error(StatusCode::BAD_REQUEST, "invalid_client", description);
+    let ClientAuth::Confidential { jwks, jwks_uri } = metadata.client_auth() else {
+        return Err(refusal(
+            "this session's client is no longer a confidential client",
+        ));
+    };
+    if let Some(jwks) = jwks {
+        return Ok(jwks.clone());
+    }
+    let Some(uri) = jwks_uri else {
+        return Err(refusal("this client's metadata names no key set"));
+    };
+    let Ok(url) = Url::parse(uri) else {
+        return Err(refusal("this client's jwks_uri is not a URL"));
+    };
+    let fetched = if bypass_cache {
+        state.client_jwks.refetch(&url).await
+    } else {
+        state.client_jwks.fetch(&url).await
+    };
+    fetched.map_err(|e| lookup_refusal(&e))
+}
+
+/// Verify and spend a client assertion, mapping every refusal to the wire
+/// (stage 2, F): a refused assertion is `invalid_client`, and a storage fault
+/// is the server's, not the client's.
+async fn spend_assertion(
+    state: &AppState,
+    jwks: &ClientJwks,
+    assertion: &str,
+) -> Result<String, Response> {
+    let issuer = format!("https://{}", state.base_domain);
+    let unspent = match client_assertion::verify(jwks, assertion, &issuer, now()) {
+        Ok(unspent) => unspent,
+        Err(e) => {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                &e.to_string(),
+            ));
+        }
+    };
+    match unspent.spend(&state.pool, now()).await {
+        Ok(verified) => Ok(verified.jkt),
+        Err(client_assertion::AssertionError::Storage(e)) => {
+            tracing::error!(error = %e, "recording a client assertion failed");
+            Err(oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "could not verify the client",
+            ))
+        }
+        Err(e) => Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_client",
+            &e.to_string(),
+        )),
+    }
+}
+
+/// The client authentication a push must carry (stage 2, F): a confidential
+/// client's jwt-bearer assertion, verified against its own key set and spent
+/// (the `jti` is single-use); a public client carries nothing. Returns the
+/// signing key's thumbprint — the `client_jkt` the session binds to — or
+/// `None` for a public client.
+async fn push_authentication(
+    state: &AppState,
+    metadata: &ClientMetadata,
+    assertion_type: Option<&str>,
+    assertion: Option<&str>,
+) -> Result<Option<String>, Response> {
+    if !metadata.client_auth().is_confidential() {
+        if carries_assertion(assertion_type, assertion) {
+            return Err(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "a public client does not authenticate with a client assertion",
+            ));
+        }
+        return Ok(None);
+    }
+    let assertion = required_assertion(assertion_type, assertion);
+    let Some(assertion) = assertion else {
+        return Err(missing_assertion());
+    };
+    let jwks = client_keys(state, metadata, false).await?;
+    Ok(Some(spend_assertion(state, &jwks, assertion).await?))
+}
+
+/// A confidential client's key set, looked up by the `client_id` its
+/// session names (stage 2, F). `bypass_cache` is the refresh case: the
+/// metadata — and the key set behind a `jwks_uri` — is fetched
+/// cache-bypassingly, the fetch `issuer_jwks` does for a Solid key rotation,
+/// so a key removed from the JWKS is noticed on the very next refresh.
+async fn confidential_keys(
+    state: &AppState,
+    client_id: &str,
+    bypass_cache: bool,
+) -> Result<ClientJwks, Response> {
+    let id = match parse_client_id(client_id) {
+        Ok(id) => id,
+        Err(e) => return Err(client_refusal(&e)),
+    };
+    let metadata = if bypass_cache {
+        refetch_client(state.clients.as_ref(), &id).await
+    } else {
+        lookup_client(state.clients.as_ref(), &id).await
+    };
+    let metadata = match metadata {
+        Ok(metadata) => metadata,
+        Err(e) => return Err(lookup_refusal(&e)),
+    };
+    client_keys(state, &metadata, bypass_cache).await
+}
+
+/// A confidential session's client authentication at the token endpoint
+/// (stage 2, F): the same kind of assertion, and the same key — a different
+/// key is a different client instance, answered `invalid_grant`.
+async fn bound_assertion(
+    state: &AppState,
+    jwks: &ClientJwks,
+    bound_jkt: &str,
+    assertion_type: Option<&str>,
+    assertion: Option<&str>,
+) -> Result<(), Response> {
+    let assertion = required_assertion(assertion_type, assertion);
+    let Some(assertion) = assertion else {
+        return Err(missing_assertion());
+    };
+    let jkt = spend_assertion(state, jwks, assertion).await?;
+    if jkt != bound_jkt {
+        return Err(oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "this session is bound to a different client key",
+        ));
+    }
+    Ok(())
 }
 
 // --- discovery -------------------------------------------------------------------
@@ -230,7 +428,7 @@ pub async fn metadata(State(state): State<AppState>, headers: HeaderMap) -> Resp
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
-        "token_endpoint_auth_methods_supported": ["none"],
+        "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
         "dpop_signing_alg_values_supported": ["ES256"],
         "scopes_supported": SCOPES_SUPPORTED,
         "client_id_metadata_document_supported": true,
@@ -238,8 +436,8 @@ pub async fn metadata(State(state): State<AppState>, headers: HeaderMap) -> Resp
         // client that checked the profile's matrix knows to expect it.
         "authorization_response_iss_parameter_supported": true,
         // The one client-authentication algorithm the profile requires (stage
-        // 2, E). Meaningful once F accepts confidential clients; declared now
-        // because the draft's consumers read metadata before their first PAR.
+        // 2, E) — the algorithm every confidential client's assertion (F) is
+        // signed with, now that `private_key_jwt` above is accepted.
         "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
     }))
     .into_response()
@@ -275,6 +473,8 @@ pub struct ParForm {
     code_challenge: Option<String>,
     code_challenge_method: Option<String>,
     login_hint: Option<String>,
+    client_assertion_type: Option<String>,
+    client_assertion: Option<String>,
 }
 
 /// `POST /oauth/atproto/par`
@@ -396,6 +596,22 @@ pub async fn par(
         }
     }
 
+    // The client authenticates here (stage 2, F): a confidential client's
+    // assertion is verified and its `jti` spent before anything is stored,
+    // the DPoP discipline — a request refused later has still used it. The
+    // thumbprint of the signing key is what the session binds to.
+    let client_jkt = match push_authentication(
+        &state,
+        &metadata,
+        form.client_assertion_type.as_deref(),
+        form.client_assertion.as_deref(),
+    )
+    .await
+    {
+        Ok(jkt) => jkt,
+        Err(response) => return response,
+    };
+
     match oauth::push_request(
         &state.pool,
         &raw_client_id,
@@ -405,6 +621,7 @@ pub async fn par(
         &code_challenge,
         &jkt,
         form.login_hint.as_deref(),
+        client_jkt.as_deref(),
     )
     .await
     {
@@ -677,6 +894,7 @@ pub async fn decide(
         &pushed.scope,
         &pushed.code_challenge,
         &pushed.dpop_jkt,
+        pushed.client_jkt.as_deref(),
     )
     .await
     {
@@ -710,6 +928,8 @@ pub struct TokenForm {
     client_id: Option<String>,
     code_verifier: Option<String>,
     refresh_token: Option<String>,
+    client_assertion_type: Option<String>,
+    client_assertion: Option<String>,
 }
 
 /// `POST /oauth/atproto/token`
@@ -796,6 +1016,39 @@ async fn code_grant(state: &AppState, form: TokenForm, jkt: &str) -> Response {
         );
     };
 
+    // A confidential session authenticates again here (stage 2, F): the same
+    // kind of assertion and the same key — a different key is a different
+    // client instance. A public session's code carries no binding, so an
+    // assertion is a refusal rather than a requirement.
+    match grant.client_jkt.as_deref() {
+        Some(bound) => {
+            if let Err(response) = token_authentication(
+                state,
+                &grant.client_id,
+                bound,
+                form.client_assertion_type.as_deref(),
+                form.client_assertion.as_deref(),
+                false,
+            )
+            .await
+            {
+                return response;
+            }
+        }
+        None if carries_assertion(
+            form.client_assertion_type.as_deref(),
+            form.client_assertion.as_deref(),
+        ) =>
+        {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "a public client does not authenticate with a client assertion",
+            );
+        }
+        None => {}
+    }
+
     // The key that pushed the request is the key that gets the token. Without
     // this, PAR's key pledge would be decorative.
     if grant.dpop_jkt != jkt {
@@ -846,6 +1099,7 @@ async fn code_grant(state: &AppState, form: TokenForm, jkt: &str) -> Response {
         grant.user_id,
         &grant.scope,
         jkt,
+        grant.client_jkt.as_deref(),
         time::OffsetDateTime::now_utc(),
     )
     .await
@@ -874,19 +1128,73 @@ async fn refresh_grant(state: &AppState, form: TokenForm, jkt: &str) -> Response
             "this refresh token was issued to a different key",
         );
     }
-    // The session anchor (stage 2, G): rotation copied `anchored_at` forward,
-    // so the overall session lifetime is capped however much the client
-    // refreshes. The presented token itself may be fresh — minted seconds ago,
-    // weeks to run — and freshness launders nothing; the anchor refuses it.
-    // The presented token was spent above either way.
-    if time::OffsetDateTime::now_utc()
-        > grant.anchored_at + time::Duration::seconds_f64(oauth::SESSION_TTL_SECONDS)
-    {
-        return oauth_error(
-            StatusCode::BAD_REQUEST,
-            "invalid_grant",
-            "this session has passed its overall lifetime",
-        );
+    let assertion_fields = (
+        form.client_assertion_type.as_deref(),
+        form.client_assertion.as_deref(),
+    );
+    if let Some(bound) = grant.client_jkt.as_deref() {
+        // A confidential session (stage 2, F). The metadata — and the key set
+        // behind a `jwks_uri` — is re-fetched cache-bypassingly, and the
+        // session is revoked if the key has left the JWKS: the profile's
+        // "must revoke the session … if the client authentication key
+        // becomes absent" — key removal is the kill switch. Then the
+        // assertion, and the same key.
+        let jwks = match confidential_keys(state, &grant.client_id, true).await {
+            Ok(jwks) => jwks,
+            Err(response) => return response,
+        };
+        if !jwks.contains(bound) {
+            tracing::info!(
+                client_id = %grant.client_id,
+                "a confidential session's key has left its client's JWKS; session revoked"
+            );
+            if let Err(e) =
+                oauth::revoke_bound_sessions(&state.pool, &grant.client_id, grant.user_id, bound)
+                    .await
+            {
+                tracing::error!(error = %e, "revoking a confidential session failed");
+                return oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "could not refresh",
+                );
+            }
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "this session's key is no longer in the client's JWKS",
+            );
+        }
+        if let Err(response) =
+            bound_assertion(state, &jwks, bound, assertion_fields.0, assertion_fields.1).await
+        {
+            return response;
+        }
+        // No anchor: the 2-week overall cap is the public client's rule (G) —
+        // this is the profile's authenticated, key-bound, remotely-revocable
+        // session, and the 180-day refresh token is its cap.
+    } else {
+        if carries_assertion(assertion_fields.0, assertion_fields.1) {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_client",
+                "a public client does not authenticate with a client assertion",
+            );
+        }
+        // The session anchor (stage 2, G): rotation copied `anchored_at`
+        // forward, so the overall session lifetime is capped however much the
+        // client refreshes. The presented token itself may be fresh — minted
+        // seconds ago, weeks to run — and freshness launders nothing; the
+        // anchor refuses it. The presented token was spent above either way.
+        if time::OffsetDateTime::now_utc()
+            > grant.anchored_at + time::Duration::seconds_f64(oauth::SESSION_TTL_SECONDS)
+        {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "this session has passed its overall lifetime",
+            );
+        }
     }
     issue_pair(
         state,
@@ -894,6 +1202,7 @@ async fn refresh_grant(state: &AppState, form: TokenForm, jkt: &str) -> Response
         grant.user_id,
         &grant.scope,
         jkt,
+        grant.client_jkt.as_deref(),
         grant.anchored_at,
     )
     .await
@@ -905,6 +1214,7 @@ async fn issue_pair(
     user_id: uuid::Uuid,
     scope: &str,
     jkt: &str,
+    client_jkt: Option<&str>,
     anchored_at: time::OffsetDateTime,
 ) -> Response {
     let Ok(Some(user)) = db::find_by_id(&state.pool, user_id).await else {
@@ -922,6 +1232,7 @@ async fn issue_pair(
         user_id,
         scope,
         jkt,
+        client_jkt,
         anchored_at,
     )
     .await;
@@ -932,6 +1243,7 @@ async fn issue_pair(
         user_id,
         scope,
         jkt,
+        client_jkt,
         anchored_at,
     )
     .await;

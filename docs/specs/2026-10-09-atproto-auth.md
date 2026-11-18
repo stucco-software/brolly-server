@@ -4,21 +4,28 @@
 <!-- The spec names files and tables this stage creates, so not every path it
      cites resolves until it's implemented. -->
 
-**Status:** Chunks 1–4 implemented (1–2 on 2026-11-17: legacy sessions + app
-passwords; DPoP nonces — the secret table, `verify`'s nonce parameter,
-`use_dpop_nonce` at PAR/token, the XRPC 401 challenge, the CORS expose; 3 on
-2026-11-18: discovery completed — the protected-resource route and the two AS
+**Status:** Implemented 2026-11-17 – 2026-11-18, all five chunks (1: legacy
+sessions + app passwords; 2: DPoP nonces — the secret table, `verify`'s nonce
+parameter, `use_dpop_nonce` at PAR/token, the XRPC 401 challenge, the CORS
+expose; 3: discovery completed — the protected-resource route and the two AS
 metadata fields, the server-side scope allowlist at PAR; lifetimes — access
 900 s, public refresh 2 weeks anchored (`anchored_at` copied forward on
 rotation); bindings — `login_hint` enforced at decide, `code_challenge` reuse
-refused within 24 h; 4 on 2026-11-18: the caller is the request — the proof
-verified and spent against the request's real `htm`/`htu` *before* the grant
-is read, the 401 `WWW-Authenticate` shape (the draft's `resource_metadata`
-challenge for a missing credential, RFC 9449's DPoP challenge for a refused
-one) plus `Cache-Control: private`/`Vary: Authorization` on authenticated
-answers, the scope gate with the reference's 403 `ScopeMissingError`, and
-`getServiceAuth` per the lexicon — `exp` bounded to now+300 s, default 60 s,
-the `did#serviceId` fragment surviving into `aud`). Chunk 5 remains. Drafted
+refused within 24 h; 4: the caller is the request — the proof verified and
+spent against the request's real `htm`/`htu` *before* the grant is read, the
+401 `WWW-Authenticate` shape (the draft's `resource_metadata` challenge for a
+missing credential, RFC 9449's DPoP challenge for a refused one) plus
+`Cache-Control: private`/`Vary: Authorization` on authenticated answers, the
+scope gate with the reference's 403 `ScopeMissingError`, and `getServiceAuth`
+per the lexicon — `exp` bounded to now+300 s, default 60 s, the
+`did#serviceId` fragment surviving into `aud`; 5: confidential clients —
+`private_key_jwt` accepted when `jwks` or `jwks_uri` is present (never both,
+https only, keys EC P-256), the ES256 jwt-bearer client assertion verified and
+its single-use `jti` spent at PAR and token, the session bound to the client
+key (`client_jkt` riding the pushed request, the code, and the tokens, a
+different key at the token endpoint answered `invalid_grant`), the
+cache-bypassing metadata re-fetch on refresh that revokes a session whose key
+has left the JWKS, and the 180-day unanchored confidential refresh). Drafted
 2026-10-09, five chunks, and revised the same day after one adversarial review
 against the ATProtocol OAuth and HTTP API
 (XRPC) specifications (atproto.com, as of this date), the `com.atproto.server`

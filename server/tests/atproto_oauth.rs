@@ -75,6 +75,30 @@ async fn harness_with(
             >,
     >,
 ) -> Harness {
+    harness_with_jwks(
+        clients,
+        Arc::new(StaticDocuments::<brolly_atproto::client_metadata::ClientJwks>::default()),
+    )
+    .await
+}
+
+/// The harness with both ATProto client lookups supplied (stage 2, F): the
+/// metadata lookup, and the key-set lookup a `jwks_uri` client's assertions
+/// verify against.
+async fn harness_with_jwks(
+    clients: Arc<
+        dyn ClientLookup<
+                Document = brolly_atproto::client_metadata::ClientMetadata,
+                Invalid = brolly_atproto::client_metadata::ClientError,
+            >,
+    >,
+    client_jwks: Arc<
+        dyn ClientLookup<
+                Document = brolly_atproto::client_metadata::ClientJwks,
+                Invalid = brolly_atproto::client_metadata::ClientError,
+            >,
+    >,
+) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
@@ -117,6 +141,7 @@ async fn harness_with(
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
             clients,
+            client_jwks,
             solid_clients: std::sync::Arc::new(StaticClientDocuments::default()),
             // The remote path's lookups (spec 6, H5): empty here, as a fetch
             // that finds nothing would be — these tests never leave the
@@ -240,6 +265,18 @@ fn client_key() -> SigningKey {
 
 fn pkce() -> (String, String) {
     let verifier = "a-high-entropy-value-for-the-atproto-oauth-flow-tests".to_string();
+    let challenge = B64.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+/// A PKCE pair with a challenge no other push has spent — for tests that push
+/// more than once, since a `code_challenge` is single-use within 24 hours
+/// (stage 2, H) and [`pkce`]'s fixed pair is not.
+fn fresh_pkce() -> (String, String) {
+    let verifier = format!(
+        "a-high-entropy-value-for-the-atproto-oauth-flow-tests-{}",
+        uuid::Uuid::new_v4()
+    );
     let challenge = B64.encode(Sha256::digest(verifier.as_bytes()));
     (verifier, challenge)
 }
@@ -1618,6 +1655,753 @@ async fn rotation_copies_the_anchor_forward_so_refreshing_launders_nothing() {
     let refused = refresh(&h, &key, &new_token).await;
     assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
     assert_eq!(refused.json()["error"], "invalid_grant");
+}
+
+// --- confidential clients (stage 2, F) ---------------------------------------------
+
+/// A second, confidential client: the metadata document a client with a key
+/// pair publishes. Its `jwks` is built from the keys it will assert with, so
+/// the signatures below really are its.
+const CONFIDENTIAL: &str = "https://conf.example/client-metadata.json";
+const CONFIDENTIAL_REDIRECT: &str = "https://conf.example/cb";
+
+fn jwks_of(keys: &[SigningKey]) -> serde_json::Value {
+    serde_json::json!({
+        "keys": keys.iter().map(|key| {
+            let sec1 = key.verifying_key().to_sec1_bytes();
+            serde_json::json!({
+                "kty": "EC", "crv": "P-256",
+                "x": B64.encode(&sec1[1..33]),
+                "y": B64.encode(&sec1[33..65]),
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
+/// The key a confidential test client asserts with. A different key from
+/// `client_key()`, the DPoP key: the client-key binding and the DPoP binding
+/// are different bindings, and the two must not be confused for each other.
+fn assertion_key() -> SigningKey {
+    SigningKey::from_slice(&[22u8; 32]).unwrap()
+}
+
+fn second_assertion_key() -> SigningKey {
+    SigningKey::from_slice(&[33u8; 32]).unwrap()
+}
+
+fn confidential_document(keys: &[SigningKey]) -> String {
+    serde_json::json!({
+        "client_id": CONFIDENTIAL,
+        "client_name": "Confidential App",
+        "redirect_uris": [CONFIDENTIAL_REDIRECT],
+        "scope": "atproto transition:generic",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "private_key_jwt",
+        "application_type": "web",
+        "dpop_bound_access_tokens": true,
+        "jwks": jwks_of(keys),
+    })
+    .to_string()
+}
+
+/// A client assertion as a confidential client produces one (stage 2, F):
+/// ES256, aud = this server's issuer, iat, a fresh jti.
+fn client_assertion(key: &SigningKey, jti: &str) -> String {
+    assertion_for_audience(key, &format!("https://{BASE}"), jti, now())
+}
+
+fn assertion_for_audience(key: &SigningKey, aud: &str, jti: &str, iat: i64) -> String {
+    let header = serde_json::json!({"alg": "ES256", "typ": "jwt"});
+    let claims = serde_json::json!({"aud": aud, "iat": iat, "jti": jti});
+    let signed = format!(
+        "{}.{}",
+        B64.encode(serde_json::to_vec(&header).unwrap()),
+        B64.encode(serde_json::to_vec(&claims).unwrap())
+    );
+    let signature: p256::ecdsa::Signature = key.sign(signed.as_bytes());
+    format!("{signed}.{}", B64.encode(signature.to_bytes()))
+}
+
+fn assertion_fields(assertion: &str) -> Vec<(String, String)> {
+    vec![
+        (
+            "client_assertion_type".to_string(),
+            "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+        ),
+        ("client_assertion".to_string(), assertion.to_string()),
+    ]
+}
+
+/// PAR for the confidential client, carrying an assertion — or, with `None`,
+/// none at all, which is itself the thing under test.
+async fn push_confidential(
+    h: &Harness,
+    challenge: &str,
+    assertion: Option<&str>,
+    extra: &[(String, String)],
+) -> Reply {
+    let mut fields = vec![
+        ("client_id".to_string(), CONFIDENTIAL.to_string()),
+        (
+            "redirect_uri".to_string(),
+            CONFIDENTIAL_REDIRECT.to_string(),
+        ),
+        ("response_type".to_string(), "code".to_string()),
+        (
+            "scope".to_string(),
+            "atproto transition:generic".to_string(),
+        ),
+        ("state".to_string(), "client-state".to_string()),
+        ("code_challenge".to_string(), challenge.to_string()),
+        ("code_challenge_method".to_string(), "S256".to_string()),
+    ];
+    if let Some(assertion) = assertion {
+        fields.extend(assertion_fields(assertion));
+    }
+    fields.extend(extra.iter().cloned());
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in &fields {
+        form.append_pair(name, value);
+    }
+    send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/par")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                proof(
+                    &client_key(),
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/par"),
+                    None,
+                    Some(&nonce(h)),
+                ),
+            )
+            .body(Body::from(form.finish()))
+            .unwrap(),
+    )
+    .await
+}
+
+/// The consent and decision for a pushed confidential request, returning the
+/// authorization code.
+async fn consent_confidential(h: &Harness, request_uri: &str) -> String {
+    let cookie = a_logged_in_member(h).await;
+    let consent = send(
+        h,
+        Request::builder()
+            .uri(format!(
+                "/oauth/atproto/authorize?client_id={}&request_uri={}",
+                urlencode(CONFIDENTIAL),
+                urlencode(request_uri)
+            ))
+            .header(header::HOST, BASE)
+            .header(header::COOKIE, &cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        consent.status,
+        StatusCode::OK,
+        "authorize: {}",
+        consent.body
+    );
+    let decision = send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/authorize")
+            .header(header::HOST, BASE)
+            .header(header::COOKIE, &cookie)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(format!(
+                "request={}&decision=allow",
+                urlencode(&request_token(&consent.body))
+            )))
+            .unwrap(),
+    )
+    .await;
+    decision.redirect_params()["code"].clone()
+}
+
+/// The code grant for the confidential client, carrying an assertion.
+async fn token_confidential(
+    h: &Harness,
+    code: &str,
+    verifier: &str,
+    assertion: Option<&str>,
+) -> Reply {
+    let mut fields = vec![
+        ("grant_type".to_string(), "authorization_code".to_string()),
+        ("code".to_string(), code.to_string()),
+        (
+            "redirect_uri".to_string(),
+            CONFIDENTIAL_REDIRECT.to_string(),
+        ),
+        ("client_id".to_string(), CONFIDENTIAL.to_string()),
+        ("code_verifier".to_string(), verifier.to_string()),
+    ];
+    if let Some(assertion) = assertion {
+        fields.extend(assertion_fields(assertion));
+    }
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in &fields {
+        form.append_pair(name, value);
+    }
+    send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/token")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                proof(
+                    &client_key(),
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/token"),
+                    None,
+                    Some(&nonce(h)),
+                ),
+            )
+            .body(Body::from(form.finish()))
+            .unwrap(),
+    )
+    .await
+}
+
+/// A confidential refresh, carrying an assertion.
+async fn refresh_confidential(h: &Harness, token: &str, assertion: Option<&str>) -> Reply {
+    let mut fields = vec![
+        ("grant_type".to_string(), "refresh_token".to_string()),
+        ("refresh_token".to_string(), token.to_string()),
+        ("client_id".to_string(), CONFIDENTIAL.to_string()),
+    ];
+    if let Some(assertion) = assertion {
+        fields.extend(assertion_fields(assertion));
+    }
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in &fields {
+        form.append_pair(name, value);
+    }
+    send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/token")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                proof(
+                    &client_key(),
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/token"),
+                    None,
+                    Some(&nonce(h)),
+                ),
+            )
+            .body(Body::from(form.finish()))
+            .unwrap(),
+    )
+    .await
+}
+
+/// The whole confidential flow: a push, a consent, and a code grant, each
+/// carrying an assertion signed by `auth_key`.
+async fn confidential_flow(h: &Harness, auth_key: &SigningKey) -> serde_json::Value {
+    let (verifier, challenge) = pkce();
+    let pushed = push_confidential(
+        h,
+        &challenge,
+        Some(&client_assertion(
+            auth_key,
+            &uuid::Uuid::new_v4().to_string(),
+        )),
+        &[],
+    )
+    .await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "par: {}", pushed.body);
+    let request_uri = pushed.json()["request_uri"].as_str().unwrap().to_string();
+
+    let code = consent_confidential(h, &request_uri).await;
+
+    let token = token_confidential(
+        h,
+        &code,
+        &verifier,
+        Some(&client_assertion(
+            auth_key,
+            &uuid::Uuid::new_v4().to_string(),
+        )),
+    )
+    .await;
+    assert_eq!(token.status, StatusCode::OK, "token: {}", token.body);
+    token.json()
+}
+
+/// A metadata lookup whose answer can change — the shape a key rotation looks
+/// like from the server's side (stage 2, F) — and one that counts, so a test
+/// can prove the refresh re-fetched rather than read a cached answer.
+struct SwitchableClients {
+    current: std::sync::Mutex<brolly_atproto::client_metadata::ClientMetadata>,
+    lookups: Arc<AtomicUsize>,
+}
+
+impl SwitchableClients {
+    fn holding(document: &str) -> (Arc<Self>, Arc<AtomicUsize>) {
+        let id = brolly_atproto::client_metadata::parse_client_id(CONFIDENTIAL).unwrap();
+        let metadata =
+            brolly_atproto::client_metadata::validate(&id, "application/json", document.as_bytes())
+                .unwrap();
+        let lookups = Arc::new(AtomicUsize::new(0));
+        (
+            Arc::new(Self {
+                current: std::sync::Mutex::new(metadata),
+                lookups: lookups.clone(),
+            }),
+            lookups,
+        )
+    }
+
+    fn switch_to(&self, document: &str) {
+        let id = brolly_atproto::client_metadata::parse_client_id(CONFIDENTIAL).unwrap();
+        let metadata =
+            brolly_atproto::client_metadata::validate(&id, "application/json", document.as_bytes())
+                .unwrap();
+        *self.current.lock().unwrap() = metadata;
+    }
+}
+
+impl ClientLookup for SwitchableClients {
+    type Document = brolly_atproto::client_metadata::ClientMetadata;
+    type Invalid = brolly_atproto::client_metadata::ClientError;
+
+    fn fetch<'a>(&'a self, _url: &'a url::Url) -> Lookup<'a, Self::Document, Self::Invalid> {
+        self.lookups.fetch_add(1, Ordering::SeqCst);
+        let found = self.current.lock().unwrap().clone();
+        Box::pin(std::future::ready(Ok(found)))
+    }
+}
+
+#[tokio::test]
+async fn a_confidential_client_must_carry_an_assertion_at_par() {
+    let h = harness_with(Arc::new(
+        brolly_server::client_metadata::StaticClients::default()
+            .with(CONFIDENTIAL, &confidential_document(&[assertion_key()]))
+            .expect("the confidential client's metadata validates"),
+    ))
+    .await;
+    let (_verifier, challenge) = fresh_pkce();
+
+    // No assertion fields at all.
+    let reply = push_confidential(&h, &challenge, None, &[]).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+
+    // The type without the JWT.
+    let (_verifier, challenge) = fresh_pkce();
+    let fields = vec![(
+        "client_assertion_type".to_string(),
+        "urn:ietf:params:oauth:client-assertion-type:jwt-bearer".to_string(),
+    )];
+    let reply = push_confidential(&h, &challenge, None, &fields).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn a_public_client_pushing_an_assertion_is_refused() {
+    // The asymmetry's other half (stage 2, F): an assertion is a credential
+    // only a confidential client can have verified, so a public client
+    // carrying one is refused rather than humored.
+    let h = harness().await;
+    let key = client_key();
+    let (_verifier, challenge) = pkce();
+    let assertion = client_assertion(&assertion_key(), &uuid::Uuid::new_v4().to_string());
+    let mut fields = vec![
+        ("client_id".to_string(), CLIENT.to_string()),
+        ("redirect_uri".to_string(), REDIRECT.to_string()),
+        ("response_type".to_string(), "code".to_string()),
+        (
+            "scope".to_string(),
+            "atproto transition:generic".to_string(),
+        ),
+        ("code_challenge".to_string(), challenge.clone()),
+        ("code_challenge_method".to_string(), "S256".to_string()),
+    ];
+    fields.extend(assertion_fields(&assertion));
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in &fields {
+        form.append_pair(name, value);
+    }
+    let reply = send(
+        &h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/par")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                proof(
+                    &key,
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/par"),
+                    None,
+                    Some(&nonce(&h)),
+                ),
+            )
+            .body(Body::from(form.finish()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn an_assertion_for_the_wrong_audience_or_with_a_stale_iat_is_refused() {
+    let h = harness_with(Arc::new(
+        brolly_server::client_metadata::StaticClients::default()
+            .with(CONFIDENTIAL, &confidential_document(&[assertion_key()]))
+            .expect("the confidential client's metadata validates"),
+    ))
+    .await;
+    let key = assertion_key();
+
+    let (_verifier, challenge) = fresh_pkce();
+    let wrong_aud = assertion_for_audience(
+        &key,
+        "https://elsewhere.example",
+        &uuid::Uuid::new_v4().to_string(),
+        now(),
+    );
+    let reply = push_confidential(&h, &challenge, Some(&wrong_aud), &[]).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+
+    let (_verifier, challenge) = fresh_pkce();
+    let stale = assertion_for_audience(
+        &key,
+        &format!("https://{BASE}"),
+        &uuid::Uuid::new_v4().to_string(),
+        now() - 3600,
+    );
+    let reply = push_confidential(&h, &challenge, Some(&stale), &[]).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn a_replayed_assertion_jti_is_refused() {
+    // A jti is single-use (stage 2, F): the second push presenting the same
+    // assertion — fresh DPoP proof and fresh challenge, so it is the jti
+    // alone that is replayed — is refused.
+    let h = harness_with(Arc::new(
+        brolly_server::client_metadata::StaticClients::default()
+            .with(CONFIDENTIAL, &confidential_document(&[assertion_key()]))
+            .expect("the confidential client's metadata validates"),
+    ))
+    .await;
+    let key = assertion_key();
+    let assertion = client_assertion(&key, "one-time-only");
+
+    let (_verifier, challenge) = fresh_pkce();
+    let first = push_confidential(&h, &challenge, Some(&assertion), &[]).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+
+    let (_verifier, challenge) = fresh_pkce();
+    let second = push_confidential(&h, &challenge, Some(&assertion), &[]).await;
+    assert_eq!(second.status, StatusCode::BAD_REQUEST, "{}", second.body);
+    assert_eq!(second.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn an_assertion_from_a_key_not_in_the_jwks_is_refused() {
+    let h = harness_with(Arc::new(
+        brolly_server::client_metadata::StaticClients::default()
+            .with(CONFIDENTIAL, &confidential_document(&[assertion_key()]))
+            .expect("the confidential client's metadata validates"),
+    ))
+    .await;
+    let (_verifier, challenge) = pkce();
+    let impostor = client_assertion(&second_assertion_key(), &uuid::Uuid::new_v4().to_string());
+    let reply = push_confidential(&h, &challenge, Some(&impostor), &[]).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn the_bound_key_must_reappear_at_the_token_endpoint() {
+    // The session is bound to the client key (stage 2, F): the JWKS holds
+    // two keys, the push asserts with the first, and the code grant asserts
+    // with the second — a different key is a different client instance,
+    // answered `invalid_grant`.
+    let h = harness_with(Arc::new(
+        brolly_server::client_metadata::StaticClients::default()
+            .with(
+                CONFIDENTIAL,
+                &confidential_document(&[assertion_key(), second_assertion_key()]),
+            )
+            .expect("the confidential client's metadata validates"),
+    ))
+    .await;
+    let key = assertion_key();
+
+    let (verifier, challenge) = pkce();
+    let pushed = push_confidential(
+        &h,
+        &challenge,
+        Some(&client_assertion(&key, &uuid::Uuid::new_v4().to_string())),
+        &[],
+    )
+    .await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "{}", pushed.body);
+    let request_uri = pushed.json()["request_uri"].as_str().unwrap().to_string();
+    let code = consent_confidential(&h, &request_uri).await;
+
+    let other = client_assertion(&second_assertion_key(), &uuid::Uuid::new_v4().to_string());
+    let reply = token_confidential(&h, &code, &verifier, Some(&other)).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn a_public_client_presenting_an_assertion_at_the_token_endpoint_is_refused() {
+    // The token endpoint's half of the asymmetry (stage 2, F): a public
+    // session's refresh carries no assertion, and one is refused.
+    let h = harness().await;
+    let key = client_key();
+    let tokens = full_flow(&h, &key).await;
+    let token = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    let assertion = client_assertion(&assertion_key(), &uuid::Uuid::new_v4().to_string());
+    let mut fields = vec![
+        ("grant_type".to_string(), "refresh_token".to_string()),
+        ("refresh_token".to_string(), token),
+        ("client_id".to_string(), CLIENT.to_string()),
+    ];
+    fields.extend(assertion_fields(&assertion));
+    let mut form = form_urlencoded::Serializer::new(String::new());
+    for (name, value) in &fields {
+        form.append_pair(name, value);
+    }
+    let reply = send(
+        &h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/token")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                proof(
+                    &key,
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/token"),
+                    None,
+                    Some(&nonce(&h)),
+                ),
+            )
+            .body(Body::from(form.finish()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_client");
+}
+
+#[tokio::test]
+async fn a_confidential_refresh_rotates_with_an_assertion_and_lives_180_days_uncapped() {
+    let h = harness_with(Arc::new(
+        brolly_server::client_metadata::StaticClients::default()
+            .with(CONFIDENTIAL, &confidential_document(&[assertion_key()]))
+            .expect("the confidential client's metadata validates"),
+    ))
+    .await;
+    let key = assertion_key();
+    let tokens = confidential_flow(&h, &key).await;
+    let token = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    // The refresh rows are born 180 days out, not two weeks (stage 2, F) —
+    // read off the row the flow just wrote, so the TTL is the one issued,
+    // not the one remembered.
+    let ttl: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch from (expires_at - now())) \
+         FROM atproto_tokens WHERE token_hash = $1 AND kind = 'refresh'",
+    )
+    .bind(db::hash_secret(&token))
+    .fetch_one(&h.db.pool)
+    .await
+    .unwrap();
+    assert!(
+        ttl > 60.0 * 60.0 * 24.0 * 179.0 && ttl <= 60.0 * 60.0 * 24.0 * 180.0,
+        "a confidential refresh token lives 180 days, not {ttl}"
+    );
+
+    // The session is uncapped: an anchor a month old — past the public
+    // client's fortnight — still refreshes (G's anchor is the public
+    // client's rule), and the rotation answers with a new pair.
+    anchor_days_ago(&h, 30).await;
+    let rotated = refresh_confidential(
+        &h,
+        &token,
+        Some(&client_assertion(&key, &uuid::Uuid::new_v4().to_string())),
+    )
+    .await;
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    assert!(rotated.json()["refresh_token"].is_string());
+
+    // The old refresh token is dead — rotation spent it — and the new one
+    // carries the binding forward: `client_jkt` rides to the tokens (stage
+    // 2, F).
+    assert!(
+        brolly_atproto::oauth::verify_token(&h.db.pool, "refresh", &token)
+            .await
+            .unwrap()
+            .is_none(),
+        "rotation must retire the refresh token it answered"
+    );
+    let bound: Option<String> = sqlx::query_scalar(
+        "SELECT client_jkt FROM atproto_tokens WHERE kind = 'refresh' AND revoked_at IS NULL",
+    )
+    .fetch_one(&h.db.pool)
+    .await
+    .unwrap();
+    assert!(
+        bound.is_some(),
+        "the rotated pair stays bound to the client key"
+    );
+}
+
+#[tokio::test]
+async fn a_refresh_after_the_key_left_the_jwks_revokes_the_session() {
+    // The kill switch (stage 2, F): the metadata is re-fetched —
+    // cache-bypassingly, which the counted third lookup proves — and the
+    // session is revoked when the key it is bound to has left the JWKS.
+    let (clients, lookups) = SwitchableClients::holding(&confidential_document(&[assertion_key()]));
+    let h = harness_with(clients.clone()).await;
+    let key = assertion_key();
+    let tokens = confidential_flow(&h, &key).await;
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+
+    let lookups_before = lookups.load(Ordering::SeqCst);
+
+    // The client removes the key: its JWKS now holds only another key, and
+    // the session's bound key has left it.
+    clients.switch_to(&confidential_document(&[second_assertion_key()]));
+
+    let refused = refresh_confidential(
+        &h,
+        &refresh,
+        Some(&client_assertion(&key, &uuid::Uuid::new_v4().to_string())),
+    )
+    .await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(refused.json()["error"], "invalid_grant");
+
+    // The re-fetch happened — one more lookup than the flow's push and code
+    // grant made — so the refusal read the wire, not a cached answer.
+    assert_eq!(
+        lookups.load(Ordering::SeqCst),
+        lookups_before + 1,
+        "the refresh must re-fetch the client metadata"
+    );
+
+    // The session is revoked, not just refused: the access token the code
+    // grant issued — never presented, never rotated — is dead too.
+    assert!(
+        brolly_atproto::oauth::verify_token(&h.db.pool, "access", &access)
+            .await
+            .unwrap()
+            .is_none(),
+        "a revoked session's access token must stop verifying immediately"
+    );
+}
+
+#[tokio::test]
+async fn the_metadata_advertises_private_key_jwt() {
+    // The AS metadata change (stage 2, F): `none` is no longer the only
+    // client-authentication method — the one thing the metadata test above
+    // does not already assert.
+    let h = harness().await;
+    let reply = send(
+        &h,
+        Request::builder()
+            .uri("/.well-known/oauth-authorization-server")
+            .header(header::HOST, BASE)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let doc = reply.json();
+    assert_eq!(
+        doc["token_endpoint_auth_methods_supported"],
+        serde_json::json!(["none", "private_key_jwt"])
+    );
+}
+
+#[tokio::test]
+async fn a_confidential_client_via_jwks_uri_verifies_against_the_fetched_set() {
+    // The `jwks_uri` half of the metadata rule (stage 2, F): the key set is
+    // fetched through the same hardened transport as the metadata, and the
+    // assertion verifies against what it serves.
+    const JWKS_URI: &str = "https://conf.example/jwks.json";
+    let document = serde_json::json!({
+        "client_id": CONFIDENTIAL,
+        "redirect_uris": [CONFIDENTIAL_REDIRECT],
+        "scope": "atproto transition:generic",
+        "grant_types": ["authorization_code", "refresh_token"],
+        "response_types": ["code"],
+        "token_endpoint_auth_method": "private_key_jwt",
+        "application_type": "web",
+        "dpop_bound_access_tokens": true,
+        "jwks_uri": JWKS_URI,
+    })
+    .to_string();
+    let key = assertion_key();
+    let set = brolly_atproto::client_metadata::ClientJwks::parse(
+        "application/json",
+        jwks_of(std::slice::from_ref(&key)).to_string().as_bytes(),
+    )
+    .unwrap();
+    let h = harness_with_jwks(
+        Arc::new(
+            brolly_server::client_metadata::StaticClients::default()
+                .with(CONFIDENTIAL, &document)
+                .expect("the jwks_uri client's metadata validates"),
+        ),
+        Arc::new(brolly_server::client_metadata::StaticDocuments::default().with(JWKS_URI, set)),
+    )
+    .await;
+
+    let (verifier, challenge) = pkce();
+    let pushed = push_confidential(
+        &h,
+        &challenge,
+        Some(&client_assertion(&key, &uuid::Uuid::new_v4().to_string())),
+        &[],
+    )
+    .await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "{}", pushed.body);
+    let request_uri = pushed.json()["request_uri"].as_str().unwrap().to_string();
+    let code = consent_confidential(&h, &request_uri).await;
+    let token = token_confidential(
+        &h,
+        &code,
+        &verifier,
+        Some(&client_assertion(&key, &uuid::Uuid::new_v4().to_string())),
+    )
+    .await;
+    assert_eq!(token.status, StatusCode::OK, "{}", token.body);
 }
 
 #[tokio::test]
