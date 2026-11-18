@@ -144,6 +144,9 @@ struct Reply {
     status: StatusCode,
     body: Vec<u8>,
     content_type: Option<String>,
+    /// The response's headers — the 401 challenges and the cache directives
+    //  the caller matrix reads (stage 2, D).
+    headers: axum::http::HeaderMap,
 }
 
 impl Reply {
@@ -158,11 +161,15 @@ impl Reply {
     fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
 }
 
 async fn send(h: &Harness, request: Request<Body>) -> Reply {
     let response = h.router.clone().oneshot(request).await.unwrap();
     let status = response.status();
+    let headers = response.headers().clone();
     let content_type = response
         .headers()
         .get(header::CONTENT_TYPE)
@@ -179,6 +186,7 @@ async fn send(h: &Harness, request: Request<Body>) -> Reply {
         status,
         body,
         content_type,
+        headers,
     }
 }
 
@@ -498,6 +506,12 @@ async fn writing_requires_authentication() {
     .await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
     assert_eq!(reply.json()["error"], "AuthenticationRequired");
+    // A missing credential gets the draft's own challenge (stage 2, D): a
+    // client starting from this hostname is told where the authorization
+    // server is.
+    let discovery =
+        format!("Bearer resource_metadata=\"https://{BASE}/.well-known/oauth-protected-resource\"");
+    assert_eq!(reply.header("www-authenticate"), Some(discovery.as_str()));
 }
 
 #[tokio::test]
@@ -1254,8 +1268,14 @@ fn dpop_proof(
 }
 
 /// Take `cookie`'s member through ATProto OAuth and return an access token
-/// bound to `key`: PAR, consent, decision, token, each through the router.
-async fn atproto_access_token(h: &Harness, cookie: &str, key: &p256::ecdsa::SigningKey) -> String {
+/// bound to `key`, granted `scope`: PAR, consent, decision, token, each
+/// through the router.
+async fn atproto_access_token(
+    h: &Harness,
+    cookie: &str,
+    key: &p256::ecdsa::SigningKey,
+    scope: &str,
+) -> String {
     let verifier = "a-high-entropy-value-for-the-xrpc-dpop-replay-test-0123456789";
     let challenge = B64.encode(Sha256::digest(verifier.as_bytes()));
 
@@ -1263,7 +1283,7 @@ async fn atproto_access_token(h: &Harness, cookie: &str, key: &p256::ecdsa::Sign
         .append_pair("client_id", OAUTH_CLIENT)
         .append_pair("redirect_uri", OAUTH_REDIRECT)
         .append_pair("response_type", "code")
-        .append_pair("scope", OAUTH_SCOPE)
+        .append_pair("scope", scope)
         .append_pair("code_challenge", &challenge)
         .append_pair("code_challenge_method", "S256")
         .finish();
@@ -1381,11 +1401,9 @@ async fn atproto_access_token(h: &Harness, cookie: &str, key: &p256::ecdsa::Sign
     token.json()["access_token"].as_str().unwrap().to_string()
 }
 
-/// `createRecord` authenticated by nothing but a DPoP-bound token.
-///
-/// The proof has to sign `POST https://<base>/xrpc/`, because that fixed target
-/// is what `token_caller` checks today. Stage 2 changes it to the method's
-/// real URL.
+/// `createRecord` authenticated by nothing but a DPoP-bound token. The proof
+/// must sign this very request — `POST` and the endpoint's own URL — which is
+/// what the caller checks (stage 2, D).
 async fn create_with_token(h: &Harness, token: &str, proof: &str, rkey: &str) -> Reply {
     send(
         h,
@@ -1416,13 +1434,17 @@ async fn an_xrpc_write_proof_is_good_for_one_request() {
     let h = harness().await;
     let (_, cookie) = a_member(&h, "alice").await;
     let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
-    let token = atproto_access_token(&h, &cookie, &key).await;
-    let target = format!("https://{BASE}/xrpc/");
+    let token = atproto_access_token(&h, &cookie, &key, OAUTH_SCOPE).await;
+    let target = format!("https://{BASE}/xrpc/com.atproto.repo.createRecord");
     let ath = B64.encode(Sha256::digest(token.as_bytes()));
 
     let proof = dpop_proof(&key, "POST", &target, Some(&ath), Some(&nonce(&h)));
     let first = create_with_token(&h, &token, &proof, "3kaaaaaaaaaab").await;
     assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+    // The authenticated answer is private to the requester (stage 2, D): no
+    // shared cache may hand one member's authorized response to another.
+    assert_eq!(first.header("cache-control"), Some("private"));
+    assert_eq!(first.header("vary"), Some("Authorization"));
 
     // A different record, so the only thing this request repeats is the proof.
     let replayed = create_with_token(&h, &token, &proof, "3kaaaaaaaaaac").await;
@@ -1433,6 +1455,10 @@ async fn an_xrpc_write_proof_is_good_for_one_request() {
         replayed.text()
     );
     assert_eq!(replayed.json()["error"], "AuthenticationRequired");
+    assert_eq!(
+        replayed.json()["message"],
+        "this method requires authentication"
+    );
 
     let fresh = dpop_proof(&key, "POST", &target, Some(&ath), Some(&nonce(&h)));
     let third = create_with_token(&h, &token, &fresh, "3kaaaaaaaaaac").await;
@@ -1448,8 +1474,8 @@ async fn a_proof_without_a_nonce_gets_the_dpop_challenge_and_the_retry_works() {
     let h = harness().await;
     let (_, cookie) = a_member(&h, "alice").await;
     let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
-    let token = atproto_access_token(&h, &cookie, &key).await;
-    let target = format!("https://{BASE}/xrpc/");
+    let token = atproto_access_token(&h, &cookie, &key, OAUTH_SCOPE).await;
+    let target = format!("https://{BASE}/xrpc/com.atproto.repo.createRecord");
     let ath = B64.encode(Sha256::digest(token.as_bytes()));
 
     let bare = dpop_proof(&key, "POST", &target, Some(&ath), None);
@@ -1477,14 +1503,26 @@ async fn a_proof_without_a_nonce_gets_the_dpop_challenge_and_the_retry_works() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-    let challenge = response
+    // The two challenges coexist (stage 2, D): RFC 7235 allows one challenge
+    // per scheme, and a client whose DPoP credential was refused may also
+    // need to find the authorization server.
+    let challenges: Vec<&str> = response
         .headers()
-        .get(header::WWW_AUTHENTICATE)
-        .and_then(|v| v.to_str().ok())
-        .expect("the 401 carries the DPoP challenge");
+        .get_all(header::WWW_AUTHENTICATE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .collect();
     assert!(
-        challenge.starts_with("DPoP error=\"use_dpop_nonce\""),
-        "the challenge names the retry: {challenge}"
+        challenges
+            .iter()
+            .any(|c| c.starts_with("DPoP error=\"use_dpop_nonce\"")),
+        "the DPoP challenge leads: {challenges:?}"
+    );
+    assert!(
+        challenges
+            .iter()
+            .any(|c| c.starts_with("Bearer resource_metadata=")),
+        "the discovery challenge rides beside it: {challenges:?}"
     );
     let fresh = response
         .headers()
@@ -1502,6 +1540,486 @@ async fn a_proof_without_a_nonce_gets_the_dpop_challenge_and_the_retry_works() {
     let with_it = dpop_proof(&key, "POST", &target, Some(&ath), Some(&fresh));
     let third = create_with_token(&h, &token, &with_it, "3kaaaaaaaaaab").await;
     assert_eq!(third.status, StatusCode::OK, "{}", third.text());
+}
+
+/// A GET authenticated by a DPoP-bound token — `getSession` and
+/// `getServiceAuth` are GETs, and the proof must say so (stage 2, D).
+async fn get_with_dpop(h: &Harness, uri: &str, token: &str, proof: &str) -> Reply {
+    send(
+        h,
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("DPoP {token}"))
+            .header("DPoP", proof)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn a_proof_must_name_the_request_it_arrives_on() {
+    // The caller is the request (stage 2, D): the proof's `htm`/`htu` must be
+    // this request's method and URL, and its `ath` this request's token. The
+    // hardcoded `POST …/xrpc/` this replaces refused every real client.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key, OAUTH_SCOPE).await;
+    let url = format!("https://{BASE}/xrpc/com.atproto.repo.createRecord");
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+
+    // Another method — the GET-vs-POST half of the getServiceAuth case, from
+    // the write side: a proof signed for a GET does not authorize this POST.
+    let for_a_get = dpop_proof(&key, "GET", &url, Some(&ath), Some(&nonce(&h)));
+    let reply = create_with_token(&h, &token, &for_a_get, "3kaaaaaaaaaab").await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+    assert_eq!(reply.json()["error"], "AuthenticationRequired");
+    assert!(
+        reply
+            .header("www-authenticate")
+            .is_some_and(|c| c.starts_with("DPoP error=\"invalid_dpop_proof\"")),
+        "a refused proof gets RFC 9449's challenge: {:?}",
+        reply.header("www-authenticate")
+    );
+
+    // Another path — a proof for another endpoint entirely.
+    let elsewhere = format!("https://{BASE}/xrpc/com.atproto.repo.putRecord");
+    let for_elsewhere = dpop_proof(&key, "POST", &elsewhere, Some(&ath), Some(&nonce(&h)));
+    let reply = create_with_token(&h, &token, &for_elsewhere, "3kaaaaaaaaaab").await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+
+    // Another token's `ath` — the proof binds to a token this is not.
+    let other_ath = B64.encode(Sha256::digest(b"a different access token"));
+    let for_another = dpop_proof(&key, "POST", &url, Some(&other_ath), Some(&nonce(&h)));
+    let reply = create_with_token(&h, &token, &for_another, "3kaaaaaaaaaab").await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+
+    // This request's own method, URL, and token: the write lands.
+    let right = dpop_proof(&key, "POST", &url, Some(&ath), Some(&nonce(&h)));
+    let reply = create_with_token(&h, &token, &right, "3kaaaaaaaaaab").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+}
+
+#[tokio::test]
+async fn a_proof_spent_on_an_unknown_tokens_request_stays_spent() {
+    // The ordering fix, made testable (stage 2, D): the proof is verified and
+    // spent *before* the token's grant is read, so a proof spent on an
+    // unknown token's request is spent for good — replaying it with a valid
+    // token fails on the spend, not the grant. Under the old order the
+    // unknown token returned before the spend, and the replay below would
+    // have landed.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key, OAUTH_SCOPE).await;
+    let url = format!("https://{BASE}/xrpc/com.atproto.repo.createRecord");
+    // No `ath`: the proof binds to the request, not to either token, which
+    // is what isolates the spend from the grant lookup.
+    let proof = dpop_proof(&key, "POST", &url, None, Some(&nonce(&h)));
+
+    // On the unknown token's request: the proof is spent, then the token
+    // refuses.
+    let unknown = create_with_token(
+        &h,
+        "not-a-token-this-server-issued",
+        &proof,
+        "3kaaaaaaaaaab",
+    )
+    .await;
+    assert_eq!(
+        unknown.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        unknown.text()
+    );
+
+    // Replayed with the valid token: the spend — not the grant — refuses it.
+    let replayed = create_with_token(&h, &token, &proof, "3kaaaaaaaaaab").await;
+    assert_eq!(
+        replayed.status,
+        StatusCode::UNAUTHORIZED,
+        "{}",
+        replayed.text()
+    );
+    assert!(
+        replayed
+            .header("www-authenticate")
+            .is_some_and(|c| c.starts_with("DPoP error=\"invalid_dpop_proof\"")),
+        "the replay is named: {:?}",
+        replayed.header("www-authenticate")
+    );
+
+    // And a fresh proof on the valid token still lands: nothing above
+    // damaged the token, only the replayed proof.
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let fresh = dpop_proof(&key, "POST", &url, Some(&ath), Some(&nonce(&h)));
+    let reply = create_with_token(&h, &token, &fresh, "3kaaaaaaaaaab").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+}
+
+#[tokio::test]
+async fn an_atproto_only_token_cannot_write() {
+    // The scope gate (stage 2, D): the profile grants write authority by
+    // `transition:generic`; an `atproto`-only token authenticates but holds
+    // no write grant. The refusal is the reference's own wire shape — a
+    // different name or message would be a protocol fork.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key, "atproto").await;
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let url = format!("https://{BASE}/xrpc/com.atproto.repo.createRecord");
+    let proof = dpop_proof(&key, "POST", &url, Some(&ath), Some(&nonce(&h)));
+
+    let refused = create_with_token(&h, &token, &proof, "3kaaaaaaaaaab").await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.text());
+    assert_eq!(refused.json()["error"], "ScopeMissingError");
+    assert_eq!(
+        refused.json()["message"],
+        "Missing required scope \"transition:generic\""
+    );
+
+    // The token itself is healthy where its grant reaches: `getSession`
+    // answers the `atproto` scope it does carry.
+    let session_url = format!("https://{BASE}/xrpc/com.atproto.server.getSession");
+    let session_proof = dpop_proof(&key, "GET", &session_url, Some(&ath), Some(&nonce(&h)));
+    let session = get_with_dpop(
+        &h,
+        "/xrpc/com.atproto.server.getSession",
+        &token,
+        &session_proof,
+    )
+    .await;
+    assert_eq!(session.status, StatusCode::OK, "{}", session.text());
+}
+
+#[tokio::test]
+async fn an_oauth_token_cannot_manage_app_passwords() {
+    // The privilege half of the gate (2, B): app-password management is a
+    // primary-password action, and the profile's `transition:generic`
+    // explicitly excludes account management — OAuth never manages them.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key, OAUTH_SCOPE).await;
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+
+    let url = format!("https://{BASE}/xrpc/com.atproto.server.createAppPassword");
+    let proof = dpop_proof(&key, "POST", &url, Some(&ath), Some(&nonce(&h)));
+    let reply = send(
+        &h,
+        Request::builder()
+            .method("POST")
+            .uri("/xrpc/com.atproto.server.createAppPassword")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::AUTHORIZATION, format!("DPoP {token}"))
+            .header("DPoP", &proof)
+            .body(Body::from(json!({"name": "device"}).to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
+    assert_eq!(reply.json()["error"], "Forbidden");
+
+    let list_url = format!("https://{BASE}/xrpc/com.atproto.server.listAppPasswords");
+    let list_proof = dpop_proof(&key, "GET", &list_url, Some(&ath), Some(&nonce(&h)));
+    let listed = get_with_dpop(
+        &h,
+        "/xrpc/com.atproto.server.listAppPasswords",
+        &token,
+        &list_proof,
+    )
+    .await;
+    assert_eq!(listed.status, StatusCode::FORBIDDEN, "{}", listed.text());
+}
+
+// --- getServiceAuth (stage 2, D) --------------------------------------------------
+
+/// A registered member's repo signing key — the key the PLC document
+/// publishes, and the key `getServiceAuth` signs with.
+async fn signing_key_of(h: &Harness, username: &str) -> brolly_atproto::keys::SigningKey {
+    let user = db::find_by_username(&h.db.pool, username)
+        .await
+        .unwrap()
+        .unwrap();
+    let (private, _) = db::load_key(&h.db.pool, user.id, brolly_atproto::keys::ATPROTO_SIGNING)
+        .await
+        .unwrap()
+        .unwrap();
+    brolly_atproto::keys::SigningKey::from_bytes(&private).unwrap()
+}
+
+/// `getServiceAuth` as a browser session calls it — the cookie arm, the shape
+/// the endpoint's own tests start from. The OAuth arm's proof requirements
+/// are the caller matrix's, tested above.
+async fn service_auth_for(h: &Harness, cookie: Option<&str>, query: &str) -> Reply {
+    let mut request = Request::builder()
+        .uri(format!("/xrpc/com.atproto.server.getServiceAuth?{query}"))
+        .header(header::HOST, BASE);
+    if let Some(cookie) = cookie {
+        request = request.header(header::COOKIE, cookie);
+    }
+    send(h, request.body(Body::empty()).unwrap()).await
+}
+
+#[tokio::test]
+async fn get_service_auth_signs_with_the_key_the_plc_document_publishes() {
+    // The whole service-auth model: the token verifies against the member's
+    // published `did:key` — the PLC document's verification method — so the
+    // receiver needs no shared secret and no registration, just the document
+    // the DID resolves to.
+    let h = harness().await;
+    let cookie = a_registered_member(&h, "alice").await;
+    let user = db::find_by_username(&h.db.pool, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    let key = signing_key_of(&h, "alice").await;
+
+    // The PLC document publishes exactly that key — what makes verifying
+    // against it the trust anchor.
+    let operation = brolly_atproto::identity::head(&h.db.pool, user.id)
+        .await
+        .unwrap()
+        .expect("a registered member has a PLC operation");
+    assert_eq!(
+        operation.operation.verification_methods.get("atproto"),
+        Some(&key.did_key())
+    );
+
+    let aud = "did:web:api.bsky.app";
+    let lxm = "app.bsky.feed.getTimeline";
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("aud", aud)
+        .append_pair("lxm", lxm)
+        .finish();
+    let reply = service_auth_for(&h, Some(&cookie), &query).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    let body = reply.json();
+    let token = body["token"].as_str().unwrap();
+    let claims = brolly_atproto::service_auth::verify(token, &key.did_key(), aud, lxm, unix_now())
+        .expect("the token verifies against the published key");
+    assert_eq!(claims.issuer, user.did_plc.unwrap());
+    assert_eq!(claims.audience, aud);
+    assert_eq!(claims.method, lxm);
+}
+
+#[tokio::test]
+async fn a_service_auth_token_binds_to_its_lxm() {
+    // `service_auth.rs` tests the primitive; this tests the endpoint: a
+    // token minted for one method does not authorize another. `lxm` is the
+    // reason these tokens are safe to hand out at all.
+    let h = harness().await;
+    let cookie = a_registered_member(&h, "alice").await;
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("aud", "did:web:api.bsky.app")
+        .append_pair("lxm", "app.bsky.feed.getTimeline")
+        .finish();
+    let reply = service_auth_for(&h, Some(&cookie), &query).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let token = reply.json()["token"].as_str().unwrap().to_string();
+
+    let key = signing_key_of(&h, "alice").await;
+    // The method it names: verifies.
+    assert!(
+        brolly_atproto::service_auth::verify(
+            &token,
+            &key.did_key(),
+            "did:web:api.bsky.app",
+            "app.bsky.feed.getTimeline",
+            unix_now(),
+        )
+        .is_ok()
+    );
+    // Any other: refused — the token does not authorize it.
+    assert!(matches!(
+        brolly_atproto::service_auth::verify(
+            &token,
+            &key.did_key(),
+            "did:web:api.bsky.app",
+            "com.atproto.repo.deleteRecord",
+            unix_now(),
+        ),
+        Err(brolly_atproto::service_auth::ServiceAuthError::WrongMethod { .. })
+    ));
+}
+
+#[tokio::test]
+async fn get_service_auth_bounds_the_expiration() {
+    // The lexicon's own error name for an `exp` outside the window: in the
+    // past, or further out than five minutes. The bound is the server's — an
+    // unbounded server-signed `lxm`-scoped token is a replay surface.
+    let h = harness().await;
+    let cookie = a_registered_member(&h, "alice").await;
+
+    for exp in [unix_now() - 1, unix_now() + 600] {
+        let query = form_urlencoded::Serializer::new(String::new())
+            .append_pair("aud", "did:web:api.bsky.app")
+            .append_pair("exp", &exp.to_string())
+            .finish();
+        let reply = service_auth_for(&h, Some(&cookie), &query).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "exp {exp}: {}",
+            reply.text()
+        );
+        assert_eq!(reply.json()["error"], "BadExpiration");
+    }
+
+    // The boundary itself is inside the window: five minutes out is allowed.
+    let edge = form_urlencoded::Serializer::new(String::new())
+        .append_pair("aud", "did:web:api.bsky.app")
+        .append_pair("exp", &(unix_now() + 300).to_string())
+        .finish();
+    let reply = service_auth_for(&h, Some(&cookie), &edge).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+}
+
+#[tokio::test]
+async fn get_service_auth_defaults_to_sixty_seconds() {
+    // No `exp`: the default is the one-minute lifetime `service_auth.rs`
+    // commits to, read straight off the token's own claims.
+    let h = harness().await;
+    let cookie = a_registered_member(&h, "alice").await;
+    let reply = service_auth_for(&h, Some(&cookie), "aud=did:web:api.bsky.app").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    let body = reply.json();
+    let token = body["token"].as_str().unwrap();
+    let claims: serde_json::Value =
+        serde_json::from_slice(&B64.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    assert_eq!(
+        claims["exp"].as_i64().unwrap() - claims["iat"].as_i64().unwrap(),
+        brolly_atproto::service_auth::TTL_SECONDS
+    );
+}
+
+#[tokio::test]
+async fn the_service_id_fragment_survives_into_the_audience() {
+    // `did#serviceId` is the lexicon's own spelling for naming one service of
+    // a DID. The fragment is not DID syntax, so it is split off for
+    // validation — and it survives into the token's `aud`, which is how the
+    // receiver binds to the exact service rather than the DID as a whole.
+    let h = harness().await;
+    let cookie = a_registered_member(&h, "alice").await;
+    let aud = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#atproto_pds";
+    let query = form_urlencoded::Serializer::new(String::new())
+        .append_pair("aud", aud)
+        .append_pair("lxm", "app.bsky.feed.getTimeline")
+        .finish();
+    let reply = service_auth_for(&h, Some(&cookie), &query).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+
+    let token = reply.json()["token"].as_str().unwrap().to_string();
+    let claims: serde_json::Value =
+        serde_json::from_slice(&B64.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
+    assert_eq!(claims["aud"].as_str().unwrap(), aud);
+
+    // It verifies as the full audience, fragment included — and the fragment
+    // is not cosmetic: the same DID without it is another audience.
+    let key = signing_key_of(&h, "alice").await;
+    assert!(
+        brolly_atproto::service_auth::verify(
+            &token,
+            &key.did_key(),
+            aud,
+            "app.bsky.feed.getTimeline",
+            unix_now(),
+        )
+        .is_ok()
+    );
+    assert!(matches!(
+        brolly_atproto::service_auth::verify(
+            &token,
+            &key.did_key(),
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa",
+            "app.bsky.feed.getTimeline",
+            unix_now(),
+        ),
+        Err(brolly_atproto::service_auth::ServiceAuthError::WrongAudience { .. })
+    ));
+}
+
+#[tokio::test]
+async fn get_service_auth_requires_authentication_and_the_write_scope() {
+    // No credential: the 401 carries the draft's discovery challenge, like
+    // every auth-requiring method's. An `atproto`-only OAuth token: minting
+    // a token that speaks for the member's repo is write authority, and the
+    // refusal is the same 403 a repo write answers.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    let anonymous = service_auth_for(&h, None, "aud=did:web:api.bsky.app").await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+    let discovery =
+        format!("Bearer resource_metadata=\"https://{BASE}/.well-known/oauth-protected-resource\"");
+    assert_eq!(
+        anonymous.header("www-authenticate"),
+        Some(discovery.as_str())
+    );
+
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key, "atproto").await;
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let url = format!("https://{BASE}/xrpc/com.atproto.server.getServiceAuth");
+    let proof = dpop_proof(&key, "GET", &url, Some(&ath), Some(&nonce(&h)));
+    let reply = get_with_dpop(
+        &h,
+        "/xrpc/com.atproto.server.getServiceAuth?aud=did:web:api.bsky.app",
+        &token,
+        &proof,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
+    assert_eq!(reply.json()["error"], "ScopeMissingError");
+}
+
+#[tokio::test]
+async fn get_service_auth_is_a_get_and_the_proof_must_say_so() {
+    // The bug's sharpest case (stage 2, D): the hardcoded `POST` could never
+    // have matched `getServiceAuth`, a GET — every OAuth client was refused
+    // before it was even checked. The proof must name the GET.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key, OAUTH_SCOPE).await;
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let url = format!("https://{BASE}/xrpc/com.atproto.server.getServiceAuth");
+    let query = "aud=did:web:api.bsky.app&lxm=app.bsky.feed.getTimeline";
+
+    // A proof signed for a POST — the shape every write takes — does not
+    // authorize this GET.
+    let for_a_post = dpop_proof(&key, "POST", &url, Some(&ath), Some(&nonce(&h)));
+    let reply = get_with_dpop(
+        &h,
+        &format!("/xrpc/com.atproto.server.getServiceAuth?{query}"),
+        &token,
+        &for_a_post,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
+
+    // The GET it actually is: the write scope is present, and the answer is
+    // a token.
+    let right = dpop_proof(&key, "GET", &url, Some(&ath), Some(&nonce(&h)));
+    let reply = get_with_dpop(
+        &h,
+        &format!("/xrpc/com.atproto.server.getServiceAuth?{query}"),
+        &token,
+        &right,
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert!(
+        reply.json()["token"]
+            .as_str()
+            .is_some_and(|t| t.contains('.'))
+    );
 }
 
 // --- legacy sessions and app passwords (stage 2, chunk 1) ----------------------------
@@ -2017,26 +2535,20 @@ async fn an_app_password_session_cannot_manage_app_passwords() {
     // DPoP credential it is, so the 403 is a privilege answer, not a 401.
     let (_, cookie) = a_member(&h, "bob").await;
     let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
-    let token = atproto_access_token(&h, &cookie, &key).await;
+    let token = atproto_access_token(&h, &cookie, &key, OAUTH_SCOPE).await;
     let ath = B64.encode(Sha256::digest(token.as_bytes()));
-    let reply = send(
+    let list_proof = dpop_proof(
+        &key,
+        "GET",
+        &format!("https://{BASE}/xrpc/com.atproto.server.listAppPasswords"),
+        Some(&ath),
+        Some(&nonce(&h)),
+    );
+    let reply = get_with_dpop(
         &h,
-        Request::builder()
-            .uri("/xrpc/com.atproto.server.listAppPasswords")
-            .header(header::HOST, BASE)
-            .header(header::AUTHORIZATION, format!("DPoP {token}"))
-            .header(
-                "DPoP",
-                dpop_proof(
-                    &key,
-                    "POST",
-                    &format!("https://{BASE}/xrpc/"),
-                    Some(&ath),
-                    Some(&nonce(&h)),
-                ),
-            )
-            .body(Body::empty())
-            .unwrap(),
+        "/xrpc/com.atproto.server.listAppPasswords",
+        &token,
+        &list_proof,
     )
     .await;
     assert_eq!(reply.status, StatusCode::FORBIDDEN, "{}", reply.text());
@@ -2114,7 +2626,7 @@ async fn changing_a_password_ends_the_atproto_sessions() {
         .unwrap();
     let cookie = format!("{SESSION_COOKIE}={session}");
     let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
-    let oauth_token = atproto_access_token(&h, &cookie, &key).await;
+    let oauth_token = atproto_access_token(&h, &cookie, &key, OAUTH_SCOPE).await;
 
     let reply = send(
         &h,
@@ -2141,31 +2653,10 @@ async fn changing_a_password_ends_the_atproto_sessions() {
 
     // ...and the OAuth one with it, which is the half that had no caller at
     // all before this (`oauth::revoke_all_for_user`).
-    let target = format!("https://{BASE}/xrpc/");
+    let target = format!("https://{BASE}/xrpc/com.atproto.repo.createRecord");
     let ath = B64.encode(Sha256::digest(oauth_token.as_bytes()));
-    let reply = send(
-        &h,
-        Request::builder()
-            .method("POST")
-            .uri("/xrpc/com.atproto.repo.createRecord")
-            .header(header::HOST, BASE)
-            .header(header::CONTENT_TYPE, "application/json")
-            .header(header::AUTHORIZATION, format!("DPoP {oauth_token}"))
-            .header(
-                "DPoP",
-                dpop_proof(&key, "POST", &target, Some(&ath), Some(&nonce(&h))),
-            )
-            .body(Body::from(
-                json!({
-                    "collection": "app.bsky.feed.post",
-                    "rkey": "3kaaaaaaaaaaa",
-                    "record": {"$type": "app.bsky.feed.post", "text": "after"},
-                })
-                .to_string(),
-            ))
-            .unwrap(),
-    )
-    .await;
+    let proof = dpop_proof(&key, "POST", &target, Some(&ath), Some(&nonce(&h)));
+    let reply = create_with_token(&h, &oauth_token, &proof, "3kaaaaaaaaaaa").await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.text());
 }
 

@@ -16,17 +16,48 @@
 //! the Solid provider uses. Two curves in one codebase is a real hazard, so the
 //! header names which one and the verifier checks it rather than assuming.
 
+use atrium_api::types::string::{Did, Nsid};
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use serde_json::json;
 
 use crate::keys::SigningKey;
 
-/// How long a service token lives.
+/// How long a service token lives by default.
 ///
 /// One minute. These are minted per call and travel to a service that is about
 /// to use them immediately; a longer window is replay surface with no benefit.
 pub const TTL_SECONDS: i64 = 60;
+
+/// The furthest-out `exp` a caller may name (stage 2, D).
+///
+/// Five minutes. The lexicon leaves the bound to the server ("may enforce
+/// certain time bounds"); an unbounded server-signed `lxm`-scoped token is a
+/// replay surface the default exists to avoid, and the ceiling is the same
+/// scale the default commits to.
+pub const MAX_EXP_SECONDS: i64 = 300;
+
+/// The lexicon's `aud` parameter: a DID, optionally `did#serviceId` naming
+/// one of the DID's services (the PLC document's `services` map is where the
+/// fragment resolves).
+///
+/// The fragment is not part of the DID syntax — atrium's `Did` grammar
+/// refuses it — so it is split off before validation and survives into the
+/// token's `aud`, which is how the receiver binds to the exact service
+/// rather than the DID as a whole.
+pub fn valid_audience(aud: &str) -> bool {
+    let (did, fragment) = match aud.split_once('#') {
+        Some((did, fragment)) => (did, Some(fragment)),
+        None => (aud, None),
+    };
+    Did::new(did.to_string()).is_ok() && fragment.is_none_or(|f| !f.is_empty())
+}
+
+/// The lexicon's `lxm` parameter: an NSID, validated with atrium's own
+/// grammar the way the repo write path validates collections.
+pub fn valid_method(lxm: &str) -> bool {
+    Nsid::new(lxm.to_string()).is_ok()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum ServiceAuthError {
@@ -79,27 +110,34 @@ pub struct ServiceClaims {
 
 /// Mint a token for one call to one method.
 ///
-/// `now` is passed rather than read so expiry is testable without sleeping.
+/// `exp` is absolute — `getServiceAuth` bounds it to `now + MAX_EXP_SECONDS`
+/// (stage 2, D) — and `method` is `None` when the caller names no `lxm`, in
+/// which case the token carries no `lxm` claim and the verifier decides what
+/// that authorizes. `now` is passed rather than read so expiry is testable
+/// without sleeping.
 pub fn issue(
     key: &SigningKey,
     issuer_did: &str,
     audience_did: &str,
-    method: &str,
+    method: Option<&str>,
+    exp: i64,
     now: i64,
 ) -> Result<String, ServiceAuthError> {
     // `typ: JWT` and the curve named explicitly. A verifier that assumes the
     // algorithm is how curve confusion gets in.
     let header = json!({"alg": "ES256K", "typ": "JWT"});
-    let claims = json!({
+    let mut claims = json!({
         "iss": issuer_did,
         "aud": audience_did,
-        "lxm": method,
         "iat": now,
-        "exp": now + TTL_SECONDS,
+        "exp": exp,
         // A nonce, so two tokens for the same call in the same second differ
         // and a receiver can deduplicate.
         "jti": B64.encode(rand::random::<[u8; 16]>()),
     });
+    if let Some(method) = method {
+        claims["lxm"] = json!(method);
+    }
 
     let signed = format!(
         "{}.{}",
@@ -205,12 +243,17 @@ mod tests {
     const METHOD: &str = "app.bsky.actor.getProfile";
     const NOW: i64 = 1_724_000_000;
 
+    /// The common shape: minted with the default lifetime, 60 s out.
+    fn minted(key: &SigningKey) -> String {
+        issue(key, ISSUER, AUDIENCE, Some(METHOD), NOW + TTL_SECONDS, NOW).expect("issue")
+    }
+
     #[test]
     fn a_token_verifies_against_the_issuers_published_key() {
         // The whole model: no shared secret, no registration. The key that
         // signs commits is the key that makes the call.
         let key = SigningKey::generate();
-        let token = issue(&key, ISSUER, AUDIENCE, METHOD, NOW).expect("issue");
+        let token = minted(&key);
 
         let claims = verify(&token, &key.did_key(), AUDIENCE, METHOD, NOW).expect("verify");
         assert_eq!(claims.issuer, ISSUER);
@@ -223,7 +266,7 @@ mod tests {
         // The reason `lxm` exists. Without it, a token minted so an AppView
         // could read a profile would equally authorize deleting the repo.
         let key = SigningKey::generate();
-        let token = issue(&key, ISSUER, AUDIENCE, METHOD, NOW).unwrap();
+        let token = minted(&key);
 
         assert_eq!(
             verify(
@@ -244,7 +287,7 @@ mod tests {
     fn a_token_for_one_service_does_not_authorize_another() {
         // Otherwise the holder is whichever service you last talked to.
         let key = SigningKey::generate();
-        let token = issue(&key, ISSUER, AUDIENCE, METHOD, NOW).unwrap();
+        let token = minted(&key);
 
         assert!(matches!(
             verify(&token, &key.did_key(), "did:web:evil.example", METHOD, NOW),
@@ -255,7 +298,7 @@ mod tests {
     #[test]
     fn a_token_expires() {
         let key = SigningKey::generate();
-        let token = issue(&key, ISSUER, AUDIENCE, METHOD, NOW).unwrap();
+        let token = minted(&key);
 
         assert_eq!(
             verify(
@@ -295,7 +338,7 @@ mod tests {
     fn another_key_cannot_forge_a_token() {
         let key = SigningKey::generate();
         let impostor = SigningKey::generate();
-        let token = issue(&impostor, ISSUER, AUDIENCE, METHOD, NOW).unwrap();
+        let token = minted(&impostor);
 
         assert_eq!(
             verify(&token, &key.did_key(), AUDIENCE, METHOD, NOW),
@@ -307,7 +350,7 @@ mod tests {
     fn a_tampered_claim_invalidates_the_signature() {
         // Specifically: editing `lxm` to widen the scope must not survive.
         let key = SigningKey::generate();
-        let token = issue(&key, ISSUER, AUDIENCE, METHOD, NOW).unwrap();
+        let token = minted(&key);
 
         let mut parts: Vec<&str> = token.split('.').collect();
         let widened = B64.encode(
@@ -338,7 +381,7 @@ mod tests {
         // This codebase signs with two curves — ES256 for the Solid provider,
         // ES256K here. A verifier that assumes is how curve confusion gets in.
         let key = SigningKey::generate();
-        let token = issue(&key, ISSUER, AUDIENCE, METHOD, NOW).unwrap();
+        let token = minted(&key);
 
         let mut parts: Vec<&str> = token.split('.').collect();
         let wrong = B64.encode(serde_json::to_vec(&json!({"alg": "ES256", "typ": "JWT"})).unwrap());
@@ -355,9 +398,78 @@ mod tests {
     fn two_tokens_for_the_same_call_differ() {
         // The `jti` nonce, so a receiver can deduplicate.
         let key = SigningKey::generate();
-        let first = issue(&key, ISSUER, AUDIENCE, METHOD, NOW).unwrap();
-        let second = issue(&key, ISSUER, AUDIENCE, METHOD, NOW).unwrap();
+        let first = minted(&key);
+        let second = minted(&key);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn an_exp_the_caller_names_is_honored() {
+        // `getServiceAuth` passes the caller's `exp` through (stage 2, D);
+        // the default is not the only lifetime a token can carry.
+        let key = SigningKey::generate();
+        let token = issue(&key, ISSUER, AUDIENCE, Some(METHOD), NOW + 120, NOW).unwrap();
+        assert!(
+            verify(&token, &key.did_key(), AUDIENCE, METHOD, NOW + 119).is_ok(),
+            "the caller's exp is the token's exp"
+        );
+        assert_eq!(
+            verify(&token, &key.did_key(), AUDIENCE, METHOD, NOW + 121),
+            Err(ServiceAuthError::Expired)
+        );
+    }
+
+    #[test]
+    fn a_token_without_lxm_carries_no_lxm_claim() {
+        // The lexicon's `lxm` is optional; absent means the token authorizes
+        // no method in particular, and a verifier that expects one refuses it
+        // — which is the binding, not a failure to parse.
+        let key = SigningKey::generate();
+        let token = issue(&key, ISSUER, AUDIENCE, None, NOW + TTL_SECONDS, NOW).unwrap();
+        let claims: serde_json::Value =
+            serde_json::from_slice(&B64.decode(token.split('.').nth(1).unwrap()).unwrap()).unwrap();
+        assert!(claims.get("lxm").is_none(), "got {claims}");
+        assert!(matches!(
+            verify(&token, &key.did_key(), AUDIENCE, METHOD, NOW),
+            Err(ServiceAuthError::WrongMethod { .. })
+        ));
+    }
+
+    #[test]
+    fn the_exp_ceiling_is_five_minutes() {
+        // `black_box` so the comparison is not folded away — the same trap
+        // the federation tripwire hit. A budget assertion that optimizes to
+        // nothing is worse than no assertion, because it reads as covered.
+        assert!(
+            std::hint::black_box(MAX_EXP_SECONDS) <= 300,
+            "an unbounded server-signed token is a replay surface"
+        );
+    }
+
+    #[test]
+    fn an_audience_is_a_did_optionally_naming_a_service() {
+        // The lexicon's own spelling: `did#serviceId`, where the fragment
+        // names one of the DID's services. The fragment is not DID syntax,
+        // so it is split off before atrium's grammar sees the DID.
+        assert!(valid_audience("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"));
+        assert!(valid_audience(
+            "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#atproto_pds"
+        ));
+        assert!(valid_audience("did:web:api.bsky.app"));
+        assert!(valid_audience("did:web:api.bsky.app#chat"));
+        // Not DIDs at all: a handle, a bare fragment, an empty fragment.
+        assert!(!valid_audience("api.bsky.app"));
+        assert!(!valid_audience("#atproto_pds"));
+        assert!(!valid_audience("did:plc:aaaaaaaaaaaaaaaaaaaaaaaa#"));
+    }
+
+    #[test]
+    fn a_method_is_an_nsid() {
+        // The same grammar the repo write path validates collections with.
+        assert!(valid_method("app.bsky.feed.getTimeline"));
+        assert!(valid_method("com.atproto.repo.deleteRecord"));
+        assert!(!valid_method("not an nsid"));
+        assert!(!valid_method(""));
     }
 
     #[test]

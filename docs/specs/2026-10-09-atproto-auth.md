@@ -4,14 +4,21 @@
 <!-- The spec names files and tables this stage creates, so not every path it
      cites resolves until it's implemented. -->
 
-**Status:** Chunks 1–3 implemented (1–2 on 2026-11-17: legacy sessions + app
+**Status:** Chunks 1–4 implemented (1–2 on 2026-11-17: legacy sessions + app
 passwords; DPoP nonces — the secret table, `verify`'s nonce parameter,
 `use_dpop_nonce` at PAR/token, the XRPC 401 challenge, the CORS expose; 3 on
 2026-11-18: discovery completed — the protected-resource route and the two AS
 metadata fields, the server-side scope allowlist at PAR; lifetimes — access
 900 s, public refresh 2 weeks anchored (`anchored_at` copied forward on
 rotation); bindings — `login_hint` enforced at decide, `code_challenge` reuse
-refused within 24 h). Chunks 4–5 remain. Drafted
+refused within 24 h; 4 on 2026-11-18: the caller is the request — the proof
+verified and spent against the request's real `htm`/`htu` *before* the grant
+is read, the 401 `WWW-Authenticate` shape (the draft's `resource_metadata`
+challenge for a missing credential, RFC 9449's DPoP challenge for a refused
+one) plus `Cache-Control: private`/`Vary: Authorization` on authenticated
+answers, the scope gate with the reference's 403 `ScopeMissingError`, and
+`getServiceAuth` per the lexicon — `exp` bounded to now+300 s, default 60 s,
+the `did#serviceId` fragment surviving into `aud`). Chunk 5 remains. Drafted
 2026-10-09, five chunks, and revised the same day after one adversarial review
 against the ATProtocol OAuth and HTTP API
 (XRPC) specifications (atproto.com, as of this date), the `com.atproto.server`

@@ -13,7 +13,7 @@
 
 use axum::Router;
 use axum::extract::{Path, Query, State};
-use axum::http::{HeaderMap, StatusCode, header};
+use axum::http::{HeaderMap, Method, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, body::Bytes};
@@ -21,7 +21,7 @@ use brolly_atproto::blocks::PodBlocks;
 use brolly_atproto::firehose::{self, CommitEvent};
 use brolly_atproto::keys::SigningKey;
 use brolly_atproto::tid::Tid;
-use brolly_atproto::{ingest, legacy, repo, state};
+use brolly_atproto::{ingest, legacy, repo, service_auth, state};
 use brolly_identity::db::{self, DbError, User};
 use brolly_identity::dpop;
 use brolly_identity::{extract, webid};
@@ -44,48 +44,104 @@ fn not_found(message: &str) -> Response {
     xrpc_error(StatusCode::NOT_FOUND, "RecordNotFound", message)
 }
 
-fn auth_required() -> Response {
-    xrpc_error(
-        StatusCode::UNAUTHORIZED,
-        "AuthenticationRequired",
-        "this method requires authentication",
+fn auth_required(state: &AppState) -> Response {
+    with_bearer_challenge(
+        state,
+        xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            "AuthenticationRequired",
+            "this method requires authentication",
+        ),
     )
 }
 
-/// The RS-side nonce dance (stage 2, C): RFC 9449's DPoP challenge on the 401,
-/// with the fresh nonce the retry needs. The body stays coarse — the
-/// machine-readable detail is in the header, per RFC 9449 — so the response is
-/// shaped exactly like any other auth-required answer apart from the headers.
-fn nonce_challenge(state: &AppState) -> Response {
-    let challenge = header::HeaderValue::from_static(
-        "DPoP error=\"use_dpop_nonce\", error_description=\"retry with a proof carrying this nonce in its nonce claim\"",
+/// The draft's own discovery challenge on a 401 (stage 2, D): a client
+/// starting from a hostname is told where the authorization server is, by the
+/// protected-resource document chunk 3 landed. Appended rather than inserted,
+/// so an RFC 9449 challenge already on the answer keeps the lead.
+fn with_bearer_challenge(state: &AppState, mut response: Response) -> Response {
+    let challenge = format!(
+        "Bearer resource_metadata=\"https://{}/.well-known/oauth-protected-resource\"",
+        state.base_domain
     );
-    let nonce = dpop::current_nonce(&state.dpop_nonce_secret, now());
-    match header::HeaderValue::from_str(&nonce) {
-        // Unreachable in practice: base64url is always a legal header value.
-        // A 401 without the nonce still beats a 200.
-        Ok(nonce) => (
-            StatusCode::UNAUTHORIZED,
-            [
-                (header::WWW_AUTHENTICATE, challenge),
-                (header::HeaderName::from_static("dpop-nonce"), nonce),
-            ],
-            Json(json!({
-                "error": "AuthenticationRequired",
-                "message": "this method requires authentication"
-            })),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::UNAUTHORIZED,
-            [(header::WWW_AUTHENTICATE, challenge)],
-            Json(json!({
-                "error": "AuthenticationRequired",
-                "message": "this method requires authentication"
-            })),
-        )
-            .into_response(),
+    // Unreachable in practice: a configured base domain is header-safe. A
+    // 401 without the challenge still beats a 200.
+    if let Ok(value) = header::HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .append(header::WWW_AUTHENTICATE, value);
     }
+    response
+}
+
+/// RFC 9449's DPoP challenge for a presented-but-refused DPoP credential
+/// (stage 2, D), with the fresh nonce the retry needs. Beside it, the draft's
+/// discovery challenge — a client whose credential was refused may also need
+/// to find the authorization server, and RFC 7235 allows one challenge per
+/// scheme, so the two coexist. The body stays coarse — the machine-readable
+/// detail is in the header, per RFC 9449 — so the response is shaped exactly
+/// like any other auth-required answer apart from the headers.
+fn dpop_challenge(state: &AppState, error: &str, description: &str) -> Response {
+    let mut response = xrpc_error(
+        StatusCode::UNAUTHORIZED,
+        "AuthenticationRequired",
+        "this method requires authentication",
+    );
+    // A description is a quoted string: any quote inside it is exchanged
+    // rather than escaped, so an error message cannot break the challenge
+    // apart — and `from_str` refuses anything a header cannot carry.
+    let challenge = format!(
+        "DPoP error=\"{error}\", error_description=\"{}\"",
+        description.replace('"', "'")
+    );
+    // Unreachable in practice: the descriptions above are header-safe. The
+    // nonce and the discovery challenge still teach the retry.
+    if let Ok(value) = header::HeaderValue::from_str(&challenge) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, value);
+    }
+    let mut response = with_bearer_challenge(state, response);
+    let nonce = dpop::current_nonce(&state.dpop_nonce_secret, now());
+    // Unreachable in practice: base64url is always a legal header value. A
+    // 401 without the nonce still beats a 200.
+    if let Ok(nonce) = header::HeaderValue::from_str(&nonce) {
+        response
+            .headers_mut()
+            .insert(header::HeaderName::from_static("dpop-nonce"), nonce);
+    }
+    response
+}
+
+/// An authenticated answer is private to the requester (stage 2, D):
+/// `Cache-Control: private` so no shared cache stores it, and `Vary:
+/// Authorization` so none that could varies it by anything but the credential
+/// that earned it — one member's authorized response must not reach another
+/// from a cache.
+fn private(mut response: Response) -> Response {
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        header::HeaderValue::from_static("private"),
+    );
+    response.headers_mut().insert(
+        header::VARY,
+        header::HeaderValue::from_static("Authorization"),
+    );
+    response
+}
+
+/// The reference's own wire shape for a missing scope (stage 2, D):
+/// `@atproto/oauth-scopes` throws `ScopeMissingError` (403, exposed) with
+/// exactly this message. Not a 401 — the credential is authenticated; it is
+/// the *grant* that is missing — and not an invented name or message either:
+/// the client's recovery is keyed on the name, and a different one is a
+/// protocol fork.
+fn scope_missing(scope: &str) -> Response {
+    xrpc_error(
+        StatusCode::FORBIDDEN,
+        "ScopeMissingError",
+        &format!("Missing required scope \"{scope}\""),
+    )
 }
 
 fn now() -> i64 {
@@ -93,22 +149,28 @@ fn now() -> i64 {
 }
 
 /// The lexicon's own name for a refresh token that is unknown or spent (2, A).
-fn invalid_token() -> Response {
-    xrpc_error(
-        StatusCode::UNAUTHORIZED,
-        "InvalidToken",
-        "this session token is invalid",
+fn invalid_token(state: &AppState) -> Response {
+    with_bearer_challenge(
+        state,
+        xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            "InvalidToken",
+            "this session token is invalid",
+        ),
     )
 }
 
 /// The lexicon's own name for a refresh token past its expiry (2, A) — a
 /// different answer than an invalid one, because a client's recovery differs:
 /// re-login, not a retry.
-fn expired_token() -> Response {
-    xrpc_error(
-        StatusCode::UNAUTHORIZED,
-        "ExpiredToken",
-        "this session token has expired",
+fn expired_token(state: &AppState) -> Response {
+    with_bearer_challenge(
+        state,
+        xrpc_error(
+            StatusCode::UNAUTHORIZED,
+            "ExpiredToken",
+            "this session token has expired",
+        ),
     )
 }
 
@@ -160,14 +222,23 @@ fn wrong_host(state: &AppState, headers: &HeaderMap) -> bool {
 enum CallerKind {
     /// The dashboard's session cookie: a primary-password login, in a browser.
     Cookie,
-    /// An ATProtocol OAuth token, DPoP-bound.
-    Oauth,
+    /// An ATProtocol OAuth token, DPoP-bound, carrying the scopes it was
+    /// granted — what the scope gate reads (stage 2, D).
+    Oauth { scopes: Vec<String> },
     /// A legacy session token through the primary password.
     PrimaryPassword,
     /// A legacy session token through an app password, carrying the one fact
     /// the privilege matrix reads: that password's `privileged` flag.
     AppPassword { privileged: bool },
 }
+
+/// The scopes an authenticated method asserts it needs (stage 2, D).
+///
+/// `atproto` is the base scope every token the profile issues carries;
+/// `transition:generic` is the one write authority — repo writes and
+/// `getServiceAuth` — is granted by.
+const SCOPE_ATPROTO: &str = "atproto";
+const SCOPE_TRANSITION_GENERIC: &str = "transition:generic";
 
 impl CallerKind {
     /// The management half of the privilege matrix (2, B): app-password
@@ -186,7 +257,17 @@ impl CallerKind {
         match self {
             CallerKind::Cookie | CallerKind::PrimaryPassword => true,
             CallerKind::AppPassword { privileged } => *privileged,
-            CallerKind::Oauth => false,
+            CallerKind::Oauth { .. } => false,
+        }
+    }
+
+    /// The scope gate (stage 2, D): an OAuth token holds only the scopes it
+    /// was granted; the cookie and legacy arms predate scopes and carry the
+    /// full authority of a primary-password login.
+    fn has_scope(&self, scope: &str) -> bool {
+        match self {
+            CallerKind::Oauth { scopes } => scopes.iter().any(|granted| granted == scope),
+            _ => true,
         }
     }
 }
@@ -199,11 +280,16 @@ struct Caller {
 
 /// Who is making this call, and how they authenticated — or the refusal that
 /// must become the response, ready-built. `Err` carries a `Response` because
-/// one failure mode has its own answer: the nonce 401 (stage 2, C), whose
-/// headers a generic `auth_required` cannot carry. Every other refusal is
-/// still `auth_required`, built at the `caller`'s tail so no call site repeats
-/// it.
-async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Caller, Response> {
+/// the refusals have their own shapes (stage 2, D): the nonce and
+/// `invalid_dpop_proof` challenges carry headers a generic `auth_required`
+/// cannot. Every other refusal is still `auth_required`, built where it is
+/// returned so no call site repeats it.
+async fn caller(
+    state: &AppState,
+    headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
+) -> Result<Caller, Response> {
     // The Authorization header, when there is one, carries the credential the
     // caller meant (extract's precedence): a DPoP-bound OAuth token, or the
     // legacy pair's access half.
@@ -213,20 +299,12 @@ async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Caller, Respons
         && let Some(credential) = extract::credential(Some(authorization), None)
     {
         match credential {
+            // The DPoP arm is terminal (stage 2, D): a presented-but-refused
+            // DPoP credential answers with its own challenge, so it no longer
+            // falls to the cookie below — a browser session would only mask
+            // what the client needs to fix.
             brolly_identity::Credential::Dpop { token, .. } => {
-                match token_caller(state, headers, &token).await {
-                    Ok(Some(user)) => {
-                        return Ok(Caller {
-                            user,
-                            kind: CallerKind::Oauth,
-                        });
-                    }
-                    // The nonce challenge is the response (stage 2, C): the
-                    // client's recovery is a retry with the fresh nonce, and a
-                    // generic 401 would leave it unable to make one.
-                    Err(response) => return Err(response),
-                    Ok(None) => {}
-                }
+                return token_caller(state, headers, method, uri, &token).await;
             }
             // The legacy arm (2, A): the access half of an opaque pair, in its
             // own table. A Mastodon token lands here too, fails the lookup,
@@ -242,13 +320,13 @@ async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Caller, Respons
     }
     // The cookie fallback stays last (2, D): the browser dashboard and the
     // tests, as before this grew the token arms.
-    let token = session_token(headers).ok_or_else(auth_required)?;
+    let token = session_token(headers).ok_or_else(|| auth_required(state))?;
     let user = db::user_for_session(&state.pool, &token)
         .await
         .ok()
         .flatten()
         .filter(User::is_active)
-        .ok_or_else(auth_required)?;
+        .ok_or_else(|| auth_required(state))?;
     Ok(Caller {
         user,
         kind: CallerKind::Cookie,
@@ -277,67 +355,129 @@ async fn legacy_caller(state: &AppState, token: &str) -> Option<Caller> {
     Some(Caller { user, kind })
 }
 
+/// The DPoP arm of `caller` (stage 2, D), rebuilt in the order the spec
+/// fixes: the proof first, then the grant.
+///
+/// **The proof is verified and spent before the token's grant is read.** The
+/// proof binds to the presented token *string* — the `ath` claim — which the
+/// `Authorization` header already carries, so nothing about the grant is
+/// needed to check it, and an unknown token's proof is spent anyway:
+/// fail-closed, the rule PAR already states. This closes the ordering hole
+/// `identity/src/dpop.rs`'s module doc assigns here — a proof replayed
+/// against a valid token, after being spent on an unknown one's request,
+/// fails on the spend.
 async fn token_caller(
     state: &AppState,
     headers: &HeaderMap,
+    method: &Method,
+    uri: &Uri,
     token: &str,
-) -> Result<Option<User>, Response> {
-    let grant = brolly_atproto::oauth::verify_token(&state.pool, "access", token)
-        .await
-        .ok()
-        .flatten();
-    let Some(grant) = grant else {
-        return Ok(None);
-    };
-
-    // The proof must be for this request, must name the key the token was
-    // issued to, and must not have been presented before.
+) -> Result<Caller, Response> {
+    // 1. The proof, against this very request. A DPoP-bound token without one
+    //    is a presented-but-refused credential: RFC 9449's challenge is the
+    //    client's recovery.
     let Some(proof) = headers.get("dpop").and_then(|h| h.to_str().ok()) else {
-        return Ok(None);
+        return Err(dpop_challenge(
+            state,
+            "invalid_dpop_proof",
+            "a DPoP-bound token requires a DPoP proof on every request",
+        ));
     };
-    let url = format!("https://{}/xrpc/", state.base_domain);
-    let method = "POST";
+    // 2. The request's own `htm`/`htu` (stage 2, D): the method and URL the
+    //    client actually used — `https://{base}{path}` — not a hardcoded
+    //    pair. The hardcoded `POST …/xrpc/` this replaces could never have
+    //    matched `getServiceAuth`, a GET.
+    let url = format!("https://{}{}", state.base_domain, uri.path());
     let at = now();
     // The ATProtocol profile requires nonces (stage 2, C): the current and
     // previous bucket's values are the ones a proof may carry.
-    let accepted = brolly_identity::dpop::accepted_nonces(&state.dpop_nonce_secret, at);
-    let unspent = match brolly_identity::dpop::verify(
+    let accepted = dpop::accepted_nonces(&state.dpop_nonce_secret, at);
+    let unspent = match dpop::verify(
         proof,
-        method,
+        method.as_str(),
         &url,
         Some(token),
         at,
         Some(&accepted),
     ) {
         Ok(unspent) => unspent,
-        // The one refusal that is the response (stage 2, C): the RS-side
-        // shape, with the fresh nonce the retry needs.
-        Err(brolly_identity::dpop::DpopError::NonceRequired) => {
-            return Err(nonce_challenge(state));
-        }
-        Err(_) => return Ok(None),
-    };
-    if !unspent.bound_to(&grant.dpop_jkt) {
-        tracing::warn!("an ATProtocol token was presented by a key it was not issued to");
-        return Ok(None);
-    }
-    match unspent.spend(&state.pool, at).await {
-        Ok(_) => {}
-        Err(brolly_identity::dpop::DpopError::Storage(e)) => {
-            tracing::error!(error = %e, "recording a DPoP proof failed");
-            return Ok(None);
+        // The one refusal with its own error name (stage 2, C): the
+        // client's recovery is a retry with the fresh nonce.
+        Err(dpop::DpopError::NonceRequired) => {
+            return Err(dpop_challenge(
+                state,
+                "use_dpop_nonce",
+                "retry with a proof carrying this nonce in its nonce claim",
+            ));
         }
         Err(e) => {
             tracing::warn!(error = %e, "an ATProtocol DPoP proof was refused");
-            return Ok(None);
+            return Err(dpop_challenge(state, "invalid_dpop_proof", &e.to_string()));
         }
+    };
+    // 3. Spent before the grant is read (stage 2, D) — the ordering that
+    //    closes the replay hole: whatever the grant lookup below says, this
+    //    proof is dead. The spent proof's thumbprint is what the key binding
+    //    below checks, so nothing needs the grant first.
+    let spent = match unspent.spend(&state.pool, at).await {
+        Ok(spent) => spent,
+        Err(dpop::DpopError::Replayed) => {
+            tracing::warn!("an ATProtocol DPoP proof was replayed");
+            return Err(dpop_challenge(
+                state,
+                "invalid_dpop_proof",
+                "this proof has already been used",
+            ));
+        }
+        Err(dpop::DpopError::Storage(storage)) => {
+            // Fail closed: a proof that cannot be recorded as spent must
+            // not authorize anything.
+            tracing::error!(error = %storage, "recording a DPoP proof failed");
+            return Err(internal_error());
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "an ATProtocol DPoP proof was refused");
+            return Err(dpop_challenge(state, "invalid_dpop_proof", &e.to_string()));
+        }
+    };
+    // 4. Only now the grant (stage 2, D): the token's own row, the key it was
+    //    issued to, and the member it speaks for.
+    let grant = brolly_atproto::oauth::verify_token(&state.pool, "access", token)
+        .await
+        .ok()
+        .flatten();
+    let Some(grant) = grant else {
+        // The proof was spent above; the token is simply not one this server
+        // issued, or no longer one it honors.
+        return Err(auth_required(state));
+    };
+    if spent.thumbprint != grant.dpop_jkt {
+        tracing::warn!("an ATProtocol token was presented by a key it was not issued to");
+        return Err(dpop_challenge(
+            state,
+            "invalid_dpop_proof",
+            "the proof's key is not the key this token was issued to",
+        ));
     }
-
-    Ok(db::find_by_id(&state.pool, grant.user_id)
+    let user = db::find_by_id(&state.pool, grant.user_id)
         .await
         .ok()
         .flatten()
-        .filter(User::is_active))
+        .filter(User::is_active);
+    let Some(user) = user else {
+        return Err(auth_required(state));
+    };
+    Ok(Caller {
+        user,
+        kind: CallerKind::Oauth {
+            scopes: grant
+                .scope
+                .split(' ')
+                .filter(|scope| !scope.is_empty())
+                .map(str::to_string)
+                .collect(),
+        },
+    })
 }
 
 /// Resolve a `repo` parameter — a DID or a handle — to a member.
@@ -869,26 +1009,38 @@ struct CreateRecord {
 /// network syncs, and the pod is what every other protocol reads (D7's faithful
 /// layer). A record in one and not the other is a member whose data exists for
 /// some readers and not others.
-async fn create_record(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn create_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
+    // The scope gate (stage 2, D): repo writes assert `transition:generic`.
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<CreateRecord>(&body) else {
-        return invalid_request("body must be a JSON object with collection and record");
+        return private(invalid_request(
+            "body must be a JSON object with collection and record",
+        ));
     };
     if let Some(target) = input.repo.as_deref()
         && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
     {
-        return xrpc_error(
+        return private(xrpc_error(
             StatusCode::FORBIDDEN,
             "Forbidden",
             "you can only write to your own repository",
-        );
+        ));
     }
 
     // A record must declare its own type, or the faithful layer has nowhere to
@@ -904,7 +1056,7 @@ async fn create_record(State(state): State<AppState>, headers: HeaderMap, body: 
         &record,
     ) {
         Ok(write) => write,
-        Err(e) => return write_refused(e),
+        Err(e) => return private(write_refused(e)),
     };
     let head = match input.swap_commit {
         // A swap write never retries (1, C).
@@ -914,9 +1066,9 @@ async fn create_record(State(state): State<AppState>, headers: HeaderMap, body: 
 
     let landed = match commit_write(&state, &user, vec![write], head, vec![record]).await {
         Ok(landed) => landed,
-        Err(response) => return response,
+        Err(response) => return private(response),
     };
-    write_response(&state, &user, &landed)
+    private(write_response(&state, &user, &landed))
 }
 
 /// The create/put answer: the lexicon's `uri`, `cid`, and the commit that
@@ -978,26 +1130,38 @@ struct PutRecord {
 /// `com.atproto.repo.putRecord`: upsert, as the lexicon defines it — absent
 /// creates, present replaces — with compare-and-set on both the record and
 /// the head when the client names either (1, B).
-async fn put_record(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn put_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
+    // The scope gate (stage 2, D): repo writes assert `transition:generic`.
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<PutRecord>(&body) else {
-        return invalid_request("body must be a JSON object with collection, rkey and record");
+        return private(invalid_request(
+            "body must be a JSON object with collection, rkey and record",
+        ));
     };
     if let Some(target) = input.repo.as_deref()
         && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
     {
-        return xrpc_error(
+        return private(xrpc_error(
             StatusCode::FORBIDDEN,
             "Forbidden",
             "you can only write to your own repository",
-        );
+        ));
     }
 
     let mut record = input.record;
@@ -1009,7 +1173,7 @@ async fn put_record(State(state): State<AppState>, headers: HeaderMap, body: Byt
         input.swap_record.as_ref().map(|swap| swap.as_deref()),
     ) {
         Ok(swap) => swap,
-        Err(e) => return write_refused(e),
+        Err(e) => return private(write_refused(e)),
     };
     let write = match brolly_atproto::repo::PlannedWrite::put(
         &input.collection,
@@ -1018,7 +1182,7 @@ async fn put_record(State(state): State<AppState>, headers: HeaderMap, body: Byt
         swap,
     ) {
         Ok(write) => write,
-        Err(e) => return write_refused(e),
+        Err(e) => return private(write_refused(e)),
     };
     let head = match input.swap_commit {
         Some(cid) => HeadSwap::AtCommit(cid),
@@ -1027,9 +1191,9 @@ async fn put_record(State(state): State<AppState>, headers: HeaderMap, body: Byt
 
     let landed = match commit_write(&state, &user, vec![write], head, vec![record]).await {
         Ok(landed) => landed,
-        Err(response) => return response,
+        Err(response) => return private(response),
     };
-    write_response(&state, &user, &landed)
+    private(write_response(&state, &user, &landed))
 }
 
 #[derive(Deserialize)]
@@ -1054,31 +1218,43 @@ struct SwapRecord {
 /// the repo knows both — the record it read and the commit it read it at —
 /// and a route that demands them cannot be sent half a compare-and-set by
 /// mistake. No retry, ever; every refusal is `InvalidSwap`.
-async fn swap_record(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn swap_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
+    // The scope gate (stage 2, D): repo writes assert `transition:generic`.
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<SwapRecord>(&body) else {
-        return invalid_request(
+        return private(invalid_request(
             "body must be a JSON object with collection, rkey, record, swapRecord and swapCommit",
-        );
+        ));
     };
     let (Some(swap_record), Some(swap_commit)) = (input.swap_record, input.swap_commit) else {
-        return invalid_request("both swapRecord and swapCommit are required");
+        return private(invalid_request(
+            "both swapRecord and swapCommit are required",
+        ));
     };
     if let Some(target) = input.repo.as_deref()
         && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
     {
-        return xrpc_error(
+        return private(xrpc_error(
             StatusCode::FORBIDDEN,
             "Forbidden",
             "you can only write to your own repository",
-        );
+        ));
     }
 
     let mut record = input.record;
@@ -1088,7 +1264,7 @@ async fn swap_record(State(state): State<AppState>, headers: HeaderMap, body: By
 
     let swap = match brolly_atproto::repo::RecordSwap::parse(Some(swap_record.as_deref())) {
         Ok(swap) => swap,
-        Err(e) => return write_refused(e),
+        Err(e) => return private(write_refused(e)),
     };
     let write = match brolly_atproto::repo::PlannedWrite::put(
         &input.collection,
@@ -1097,7 +1273,7 @@ async fn swap_record(State(state): State<AppState>, headers: HeaderMap, body: By
         swap,
     ) {
         Ok(write) => write,
-        Err(e) => return write_refused(e),
+        Err(e) => return private(write_refused(e)),
     };
 
     let landed = match commit_write(
@@ -1110,9 +1286,9 @@ async fn swap_record(State(state): State<AppState>, headers: HeaderMap, body: By
     .await
     {
         Ok(landed) => landed,
-        Err(response) => return response,
+        Err(response) => return private(response),
     };
-    write_response(&state, &user, &landed)
+    private(write_response(&state, &user, &landed))
 }
 
 #[derive(Deserialize)]
@@ -1132,28 +1308,38 @@ struct SwapCommit {
 /// This is the compare-and-set C's retry half needs to be reachable by a
 /// client that has synced the repo: it names the commit it read, and if the
 /// head has moved, `InvalidSwap` is the whole answer. No retry, ever.
-async fn swap_commit(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn swap_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
+    // The scope gate (stage 2, D): repo writes assert `transition:generic`.
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<SwapCommit>(&body) else {
-        return invalid_request(
+        return private(invalid_request(
             "body must be a JSON object with collection, rkey, record and commitCid",
-        );
+        ));
     };
     if let Some(target) = input.repo.as_deref()
         && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
     {
-        return xrpc_error(
+        return private(xrpc_error(
             StatusCode::FORBIDDEN,
             "Forbidden",
             "you can only write to your own repository",
-        );
+        ));
     }
 
     let mut record = input.record;
@@ -1168,7 +1354,7 @@ async fn swap_commit(State(state): State<AppState>, headers: HeaderMap, body: By
         brolly_atproto::repo::RecordSwap::Any,
     ) {
         Ok(write) => write,
-        Err(e) => return write_refused(e),
+        Err(e) => return private(write_refused(e)),
     };
 
     let landed = match commit_write(
@@ -1181,9 +1367,9 @@ async fn swap_commit(State(state): State<AppState>, headers: HeaderMap, body: By
     .await
     {
         Ok(landed) => landed,
-        Err(response) => return response,
+        Err(response) => return private(response),
     };
-    write_response(&state, &user, &landed)
+    private(write_response(&state, &user, &landed))
 }
 
 #[derive(Deserialize)]
@@ -1217,35 +1403,47 @@ struct ApplyWrites {
 /// revision, one signature, one event with one op per write (1, B).
 ///
 /// Atomic: any invalid op refuses the whole batch before anything is signed.
-async fn apply_writes(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn apply_writes(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
+    // The scope gate (stage 2, D): repo writes assert `transition:generic`.
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<ApplyWrites>(&body) else {
-        return invalid_request("body must be a JSON object with a non-empty writes array");
+        return private(invalid_request(
+            "body must be a JSON object with a non-empty writes array",
+        ));
     };
     if let Some(target) = input.repo.as_deref()
         && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
     {
-        return xrpc_error(
+        return private(xrpc_error(
             StatusCode::FORBIDDEN,
             "Forbidden",
             "you can only write to your own repository",
-        );
+        ));
     }
     if input.writes.is_empty() {
-        return invalid_request("writes must not be empty");
+        return private(invalid_request("writes must not be empty"));
     }
     if input.writes.len() > brolly_atproto::repo::MAX_BATCH_OPS {
-        return invalid_request(&format!(
+        return private(invalid_request(&format!(
             "a batch is capped at {} writes",
             brolly_atproto::repo::MAX_BATCH_OPS
-        ));
+        )));
     }
 
     // The plan and the records, in the order the batch applies them. A value
@@ -1286,7 +1484,7 @@ async fn apply_writes(State(state): State<AppState>, headers: HeaderMap, body: B
         };
         match planned {
             Ok(planned) => writes.push(planned),
-            Err(e) => return write_refused(e),
+            Err(e) => return private(write_refused(e)),
         }
     }
     let head = match input.swap_commit {
@@ -1296,7 +1494,7 @@ async fn apply_writes(State(state): State<AppState>, headers: HeaderMap, body: B
 
     let landed = match commit_write(&state, &user, writes, head, records).await {
         Ok(landed) => landed,
-        Err(response) => return response,
+        Err(response) => return private(response),
     };
 
     // One result per write, in order: the uri and cid it landed at.
@@ -1313,14 +1511,16 @@ async fn apply_writes(State(state): State<AppState>, headers: HeaderMap, body: B
             None => json!({}),
         })
         .collect();
-    Json(json!({
-        "commit": {
-            "cid": landed.applied.commit.to_string(),
-            "rev": landed.applied.rev.as_str(),
-        },
-        "results": results,
-    }))
-    .into_response()
+    private(
+        Json(json!({
+            "commit": {
+                "cid": landed.applied.commit.to_string(),
+                "rev": landed.applied.rev.as_str(),
+            },
+            "results": results,
+        }))
+        .into_response(),
+    )
 }
 
 #[derive(Deserialize)]
@@ -1332,38 +1532,48 @@ struct DeleteRecord {
 }
 
 /// `com.atproto.repo.deleteRecord`
-async fn delete_record(State(state): State<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+async fn delete_record(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
+    // The scope gate (stage 2, D): repo writes assert `transition:generic`.
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<DeleteRecord>(&body) else {
-        return invalid_request("body must name a collection and rkey");
+        return private(invalid_request("body must name a collection and rkey"));
     };
     if let Some(target) = input.repo.as_deref()
         && resolve_repo(&state, target).await.map(|u| u.id) != Some(user.id)
     {
-        return xrpc_error(
+        return private(xrpc_error(
             StatusCode::FORBIDDEN,
             "Forbidden",
             "you can only write to your own repository",
-        );
+        ));
     }
 
     let write = match brolly_atproto::repo::PlannedWrite::delete(&input.collection, &input.rkey) {
         Ok(write) => write,
-        Err(e) => return write_refused(e),
+        Err(e) => return private(write_refused(e)),
     };
 
     // A plain write: no swap was named, so the head's movement is retried
     // through rather than answered (1, C).
     match commit_write(&state, &user, vec![write], HeadSwap::Plain, Vec::new()).await {
-        Ok(_) => Json(json!({})).into_response(),
-        Err(response) => response,
+        Ok(_) => private(Json(json!({})).into_response()),
+        Err(response) => private(response),
     }
 }
 
@@ -1488,7 +1698,7 @@ pub async fn create_session(
         // A login for nobody costs the same one Argon2 run as a wrong
         // password for somebody — the `authenticate` pattern (2, A).
         db::dummy_verify(&input.password);
-        return auth_required();
+        return auth_required(&state);
     };
 
     // The app-password table first — an indexed SHA-256 lookup — then Argon2
@@ -1501,7 +1711,7 @@ pub async fn create_session(
         Some((id, privileged)) => (Some(id), privileged),
         None => match db::verify_primary_password(&state.pool, user.id, &input.password).await {
             Ok(Some(true)) => (None, true),
-            Ok(_) => return auth_required(),
+            Ok(_) => return auth_required(&state),
             Err(e) => {
                 tracing::error!(error = %e, "the primary password check failed");
                 return internal_error();
@@ -1513,10 +1723,13 @@ pub async fn create_session(
     // (2, A): brolly's `disabled` is the spec's `takendown` — the moderation
     // reading of the two — and the lexicon's own error name says so.
     if !user.is_active() {
-        return xrpc_error(
-            StatusCode::UNAUTHORIZED,
-            "AccountTakedown",
-            "this account has been taken down",
+        return with_bearer_challenge(
+            &state,
+            xrpc_error(
+                StatusCode::UNAUTHORIZED,
+                "AccountTakedown",
+                "this account has been taken down",
+            ),
         );
     }
 
@@ -1535,20 +1748,32 @@ pub async fn create_session(
 
 /// `com.atproto.server.getSession` (2, A): the current session, for the bearer
 /// access token.
-pub async fn get_session(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn get_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
-    Json(session_view(
-        &state,
-        &caller.user,
-        caller.kind.may_see_email(),
-    ))
-    .into_response()
+    // The scope gate (stage 2, D): `getSession` asserts the base `atproto`
+    // scope — the one every token the profile issues carries.
+    if !caller.kind.has_scope(SCOPE_ATPROTO) {
+        return private(scope_missing(SCOPE_ATPROTO));
+    }
+    private(
+        Json(session_view(
+            &state,
+            &caller.user,
+            caller.kind.may_see_email(),
+        ))
+        .into_response(),
+    )
 }
 
 /// The `Bearer` credential of a request, read through the identity-owned
@@ -1572,27 +1797,30 @@ pub async fn refresh_session(State(state): State<AppState>, headers: HeaderMap) 
         return not_found("not served here");
     }
     let Some(token) = bearer_token(&headers) else {
-        return auth_required();
+        return auth_required(&state);
     };
     let grant = match legacy::inspect_refresh(&state.pool, &token).await {
         Ok(legacy::RefreshToken::Valid(grant)) => grant,
-        Ok(legacy::RefreshToken::Expired) => return expired_token(),
-        Ok(legacy::RefreshToken::Invalid) => return invalid_token(),
+        Ok(legacy::RefreshToken::Expired) => return expired_token(&state),
+        Ok(legacy::RefreshToken::Invalid) => return invalid_token(&state),
         Err(e) => {
             tracing::error!(error = %e, "classifying a refresh token failed");
             return internal_error();
         }
     };
     let Ok(Some(user)) = db::find_by_id(&state.pool, grant.user_id).await else {
-        return invalid_token();
+        return invalid_token(&state);
     };
     // A disabled member's refresh answers the lexicon's own name (2, A), for
     // the same reason `createSession` does.
     if !user.is_active() {
-        return xrpc_error(
-            StatusCode::UNAUTHORIZED,
-            "AccountTakedown",
-            "this account has been taken down",
+        return with_bearer_challenge(
+            &state,
+            xrpc_error(
+                StatusCode::UNAUTHORIZED,
+                "AccountTakedown",
+                "this account has been taken down",
+            ),
         );
     }
     let pair = match legacy::rotate_pair(&state.pool, &grant).await {
@@ -1600,7 +1828,7 @@ pub async fn refresh_session(State(state): State<AppState>, headers: HeaderMap) 
         // The classification above is a snapshot; the rotation is the race's
         // arbiter (2, A): `None` means another refresh of the same session
         // won, and a rotated refresh token is an invalid one.
-        Ok(None) => return invalid_token(),
+        Ok(None) => return invalid_token(&state),
         Err(e) => {
             tracing::error!(error = %e, "rotating a legacy session failed");
             return internal_error();
@@ -1620,7 +1848,7 @@ pub async fn delete_session(State(state): State<AppState>, headers: HeaderMap) -
         return not_found("not served here");
     }
     let Some(token) = bearer_token(&headers) else {
-        return auth_required();
+        return auth_required(&state);
     };
     match legacy::inspect_refresh(&state.pool, &token).await {
         Ok(legacy::RefreshToken::Valid(grant)) => {
@@ -1634,8 +1862,8 @@ pub async fn delete_session(State(state): State<AppState>, headers: HeaderMap) -
                 }
             }
         }
-        Ok(legacy::RefreshToken::Expired) => expired_token(),
-        Ok(legacy::RefreshToken::Invalid) => invalid_token(),
+        Ok(legacy::RefreshToken::Expired) => expired_token(&state),
+        Ok(legacy::RefreshToken::Invalid) => invalid_token(&state),
         Err(e) => {
             tracing::error!(error = %e, "classifying a refresh token failed");
             internal_error()
@@ -1666,24 +1894,26 @@ fn app_password_management_forbidden() -> Response {
 pub async fn create_app_password(
     State(state): State<AppState>,
     headers: HeaderMap,
+    method: Method,
+    uri: Uri,
     body: Bytes,
 ) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
     if !caller.kind.may_manage_app_passwords() {
-        return app_password_management_forbidden();
+        return private(app_password_management_forbidden());
     }
     let Ok(input) = serde_json::from_slice::<CreateAppPasswordInput>(&body) else {
-        return invalid_request("body must name the app password");
+        return private(invalid_request("body must name the app password"));
     };
     let name = input.name.trim();
     if name.is_empty() {
-        return invalid_request("the name must not be empty");
+        return private(invalid_request("the name must not be empty"));
     }
     match legacy::create_app_password(
         &state.pool,
@@ -1693,19 +1923,21 @@ pub async fn create_app_password(
     )
     .await
     {
-        Ok((row, password)) => Json(json!({
-            "name": row.name,
-            "password": password,
-            "createdAt": wire_time(row.created_at),
-            "privileged": row.privileged,
-        }))
-        .into_response(),
-        Err(DbError::AppPasswordNameTaken) => {
-            invalid_request("you already have an app password with that name")
-        }
+        Ok((row, password)) => private(
+            Json(json!({
+                "name": row.name,
+                "password": password,
+                "createdAt": wire_time(row.created_at),
+                "privileged": row.privileged,
+            }))
+            .into_response(),
+        ),
+        Err(DbError::AppPasswordNameTaken) => private(invalid_request(
+            "you already have an app password with that name",
+        )),
         Err(e) => {
             tracing::error!(error = %e, "creating an app password failed");
-            internal_error()
+            private(internal_error())
         }
     }
 }
@@ -1713,32 +1945,39 @@ pub async fn create_app_password(
 /// `com.atproto.server.listAppPasswords` (2, B): the list without the
 /// password — the lexicon's list schema omits the field, and the stored hash
 /// could not return one anyway.
-pub async fn list_app_passwords(State(state): State<AppState>, headers: HeaderMap) -> Response {
+pub async fn list_app_passwords(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
     if !caller.kind.may_manage_app_passwords() {
-        return app_password_management_forbidden();
+        return private(app_password_management_forbidden());
     }
     match legacy::list_app_passwords(&state.pool, caller.user.id).await {
-        Ok(rows) => Json(json!({
-            "passwords": rows
-                .iter()
-                .map(|row| json!({
-                    "name": row.name,
-                    "createdAt": wire_time(row.created_at),
-                    "privileged": row.privileged,
-                }))
-                .collect::<Vec<_>>(),
-        }))
-        .into_response(),
+        Ok(rows) => private(
+            Json(json!({
+                "passwords": rows
+                    .iter()
+                    .map(|row| json!({
+                        "name": row.name,
+                        "createdAt": wire_time(row.created_at),
+                        "privileged": row.privileged,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+            .into_response(),
+        ),
         Err(e) => {
             tracing::error!(error = %e, "listing app passwords failed");
-            internal_error()
+            private(internal_error())
         }
     }
 }
@@ -1755,28 +1994,119 @@ struct RevokeAppPasswordInput {
 pub async fn revoke_app_password(
     State(state): State<AppState>,
     headers: HeaderMap,
+    method: Method,
+    uri: Uri,
     body: Bytes,
 ) -> Response {
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let caller = match caller(&state, &headers).await {
+    let caller = match caller(&state, &headers, &method, &uri).await {
         Ok(caller) => caller,
         Err(response) => return response,
     };
     if !caller.kind.may_manage_app_passwords() {
-        return app_password_management_forbidden();
+        return private(app_password_management_forbidden());
     }
     let Ok(input) = serde_json::from_slice::<RevokeAppPasswordInput>(&body) else {
-        return invalid_request("body must name the app password");
+        return private(invalid_request("body must name the app password"));
     };
     match legacy::revoke_app_password(&state.pool, caller.user.id, &input.name).await {
         // The lexicon defines no error for an unknown name, and a password
         // that is not there is the state it asks for.
-        Ok(_) => Json(json!({})).into_response(),
+        Ok(_) => private(Json(json!({})).into_response()),
         Err(e) => {
             tracing::error!(error = %e, "revoking an app password failed");
-            internal_error()
+            private(internal_error())
+        }
+    }
+}
+
+// --- getServiceAuth (stage 2, D) ------------------------------------------------
+
+#[derive(Deserialize)]
+pub struct GetServiceAuthQuery {
+    /// The service being called: a DID, optionally `did#serviceId` naming one
+    /// of its services.
+    aud: String,
+    /// The one method the token authorizes. Optional: absent means the token
+    /// carries no `lxm`, and the verifier decides what that authorizes.
+    lxm: Option<String>,
+    /// The token's `exp`, as a Unix timestamp. Optional: 60 s out by default.
+    exp: Option<i64>,
+}
+
+/// `com.atproto.server.getServiceAuth` (stage 2, D): a short-lived service
+/// token signed with the member's `atproto_signing` key — the key the PLC
+/// document publishes, the identity that signs commits — scoped to one
+/// audience and, when `lxm` names it, one method.
+///
+/// The consumer is stage 3's `atproto-proxy` forwarding; the endpoint is the
+/// lexicon's shape and nothing more.
+pub async fn get_service_auth(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    Query(query): Query<GetServiceAuthQuery>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let caller = match caller(&state, &headers, &method, &uri).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    // The write scope (stage 2, D): minting a token that speaks for the
+    // member's repo is write authority, and `getServiceAuth` asserts the same
+    // scope a repo write does.
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
+    // `aud` and `lxm` are validated with atrium's own grammars, the way stage
+    // 1 validated NSIDs: a DID — its `#serviceId` fragment is not DID syntax,
+    // and survives into the token's `aud` — and an NSID.
+    if !service_auth::valid_audience(&query.aud) {
+        return private(invalid_request(
+            "aud must be a DID, optionally did#serviceId",
+        ));
+    }
+    if let Some(lxm) = query.lxm.as_deref()
+        && !service_auth::valid_method(lxm)
+    {
+        return private(invalid_request("lxm must be an NSID"));
+    }
+    // `exp`: the lexicon's own window — not in the past, not further out than
+    // five minutes; absent means the 60 s lifetime `service_auth.rs` already
+    // commits to.
+    let at = now();
+    let exp = match query.exp {
+        Some(exp) if exp <= at || exp > at + service_auth::MAX_EXP_SECONDS => {
+            return private(xrpc_error(
+                StatusCode::BAD_REQUEST,
+                "BadExpiration",
+                "exp must be in the future and at most five minutes out",
+            ));
+        }
+        Some(exp) => exp,
+        None => at + service_auth::TTL_SECONDS,
+    };
+    let key = match signing_key(&state, &caller.user).await {
+        Ok(key) => key,
+        Err(response) => return private(response),
+    };
+    match service_auth::issue(
+        &key,
+        &did_of(&caller.user, &state),
+        &query.aud,
+        query.lxm.as_deref(),
+        exp,
+        at,
+    ) {
+        Ok(token) => private(Json(json!({"token": token})).into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, "issuing a service auth token failed");
+            private(internal_error())
         }
     }
 }
@@ -2170,6 +2500,10 @@ pub fn routes() -> Router<AppState> {
         .route(
             "/xrpc/com.atproto.server.revokeAppPassword",
             post(revoke_app_password),
+        )
+        .route(
+            "/xrpc/com.atproto.server.getServiceAuth",
+            get(get_service_auth),
         )
         // Last, and a wildcard: literal segments match first.
         .route(

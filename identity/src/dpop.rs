@@ -38,11 +38,15 @@
 //! rows, so any process of the instance verifies the same nonces with no
 //! hot-path storage and no rotation job.
 //!
-//! That guarantee covers only what arrives inside the `Unspent`. A caller that
-//! learns something from elsewhere before checking the proof is not held to it
-//! by the compiler: XRPC's `token_caller` gets the grant, and so the `user_id`,
-//! from `brolly_atproto::oauth::verify_token` before any proof is looked at,
-//! and spends only by convention. Closing that is a stage 2 follow-up.
+//! That guarantee covers only what arrives inside the `Unspent`. A caller
+//! that learns something from elsewhere before checking the proof is not held
+//! to it by the compiler: XRPC's `token_caller` once got the grant — and so
+//! the `user_id` — from `brolly_atproto::oauth::verify_token` before any
+//! proof was looked at, and spent only by convention. Stage 2 (D) rebuilt it
+//! the other way round — the proof is verified and spent *before* the grant
+//! is read, so an unknown token's proof is spent anyway — and the order is
+//! now part of that caller's contract: the spend must never depend on the
+//! grant lookup succeeding.
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
