@@ -197,6 +197,13 @@ fn app_name(client_id: &str) -> Option<String> {
 
 // --- discovery -------------------------------------------------------------------
 
+/// The scopes this server grants (stage 2, E): everything the AS metadata
+/// advertises as `scopes_supported`, in one constant so the advertisement and
+/// the PAR check cannot drift. A requested scope outside it is refused at
+/// push, not echoed into a token response — a granted scope the metadata
+/// never declared is the metadata lying.
+const SCOPES_SUPPORTED: &[&str] = &["atproto", "transition:generic"];
+
 /// `GET /.well-known/oauth-authorization-server`
 ///
 /// Generated from the endpoint map, so an advertised path that is not mounted
@@ -225,8 +232,33 @@ pub async fn metadata(State(state): State<AppState>, headers: HeaderMap) -> Resp
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
         "dpop_signing_alg_values_supported": ["ES256"],
-        "scopes_supported": ["atproto", "transition:generic"],
+        "scopes_supported": SCOPES_SUPPORTED,
         "client_id_metadata_document_supported": true,
+        // Declaring the `iss` the redirect already emits (stage 2, E), so a
+        // client that checked the profile's matrix knows to expect it.
+        "authorization_response_iss_parameter_supported": true,
+        // The one client-authentication algorithm the profile requires (stage
+        // 2, E). Meaningful once F accepts confidential clients; declared now
+        // because the draft's consumers read metadata before their first PAR.
+        "token_endpoint_auth_signing_alg_values_supported": ["ES256"],
+    }))
+    .into_response()
+}
+
+/// `GET /.well-known/oauth-protected-resource` (stage 2, E).
+///
+/// The base domain's answer: this origin is its own authorization server. A
+/// single origin URL, no path — the draft's requirement — so a client that
+/// finds this document is told where to take OAuth, not left guessing at an
+/// AS on some other host.
+pub async fn protected_resource(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found();
+    }
+    let origin = format!("https://{}", state.base_domain);
+    Json(json!({
+        "resource": origin,
+        "authorization_servers": [origin],
     }))
     .into_response()
 }
@@ -313,6 +345,20 @@ pub async fn par(
     if let Err(e) = check_request(&metadata, &redirect_uri, scope) {
         return client_refusal(&e);
     }
+    // The server's own allowlist too (stage 2, E): requested ⊆ client-declared
+    // *and* ⊆ `scopes_supported`. A scope the server does not grant is refused
+    // `invalid_scope` at push time, not echoed in a token response the
+    // metadata then lies about.
+    if scope
+        .split(' ')
+        .any(|s| !s.is_empty() && !SCOPES_SUPPORTED.contains(&s))
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_scope",
+            "a requested scope is not one this server grants",
+        );
+    }
     // A loopback redirect matched after URL parsing (ports ignored), and
     // parsing strips tabs and newlines and normalises the host, so the raw
     // string may not be the URL that was checked. It is stored, sent as
@@ -325,6 +371,29 @@ pub async fn par(
         && !Url::parse(&redirect_uri).is_ok_and(|u| u.as_str() == redirect_uri)
     {
         return client_refusal(&ClientError::RedirectUriNotAllowed);
+    }
+
+    // A code_challenge is single-use within 24 hours (stage 2, H): the
+    // profile's PKCE "must", defense in depth against a challenge-carrying
+    // interceptor. Last check before storing, so a refused push above does not
+    // burn the challenge a corrected retry carries.
+    match oauth::use_code_challenge(&state.pool, &code_challenge, now()).await {
+        Ok(true) => {}
+        Ok(false) => {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "this code_challenge has already been used within the last 24 hours",
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "recording a code_challenge failed");
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "could not store the request",
+            );
+        }
     }
 
     match oauth::push_request(
@@ -418,18 +487,19 @@ pub async fn authorize(
     };
 
     let Some(user) = session_user(&state, &headers).await else {
-        let next = format!(
-            "/oauth/atproto/authorize?{}",
-            form_urlencoded::Serializer::new(String::new())
-                .append_pair("client_id", &client_id)
-                .append_pair("request_uri", &request_uri)
-                .finish()
-        );
-        let query: String = form_urlencoded::Serializer::new(String::new())
-            .append_pair("next", &next)
-            .finish();
-        return Redirect::to(&format!("/login?{query}")).into_response();
+        return login_redirect(&client_id, &request_uri);
     };
+    // The hint is the account the client bound the session to (stage 2, H).
+    // A member logged in as someone else never sees the consent screen —
+    // they are sent to log in as the hinted account, the same redirect an
+    // anonymous arrival gets. Consenting as someone else would only surface
+    // later as the client's `sub` verification failure: a flow that completes
+    // and then breaks, rather than one that never misleads.
+    if let Some(hint) = pushed.login_hint.as_deref()
+        && !hint_names(&state, &user, hint)
+    {
+        return login_redirect(&client_id, &request_uri);
+    }
 
     let request_token = match state.provider_key.sign(&json!({
         "typ": "brolly:consent",
@@ -476,6 +546,45 @@ fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> String {
     }
     let separator = if redirect_uri.contains('?') { '&' } else { '?' };
     format!("{redirect_uri}{separator}{}", query.finish())
+}
+
+/// The login redirect an arrival that must (re-)authenticate gets (stage 2,
+/// H): the authorize URL as `next`, so the flow resumes as the member the
+/// `login_hint` named. The same shape for an anonymous arrival and for a
+/// member who is logged in as someone else — the hint is the account the
+/// *client* bound the session to, and only that account may consent.
+fn login_redirect(client_id: &str, request_uri: &str) -> Response {
+    let next = format!(
+        "/oauth/atproto/authorize?{}",
+        form_urlencoded::Serializer::new(String::new())
+            .append_pair("client_id", client_id)
+            .append_pair("request_uri", request_uri)
+            .finish()
+    );
+    let query: String = form_urlencoded::Serializer::new(String::new())
+        .append_pair("next", &next)
+        .finish();
+    Redirect::to(&format!("/login?{query}")).into_response()
+}
+
+/// Whether a `login_hint` names this member (stage 2, H): any of their
+/// identifier forms satisfies it — username, handle, either DID, email. The
+/// comparison is case-insensitive because the forms themselves are: emails are
+/// stored lowercased, handles and `did:web` hosts are case-insensitive
+/// hostnames, and `did:plc` DIDs are lowercase base32 by construction — so an
+/// exact comparison could only produce a redirect loop for the *right* member.
+fn hint_names(state: &AppState, user: &User, hint: &str) -> bool {
+    let hint = hint.trim().to_ascii_lowercase();
+    [
+        Some(user.username.clone()),
+        Some(format!("{}.{}", user.username, state.base_domain)),
+        user.did_plc.clone(),
+        Some(format!("did:web:{}.{}", user.username, state.base_domain)),
+        user.email.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|form| form.to_ascii_lowercase() == hint)
 }
 
 /// `POST /oauth/atproto/authorize`
@@ -539,6 +648,18 @@ pub async fn decide(
             "this request has expired or was already used",
         );
     };
+
+    // The authoritative hint check (stage 2, H), on the pair the spec names:
+    // `decide` compares the pushed `login_hint` against the consenting
+    // member. Unreachable in practice — `authorize` refuses to render (and so
+    // to mint a request token) for a mismatch — but the render-time check is
+    // UX, and this one is the rule: a stale or forged request token must not
+    // turn a hinted flow into someone else's session.
+    if let Some(hint) = pushed.login_hint.as_deref()
+        && !hint_names(&state, &user, hint)
+    {
+        return login_redirect(&pushed.client_id, request_uri);
+    }
 
     if form.decision.as_deref() != Some("allow") {
         let mut params = vec![("error", "access_denied")];
@@ -719,7 +840,15 @@ async fn code_grant(state: &AppState, form: TokenForm, jkt: &str) -> Response {
         );
     }
 
-    issue_pair(state, &grant.client_id, grant.user_id, &grant.scope, jkt).await
+    issue_pair(
+        state,
+        &grant.client_id,
+        grant.user_id,
+        &grant.scope,
+        jkt,
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
 }
 
 async fn refresh_grant(state: &AppState, form: TokenForm, jkt: &str) -> Response {
@@ -745,7 +874,29 @@ async fn refresh_grant(state: &AppState, form: TokenForm, jkt: &str) -> Response
             "this refresh token was issued to a different key",
         );
     }
-    issue_pair(state, &grant.client_id, grant.user_id, &grant.scope, jkt).await
+    // The session anchor (stage 2, G): rotation copied `anchored_at` forward,
+    // so the overall session lifetime is capped however much the client
+    // refreshes. The presented token itself may be fresh — minted seconds ago,
+    // weeks to run — and freshness launders nothing; the anchor refuses it.
+    // The presented token was spent above either way.
+    if time::OffsetDateTime::now_utc()
+        > grant.anchored_at + time::Duration::seconds_f64(oauth::SESSION_TTL_SECONDS)
+    {
+        return oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_grant",
+            "this session has passed its overall lifetime",
+        );
+    }
+    issue_pair(
+        state,
+        &grant.client_id,
+        grant.user_id,
+        &grant.scope,
+        jkt,
+        grant.anchored_at,
+    )
+    .await
 }
 
 async fn issue_pair(
@@ -754,6 +905,7 @@ async fn issue_pair(
     user_id: uuid::Uuid,
     scope: &str,
     jkt: &str,
+    anchored_at: time::OffsetDateTime,
 ) -> Response {
     let Ok(Some(user)) = db::find_by_id(&state.pool, user_id).await else {
         return oauth_error(
@@ -763,8 +915,26 @@ async fn issue_pair(
         );
     };
 
-    let access = oauth::issue_token(&state.pool, "access", client_id, user_id, scope, jkt).await;
-    let refresh = oauth::issue_token(&state.pool, "refresh", client_id, user_id, scope, jkt).await;
+    let access = oauth::issue_token(
+        &state.pool,
+        "access",
+        client_id,
+        user_id,
+        scope,
+        jkt,
+        anchored_at,
+    )
+    .await;
+    let refresh = oauth::issue_token(
+        &state.pool,
+        "refresh",
+        client_id,
+        user_id,
+        scope,
+        jkt,
+        anchored_at,
+    )
+    .await;
 
     match (access, refresh) {
         (Ok(access), Ok(refresh)) => {
@@ -781,6 +951,10 @@ async fn issue_pair(
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/.well-known/oauth-authorization-server", get(metadata))
+        .route(
+            "/.well-known/oauth-protected-resource",
+            get(protected_resource),
+        )
         .route("/oauth/atproto/par", post(par))
         .route("/oauth/atproto/authorize", get(authorize).post(decide))
         .route("/oauth/atproto/token", post(token))

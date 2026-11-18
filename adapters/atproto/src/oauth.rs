@@ -15,15 +15,32 @@
 
 use brolly_identity::db::{DbError, generate_secret, hash_secret};
 use sqlx::PgPool;
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 /// How long a pushed request stays redeemable. Short: the client redirects the
 /// member immediately.
 const PAR_TTL_SECONDS: f64 = 300.0;
 const CODE_TTL_SECONDS: f64 = 60.0;
-/// Access tokens are short and refreshed, unlike Mastodon's non-expiring ones.
-pub const ACCESS_TTL_SECONDS: f64 = 3600.0;
-const REFRESH_TTL_SECONDS: f64 = 60.0 * 60.0 * 24.0 * 90.0;
+/// Access tokens live a quarter hour (stage 2, G). The profile's hard cap is
+/// 30 minutes and its recommendation 5; brolly can revoke individual rows, but
+/// the only revocation *wired* today is revoke-all, so a stolen token
+/// realistically lives its full TTL — 900 s is the conservative end that keeps
+/// refresh chatter low (one refresh per quarter hour, not per five minutes).
+pub const ACCESS_TTL_SECONDS: f64 = 900.0;
+/// A public client's refresh tokens live two weeks (stage 2, G). Confidential
+/// clients earn 180 days (F, chunk 5); this is every client brolly accepts
+/// today.
+pub const REFRESH_TTL_SECONDS: f64 = 60.0 * 60.0 * 24.0 * 14.0;
+/// The overall cap on a public client's session (stage 2, G): `anchored_at`
+/// plus this is the last moment a refresh is answered. The profile caps
+/// "overall session lifetime **and** individual refresh tokens", and rotation
+/// alone caps only the second — the anchor, copied forward on every rotation,
+/// is what caps the first.
+pub const SESSION_TTL_SECONDS: f64 = 60.0 * 60.0 * 24.0 * 14.0;
+/// How long a spent code_challenge is remembered (stage 2, H): the profile's
+/// own window — "at least … a 24 hour period".
+pub const CODE_CHALLENGE_WINDOW_SECONDS: i64 = 24 * 60 * 60;
 
 /// A pushed authorization request.
 #[derive(Debug, Clone, sqlx::FromRow, PartialEq, Eq)]
@@ -166,8 +183,13 @@ pub struct Grant {
     pub client_id: String,
     pub scope: String,
     pub dpop_jkt: String,
+    /// The session's anchor (stage 2, G): set at the code grant, copied
+    /// forward on every rotation — the cap on overall session lifetime that
+    /// rotation alone cannot give.
+    pub anchored_at: OffsetDateTime,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn issue_token(
     pool: &PgPool,
     kind: &str,
@@ -175,6 +197,7 @@ pub async fn issue_token(
     user_id: Uuid,
     scope: &str,
     dpop_jkt: &str,
+    anchored_at: OffsetDateTime,
 ) -> Result<String, DbError> {
     let ttl = if kind == "refresh" {
         REFRESH_TTL_SECONDS
@@ -184,8 +207,9 @@ pub async fn issue_token(
     let token = generate_secret();
     sqlx::query(
         "INSERT INTO atproto_tokens
-           (token_hash, kind, client_id, user_id, scope, dpop_jkt, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, now() + make_interval(secs => $7))",
+           (token_hash, kind, client_id, user_id, scope, dpop_jkt, anchored_at,
+            expires_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, now() + make_interval(secs => $8))",
     )
     .bind(hash_secret(&token))
     .bind(kind)
@@ -193,6 +217,7 @@ pub async fn issue_token(
     .bind(user_id)
     .bind(scope)
     .bind(dpop_jkt)
+    .bind(anchored_at)
     .bind(ttl)
     .execute(pool)
     .await?;
@@ -210,7 +235,7 @@ pub async fn verify_token(
     token: &str,
 ) -> Result<Option<Grant>, DbError> {
     Ok(sqlx::query_as::<_, Grant>(
-        "SELECT user_id, client_id, scope, dpop_jkt FROM atproto_tokens
+        "SELECT user_id, client_id, scope, dpop_jkt, anchored_at FROM atproto_tokens
          WHERE token_hash = $1 AND kind = $2 AND revoked_at IS NULL AND expires_at > now()",
     )
     .bind(hash_secret(token))
@@ -219,13 +244,15 @@ pub async fn verify_token(
     .await?)
 }
 
-/// Spend a refresh token, so rotation makes theft visible.
+/// Spend a refresh token, so rotation makes theft visible. The anchor rides
+/// back with the grant (stage 2, G): the caller copies it onto the new pair,
+/// so rotation cannot reset it.
 pub async fn rotate_refresh(pool: &PgPool, token: &str) -> Result<Option<Grant>, DbError> {
     Ok(sqlx::query_as::<_, Grant>(
         "UPDATE atproto_tokens SET revoked_at = now()
          WHERE token_hash = $1 AND kind = 'refresh' AND revoked_at IS NULL
            AND expires_at > now()
-         RETURNING user_id, client_id, scope, dpop_jkt",
+         RETURNING user_id, client_id, scope, dpop_jkt, anchored_at",
     )
     .bind(hash_secret(token))
     .fetch_optional(pool)
@@ -241,4 +268,95 @@ pub async fn revoke_all_for_user(pool: &PgPool, user_id: Uuid) -> Result<u64, Db
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
+}
+
+// --- PKCE challenge reuse ---------------------------------------------------------
+
+/// Record a code_challenge and prune expired ones, in one statement — the
+/// `dpop_jti` pattern (S7).
+///
+/// `$2` is the prune cutoff and `$3` the row's expiry. Both come from the
+/// application's clock. No row back means the challenge was already used
+/// within the window.
+const SPEND_CHALLENGE: &str = "\
+    WITH pruned AS (DELETE FROM atproto_used_code_challenges WHERE expires_at < to_timestamp($2)) \
+    INSERT INTO atproto_used_code_challenges (code_challenge, expires_at) \
+    VALUES ($1, to_timestamp($3)) \
+    ON CONFLICT DO NOTHING \
+    RETURNING code_challenge";
+
+/// Refuse a `code_challenge` that has been used within the window (stage 2,
+/// H). The profile's PKCE section makes this a "must" — defense in depth
+/// against a challenge-carrying interceptor, and one indexed insert: the
+/// challenge value is itself a SHA-256, so it is its own primary key.
+///
+/// A challenge is spent only when the push stores: a request refused earlier
+/// (a bad redirect URI, a scope the client or the server refuses) must not
+/// burn the challenge a corrected retry carries.
+///
+/// `now` is the application's clock — the `dpop_jti` rule: the database's
+/// clock would let a running-ahead prune forget a row the application still
+/// counts. Returns `false` when the challenge was already used within the
+/// window; callers must treat that as a refusal.
+pub async fn use_code_challenge(
+    pool: &PgPool,
+    code_challenge: &str,
+    now: i64,
+) -> Result<bool, DbError> {
+    let recorded: Option<String> = sqlx::query_scalar(SPEND_CHALLENGE)
+        .bind(code_challenge)
+        .bind(now)
+        .bind(now.saturating_add(CODE_CHALLENGE_WINDOW_SECONDS))
+        .fetch_optional(pool)
+        .await?;
+    Ok(recorded.is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn access_tokens_live_a_quarter_hour() {
+        // `black_box` so the comparison is not folded away — the service_auth
+        // trap: a budget assertion that optimizes to nothing is worse than
+        // none, because it reads as covered. The number is the profile's own
+        // (its hard cap is 30 minutes); changing it is a deliberate act.
+        assert_eq!(
+            std::hint::black_box(ACCESS_TTL_SECONDS),
+            900.0,
+            "a longer access token is a stolen token that lives longer: the \
+             only revocation wired today is revoke-all"
+        );
+    }
+
+    #[test]
+    fn a_public_session_is_capped_at_a_fortnight() {
+        // Both halves of the profile's sentence: it caps "overall session
+        // lifetime **and** individual refresh tokens" — `SESSION_TTL` is the
+        // first (the anchor's cap), `REFRESH_TTL` the second. Equal today
+        // because public clients are every client; chunk 5 parts them.
+        assert_eq!(
+            std::hint::black_box(REFRESH_TTL_SECONDS),
+            60.0 * 60.0 * 24.0 * 14.0,
+            "a public client's refresh tokens live two weeks"
+        );
+        assert_eq!(
+            std::hint::black_box(SESSION_TTL_SECONDS),
+            60.0 * 60.0 * 24.0 * 14.0,
+            "rotation copies the anchor forward, so the overall session is \
+             capped at two weeks however much the client refreshes"
+        );
+    }
+
+    #[test]
+    fn a_spent_challenge_is_remembered_for_a_day() {
+        // The profile's own floor: "at least … a 24 hour period".
+        assert_eq!(
+            std::hint::black_box(CODE_CHALLENGE_WINDOW_SECONDS),
+            24 * 60 * 60,
+            "a shorter window re-opens the challenge-reuse hole the profile \
+             closes with its 24-hour floor"
+        );
+    }
 }

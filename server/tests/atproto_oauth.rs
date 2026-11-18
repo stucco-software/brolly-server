@@ -349,10 +349,16 @@ impl ClientLookup for CountingClients {
 }
 
 async fn a_logged_in_member(h: &Harness) -> String {
+    logged_in_as(h, "alice").await
+}
+
+/// A member logged in by name — the `login_hint` tests need someone logged in
+/// *as the wrong member* (2, H).
+async fn logged_in_as(h: &Harness, username: &str) -> String {
     db::create_user(
         &h.db.pool,
-        "alice",
-        None,
+        username,
+        Some(&format!("{username}@example.com")),
         "correct-horse-battery-staple",
         "member",
     )
@@ -365,9 +371,9 @@ async fn a_logged_in_member(h: &Harness) -> String {
             .uri("/login")
             .header(header::HOST, BASE)
             .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(
-                "username=alice&password=correct-horse-battery-staple",
-            ))
+            .body(Body::from(format!(
+                "username={username}&password=correct-horse-battery-staple"
+            )))
             .unwrap(),
     )
     .await;
@@ -381,6 +387,48 @@ fn request_token(html: &str) -> String {
         .unwrap_or_else(|| panic!("no token in {html}"))
         + marker.len();
     html[start..].split('"').next().unwrap().to_string()
+}
+
+/// A refresh request as a client sends one — the shape every anchored-session
+/// test presents (2, G).
+async fn refresh(h: &Harness, key: &p256::ecdsa::SigningKey, token: &str) -> Reply {
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", token)
+        .append_pair("client_id", CLIENT)
+        .finish();
+    send(
+        h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/token")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                proof(
+                    key,
+                    "POST",
+                    &format!("https://{BASE}/oauth/atproto/token"),
+                    None,
+                    Some(&nonce(h)),
+                ),
+            )
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await
+}
+
+/// Move a session's anchor back in time — the test's stand-in for the passage
+/// of days (2, G). The anchor is the session's property, so every row of it
+/// moves together.
+async fn anchor_days_ago(h: &Harness, days: i32) {
+    sqlx::query("UPDATE atproto_tokens SET anchored_at = now() - make_interval(days => $1)")
+        .bind(days)
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
 }
 
 /// The whole flow, returning the token response.
@@ -481,6 +529,20 @@ async fn the_metadata_advertises_mounted_endpoints_and_mandatory_par() {
     assert_eq!(doc["require_pushed_authorization_requests"], true);
     assert_eq!(doc["dpop_signing_alg_values_supported"][0], "ES256");
     assert_eq!(doc["code_challenge_methods_supported"][0], "S256");
+    // The two fields the draft's consumers read before their first PAR (2,
+    // E): the `iss` the redirect already emits, and the one
+    // client-authentication algorithm the profile requires.
+    assert_eq!(doc["authorization_response_iss_parameter_supported"], true);
+    assert_eq!(
+        doc["token_endpoint_auth_signing_alg_values_supported"],
+        serde_json::json!(["ES256"])
+    );
+    // What PAR enforces is what the metadata advertises (2, E): one constant,
+    // so the two cannot drift.
+    assert_eq!(
+        doc["scopes_supported"],
+        serde_json::json!(["atproto", "transition:generic"])
+    );
 
     // Every advertised endpoint must actually answer (ADR 0008).
     for key in [
@@ -940,7 +1002,14 @@ async fn a_par_proof_is_good_for_one_request() {
     );
     assert_eq!(replayed.json()["error"], "invalid_dpop_proof");
 
-    let fresh = push(&h, &key, &challenge).await;
+    // A fresh challenge for the fresh proof: the proof was the refused thing,
+    // and the challenge must not become the second refusal (2, H spends one
+    // per push).
+    let (_, second) = pkce();
+    let second = B64.encode(Sha256::digest(
+        format!("{second}-a-second-verifier").as_bytes(),
+    ));
+    let fresh = push(&h, &key, &second).await;
     assert_eq!(fresh.status, StatusCode::CREATED, "{}", fresh.body);
 }
 
@@ -1283,10 +1352,280 @@ async fn the_token_endpoint_answers_the_nonce_dance_too() {
 }
 
 #[tokio::test]
+async fn the_protected_resource_document_names_this_origin_alone() {
+    // 2, E: the draft's requirements, both of them — `authorization_servers`
+    // holds a single origin URL, no path, naming where OAuth happens. A client
+    // that finds this document is told where to go, not left guessing at an AS
+    // on some other host.
+    let h = harness().await;
+    let reply = send(
+        &h,
+        Request::builder()
+            .uri("/.well-known/oauth-protected-resource")
+            .header(header::HOST, BASE)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.body);
+    let doc = reply.json();
+
+    assert_eq!(doc["resource"], format!("https://{BASE}"));
+    let servers = doc["authorization_servers"]
+        .as_array()
+        .expect("authorization_servers is a list");
+    assert_eq!(servers.len(), 1, "one authorization server: this origin");
+    // Equal to `https://{BASE}` is the whole requirement: a bare origin, no
+    // path — the draft rejects an origin URL with one.
+    assert_eq!(servers[0], format!("https://{BASE}"));
+}
+
+#[tokio::test]
+async fn a_scope_the_server_does_not_grant_is_refused_at_push() {
+    // 2, E: requested ⊆ client-declared is not enough. A scope outside the
+    // server's `scopes_supported` — `transition:email`, which the client
+    // declares here — is refused `invalid_scope` at push time, not echoed in a
+    // token response the metadata then lies about.
+    let h = harness_with(Arc::new(
+        brolly_server::client_metadata::StaticClients::default()
+            .with(
+                CLIENT,
+                &serde_json::json!({
+                    "client_id": CLIENT,
+                    "client_name": "Example App",
+                    "redirect_uris": [REDIRECT],
+                    "scope": "atproto transition:generic transition:email",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "response_types": ["code"],
+                    "token_endpoint_auth_method": "none",
+                    "application_type": "web",
+                    "dpop_bound_access_tokens": true,
+                })
+                .to_string(),
+            )
+            .expect("app.example's metadata validates"),
+    ))
+    .await;
+
+    let (_, challenge) = pkce();
+    let reply = par_with(
+        &h,
+        &[
+            ("client_id", CLIENT),
+            ("redirect_uri", REDIRECT),
+            ("response_type", "code"),
+            ("scope", "atproto transition:email"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+        ],
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_scope");
+}
+
+#[tokio::test]
+async fn a_code_challenge_is_good_for_one_push_a_day_long() {
+    // 2, H: the profile's PKCE "must" — a challenge that already built one
+    // session must not build another within 24 hours, so a
+    // challenge-carrying interceptor gets nothing either.
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let first = push(&h, &client_key(), &challenge).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{}", first.body);
+
+    // A fresh proof, so the challenge is the refused thing here, not a
+    // replayed jti.
+    let second = push(&h, &client_key(), &challenge).await;
+    assert_eq!(second.status, StatusCode::BAD_REQUEST, "{}", second.body);
+    assert_eq!(second.json()["error"], "invalid_request");
+}
+
+#[tokio::test]
+async fn a_login_hint_naming_another_member_redirects_to_login_never_consent() {
+    // 2, H: the hint is the account the *client* bound the session to. A
+    // member logged in as someone else never sees the consent screen — they
+    // are sent to log in as the hinted account, the same `next` an anonymous
+    // arrival gets. Consenting as someone else would only surface later as
+    // the client's `sub` verification failure: a flow that completes and then
+    // breaks, rather than one that never misleads.
+    let h = harness().await;
+    let (_, challenge) = pkce();
+    let pushed = par_with(
+        &h,
+        &[
+            ("client_id", CLIENT),
+            ("redirect_uri", REDIRECT),
+            ("response_type", "code"),
+            ("scope", "atproto transition:generic"),
+            ("code_challenge", &challenge),
+            ("code_challenge_method", "S256"),
+            ("login_hint", "bob.brolly.test"),
+        ],
+    )
+    .await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "{}", pushed.body);
+    let request_uri = pushed.json()["request_uri"].as_str().unwrap().to_string();
+
+    // Alice is logged in; the hint names bob.
+    let cookie = a_logged_in_member(&h).await;
+    let reply = consent_page(&h, CLIENT, &request_uri, &cookie).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::SEE_OTHER,
+        "never consent: {}",
+        reply.body
+    );
+    let location = reply.location.expect("a redirect");
+    assert!(
+        location.starts_with("/login?"),
+        "to login, not consent: {location}"
+    );
+    let next: std::collections::HashMap<String, String> =
+        form_urlencoded::parse(location.split_once('?').unwrap().1.as_bytes())
+            .map(|(k, v)| (k.into_owned(), v.into_owned()))
+            .collect();
+    assert_eq!(
+        next["next"]
+            .split_once('?')
+            .expect("next is the authorize URL")
+            .0,
+        "/oauth/atproto/authorize",
+        "the same next an anonymous arrival gets"
+    );
+}
+
+#[tokio::test]
+async fn a_login_hint_matching_any_identifier_form_consents() {
+    // 2, H: any of the member's identifiers satisfies the hint — username,
+    // handle, either DID, email.
+    let h = harness().await;
+    let cookie = a_logged_in_member(&h).await;
+    let alice = db::find_by_username(&h.db.pool, "alice")
+        .await
+        .unwrap()
+        .expect("alice was created");
+    // A member without a stored `did:plc` still has the derived `did:web` —
+    // but the hint must match the stored form too, so give alice one.
+    let did_plc = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    db::set_did_plc(&h.db.pool, alice.id, &did_plc)
+        .await
+        .unwrap();
+    let handle = format!("alice.{BASE}");
+
+    for (i, hint) in [
+        "alice".to_string(),
+        handle.clone(),
+        did_plc,
+        format!("did:web:{handle}"),
+        "alice@example.com".to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // A distinct challenge per push — one challenge builds one session a
+        // day (2, H).
+        let challenge = B64.encode(Sha256::digest(
+            format!("verifier-{i}-for-hint-{hint}").as_bytes(),
+        ));
+        let pushed = par_with(
+            &h,
+            &[
+                ("client_id", CLIENT),
+                ("redirect_uri", REDIRECT),
+                ("response_type", "code"),
+                ("scope", "atproto transition:generic"),
+                ("code_challenge", &challenge),
+                ("code_challenge_method", "S256"),
+                ("login_hint", hint.as_str()),
+            ],
+        )
+        .await;
+        assert_eq!(
+            pushed.status,
+            StatusCode::CREATED,
+            "hint {hint}: {}",
+            pushed.body
+        );
+        let request_uri = pushed.json()["request_uri"].as_str().unwrap().to_string();
+        let consent = consent_page(&h, CLIENT, &request_uri, &cookie).await;
+        assert_eq!(
+            consent.status,
+            StatusCode::OK,
+            "hint {hint} consents: {}",
+            consent.body
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_public_refresh_past_two_weeks_from_anchored_at_is_refused() {
+    // 2, G: the anchor caps overall session lifetime, which rotation alone
+    // never could — the token itself has two weeks to run, and that launders
+    // nothing.
+    let h = harness().await;
+    let key = client_key();
+    let tokens = full_flow(&h, &key).await;
+    let token = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    anchor_days_ago(&h, 15).await;
+    let reply = refresh(&h, &key, &token).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn rotation_copies_the_anchor_forward_so_refreshing_launders_nothing() {
+    // The iat-freshness lesson (identity/src/dpop.rs tests) applied to
+    // sessions: a refresh token minted seconds ago still answers to the
+    // anchor its session was born with (2, G).
+    let h = harness().await;
+    let key = client_key();
+    let tokens = full_flow(&h, &key).await;
+    let token = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    // The session started a fortnight less a day ago: inside the cap, so the
+    // rotation is answered.
+    anchor_days_ago(&h, 13).await;
+    let anchor: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT anchored_at FROM atproto_tokens WHERE token_hash = $1")
+            .bind(db::hash_secret(&token))
+            .fetch_one(&h.db.pool)
+            .await
+            .unwrap();
+
+    let rotated = refresh(&h, &key, &token).await;
+    assert_eq!(rotated.status, StatusCode::OK, "{}", rotated.body);
+    let new_token = rotated.json()["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // The new pair carries the session's anchor forward, not `now()` — the
+    // copy is the whole cap: without it, rotation makes the session
+    // unlimited.
+    let carried: time::OffsetDateTime =
+        sqlx::query_scalar("SELECT anchored_at FROM atproto_tokens WHERE token_hash = $1")
+            .bind(db::hash_secret(&new_token))
+            .fetch_one(&h.db.pool)
+            .await
+            .unwrap();
+    assert_eq!(carried, anchor, "rotation must not reset the anchor");
+
+    // The anchor passes the cap. The new token is seconds old and fresh —
+    // and that launders nothing.
+    anchor_days_ago(&h, 15).await;
+    let refused = refresh(&h, &key, &new_token).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(refused.json()["error"], "invalid_grant");
+}
+
+#[tokio::test]
 async fn the_atproto_oauth_surface_is_apex_only() {
     let h = harness().await;
     for (method, path) in [
         ("GET", "/.well-known/oauth-authorization-server"),
+        ("GET", "/.well-known/oauth-protected-resource"),
         ("POST", "/oauth/atproto/par"),
         ("GET", "/oauth/atproto/authorize"),
         ("POST", "/oauth/atproto/token"),
