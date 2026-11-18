@@ -34,6 +34,9 @@ struct Harness {
     /// The firehose channel's sender, kept so a test can subscribe a witness
     /// of its own beside the sockets (1, G).
     commits: tokio::sync::broadcast::Sender<brolly_atproto::firehose::Event>,
+    /// The instance's nonce secret, kept so tests can mint the nonces a real
+    /// client would carry in its proofs' `nonce` claim (stage 2, C).
+    nonce_secret: [u8; 64],
 }
 
 async fn harness() -> Harness {
@@ -53,6 +56,9 @@ async fn harness() -> Harness {
         db.pool.clone(),
         commits.clone(),
     ));
+    let nonce_secret = brolly_identity::dpop::load_or_create_nonce_secret(&db.pool)
+        .await
+        .expect("nonce secret");
     let router = app(
         AppState {
             pool: db.pool.clone(),
@@ -83,6 +89,7 @@ async fn harness() -> Harness {
                 .await
                 .expect("instance actor"),
             ),
+            dpop_nonce_secret: nonce_secret,
             plc_client: None,
             commits: commits.clone(),
             // an_xrpc_write_proof_is_good_for_one_request pushes a PAR as this
@@ -129,6 +136,7 @@ async fn harness() -> Harness {
         router,
         stores,
         commits,
+        nonce_secret,
     }
 }
 
@@ -1199,8 +1207,26 @@ const OAUTH_CLIENT: &str = "https://app.example/client-metadata.json";
 const OAUTH_REDIRECT: &str = "https://app.example/cb";
 const OAUTH_SCOPE: &str = "atproto transition:generic";
 
-/// A DPoP proof, as a real client produces one.
-fn dpop_proof(key: &p256::ecdsa::SigningKey, method: &str, url: &str, ath: Option<&str>) -> String {
+/// The nonce a real client would carry in its proofs' `nonce` claim (stage
+/// 2, C): the current bucket's value for this harness's secret.
+fn nonce(h: &Harness) -> String {
+    brolly_identity::dpop::current_nonce(&h.nonce_secret, unix_now())
+}
+
+fn unix_now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+
+/// A DPoP proof, as a real client produces one. `None` for the nonce omits
+/// the claim — the shape a client that has not yet done the nonce dance
+/// presents, and the shape XRPC must answer with the DPoP challenge.
+fn dpop_proof(
+    key: &p256::ecdsa::SigningKey,
+    method: &str,
+    url: &str,
+    ath: Option<&str>,
+    nonce: Option<&str>,
+) -> String {
     let sec1 = key.verifying_key().to_sec1_bytes();
     let header = json!({
         "alg": "ES256", "typ": "dpop+jwt",
@@ -1210,10 +1236,13 @@ fn dpop_proof(key: &p256::ecdsa::SigningKey, method: &str, url: &str, ath: Optio
     let mut claims = json!({
         "htm": method, "htu": url,
         "jti": uuid::Uuid::new_v4().to_string(),
-        "iat": time::OffsetDateTime::now_utc().unix_timestamp(),
+        "iat": unix_now(),
     });
     if let Some(ath) = ath {
         claims["ath"] = json!(ath);
+    }
+    if let Some(nonce) = nonce {
+        claims["nonce"] = json!(nonce);
     }
     let signed = format!(
         "{}.{}",
@@ -1252,6 +1281,7 @@ async fn atproto_access_token(h: &Harness, cookie: &str, key: &p256::ecdsa::Sign
                     "POST",
                     &format!("https://{BASE}/oauth/atproto/par"),
                     None,
+                    Some(&nonce(h)),
                 ),
             )
             .body(Body::from(par))
@@ -1340,6 +1370,7 @@ async fn atproto_access_token(h: &Harness, cookie: &str, key: &p256::ecdsa::Sign
                     "POST",
                     &format!("https://{BASE}/oauth/atproto/token"),
                     None,
+                    Some(&nonce(h)),
                 ),
             )
             .body(Body::from(exchange))
@@ -1389,7 +1420,7 @@ async fn an_xrpc_write_proof_is_good_for_one_request() {
     let target = format!("https://{BASE}/xrpc/");
     let ath = B64.encode(Sha256::digest(token.as_bytes()));
 
-    let proof = dpop_proof(&key, "POST", &target, Some(&ath));
+    let proof = dpop_proof(&key, "POST", &target, Some(&ath), Some(&nonce(&h)));
     let first = create_with_token(&h, &token, &proof, "3kaaaaaaaaaab").await;
     assert_eq!(first.status, StatusCode::OK, "{}", first.text());
 
@@ -1403,8 +1434,73 @@ async fn an_xrpc_write_proof_is_good_for_one_request() {
     );
     assert_eq!(replayed.json()["error"], "AuthenticationRequired");
 
-    let fresh = dpop_proof(&key, "POST", &target, Some(&ath));
+    let fresh = dpop_proof(&key, "POST", &target, Some(&ath), Some(&nonce(&h)));
     let third = create_with_token(&h, &token, &fresh, "3kaaaaaaaaaac").await;
+    assert_eq!(third.status, StatusCode::OK, "{}", third.text());
+}
+
+#[tokio::test]
+async fn a_proof_without_a_nonce_gets_the_dpop_challenge_and_the_retry_works() {
+    // The RS-side dance (stage 2, C): the 401 carries RFC 9449's DPoP challenge
+    // in `WWW-Authenticate` and the fresh nonce in `DPoP-Nonce`, and the retry
+    // with that nonce in the proof's claim succeeds. The body stays coarse —
+    // the machine-readable detail is in the header.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let key = p256::ecdsa::SigningKey::from_slice(&[21u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &cookie, &key).await;
+    let target = format!("https://{BASE}/xrpc/");
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+
+    let bare = dpop_proof(&key, "POST", &target, Some(&ath), None);
+    let response = h
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/xrpc/com.atproto.repo.createRecord")
+                .header(header::HOST, BASE)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("DPoP {token}"))
+                .header("DPoP", &bare)
+                .body(Body::from(
+                    json!({
+                        "collection": "app.bsky.feed.post",
+                        "rkey": "3kaaaaaaaaaab",
+                        "record": {"$type": "app.bsky.feed.post", "text": "nonceless"},
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    let challenge = response
+        .headers()
+        .get(header::WWW_AUTHENTICATE)
+        .and_then(|v| v.to_str().ok())
+        .expect("the 401 carries the DPoP challenge");
+    assert!(
+        challenge.starts_with("DPoP error=\"use_dpop_nonce\""),
+        "the challenge names the retry: {challenge}"
+    );
+    let fresh = response
+        .headers()
+        .get("dpop-nonce")
+        .and_then(|v| v.to_str().ok())
+        .expect("the 401 carries the fresh nonce")
+        .to_string();
+    assert_eq!(
+        fresh,
+        nonce(&h),
+        "the handed-out nonce is one this instance minted"
+    );
+
+    // The retry, with the nonce in the proof's claim, lands.
+    let with_it = dpop_proof(&key, "POST", &target, Some(&ath), Some(&fresh));
+    let third = create_with_token(&h, &token, &with_it, "3kaaaaaaaaaab").await;
     assert_eq!(third.status, StatusCode::OK, "{}", third.text());
 }
 
@@ -1931,7 +2027,13 @@ async fn an_app_password_session_cannot_manage_app_passwords() {
             .header(header::AUTHORIZATION, format!("DPoP {token}"))
             .header(
                 "DPoP",
-                dpop_proof(&key, "POST", &format!("https://{BASE}/xrpc/"), Some(&ath)),
+                dpop_proof(
+                    &key,
+                    "POST",
+                    &format!("https://{BASE}/xrpc/"),
+                    Some(&ath),
+                    Some(&nonce(&h)),
+                ),
             )
             .body(Body::empty())
             .unwrap(),
@@ -2049,7 +2151,10 @@ async fn changing_a_password_ends_the_atproto_sessions() {
             .header(header::HOST, BASE)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::AUTHORIZATION, format!("DPoP {oauth_token}"))
-            .header("DPoP", dpop_proof(&key, "POST", &target, Some(&ath)))
+            .header(
+                "DPoP",
+                dpop_proof(&key, "POST", &target, Some(&ath), Some(&nonce(&h))),
+            )
             .body(Body::from(
                 json!({
                     "collection": "app.bsky.feed.post",

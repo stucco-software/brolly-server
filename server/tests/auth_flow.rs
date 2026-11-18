@@ -67,6 +67,7 @@ async fn harness_as(
                 .await
                 .expect("instance actor"),
         ),
+        dpop_nonce_secret: [0x42; 64],
         commits: tokio::sync::broadcast::channel(64).0,
         plc_client: None,
         clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),

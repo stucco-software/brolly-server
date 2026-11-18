@@ -62,11 +62,22 @@ fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "not found").into_response()
 }
 
-/// Verify and spend the DPoP proof on a request to one of these endpoints.
+/// A DPoP proof checked for one of these endpoints.
 ///
-/// Returns the key thumbprint the token will be bound to.
-/// `Option`, not `Result<_, Response>`: a `Response` is a large `Err` to
-/// carry, and both callers want the same error anyway — [`missing_proof`].
+/// The nonce failure gets its own arm (stage 2, C): it is the one refusal
+/// whose answer is a *retry*, with the fresh nonce the retry needs, so both
+/// endpoints must be able to tell it from any other bad proof.
+enum ProofCheck {
+    /// Verified and spent; carries the key thumbprint the token binds to.
+    Spent(String),
+    /// The proof carries no valid nonce: answer `use_dpop_nonce` with a fresh
+    /// one, and the client retries.
+    NeedNonce,
+    /// No usable proof: the refusal both endpoints already made.
+    Missing,
+}
+
+/// Verify and spend the DPoP proof on a request to one of these endpoints.
 ///
 /// The proof is spent before anything else about the request is checked, so a
 /// request refused later has still used it (see `Unspent::spend`). A failure to
@@ -77,26 +88,32 @@ async fn proof_thumbprint(
     headers: &HeaderMap,
     method: &str,
     path: &str,
-) -> Option<String> {
-    let proof = headers.get("dpop").and_then(|h| h.to_str().ok())?;
+) -> ProofCheck {
+    let Some(proof) = headers.get("dpop").and_then(|h| h.to_str().ok()) else {
+        return ProofCheck::Missing;
+    };
     let url = format!("https://{}{path}", state.base_domain);
     let at = now();
-    let unspent = match dpop::verify(proof, method, &url, None, at) {
+    // The ATProtocol profile requires nonces (stage 2, C): the current and
+    // previous bucket's values are the ones a proof may carry.
+    let accepted = dpop::accepted_nonces(&state.dpop_nonce_secret, at);
+    let unspent = match dpop::verify(proof, method, &url, None, at, Some(&accepted)) {
         Ok(unspent) => unspent,
+        Err(DpopError::NonceRequired) => return ProofCheck::NeedNonce,
         Err(e) => {
             tracing::warn!(error = %e, "DPoP proof rejected");
-            return None;
+            return ProofCheck::Missing;
         }
     };
     match unspent.spend(&state.pool, at).await {
-        Ok(verified) => Some(verified.thumbprint),
+        Ok(verified) => ProofCheck::Spent(verified.thumbprint),
         Err(DpopError::Storage(e)) => {
             tracing::error!(error = %e, "recording a DPoP proof failed");
-            None
+            ProofCheck::Missing
         }
         Err(e) => {
             tracing::warn!(error = %e, "DPoP proof refused");
-            None
+            ProofCheck::Missing
         }
     }
 }
@@ -107,6 +124,39 @@ fn missing_proof() -> Response {
         "invalid_dpop_proof",
         "ATProtocol requires a valid DPoP proof on this endpoint",
     )
+}
+
+/// The `DPoP-Nonce` header a response hands out: the current bucket's value
+/// (stage 2, C). `Ok`/`Err` rather than `expect` because that is the pattern
+/// `pod.rs`'s `challenge_response` set — and the fallback is a degraded but
+/// honest answer, not a panic. Unreachable in practice: base64url is always a
+/// legal header value.
+fn nonce_header(state: &AppState) -> Option<(header::HeaderName, header::HeaderValue)> {
+    let nonce = dpop::current_nonce(&state.dpop_nonce_secret, now());
+    let value = header::HeaderValue::from_str(&nonce).ok()?;
+    Some((header::HeaderName::from_static("dpop-nonce"), value))
+}
+
+/// The AS-side nonce dance (stage 2, C): a 400 naming the retry, plus the
+/// fresh nonce to retry with — the shape the reference's `UseDpopNonceError`
+/// builds. RFC 9449's flow, which clients are required to be resilient to.
+fn use_dpop_nonce(state: &AppState) -> Response {
+    match nonce_header(state) {
+        Some((name, value)) => (
+            StatusCode::BAD_REQUEST,
+            [(name, value)],
+            Json(json!({
+                "error": "use_dpop_nonce",
+                "error_description": "retry with this nonce in the proof's nonce claim",
+            })),
+        )
+            .into_response(),
+        None => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "use_dpop_nonce",
+            "retry with a fresh DPoP nonce",
+        ),
+    }
 }
 
 /// A client, or what it asked for, was refused.
@@ -204,8 +254,10 @@ pub async fn par(
     if wrong_host(&state, &headers) {
         return not_found();
     }
-    let Some(jkt) = proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/par").await else {
-        return missing_proof();
+    let jkt = match proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/par").await {
+        ProofCheck::Spent(jkt) => jkt,
+        ProofCheck::NeedNonce => return use_dpop_nonce(&state),
+        ProofCheck::Missing => return missing_proof(),
     };
     let form: ParForm = serde_urlencoded::from_bytes(&body).unwrap_or_default();
 
@@ -287,11 +339,22 @@ pub async fn par(
     )
     .await
     {
-        Ok(request_uri) => (
-            StatusCode::CREATED,
-            Json(json!({"request_uri": request_uri, "expires_in": 300})),
-        )
-            .into_response(),
+        // The 201 carries the nonce (stage 2, C): the profile's own flow —
+        // "including a DPoP nonce via HTTP header" — so the client stays
+        // current without waiting for a refusal to teach it.
+        Ok(request_uri) => match nonce_header(&state) {
+            Some((name, value)) => (
+                StatusCode::CREATED,
+                [(name, value)],
+                Json(json!({"request_uri": request_uri, "expires_in": 300})),
+            )
+                .into_response(),
+            None => (
+                StatusCode::CREATED,
+                Json(json!({"request_uri": request_uri, "expires_in": 300})),
+            )
+                .into_response(),
+        },
         Err(e) => {
             tracing::error!(error = %e, "storing a pushed request failed");
             oauth_error(
@@ -537,8 +600,10 @@ pub async fn token(
     if wrong_host(&state, &headers) {
         return not_found();
     }
-    let Some(jkt) = proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/token").await else {
-        return missing_proof();
+    let jkt = match proof_thumbprint(&state, &headers, "POST", "/oauth/atproto/token").await {
+        ProofCheck::Spent(jkt) => jkt,
+        ProofCheck::NeedNonce => return use_dpop_nonce(&state),
+        ProofCheck::Missing => return missing_proof(),
     };
     let form: TokenForm = serde_urlencoded::from_bytes(&body).unwrap_or_default();
 
@@ -553,8 +618,17 @@ pub async fn token(
     }
 }
 
-fn token_response(access: String, refresh: String, scope: &str, did: &str) -> Response {
-    (
+fn token_response(
+    state: &AppState,
+    access: String,
+    refresh: String,
+    scope: &str,
+    did: &str,
+) -> Response {
+    // The 200 carries the nonce (stage 2, C), keeping the client's nonce
+    // current across the session the way PAR's 201 does at its start.
+    let nonce = nonce_header(state);
+    let mut response = (
         StatusCode::OK,
         [
             (header::CACHE_CONTROL, "no-store"),
@@ -571,7 +645,11 @@ fn token_response(access: String, refresh: String, scope: &str, did: &str) -> Re
             "sub": did,
         })),
     )
-        .into_response()
+        .into_response();
+    if let Some((name, value)) = nonce {
+        response.headers_mut().insert(name, value);
+    }
+    response
 }
 
 fn did_of(user: &User, state: &AppState) -> String {
@@ -689,7 +767,9 @@ async fn issue_pair(
     let refresh = oauth::issue_token(&state.pool, "refresh", client_id, user_id, scope, jkt).await;
 
     match (access, refresh) {
-        (Ok(access), Ok(refresh)) => token_response(access, refresh, scope, &did_of(&user, state)),
+        (Ok(access), Ok(refresh)) => {
+            token_response(state, access, refresh, scope, &did_of(&user, state))
+        }
         _ => oauth_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "server_error",

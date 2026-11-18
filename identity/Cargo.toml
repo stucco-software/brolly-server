@@ -12,6 +12,8 @@ brolly-authz.workspace = true
 brolly-domain.workspace = true
 brolly-store.workspace = true
 hex = "0.4.3"
+# Time-bucketed DPoP nonces (RFC 9449 §8.1), keyed by the instance secret.
+hmac = "0.13.0"
 rand = "0.10.2"
 sha2 = "0.11.0"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "migrate", "uuid", "time", "macros"] }

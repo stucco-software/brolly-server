@@ -4,8 +4,11 @@
 <!-- The spec names files and tables this stage creates, so not every path it
      cites resolves until it's implemented. -->
 
-**Status:** Draft, 2026-10-09, five chunks. Drafted 2026-10-09 and revised the
-same day after one adversarial review against the ATProtocol OAuth and HTTP API
+**Status:** Chunks 1–2 implemented 2026-11-17 (legacy sessions + app passwords;
+DPoP nonces — the secret table, `verify`'s nonce parameter, `use_dpop_nonce` at
+PAR/token, the XRPC 401 challenge, the CORS expose). Chunks 3–5 remain. Drafted
+2026-10-09, five chunks, and revised the same day after one adversarial review
+against the ATProtocol OAuth and HTTP API
 (XRPC) specifications (atproto.com, as of this date), the `com.atproto.server`
 lexicons (`createSession`, `getSession`, `refreshSession`, `deleteSession`,
 `createAppPassword`, `listAppPasswords`, `revokeAppPassword`, `getServiceAuth`)

@@ -57,6 +57,9 @@ fn app_example() -> StaticClients {
 struct Harness {
     db: brolly_test_support::TestDb,
     _dir: tempfile::TempDir,
+    /// The instance's nonce secret, kept so tests can mint the nonces a real
+    /// client would receive in a `DPoP-Nonce` header (stage 2, C).
+    nonce_secret: [u8; 64],
     router: axum::Router,
 }
 
@@ -75,6 +78,9 @@ async fn harness_with(
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
+    let nonce_secret = brolly_identity::dpop::load_or_create_nonce_secret(&db.pool)
+        .await
+        .expect("nonce secret");
     let router = app(
         AppState {
             pool: db.pool.clone(),
@@ -107,6 +113,7 @@ async fn harness_with(
                 .await
                 .expect("instance actor"),
             ),
+            dpop_nonce_secret: nonce_secret,
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
             clients,
@@ -123,6 +130,7 @@ async fn harness_with(
     Harness {
         db,
         _dir: dir,
+        nonce_secret,
         router,
     }
 }
@@ -132,6 +140,9 @@ struct Reply {
     body: String,
     location: Option<String>,
     cookies: Vec<String>,
+    /// The `DPoP-Nonce` a response hands out (stage 2, C) — `None` when the
+    /// response carries no nonce, which is itself an assertion the tests make.
+    dpop_nonce: Option<String>,
 }
 
 impl Reply {
@@ -162,6 +173,11 @@ async fn send(h: &Harness, request: Request<Body>) -> Reply {
         .iter()
         .filter_map(|v| v.to_str().ok().map(str::to_string))
         .collect();
+    let dpop_nonce = response
+        .headers()
+        .get("dpop-nonce")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body = String::from_utf8_lossy(&response.into_body().collect().await.unwrap().to_bytes())
         .to_string();
     Reply {
@@ -169,6 +185,7 @@ async fn send(h: &Harness, request: Request<Body>) -> Reply {
         body,
         location,
         cookies,
+        dpop_nonce,
     }
 }
 
@@ -176,8 +193,22 @@ fn now() -> i64 {
     time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
-/// A DPoP proof, as a real client produces one.
-fn proof(key: &SigningKey, method: &str, url: &str, ath: Option<&str>) -> String {
+/// The nonce a real client would have received in a `DPoP-Nonce` header
+/// (stage 2, C): the current bucket's value for this harness's secret.
+fn nonce(h: &Harness) -> String {
+    brolly_identity::dpop::current_nonce(&h.nonce_secret, now())
+}
+
+/// A DPoP proof, as a real client produces one. `None` for the nonce omits
+/// the claim — the shape a client that has not yet done the nonce dance
+/// presents, and the shape the endpoints must answer `use_dpop_nonce` to.
+fn proof(
+    key: &SigningKey,
+    method: &str,
+    url: &str,
+    ath: Option<&str>,
+    nonce: Option<&str>,
+) -> String {
     let sec1 = key.verifying_key().to_sec1_bytes();
     let header = serde_json::json!({
         "alg": "ES256", "typ": "dpop+jwt",
@@ -190,6 +221,9 @@ fn proof(key: &SigningKey, method: &str, url: &str, ath: Option<&str>) -> String
     });
     if let Some(ath) = ath {
         claims["ath"] = serde_json::Value::String(ath.to_string());
+    }
+    if let Some(nonce) = nonce {
+        claims["nonce"] = serde_json::Value::String(nonce.to_string());
     }
     let signed = format!(
         "{}.{}",
@@ -220,6 +254,7 @@ async fn push(h: &Harness, key: &SigningKey, challenge: &str) -> Reply {
         "POST",
         &format!("https://{BASE}/oauth/atproto/par"),
         None,
+        Some(&nonce(h)),
     );
     push_with_proof(h, &dpop, challenge).await
 }
@@ -270,6 +305,7 @@ async fn par_with(h: &Harness, fields: &[(&str, &str)]) -> Reply {
                     "POST",
                     &format!("https://{BASE}/oauth/atproto/par"),
                     None,
+                    Some(&nonce(h)),
                 ),
             )
             .body(Body::from(form.finish()))
@@ -414,6 +450,7 @@ async fn full_flow(h: &Harness, key: &SigningKey) -> serde_json::Value {
                     "POST",
                     &format!("https://{BASE}/oauth/atproto/token"),
                     None,
+                    Some(&nonce(h)),
                 ),
             )
             .body(Body::from(body))
@@ -518,6 +555,94 @@ async fn a_pushed_request_requires_a_dpop_proof() {
 }
 
 #[tokio::test]
+async fn a_proof_without_a_nonce_gets_use_dpop_nonce_and_a_fresh_one() {
+    // The AS-side dance (stage 2, C): the 400 names the retry and carries the
+    // nonce to retry with, and the retry succeeds. RFC 9449's own flow, which
+    // every client is required to be resilient to — a first proof without a
+    // nonce is how every session starts against a server it hasn't seen.
+    let h = harness().await;
+    let key = client_key();
+    let (_, challenge) = pkce();
+
+    let bare = proof(
+        &key,
+        "POST",
+        &format!("https://{BASE}/oauth/atproto/par"),
+        None,
+        None,
+    );
+    let refused = push_with_proof(&h, &bare, &challenge).await;
+    assert_eq!(refused.status, StatusCode::BAD_REQUEST, "{}", refused.body);
+    assert_eq!(refused.json()["error"], "use_dpop_nonce");
+    let fresh = refused
+        .dpop_nonce
+        .as_deref()
+        .expect("the refusal carries the nonce to retry with");
+    // The handed-out nonce is one this instance's secret produced.
+    assert_eq!(fresh, nonce(&h));
+
+    // The retry, with the nonce in the proof's claim, is the same session.
+    let retry = proof(
+        &key,
+        "POST",
+        &format!("https://{BASE}/oauth/atproto/par"),
+        None,
+        Some(fresh),
+    );
+    let pushed = push_with_proof(&h, &retry, &challenge).await;
+    assert_eq!(pushed.status, StatusCode::CREATED, "{}", pushed.body);
+    // The 201 carries the nonce too (stage 2, C): the profile's own flow, so a
+    // client that never meets a refusal stays current anyway.
+    assert!(pushed.dpop_nonce.is_some());
+}
+
+#[tokio::test]
+async fn a_nonce_two_buckets_old_is_refused_at_par() {
+    // One stale generation is the in-flight allowance; two is a refusal, and
+    // the refusal is the nonce dance again — not a generic bad proof.
+    let h = harness().await;
+    let key = client_key();
+    let (_, challenge) = pkce();
+    let stale = brolly_identity::dpop::current_nonce(
+        &h.nonce_secret,
+        now() - 2 * brolly_identity::dpop::NONCE_BUCKET_SECONDS,
+    );
+
+    let proof_with_it = proof(
+        &key,
+        "POST",
+        &format!("https://{BASE}/oauth/atproto/par"),
+        None,
+        Some(&stale),
+    );
+    let reply = push_with_proof(&h, &proof_with_it, &challenge).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "use_dpop_nonce");
+    assert!(reply.dpop_nonce.is_some(), "the retry nonce is attached");
+}
+
+#[tokio::test]
+async fn a_nonce_from_a_foreign_secret_is_refused_at_par() {
+    // Only this instance's secret produces the values it accepts — a nonce
+    // from another server (or a client's guess) is the dance, not a pass.
+    let h = harness().await;
+    let key = client_key();
+    let (_, challenge) = pkce();
+    let foreign = brolly_identity::dpop::current_nonce(&[0xAB; 64], now());
+
+    let proof_with_it = proof(
+        &key,
+        "POST",
+        &format!("https://{BASE}/oauth/atproto/par"),
+        None,
+        Some(&foreign),
+    );
+    let reply = push_with_proof(&h, &proof_with_it, &challenge).await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "use_dpop_nonce");
+}
+
+#[tokio::test]
 async fn a_client_id_that_is_not_a_fetchable_url_is_refused() {
     // Without a fetchable metadata document there is nothing to hold the
     // client to its declared redirect URIs.
@@ -546,6 +671,7 @@ async fn a_client_id_that_is_not_a_fetchable_url_is_refused() {
                     "POST",
                     &format!("https://{BASE}/oauth/atproto/par"),
                     None,
+                    Some(&nonce(&h)),
                 ),
             )
             .body(Body::from(body))
@@ -799,6 +925,7 @@ async fn a_par_proof_is_good_for_one_request() {
         "POST",
         &format!("https://{BASE}/oauth/atproto/par"),
         None,
+        Some(&nonce(&h)),
     );
 
     let first = push_with_proof(&h, &dpop, &challenge).await;
@@ -931,6 +1058,7 @@ async fn the_token_is_bound_to_the_key_that_pushed_the_request() {
                     "POST",
                     &format!("https://{BASE}/oauth/atproto/token"),
                     None,
+                    Some(&nonce(&h)),
                 ),
             )
             .body(Body::from(body))
@@ -1063,6 +1191,7 @@ async fn a_refresh_rotates_and_the_old_token_dies() {
                     "POST",
                     &format!("https://{BASE}/oauth/atproto/token"),
                     None,
+                    Some(&nonce(&h)),
                 ),
             )
             .body(Body::from(body))
@@ -1079,6 +1208,78 @@ async fn a_refresh_rotates_and_the_old_token_dies() {
         StatusCode::BAD_REQUEST,
         "a spent refresh token must not work twice"
     );
+}
+
+#[tokio::test]
+async fn the_token_endpoint_answers_the_nonce_dance_too() {
+    // The token endpoint shares `proof_thumbprint` with PAR, so the nonce
+    // applies there too — the AS-side shape, the fresh nonce attached. This is
+    // the endpoint an access-token expiry drives every client back to, so a
+    // nonce that lapsed across the session's life is the common case.
+    let h = harness().await;
+    let key = client_key();
+    let tokens = full_flow(&h, &key).await;
+    let refresh = tokens["refresh_token"].as_str().unwrap().to_string();
+
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", &refresh)
+        .append_pair("client_id", CLIENT)
+        .finish();
+    let bare = proof(
+        &key,
+        "POST",
+        &format!("https://{BASE}/oauth/atproto/token"),
+        None,
+        None,
+    );
+    let reply = send(
+        &h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/token")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("DPoP", bare)
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{}", reply.body);
+    assert_eq!(reply.json()["error"], "use_dpop_nonce");
+    let fresh = reply
+        .dpop_nonce
+        .as_deref()
+        .expect("the refusal carries the nonce to retry with");
+
+    // The retry succeeds, and the 200 carries the nonce too (stage 2, C),
+    // keeping the client current for the next round.
+    let body = form_urlencoded::Serializer::new(String::new())
+        .append_pair("grant_type", "refresh_token")
+        .append_pair("refresh_token", &refresh)
+        .append_pair("client_id", CLIENT)
+        .finish();
+    let with_it = proof(
+        &key,
+        "POST",
+        &format!("https://{BASE}/oauth/atproto/token"),
+        None,
+        Some(fresh),
+    );
+    let retry = send(
+        &h,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/atproto/token")
+            .header(header::HOST, BASE)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("DPoP", with_it)
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(retry.status, StatusCode::OK, "{}", retry.body);
+    assert!(retry.dpop_nonce.is_some(), "the 200 carries the nonce");
 }
 
 #[tokio::test]

@@ -28,6 +28,16 @@
 //! records the proof's `jti`. A call site can't read the key thumbprint, or a
 //! bound Solid token's claims, without spending the proof first.
 //!
+//! A proof may also carry a **nonce** (RFC 9449 §8.1) — a value the server
+//! hands out and later demands, which is what stops a client from minting a
+//! pile of proofs in advance. Nonces are per-protocol: ATProtocol's profile
+//! requires them, Solid-OIDC does not, so [`verify`] takes the accepted
+//! values as an optional argument and the check is simply off when it is
+//! `None`. The values themselves are time buckets keyed by an instance
+//! secret ([`current_nonce`], [`accepted_nonces`]) — HMACs rather than stored
+//! rows, so any process of the instance verifies the same nonces with no
+//! hot-path storage and no rotation job.
+//!
 //! That guarantee covers only what arrives inside the `Unspent`. A caller that
 //! learns something from elsewhere before checking the proof is not held to it
 //! by the compiler: XRPC's `token_caller` gets the grant, and so the `user_id`,
@@ -36,6 +46,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
+use hmac::{KeyInit, Mac, SimpleHmac};
 use p256::ecdsa::signature::Verifier;
 use p256::ecdsa::{Signature, VerifyingKey};
 use serde::Deserialize;
@@ -56,6 +67,13 @@ pub const MAX_AGE_SECONDS: i64 = 60;
 /// storage fault.
 pub const MAX_JTI_BYTES: usize = 256;
 
+/// How long one nonce value is handed out for, in seconds (stage 2, C).
+///
+/// RFC 9449 leaves nonce rotation to the server; the ATProtocol profile caps
+/// it at five minutes. Time buckets of this width give exactly that: no value
+/// is served for longer than one bucket, and rotation needs no job.
+pub const NONCE_BUCKET_SECONDS: i64 = 300;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DpopError {
     Malformed(String),
@@ -73,6 +91,11 @@ pub enum DpopError {
     TokenBindingFailed,
     /// This key has already presented a proof with this `jti`.
     Replayed,
+    /// The proof carries no `nonce` claim, or one this server did not issue.
+    ///
+    /// Both cases get the same answer — the retry is the client's, with a
+    /// fresh nonce the refusal hands it — so they share a variant.
+    NonceRequired,
     /// The proof could not be recorded, so it is not accepted.
     ///
     /// Holds the message rather than the `sqlx::Error`, so this enum can stay
@@ -93,6 +116,7 @@ impl std::fmt::Display for DpopError {
             DpopError::Expired => write!(f, "DPoP proof is outside the freshness window"),
             DpopError::TokenBindingFailed => write!(f, "DPoP proof is not bound to this token"),
             DpopError::Replayed => write!(f, "DPoP proof has already been used"),
+            DpopError::NonceRequired => write!(f, "DPoP proof carries no valid nonce"),
             DpopError::Storage(e) => write!(f, "could not record the DPoP proof: {e}"),
         }
     }
@@ -124,6 +148,8 @@ struct Claims {
     iat: i64,
     #[serde(default)]
     ath: Option<String>,
+    #[serde(default)]
+    nonce: Option<String>,
 }
 
 /// A verified proof.
@@ -277,6 +303,84 @@ pub fn access_token_hash(access_token: &str) -> String {
     B64.encode(Sha256::digest(access_token.as_bytes()))
 }
 
+/// The nonce for one time bucket: `base64url(HMAC-SHA256(secret, bucket))`.
+///
+/// The bucket is the decimal seconds-elapsed string. The encoding is internal
+/// to the instance — a client treats the nonce as opaque — but it is stable
+/// across processes, which is the one property it must have.
+///
+/// The secret is exactly SHA-256's block size, so `KeyInit::new` takes it
+/// with no slicing and no error path.
+fn nonce_for_bucket(secret: &[u8; 64], bucket: i64) -> String {
+    let mut mac = SimpleHmac::<Sha256>::new(secret.into());
+    mac.update(bucket.to_string().as_bytes());
+    B64.encode(mac.finalize().into_bytes())
+}
+
+/// The nonce to hand out right now: the current bucket's value (stage 2, C).
+///
+/// This is the value a `DPoP-Nonce` response header carries, and the value a
+/// client puts in the next proof's `nonce` claim.
+pub fn current_nonce(secret: &[u8; 64], now: i64) -> String {
+    nonce_for_bucket(secret, now.div_euclid(NONCE_BUCKET_SECONDS))
+}
+
+/// The nonce values a proof may carry right now (stage 2, C).
+///
+/// The current bucket's and the previous one's. Accepting the previous is the
+/// ATProtocol profile's "recently-stale" allowance: a proof minted in the
+/// last second of a bucket stays verifiable through the next one, so every
+/// request in flight survives the boundary. Two buckets is a refusal — the
+/// `iat` window is what bounds freshness, and it never launders a nonce.
+pub fn accepted_nonces(secret: &[u8; 64], now: i64) -> [String; 2] {
+    let bucket = now.div_euclid(NONCE_BUCKET_SECONDS);
+    [
+        nonce_for_bucket(secret, bucket),
+        nonce_for_bucket(secret, bucket - 1),
+    ]
+}
+
+/// Load the instance's DPoP nonce secret, creating it on first start.
+///
+/// One row, one secret, `ON CONFLICT DO NOTHING` then read back — the
+/// `load_or_create` pattern `instance.rs` established, so two processes
+/// starting together converge on one secret rather than one of them handing
+/// out nonces from a key that was never stored.
+pub async fn load_or_create_nonce_secret(pool: &PgPool) -> Result<[u8; 64], DpopError> {
+    if let Some(secret) = read_nonce_secret(pool).await? {
+        return Ok(secret);
+    }
+    let secret: [u8; 64] = rand::random();
+    sqlx::query(
+        "INSERT INTO dpop_nonce_secrets (id, secret) VALUES (1, $1) \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(secret.as_slice())
+    .execute(pool)
+    .await
+    .map_err(|e| DpopError::Storage(e.to_string()))?;
+    read_nonce_secret(pool).await?.ok_or(DpopError::Storage(
+        "the nonce secret did not appear after inserting it".into(),
+    ))
+}
+
+async fn read_nonce_secret(pool: &PgPool) -> Result<Option<[u8; 64]>, DpopError> {
+    let stored: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT secret FROM dpop_nonce_secrets WHERE id = 1")
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| DpopError::Storage(e.to_string()))?;
+    // A row of any other length is a corrupted one, and a startup failure is
+    // the honest answer: every nonce it minted would be a guess.
+    stored
+        .map(|bytes| {
+            bytes
+                .try_into()
+                .map_err(|_| DpopError::Storage("the stored nonce secret is not 64 bytes".into()))
+        })
+        .transpose()
+}
+
 fn verifying_key(jwk: &PublicJwk) -> Result<VerifyingKey, DpopError> {
     if jwk.kty != "EC" || jwk.crv != "P-256" {
         return Err(DpopError::UnsupportedAlgorithm(format!(
@@ -311,6 +415,12 @@ fn verifying_key(jwk: &PublicJwk) -> Result<VerifyingKey, DpopError> {
 /// carries must match it (a proof without one is accepted), and `None` at the
 /// token endpoint, where there is no token to bind to yet.
 ///
+/// `accepted_nonces` is `Some` where the protocol requires nonces —
+/// ATProtocol does (stage 2, C); Solid-OIDC does not, and passes `None` to
+/// leave that check off entirely. When it is `Some`, the proof's `nonce`
+/// claim must be present and one of the accepted values, or the proof is
+/// refused as [`DpopError::NonceRequired`].
+///
 /// Passing every check here doesn't make the proof usable yet. It has not been
 /// checked for replay, so it comes back [`Unspent`].
 pub fn verify(
@@ -319,6 +429,7 @@ pub fn verify(
     url: &str,
     access_token: Option<&str>,
     now: i64,
+    accepted_nonces: Option<&[String]>,
 ) -> Result<Unspent<VerifiedProof>, DpopError> {
     let mut parts = proof.split('.');
     let (Some(header_b64), Some(claims_b64), Some(signature_b64), None) =
@@ -391,6 +502,21 @@ pub fn verify(
         _ => {}
     }
 
+    // The nonce is a separate check with a separate window: the `iat` bound
+    // above judges the *proof*, this judges the *nonce* — a fresh `iat`
+    // wrapping a stale nonce is exactly the pair that must not slip through.
+    // The accepted values are handed out by this server (`current_nonce`),
+    // which is why a plain comparison suffices: the values are public, and
+    // only this server's secret can produce the ones that pass.
+    if let Some(accepted) = accepted_nonces
+        && !claims
+            .nonce
+            .as_deref()
+            .is_some_and(|nonce| accepted.iter().any(|a| a == nonce))
+    {
+        return Err(DpopError::NonceRequired);
+    }
+
     let jkt = thumbprint(&header.jwk);
     Ok(Unspent {
         value: VerifiedProof {
@@ -426,6 +552,50 @@ mod tests {
         typ: &str,
     ) -> String {
         make_proof_with_jti(key, method, url, iat, ath, typ, "unique")
+    }
+
+    /// A proof carrying a `nonce` claim, as an ATProtocol client produces one
+    /// (stage 2, C).
+    fn make_nonce_proof(
+        key: &SigningKey,
+        method: &str,
+        url: &str,
+        iat: i64,
+        ath: Option<&str>,
+        nonce: Option<&str>,
+    ) -> String {
+        let proof = make_proof(key, method, url, iat, ath, "dpop+jwt");
+        let Some(nonce) = nonce else {
+            return proof;
+        };
+        // Rebuild the claims with the nonce and re-sign: the proof is a
+        // signature over the claims, so the claim cannot be added after.
+        let parts: Vec<&str> = proof.split('.').collect();
+        let mut claims: serde_json::Value =
+            serde_json::from_slice(&B64.decode(parts[1]).unwrap()).unwrap();
+        claims["nonce"] = serde_json::Value::String(nonce.to_string());
+        let signed = format!(
+            "{}.{}",
+            parts[0],
+            B64.encode(serde_json::to_vec(&claims).unwrap())
+        );
+        let signature: Signature = key.sign(signed.as_bytes());
+        format!("{signed}.{}", B64.encode(signature.to_bytes()))
+    }
+
+    /// `verify` in the Solid-OIDC shape: no nonces, the check off entirely.
+    ///
+    /// The pre-nonce tests keep calling this so that the one behaviour this
+    /// change must not alter — Solid — stays pinned by exactly these tests,
+    /// untouched.
+    fn verify_solid(
+        proof: &str,
+        method: &str,
+        url: &str,
+        access_token: Option<&str>,
+        now: i64,
+    ) -> Result<Unspent<VerifiedProof>, DpopError> {
+        verify(proof, method, url, access_token, now, None)
     }
 
     fn make_proof_with_jti(
@@ -493,7 +663,7 @@ mod tests {
             Some(&access_token_hash(token)),
             "dpop+jwt",
         );
-        let verified = verify(&proof, "GET", URL, Some(token), 1000).unwrap();
+        let verified = verify_solid(&proof, "GET", URL, Some(token), 1000).unwrap();
         assert!(verified.bound_to(&jkt_of(&key())));
     }
 
@@ -509,7 +679,7 @@ mod tests {
             "dpop+jwt",
         );
         assert!(
-            verify(
+            verify_solid(
                 &proof,
                 "POST",
                 "https://brolly.id/oauth/solid/token",
@@ -526,7 +696,7 @@ mod tests {
         // (3.x through 5.x), and the reference server checks it only when it
         // is present. Requiring it locked every one of those apps out.
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
-        assert!(verify(&proof, "GET", URL, Some("access-token"), 1000).is_ok());
+        assert!(verify_solid(&proof, "GET", URL, Some("access-token"), 1000).is_ok());
     }
 
     #[test]
@@ -542,7 +712,7 @@ mod tests {
             "dpop+jwt",
         );
         assert_eq!(
-            verify(&proof, "GET", URL, Some("access-token"), 1000).err(),
+            verify_solid(&proof, "GET", URL, Some("access-token"), 1000).err(),
             Some(DpopError::TokenBindingFailed)
         );
     }
@@ -551,11 +721,11 @@ mod tests {
     fn a_proof_for_another_method_or_url_is_refused() {
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
         assert!(matches!(
-            verify(&proof, "DELETE", URL, None, 1000),
+            verify_solid(&proof, "DELETE", URL, None, 1000),
             Err(DpopError::WrongTarget { .. })
         ));
         assert!(matches!(
-            verify(&proof, "GET", "https://alice.brolly.id/~/other", None, 1000),
+            verify_solid(&proof, "GET", "https://alice.brolly.id/~/other", None, 1000),
             Err(DpopError::WrongTarget { .. })
         ));
     }
@@ -564,18 +734,18 @@ mod tests {
     fn query_and_fragment_are_ignored_when_matching_htu() {
         // RFC 9449 compares the URL without query or fragment.
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
-        assert!(verify(&proof, "GET", &format!("{URL}?page=2"), None, 1000).is_ok());
+        assert!(verify_solid(&proof, "GET", &format!("{URL}?page=2"), None, 1000).is_ok());
     }
 
     #[test]
     fn a_stale_or_future_proof_is_refused() {
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
         assert_eq!(
-            verify(&proof, "GET", URL, None, 5000).err(),
+            verify_solid(&proof, "GET", URL, None, 5000).err(),
             Some(DpopError::Expired)
         );
         assert_eq!(
-            verify(&proof, "GET", URL, None, 0).err(),
+            verify_solid(&proof, "GET", URL, None, 0).err(),
             Some(DpopError::Expired)
         );
     }
@@ -590,7 +760,7 @@ mod tests {
         for iat in [i64::MIN, i64::MAX, i64::MIN + 1] {
             let proof = make_proof(&key(), "GET", URL, iat, None, "dpop+jwt");
             assert_eq!(
-                verify(&proof, "GET", URL, None, 1_000).err(),
+                verify_solid(&proof, "GET", URL, None, 1_000).err(),
                 Some(DpopError::Expired),
                 "iat = {iat}"
             );
@@ -601,7 +771,7 @@ mod tests {
     fn a_plain_jwt_is_not_a_proof() {
         let proof = make_proof(&key(), "GET", URL, 1000, None, "JWT");
         assert_eq!(
-            verify(&proof, "GET", URL, None, 1000).err(),
+            verify_solid(&proof, "GET", URL, None, 1000).err(),
             Some(DpopError::WrongType)
         );
     }
@@ -618,7 +788,7 @@ mod tests {
         );
         parts[1] = &forged;
         assert_eq!(
-            verify(&parts.join("."), "DELETE", URL, None, 1000).err(),
+            verify_solid(&parts.join("."), "DELETE", URL, None, 1000).err(),
             Some(DpopError::BadSignature)
         );
     }
@@ -631,11 +801,19 @@ mod tests {
         assert_ne!(mine, theirs, "the jkt must identify the key");
 
         let a = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
-        assert!(verify(&a, "GET", URL, None, 1000).unwrap().bound_to(&mine));
-        assert!(verify(&a, "GET", URL, None, 1000).unwrap().bound_to(&mine));
+        assert!(
+            verify_solid(&a, "GET", URL, None, 1000)
+                .unwrap()
+                .bound_to(&mine)
+        );
+        assert!(
+            verify_solid(&a, "GET", URL, None, 1000)
+                .unwrap()
+                .bound_to(&mine)
+        );
 
         let b = make_proof(&other, "GET", URL, 1000, None, "dpop+jwt");
-        let different = verify(&b, "GET", URL, None, 1000).unwrap();
+        let different = verify_solid(&b, "GET", URL, None, 1000).unwrap();
         assert!(different.bound_to(&theirs));
         assert!(!different.bound_to(&mine));
     }
@@ -643,7 +821,7 @@ mod tests {
     #[test]
     fn a_verified_proof_carries_what_spending_it_needs() {
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
-        let unspent = verify(&proof, "GET", URL, None, 1000).unwrap();
+        let unspent = verify_solid(&proof, "GET", URL, None, 1000).unwrap();
         assert_eq!(unspent.jti, "unique");
         assert_eq!(unspent.iat, 1000);
         assert_eq!(unspent.jkt, jkt_of(&key()));
@@ -654,7 +832,7 @@ mod tests {
         // What verify_access relies on: the claims come from the token, but
         // the proof that has to be spent is still this one.
         let proof = make_proof(&key(), "GET", URL, 1000, None, "dpop+jwt");
-        let replaced = verify(&proof, "GET", URL, None, 1000)
+        let replaced = verify_solid(&proof, "GET", URL, None, 1000)
             .unwrap()
             .replace("claims");
         assert_eq!(replaced.value, "claims");
@@ -668,7 +846,7 @@ mod tests {
         // Nothing to record, so nothing to stop a replay.
         let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", "");
         assert!(matches!(
-            verify(&proof, "GET", URL, None, 1000),
+            verify_solid(&proof, "GET", URL, None, 1000),
             Err(DpopError::Malformed(_))
         ));
     }
@@ -677,7 +855,7 @@ mod tests {
     fn a_jti_of_exactly_the_limit_is_accepted() {
         let jti = "j".repeat(MAX_JTI_BYTES);
         let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", &jti);
-        let unspent = verify(&proof, "GET", URL, None, 1000).unwrap();
+        let unspent = verify_solid(&proof, "GET", URL, None, 1000).unwrap();
         assert_eq!(unspent.jti, jti);
     }
 
@@ -689,7 +867,7 @@ mod tests {
         let jti = "j".repeat(MAX_JTI_BYTES + 1);
         let proof = make_proof_with_jti(&key(), "GET", URL, 1000, None, "dpop+jwt", &jti);
         assert!(matches!(
-            verify(&proof, "GET", URL, None, 1000),
+            verify_solid(&proof, "GET", URL, None, 1000),
             Err(DpopError::Malformed(_))
         ));
     }
@@ -705,7 +883,7 @@ mod tests {
         let der = B64.encode(signature.to_der().as_bytes());
         let rebuilt = format!("{}.{}.{}", parts[0], parts[1], der);
         assert_eq!(
-            verify(&rebuilt, "GET", URL, None, 1000).err(),
+            verify_solid(&rebuilt, "GET", URL, None, 1000).err(),
             Some(DpopError::BadSignature)
         );
     }
@@ -713,7 +891,136 @@ mod tests {
     #[test]
     fn malformed_input_is_an_error_not_a_panic() {
         for bad in ["", "a.b", "a.b.c.d", "not-base64.!!!.???"] {
-            assert!(verify(bad, "GET", URL, None, 1000).is_err());
+            assert!(verify_solid(bad, "GET", URL, None, 1000).is_err());
         }
+    }
+
+    // --- nonces (stage 2, C) ---------------------------------------------------------
+
+    /// A secret that is not the test default, for the secret-specificity test.
+    const OTHER_SECRET: &[u8; 64] = &[42u8; 64];
+
+    #[test]
+    fn a_proof_with_the_current_nonce_verifies() {
+        let now = 1_000_000;
+        let secret = [7u8; 64];
+        let nonce = current_nonce(&secret, now);
+        let proof = make_nonce_proof(&key(), "GET", URL, now, None, Some(&nonce));
+        let accepted = accepted_nonces(&secret, now);
+        assert!(verify(&proof, "GET", URL, None, now, Some(&accepted)).is_ok());
+    }
+
+    #[test]
+    fn a_proof_with_the_previous_buckets_nonce_still_verifies() {
+        // The profile's "recently-stale" allowance: a proof minted in the last
+        // second of a bucket stays verifiable through the next one, so every
+        // request in flight survives the boundary. The worst case is a client
+        // that received a nonce in bucket N's first second and returns at
+        // bucket N+1's last — one generation stale, still accepted.
+        let secret = [7u8; 64];
+        let bucket = 3_333; // arbitrary
+        let boundary = bucket * NONCE_BUCKET_SECONDS;
+        let minted_at = boundary - 1; // the last second of the previous bucket
+        let stale_nonce = current_nonce(&secret, minted_at);
+
+        // Verified anywhere inside the next bucket...
+        for now in [boundary, boundary + 1, boundary + NONCE_BUCKET_SECONDS - 1] {
+            let proof = make_nonce_proof(&key(), "GET", URL, now, None, Some(&stale_nonce));
+            let accepted = accepted_nonces(&secret, now);
+            assert!(
+                verify(&proof, "GET", URL, None, now, Some(&accepted)).is_ok(),
+                "now = {now}"
+            );
+        }
+        // ...and not one bucket further (two generations stale).
+        let after = boundary + NONCE_BUCKET_SECONDS;
+        let proof = make_nonce_proof(&key(), "GET", URL, after, None, Some(&stale_nonce));
+        let accepted = accepted_nonces(&secret, after);
+        assert_eq!(
+            verify(&proof, "GET", URL, None, after, Some(&accepted)).err(),
+            Some(DpopError::NonceRequired)
+        );
+    }
+
+    #[test]
+    fn a_missing_nonce_is_refused_where_nonces_are_required() {
+        let now = 1_000_000;
+        let secret = [7u8; 64];
+        let proof = make_nonce_proof(&key(), "GET", URL, now, None, None);
+        let accepted = accepted_nonces(&secret, now);
+        assert_eq!(
+            verify(&proof, "GET", URL, None, now, Some(&accepted)).err(),
+            Some(DpopError::NonceRequired)
+        );
+    }
+
+    #[test]
+    fn a_nonce_from_a_different_secret_is_refused() {
+        // The values are public, but only this server's secret produces the
+        // ones that pass — which is what makes a nonce a thing the server
+        // issued rather than a claim the client chose.
+        let now = 1_000_000;
+        let secret = [7u8; 64];
+        let foreign = current_nonce(OTHER_SECRET, now);
+        let proof = make_nonce_proof(&key(), "GET", URL, now, None, Some(&foreign));
+        let accepted = accepted_nonces(&secret, now);
+        assert_eq!(
+            verify(&proof, "GET", URL, None, now, Some(&accepted)).err(),
+            Some(DpopError::NonceRequired)
+        );
+    }
+
+    #[test]
+    fn a_fresh_iat_does_not_launder_a_stale_nonce() {
+        // The two windows are independent: `iat` bounds the proof, the bucket
+        // bounds the nonce, and both must pass. A proof minted *now* carrying a
+        // nonce from two buckets ago is fresh by `iat` and still refused.
+        let secret = [7u8; 64];
+        let now = 1_000_000;
+        let stale = current_nonce(&secret, now - 2 * NONCE_BUCKET_SECONDS);
+        let proof = make_nonce_proof(&key(), "GET", URL, now, None, Some(&stale));
+        let accepted = accepted_nonces(&secret, now);
+        assert_eq!(
+            verify(&proof, "GET", URL, None, now, Some(&accepted)).err(),
+            Some(DpopError::NonceRequired)
+        );
+    }
+
+    #[test]
+    fn a_nonce_claim_is_ignored_where_nonces_are_not_required() {
+        // Solid passes `None`, so a Solid client that sends a nonce anyway —
+        // one library shared with an ATProtocol client, say — is not refused
+        // for it. The proof's own bindings do the work there.
+        let now = 1_000_000;
+        let proof = make_nonce_proof(
+            &key(),
+            "GET",
+            URL,
+            now,
+            None,
+            Some("a nonce no server issued"),
+        );
+        assert!(verify_solid(&proof, "GET", URL, None, now).is_ok());
+    }
+
+    #[test]
+    fn nonces_rotate_at_bucket_boundaries_and_identify_the_secret() {
+        let secret = [7u8; 64];
+        let t = 90 * NONCE_BUCKET_SECONDS;
+
+        // Stable within a bucket, across every second of it.
+        assert_eq!(current_nonce(&secret, t), current_nonce(&secret, t + 299));
+        // Different in the next.
+        assert_ne!(current_nonce(&secret, t), current_nonce(&secret, t + 300));
+        // Different for a different secret, at the same time.
+        assert_ne!(current_nonce(&secret, t), current_nonce(OTHER_SECRET, t));
+
+        // `accepted_nonces` is exactly the current and previous values.
+        let accepted = accepted_nonces(&secret, t + 1);
+        assert_eq!(accepted[0], current_nonce(&secret, t + 1));
+        assert_eq!(
+            accepted[1],
+            current_nonce(&secret, t + 1 - NONCE_BUCKET_SECONDS)
+        );
     }
 }

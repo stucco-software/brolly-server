@@ -23,6 +23,7 @@ use brolly_atproto::keys::SigningKey;
 use brolly_atproto::tid::Tid;
 use brolly_atproto::{ingest, legacy, repo, state};
 use brolly_identity::db::{self, DbError, User};
+use brolly_identity::dpop;
 use brolly_identity::{extract, webid};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -49,6 +50,46 @@ fn auth_required() -> Response {
         "AuthenticationRequired",
         "this method requires authentication",
     )
+}
+
+/// The RS-side nonce dance (stage 2, C): RFC 9449's DPoP challenge on the 401,
+/// with the fresh nonce the retry needs. The body stays coarse — the
+/// machine-readable detail is in the header, per RFC 9449 — so the response is
+/// shaped exactly like any other auth-required answer apart from the headers.
+fn nonce_challenge(state: &AppState) -> Response {
+    let challenge = header::HeaderValue::from_static(
+        "DPoP error=\"use_dpop_nonce\", error_description=\"retry with a proof carrying this nonce in its nonce claim\"",
+    );
+    let nonce = dpop::current_nonce(&state.dpop_nonce_secret, now());
+    match header::HeaderValue::from_str(&nonce) {
+        // Unreachable in practice: base64url is always a legal header value.
+        // A 401 without the nonce still beats a 200.
+        Ok(nonce) => (
+            StatusCode::UNAUTHORIZED,
+            [
+                (header::WWW_AUTHENTICATE, challenge),
+                (header::HeaderName::from_static("dpop-nonce"), nonce),
+            ],
+            Json(json!({
+                "error": "AuthenticationRequired",
+                "message": "this method requires authentication"
+            })),
+        )
+            .into_response(),
+        Err(_) => (
+            StatusCode::UNAUTHORIZED,
+            [(header::WWW_AUTHENTICATE, challenge)],
+            Json(json!({
+                "error": "AuthenticationRequired",
+                "message": "this method requires authentication"
+            })),
+        )
+            .into_response(),
+    }
+}
+
+fn now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
 }
 
 /// The lexicon's own name for a refresh token that is unknown or spent (2, A).
@@ -156,18 +197,13 @@ struct Caller {
     kind: CallerKind,
 }
 
-/// Who is making this call.
-///
-/// A **DPoP-bound ATProtocol token** first, because that is what a real client
-/// presents; the **access half of a legacy token pair** second (2, A), for
-/// bsky.app and every client like it; a session cookie last, so the browser
-/// dashboard and tests can drive the same endpoints. Session-only auth was a
-/// placeholder — it is useless to any client that is not a browser on this
-/// origin.
-///
-/// The proof is verified against the presented token, not merely present: a
-/// bound token accepted without its proof is a bearer token wearing a costume.
-async fn caller(state: &AppState, headers: &HeaderMap) -> Option<Caller> {
+/// Who is making this call, and how they authenticated — or the refusal that
+/// must become the response, ready-built. `Err` carries a `Response` because
+/// one failure mode has its own answer: the nonce 401 (stage 2, C), whose
+/// headers a generic `auth_required` cannot carry. Every other refusal is
+/// still `auth_required`, built at the `caller`'s tail so no call site repeats
+/// it.
+async fn caller(state: &AppState, headers: &HeaderMap) -> Result<Caller, Response> {
     // The Authorization header, when there is one, carries the credential the
     // caller meant (extract's precedence): a DPoP-bound OAuth token, or the
     // legacy pair's access half.
@@ -178,11 +214,18 @@ async fn caller(state: &AppState, headers: &HeaderMap) -> Option<Caller> {
     {
         match credential {
             brolly_identity::Credential::Dpop { token, .. } => {
-                if let Some(user) = token_caller(state, headers, &token).await {
-                    return Some(Caller {
-                        user,
-                        kind: CallerKind::Oauth,
-                    });
+                match token_caller(state, headers, &token).await {
+                    Ok(Some(user)) => {
+                        return Ok(Caller {
+                            user,
+                            kind: CallerKind::Oauth,
+                        });
+                    }
+                    // The nonce challenge is the response (stage 2, C): the
+                    // client's recovery is a retry with the fresh nonce, and a
+                    // generic 401 would leave it unable to make one.
+                    Err(response) => return Err(response),
+                    Ok(None) => {}
                 }
             }
             // The legacy arm (2, A): the access half of an opaque pair, in its
@@ -191,7 +234,7 @@ async fn caller(state: &AppState, headers: &HeaderMap) -> Option<Caller> {
             // unknown credential always got.
             brolly_identity::Credential::Bearer(token) => {
                 if let Some(caller) = legacy_caller(state, &token).await {
-                    return Some(caller);
+                    return Ok(caller);
                 }
             }
             brolly_identity::Credential::Session(_) => {}
@@ -199,13 +242,14 @@ async fn caller(state: &AppState, headers: &HeaderMap) -> Option<Caller> {
     }
     // The cookie fallback stays last (2, D): the browser dashboard and the
     // tests, as before this grew the token arms.
-    let token = session_token(headers)?;
+    let token = session_token(headers).ok_or_else(auth_required)?;
     let user = db::user_for_session(&state.pool, &token)
         .await
         .ok()
         .flatten()
-        .filter(User::is_active)?;
-    Some(Caller {
+        .filter(User::is_active)
+        .ok_or_else(auth_required)?;
+    Ok(Caller {
         user,
         kind: CallerKind::Cookie,
     })
@@ -233,40 +277,67 @@ async fn legacy_caller(state: &AppState, token: &str) -> Option<Caller> {
     Some(Caller { user, kind })
 }
 
-async fn token_caller(state: &AppState, headers: &HeaderMap, token: &str) -> Option<User> {
+async fn token_caller(
+    state: &AppState,
+    headers: &HeaderMap,
+    token: &str,
+) -> Result<Option<User>, Response> {
     let grant = brolly_atproto::oauth::verify_token(&state.pool, "access", token)
         .await
         .ok()
-        .flatten()?;
+        .flatten();
+    let Some(grant) = grant else {
+        return Ok(None);
+    };
 
     // The proof must be for this request, must name the key the token was
     // issued to, and must not have been presented before.
-    let proof = headers.get("dpop").and_then(|h| h.to_str().ok())?;
+    let Some(proof) = headers.get("dpop").and_then(|h| h.to_str().ok()) else {
+        return Ok(None);
+    };
     let url = format!("https://{}/xrpc/", state.base_domain);
     let method = "POST";
-    let now = time::OffsetDateTime::now_utc().unix_timestamp();
-    let unspent = brolly_identity::dpop::verify(proof, method, &url, Some(token), now).ok()?;
+    let at = now();
+    // The ATProtocol profile requires nonces (stage 2, C): the current and
+    // previous bucket's values are the ones a proof may carry.
+    let accepted = brolly_identity::dpop::accepted_nonces(&state.dpop_nonce_secret, at);
+    let unspent = match brolly_identity::dpop::verify(
+        proof,
+        method,
+        &url,
+        Some(token),
+        at,
+        Some(&accepted),
+    ) {
+        Ok(unspent) => unspent,
+        // The one refusal that is the response (stage 2, C): the RS-side
+        // shape, with the fresh nonce the retry needs.
+        Err(brolly_identity::dpop::DpopError::NonceRequired) => {
+            return Err(nonce_challenge(state));
+        }
+        Err(_) => return Ok(None),
+    };
     if !unspent.bound_to(&grant.dpop_jkt) {
         tracing::warn!("an ATProtocol token was presented by a key it was not issued to");
-        return None;
+        return Ok(None);
     }
-    match unspent.spend(&state.pool, now).await {
+    match unspent.spend(&state.pool, at).await {
         Ok(_) => {}
         Err(brolly_identity::dpop::DpopError::Storage(e)) => {
             tracing::error!(error = %e, "recording a DPoP proof failed");
-            return None;
+            return Ok(None);
         }
         Err(e) => {
             tracing::warn!(error = %e, "an ATProtocol DPoP proof was refused");
-            return None;
+            return Ok(None);
         }
     }
 
-    db::find_by_id(&state.pool, grant.user_id)
+    Ok(db::find_by_id(&state.pool, grant.user_id)
         .await
         .ok()
         .flatten()
-        .filter(User::is_active)
+        .filter(User::is_active))
 }
 
 /// Resolve a `repo` parameter — a DID or a handle — to a member.
@@ -802,8 +873,9 @@ async fn create_record(State(state): State<AppState>, headers: HeaderMap, body: 
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<CreateRecord>(&body) else {
@@ -910,8 +982,9 @@ async fn put_record(State(state): State<AppState>, headers: HeaderMap, body: Byt
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<PutRecord>(&body) else {
@@ -985,8 +1058,9 @@ async fn swap_record(State(state): State<AppState>, headers: HeaderMap, body: By
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<SwapRecord>(&body) else {
@@ -1062,8 +1136,9 @@ async fn swap_commit(State(state): State<AppState>, headers: HeaderMap, body: By
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<SwapCommit>(&body) else {
@@ -1146,8 +1221,9 @@ async fn apply_writes(State(state): State<AppState>, headers: HeaderMap, body: B
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<ApplyWrites>(&body) else {
@@ -1260,8 +1336,9 @@ async fn delete_record(State(state): State<AppState>, headers: HeaderMap, body: 
     if wrong_host(&state, &headers) {
         return not_found("no such repository on this host");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     let user = caller.user;
     let Ok(input) = serde_json::from_slice::<DeleteRecord>(&body) else {
@@ -1462,8 +1539,9 @@ pub async fn get_session(State(state): State<AppState>, headers: HeaderMap) -> R
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     Json(session_view(
         &state,
@@ -1593,8 +1671,9 @@ pub async fn create_app_password(
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     if !caller.kind.may_manage_app_passwords() {
         return app_password_management_forbidden();
@@ -1638,8 +1717,9 @@ pub async fn list_app_passwords(State(state): State<AppState>, headers: HeaderMa
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     if !caller.kind.may_manage_app_passwords() {
         return app_password_management_forbidden();
@@ -1680,8 +1760,9 @@ pub async fn revoke_app_password(
     if wrong_host(&state, &headers) {
         return not_found("not served here");
     }
-    let Some(caller) = caller(&state, &headers).await else {
-        return auth_required();
+    let caller = match caller(&state, &headers).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
     };
     if !caller.kind.may_manage_app_passwords() {
         return app_password_management_forbidden();

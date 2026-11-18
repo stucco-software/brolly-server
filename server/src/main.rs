@@ -72,6 +72,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         brolly_identity::instance::load_or_create(&pool, brolly_activitypub::keys::generate)
             .await?;
 
+    // The DPoP nonce secret (stage 2, C): the HMAC key behind the time-bucketed
+    // nonces the ATProtocol profile requires. One row, created on first start
+    // and never rotated — rotation would invalidate every nonce in flight for
+    // no gain, since a client that gets a fresh one simply retries.
+    let dpop_nonce_secret = brolly_identity::dpop::load_or_create_nonce_secret(&pool).await?;
+
     let base_domain =
         std::env::var("BROLLY_BASE_DOMAIN").unwrap_or_else(|_| "brolly.test".to_string());
 
@@ -166,6 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stores: std::sync::Arc::new(stores),
         provider_key: std::sync::Arc::new(provider_key),
         instance_actor: std::sync::Arc::new(instance_actor),
+        dpop_nonce_secret,
         commits: tokio::sync::broadcast::channel(
             // Bounded: a consumer that falls this far behind is dropped and
             // reconnects with its cursor, which is cheaper than letting one

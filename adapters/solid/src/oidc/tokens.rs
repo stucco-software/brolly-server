@@ -185,7 +185,9 @@ fn bind_proof(
     let Some(proof) = proof else {
         return Err(TokenError::ProofRequired);
     };
-    let verified = dpop::verify(proof, method, url, Some(token), now)?;
+    // Solid-OIDC does not use nonces, so the check is off entirely (stage 2,
+    // C): `None` is the protocol's own answer, not a skipped check.
+    let verified = dpop::verify(proof, method, url, Some(token), now, None)?;
     if !verified.bound_to(jkt) {
         return Err(TokenError::WrongHolder);
     }

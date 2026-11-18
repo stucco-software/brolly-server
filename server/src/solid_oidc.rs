@@ -652,7 +652,9 @@ pub async fn token(
         );
     };
     let at = now();
-    let unspent = match dpop::verify(proof, "POST", &url, None, at) {
+    // Solid-OIDC does not use nonces — `None` leaves that check off (stage 2,
+    // C), and this endpoint's behaviour is unchanged by the nonce work.
+    let unspent = match dpop::verify(proof, "POST", &url, None, at, None) {
         Ok(unspent) => unspent,
         Err(e) => {
             tracing::warn!(error = %e, "DPoP proof rejected at the token endpoint");

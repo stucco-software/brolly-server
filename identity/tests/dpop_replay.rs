@@ -47,8 +47,10 @@ fn proof(key: &SigningKey, jti: &str, iat: i64) -> String {
 }
 
 /// Verify and spend, as a call site does, with `now` as the application clock.
+/// No nonces: the replay store is protocol-independent (stage 2, C).
 async fn present(pool: &PgPool, proof: &str, now: i64) -> Result<VerifiedProof, DpopError> {
-    let unspent = dpop::verify(proof, "POST", URL, None, now).expect("the proof itself is valid");
+    let unspent =
+        dpop::verify(proof, "POST", URL, None, now, None).expect("the proof itself is valid");
     unspent.spend(pool, now).await
 }
 
@@ -141,8 +143,15 @@ async fn the_next_spend_prunes_rows_past_their_window_by_the_application_clock()
 async fn a_storage_failure_refuses_the_proof() {
     // Fail closed. A proof that couldn't be recorded can't be known unspent.
     let (_db, pool) = fresh().await;
-    let unspent = dpop::verify(&proof(&key(7), "unrecorded", 1000), "POST", URL, None, 1000)
-        .expect("the proof itself is valid");
+    let unspent = dpop::verify(
+        &proof(&key(7), "unrecorded", 1000),
+        "POST",
+        URL,
+        None,
+        1000,
+        None,
+    )
+    .expect("the proof itself is valid");
     pool.close().await;
 
     assert!(matches!(

@@ -146,6 +146,13 @@ pub struct AppState {
     /// published yet is very different from a member who was never given an
     /// identity at all (ADR 0016).
     pub plc_client: Option<reqwest::Client>,
+    /// The instance's DPoP nonce secret (stage 2, C).
+    ///
+    /// The HMAC key behind the time-bucketed nonces RFC 9449 hands out and
+    /// the ATProtocol profile makes mandatory. Loaded once at startup — no
+    /// database read on the proof path — and shared by every process of the
+    /// instance, so any of them verifies the same nonces.
+    pub dpop_nonce_secret: [u8; 64],
     /// Where ATProto OAuth client metadata comes from.
     ///
     /// The network in production (`client_metadata::Fetcher`), a fixed,
@@ -307,10 +314,14 @@ async fn cors(request: axum::extract::Request, next: axum::middleware::Next) -> 
     // A script sees only safelisted response headers unless they are exposed.
     // `location` after a POST and `link` for the ACL are load-bearing in LDP;
     // `www-authenticate` is how a client learns to re-authenticate (H3) and
-    // `vary` is how it learns what the answer depended on (H10). `updates-via`
-    // is gone: nothing sends it until stage 7, and an expose list is a promise.
+    // `vary` is how it learns what the answer depended on (H10). `dpop-nonce`
+    // is how a browser client learns the nonce at all (stage 2, C) — without
+    // the expose, a script must reject every response missing a
+    // `DPoP-Nonce` header per the profile, which breaks exactly one class of
+    // client: the browser one. `updates-via` is gone: nothing sends it until
+    // stage 7, and an expose list is a promise.
     const EXPOSE_HEADERS: &str = "location, link, etag, allow, accept-patch, \
-         accept-post, accept-put, wac-allow, www-authenticate, vary";
+         accept-post, accept-put, wac-allow, www-authenticate, dpop-nonce, vary";
 
     let headers = response.headers_mut();
     for (name, value) in [
