@@ -15,8 +15,13 @@
 //!   be edited, cannot be replayed by another member, and needs no table.
 //! * **`prompt=none` answers with the flow's own shapes** (spec 6, H4). Its two
 //!   error redirects are the deny path's error redirect — `error`, then
-//!   `state` — and its silent success is the allow path's issuance, code for
-//!   code, so a client cannot tell a silent answer from an interactive one.
+//!   `state`, then `iss` — and its silent success is the allow path's
+//!   issuance, code for code, so a client cannot tell a silent answer from an
+//!   interactive one.
+//! * **Every authorization response names its issuer** (RFC 9207). Codes and
+//!   errors alike carry `iss`, exactly the discovery document's `issuer`, so a
+//!   client can refuse an answer from the wrong server — and so clients that
+//!   insist on it, `@uvdsl/solid-oidc-client-browser` among them, can log in.
 //! * **`client_credentials` is the agent grant** (ADR 0020). An id/secret pair
 //!   an operator minted against a WebID linked to an account, exchanged over
 //!   `Authorization: Basic` for a DPoP-bound access token naming the linked
@@ -384,7 +389,12 @@ pub async fn authorize(
     // handle — never the login page, never the consent screen.
     if silent {
         let Some(user) = session else {
-            return error_redirect(redirect_uri, "login_required", params.state.as_deref());
+            return error_redirect(
+                &issuer(&state),
+                redirect_uri,
+                "login_required",
+                params.state.as_deref(),
+            );
         };
         let covered = match store::remembered_consent(&state.pool, user.id, client_id).await {
             Ok(Some(consent)) => consent.covers(&params.scope, redirect_uri),
@@ -395,7 +405,12 @@ pub async fn authorize(
             }
         };
         if !covered {
-            return error_redirect(redirect_uri, "consent_required", params.state.as_deref());
+            return error_redirect(
+                &issuer(&state),
+                redirect_uri,
+                "consent_required",
+                params.state.as_deref(),
+            );
         }
         // Silent success: exactly what a consent-screen allow produces — the
         // same issuance, the same redirect. The consent needs no re-write:
@@ -496,13 +511,18 @@ fn redirect_with(redirect_uri: &str, params: &[(&str, &str)]) -> String {
 /// `decide`'s deny path established, and the one `prompt=none`'s two error
 /// answers reuse (spec 6, H4), so an error correlates the same way however
 /// the flow was reached.
-fn error_redirect(redirect_uri: &str, error: &str, state: Option<&str>) -> Response {
+///
+/// `iss` rides on errors as well as codes (RFC 9207 §2): the mix-up defence
+/// covers every authorization response, and a client that requires it — as
+/// `@uvdsl/solid-oidc-client-browser` does — cannot read the error otherwise.
+fn error_redirect(issuer: &str, redirect_uri: &str, error: &str, state: Option<&str>) -> Response {
     let mut params: Vec<(&str, &str)> = vec![("error", error)];
     // The client needs `state` back even on an error, or it cannot
     // correlate the answer with the request it made.
     if let Some(s) = state {
         params.push(("state", s));
     }
+    params.push(("iss", issuer));
     Redirect::to(&redirect_with(redirect_uri, &params)).into_response()
 }
 
@@ -541,10 +561,15 @@ async fn issue_and_redirect(
             return authorize_refusal("Something went wrong. Try again.");
         }
     };
+    // RFC 9207: name ourselves, so a client talking to several issuers can
+    // tell which one answered — the mix-up defence. Exactly the discovery
+    // document's `issuer`, which is what clients compare it against.
+    let issuer = issuer(state);
     let mut redirect: Vec<(&str, &str)> = vec![("code", code.as_str())];
     if let Some(s) = state_param {
         redirect.push(("state", s));
     }
+    redirect.push(("iss", issuer.as_str()));
     Redirect::to(&redirect_with(redirect_uri, &redirect)).into_response()
 }
 
@@ -586,7 +611,7 @@ pub async fn decide(
     let state_param = claims["state"].as_str();
 
     if form.decision != "allow" {
-        return error_redirect(&redirect_uri, "access_denied", state_param);
+        return error_redirect(&issuer(&state), &redirect_uri, "access_denied", state_param);
     }
 
     // Remember the consent (spec 6, H4): every allow widens the remembered

@@ -1280,14 +1280,16 @@ async fn prompt_none_with_a_covering_consent_issues_silently_exactly_as_an_allow
     assert_eq!(silent.status, StatusCode::SEE_OTHER, "{}", silent.body);
 
     // Byte-for-byte what the allow produced: the same target, the same
-    // parameters in the same order — a code, then the state. Only the
-    // code's value differs, because every code is freshly random.
+    // parameters in the same order — a code, then the state, then the issuer
+    // (RFC 9207). Only the code's value differs, because every code is
+    // freshly random.
+    let iss = urlencode(&format!("https://{BASE}"));
     for reply in [&allowed, &silent] {
         let location = reply.location.as_deref().expect("a redirect");
         assert!(
             location.starts_with(&format!("{REDIRECT}?code="))
-                && location.ends_with("&state=opaque-client-state"),
-            "an issuance redirect is a code then the state, got {location}"
+                && location.ends_with(&format!("&state=opaque-client-state&iss={iss}")),
+            "an issuance redirect is a code, the state, then the issuer, got {location}"
         );
     }
 
@@ -3005,4 +3007,310 @@ async fn the_operator_path_provisions_a_working_credential() {
     assert!(ok, "unlink-webid failed: {stderr}");
     let reply = client_credentials_request(&harness, &id, &secret, Some("webid"), true).await;
     assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{}", reply.body);
+}
+
+// --- RFC 9207, and the clients that insist on it ----------------------------
+
+#[tokio::test]
+async fn every_authorization_response_names_the_issuer() {
+    // RFC 9207 §2: `iss` on every authorization response, error or code, so a
+    // client talking to several issuers can refuse an answer from the wrong
+    // one. It is exactly the discovery document's `issuer`, because that is
+    // the string clients compare it with.
+    let harness = harness().await;
+    let doc = get(&harness, "/.well-known/openid-configuration", None)
+        .await
+        .json();
+    assert_eq!(doc["authorization_response_iss_parameter_supported"], true);
+    let issuer = doc["issuer"].as_str().unwrap().to_string();
+
+    let client_id = register(&harness).await;
+    let (_, challenge) = pkce();
+
+    // prompt=none with no session: an error redirect.
+    let login_required = get(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid webid",
+            &challenge,
+            Some("none"),
+        ),
+        None,
+    )
+    .await;
+
+    // A consent screen answered both ways.
+    let cookie = a_logged_in_member(&harness).await;
+    let allowed = allow(&harness, &authorize_url(&client_id, &challenge), &cookie).await;
+    let consent = get(
+        &harness,
+        &authorize_url(&client_id, &challenge),
+        Some(&cookie),
+    )
+    .await;
+    let denied = post_form(
+        &harness,
+        "/oauth/solid/authorize",
+        &format!(
+            "request={}&decision=deny",
+            urlencode(&request_token(&consent.body))
+        ),
+        Some(&cookie),
+    )
+    .await;
+
+    for (what, reply) in [
+        ("a prompt=none error", &login_required),
+        ("an allow", &allowed),
+        ("a deny", &denied),
+    ] {
+        assert_eq!(
+            reply.status,
+            StatusCode::SEE_OTHER,
+            "{what}: {}",
+            reply.body
+        );
+        assert_eq!(
+            reply.redirect_params().get("iss"),
+            Some(&issuer),
+            "{what} must name the issuer"
+        );
+    }
+}
+
+/// A token-endpoint proof as `@uvdsl/solid-oidc-client-browser` writes it:
+/// jose's `exportJWK`, plus an `alg` member it adds itself. Its resource
+/// proofs leave `alg` out, so the thumbprint has to ignore the extra member
+/// (RFC 7638 §3.2) or the token is bound to a key no later proof matches.
+fn dpop_proof_with_jwk_alg(key: &SigningKey, method: &str, url: &str) -> String {
+    let sec1 = key.verifying_key().to_sec1_bytes();
+    let header = serde_json::json!({
+        "alg": "ES256",
+        "typ": "dpop+jwt",
+        "jwk": {
+            "kty": "EC",
+            "crv": "P-256",
+            "x": B64.encode(&sec1[1..33]),
+            "y": B64.encode(&sec1[33..65]),
+            "alg": "ES256",
+        },
+    });
+    let claims = serde_json::json!({
+        "htu": url,
+        "htm": method,
+        "iat": now(),
+        "jti": uuid::Uuid::new_v4().to_string(),
+    });
+    let signed = format!(
+        "{}.{}",
+        B64.encode(serde_json::to_vec(&header).unwrap()),
+        B64.encode(serde_json::to_vec(&claims).unwrap())
+    );
+    let signature: p256::ecdsa::Signature = key.sign(signed.as_bytes());
+    format!("{signed}.{}", B64.encode(signature.to_bytes()))
+}
+
+/// Everything uvdsl checks before it calls a session active: jose's
+/// `jwtVerify` against the JWKS (signature, `iss`, `aud: "solid"`, `exp`),
+/// then `cnf.jkt` against its own key, `client_id`, and a `webid` claim.
+async fn assert_uvdsl_accepts(
+    harness: &Harness,
+    issuer: &str,
+    client_id: &str,
+    key: &SigningKey,
+    access: &str,
+) {
+    let mut parts = access.split('.');
+    let header: serde_json::Value =
+        serde_json::from_slice(&B64.decode(parts.next().unwrap()).unwrap()).unwrap();
+    let claims: serde_json::Value =
+        serde_json::from_slice(&B64.decode(parts.next().unwrap()).unwrap()).unwrap();
+
+    // jose picks the JWKS key by `kid` and `alg`.
+    let jwks = get(harness, "/oauth/solid/jwks", None).await.json();
+    let jwk = jwks["keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|k| k["kid"] == header["kid"])
+        .unwrap_or_else(|| panic!("no JWKS key for kid {}", header["kid"]));
+    assert_eq!(header["alg"], "ES256");
+    let mut sec1 = vec![0x04];
+    sec1.extend(B64.decode(jwk["x"].as_str().unwrap()).unwrap());
+    sec1.extend(B64.decode(jwk["y"].as_str().unwrap()).unwrap());
+    let verifying = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1).unwrap();
+    let (signed, signature) = access.rsplit_once('.').unwrap();
+    let signature = p256::ecdsa::Signature::from_slice(&B64.decode(signature).unwrap()).unwrap();
+    use p256::ecdsa::signature::Verifier;
+    verifying
+        .verify(signed.as_bytes(), &signature)
+        .expect("the access token verifies against the JWKS");
+
+    assert_eq!(claims["iss"], issuer, "iss must equal discovery's issuer");
+    assert_eq!(claims["aud"], "solid");
+    assert!(claims["exp"].as_i64().unwrap() > now());
+    assert_eq!(claims["cnf"]["jkt"], thumbprint(key));
+    assert_eq!(claims["client_id"], client_id);
+    assert_eq!(claims["webid"], format!("https://alice.{BASE}/profile#me"));
+}
+
+#[tokio::test]
+async fn the_uvdsl_browser_client_logs_in_and_refreshes() {
+    // `@uvdsl/solid-oidc-client-browser` (v0.2.3) is the client SolidOS is
+    // moving to. This walks its sequence request for request, and checks
+    // each answer the way it does — it is stricter than most: it requires
+    // `iss` on the callback and verifies the access token itself.
+    let harness = harness().await;
+
+    // Discovery at the origin the member typed. It refuses to go on unless
+    // `issuer` matches that origin, ignoring a trailing slash.
+    let doc = get(&harness, "/.well-known/openid-configuration", None)
+        .await
+        .json();
+    let issuer = doc["issuer"].as_str().unwrap().to_string();
+    assert_eq!(issuer.trim_end_matches('/'), format!("https://{BASE}"));
+    let token_endpoint = doc["token_endpoint"].as_str().unwrap().to_string();
+    let token_path = token_endpoint.strip_prefix(&issuer).unwrap().to_string();
+
+    // A browser app on another origin: the preflights for registration and
+    // for the token endpoint (`dpop` is not a safelisted header).
+    for (path, headers) in [
+        ("/oauth/solid/register", "content-type"),
+        (token_path.as_str(), "content-type,dpop"),
+    ] {
+        let preflight = send(
+            &harness,
+            builder("OPTIONS", path)
+                .header(header::ORIGIN, "https://app.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "POST")
+                .header(header::ACCESS_CONTROL_REQUEST_HEADERS, headers)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert!(preflight.status.is_success(), "preflight {path}");
+    }
+
+    // Dynamic registration, with the members it always sends.
+    let registered = send(
+        &harness,
+        builder("POST", "/oauth/solid/register")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "redirect_uris": [REDIRECT],
+                    "client_name": "A uvdsl app",
+                    "grant_types": ["authorization_code", "refresh_token"],
+                    "token_endpoint_auth_method": "none",
+                    "application_type": "web",
+                    "subject_type": "public",
+                })
+                .to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        registered.status,
+        StatusCode::CREATED,
+        "{}",
+        registered.body
+    );
+    let client_id = registered.json()["client_id"].as_str().unwrap().to_string();
+
+    // Authorize, always with `prompt=consent` (CSS needs it for a refresh
+    // token), and allow.
+    let cookie = a_logged_in_member(&harness).await;
+    let (verifier, challenge) = pkce();
+    let callback = allow(
+        &harness,
+        &authorize_query(
+            &client_id,
+            REDIRECT,
+            "openid offline_access webid",
+            &challenge,
+            Some("consent"),
+        ),
+        &cookie,
+    )
+    .await;
+    assert_eq!(callback.status, StatusCode::SEE_OTHER, "{}", callback.body);
+    let params = callback.redirect_params();
+    // The check that kept it from logging in at all: `iss` must be present
+    // and equal to the issuer it discovered.
+    assert_eq!(
+        params.get("iss"),
+        Some(&issuer),
+        "RFC 9207 iss on the callback"
+    );
+    assert_eq!(params["state"], "opaque-client-state");
+
+    // The code exchange. Its redirect_uri is the callback URL with `code`,
+    // `state` and `iss` deleted again — the registered one.
+    let key = client_key();
+    let token_request = |body: String| {
+        builder("POST", &token_path)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(
+                "DPoP",
+                dpop_proof_with_jwk_alg(&key, "POST", &token_endpoint),
+            )
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let exchanged = send(
+        &harness,
+        token_request(
+            form_urlencoded::Serializer::new(String::new())
+                .append_pair("grant_type", "authorization_code")
+                .append_pair("code", &params["code"])
+                .append_pair("code_verifier", &verifier)
+                .append_pair("redirect_uri", REDIRECT)
+                .append_pair("client_id", &client_id)
+                .finish(),
+        ),
+    )
+    .await;
+    assert_eq!(exchanged.status, StatusCode::OK, "{}", exchanged.body);
+    let tokens = exchanged.json();
+    assert_uvdsl_accepts(
+        &harness,
+        &issuer,
+        &client_id,
+        &key,
+        tokens["access_token"].as_str().unwrap(),
+    )
+    .await;
+    let first_refresh = tokens["refresh_token"]
+        .as_str()
+        .expect("a refresh token")
+        .to_string();
+
+    // Restoring after a reload: the refresh grant. It stores whatever
+    // `refresh_token` comes back, so one must come back.
+    let refreshed = send(
+        &harness,
+        token_request(
+            form_urlencoded::Serializer::new(String::new())
+                .append_pair("grant_type", "refresh_token")
+                .append_pair("refresh_token", &first_refresh)
+                .append_pair("client_id", &client_id)
+                .finish(),
+        ),
+    )
+    .await;
+    assert_eq!(refreshed.status, StatusCode::OK, "{}", refreshed.body);
+    let tokens = refreshed.json();
+    let second_refresh = tokens["refresh_token"]
+        .as_str()
+        .expect("a rotated refresh token");
+    assert_ne!(second_refresh, first_refresh);
+    let access = tokens["access_token"].as_str().unwrap().to_string();
+    assert_uvdsl_accepts(&harness, &issuer, &client_id, &key, &access).await;
+
+    // Its `authFetch` proofs — jwk without `alg`, `ath` always, htu origin
+    // plus path — are the shape `solid_token_access.rs` already presents to
+    // the pod, so the pod half is proven there.
 }

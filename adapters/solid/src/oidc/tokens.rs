@@ -524,6 +524,9 @@ pub fn discovery_document(issuer: &str) -> serde_json::Value {
         "token_endpoint_auth_methods_supported": ["none", "client_secret_basic"],
         // PKCE is required by Solid-OIDC, and S256 is the only method we accept.
         "code_challenge_methods_supported": ["S256"],
+        // RFC 9207: every authorization response — code or error — names us
+        // in `iss`, so clients can refuse an answer from the wrong issuer.
+        "authorization_response_iss_parameter_supported": true,
         "scopes_supported": ["openid", "webid", "offline_access"],
         "claims_supported": ["sub", "webid", "iss", "aud", "exp", "iat"],
         "solid_oidc_supported": "https://solidproject.org/TR/solid-oidc",
