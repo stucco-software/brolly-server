@@ -611,7 +611,7 @@ async fn open_repo(state: &AppState, user: User) -> Result<RepoHandle, Response>
     })
 }
 
-async fn signing_key(state: &AppState, user: &User) -> Result<SigningKey, Response> {
+pub(crate) async fn signing_key(state: &AppState, user: &User) -> Result<SigningKey, Response> {
     let stored = db::load_key(&state.pool, user.id, brolly_atproto::keys::ATPROTO_SIGNING)
         .await
         .ok()
@@ -690,10 +690,52 @@ pub async fn get_record(
 /// Falls back to `did:web` derived from the host when PLC registration has not
 /// happened — D11 keeps `did:web` for routing, and a repo has to be addressable
 /// before Phase 8 submits its `did:plc`.
-fn did_of(user: &User, state: &AppState) -> String {
+pub(crate) fn did_of(user: &User, state: &AppState) -> String {
     user.did_plc
         .clone()
         .unwrap_or_else(|| format!("did:web:{}.{}", user.username, state.base_domain))
+}
+
+#[derive(Deserialize)]
+pub struct ResolveHandleQuery {
+    handle: String,
+}
+
+/// The member a handle names, if it names one here (stage 3, B).
+///
+/// A handle is a domain name, `{username}.{base}`, and nothing else: the
+/// bare username `resolve_repo` tolerates for `repo` is not a handle, and a
+/// port is not part of one. Case-insensitive, as DNS is. A takendown member's
+/// handle resolves to nothing, as their repo does.
+pub(crate) async fn member_by_handle(state: &AppState, handle: &str) -> Option<User> {
+    if handle.contains(':') {
+        return None;
+    }
+    let username = extract::subdomain_user(handle, &state.base_domain)?;
+    db::find_by_username(&state.pool, &username)
+        .await
+        .ok()
+        .flatten()
+        .filter(User::is_active)
+}
+
+/// `com.atproto.identity.resolveHandle` (stage 3, B): a member's handle to
+/// their DID — `did:plc` once registered, the derived `did:web` before (D11).
+///
+/// A handle that does not resolve is this endpoint's normal outcome, not a
+/// fault, so it is the reference's own `InvalidRequest` and message.
+pub async fn resolve_handle(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ResolveHandleQuery>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    match member_by_handle(&state, &query.handle).await {
+        Some(user) => Json(json!({"did": did_of(&user, &state)})).into_response(),
+        None => invalid_request("Unable to resolve handle"),
+    }
 }
 
 #[derive(Deserialize)]
@@ -2800,6 +2842,10 @@ pub fn routes() -> Router<AppState> {
         .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
         .route("/xrpc/com.atproto.repo.listRecords", get(list_records))
+        .route(
+            "/xrpc/com.atproto.identity.resolveHandle",
+            get(resolve_handle),
+        )
         .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
         .route("/xrpc/com.atproto.sync.getBlocks", get(get_blocks))
         .route(

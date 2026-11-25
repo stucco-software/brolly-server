@@ -19,6 +19,7 @@ use tower_http::services::ServeDir;
 pub mod account;
 pub mod activitypub;
 pub mod admin;
+pub mod atproto_identity;
 pub mod atproto_oauth;
 pub mod auth;
 pub mod client_metadata;
@@ -876,6 +877,13 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         // own 405 would answer on the apex too, where the resource doesn't
         // exist, and the handler's 405 carries an `Allow` we chose.
         .route("/.well-known/solid", any(pod::storage_description))
+        // The handle and DID documents (stage 3, B): member subdomains only,
+        // resolved by the handlers themselves, as the storage description is.
+        .route(
+            "/.well-known/atproto-did",
+            get(atproto_identity::atproto_did),
+        )
+        .route("/.well-known/did.json", get(atproto_identity::did_json))
         .route("/nodeinfo/2.1", get(activitypub::nodeinfo))
         // Mastodon owns the bare OAuth paths, because its clients hardcode
         // them and it is the only protocol with no discovery document to be

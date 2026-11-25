@@ -4336,3 +4336,146 @@ async fn list_repos_enumerates_every_repo_by_did() {
         assert_eq!(reply.status, StatusCode::BAD_REQUEST, "limit={limit}");
     }
 }
+
+// --- handle and DID resolution (stage 3, B) --------------------------------------
+
+async fn get_on(h: &Harness, host: &str, uri: &str) -> Reply {
+    send(
+        h,
+        Request::builder()
+            .uri(uri)
+            .header(header::HOST, host)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+#[tokio::test]
+async fn resolve_handle_answers_the_members_did() {
+    let h = harness().await;
+    a_member(&h, "alice").await;
+    let resolve = |handle: &'static str| {
+        let h = &h;
+        async move {
+            get(
+                h,
+                &format!("/xrpc/com.atproto.identity.resolveHandle?handle={handle}"),
+            )
+            .await
+        }
+    };
+
+    for handle in ["alice.brolly.test", "ALICE.Brolly.Test"] {
+        let reply = resolve(handle).await;
+        assert_eq!(reply.status, StatusCode::OK, "{handle}: {}", reply.text());
+        assert_eq!(
+            reply.json(),
+            json!({"did": format!("did:web:alice.{BASE}")})
+        );
+    }
+
+    // Once registered, the did:plc is the answer (D11).
+    sqlx::query(
+        "UPDATE users SET did_plc = 'did:plc:aaaaaaaaaaaaaaaaaaaaaaaa' WHERE username = 'alice'",
+    )
+    .execute(&h.db.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        resolve("alice.brolly.test").await.json()["did"],
+        "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+
+    // A bare username is not a handle; an unknown handle, a foreign domain
+    // and a port are not ours to resolve.
+    for handle in [
+        "alice",
+        "nobody.brolly.test",
+        "alice.example.com",
+        "alice.brolly.test:443",
+    ] {
+        let reply = get(
+            &h,
+            &format!("/xrpc/com.atproto.identity.resolveHandle?handle={handle}"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "{handle}");
+        assert_eq!(reply.json()["error"], "InvalidRequest", "{handle}");
+    }
+
+    // A takendown member's handle resolves to nothing, as their repo does.
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'alice'")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        resolve("alice.brolly.test").await.status,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn the_member_subdomain_serves_its_atproto_did() {
+    let h = harness().await;
+    a_member(&h, "alice").await;
+
+    let reply = get_on(&h, &format!("alice.{BASE}"), "/.well-known/atproto-did").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    // The bare DID: `did=` is the DNS TXT record's prefix, not this document's.
+    assert_eq!(reply.text(), format!("did:web:alice.{BASE}"));
+    assert!(
+        reply
+            .content_type
+            .as_deref()
+            .unwrap()
+            .starts_with("text/plain")
+    );
+    assert_eq!(reply.header("cache-control"), Some("public, max-age=3600"));
+
+    // The apex is not a handle, and an unknown subdomain names nobody.
+    for host in [BASE.to_string(), format!("nobody.{BASE}")] {
+        let reply = get_on(&h, &host, "/.well-known/atproto-did").await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{host}");
+    }
+}
+
+#[tokio::test]
+async fn the_member_subdomain_serves_its_did_web_document() {
+    let h = harness().await;
+    a_member(&h, "alice").await;
+
+    let reply = get_on(&h, &format!("alice.{BASE}"), "/.well-known/did.json").await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.header("cache-control"), Some("public, max-age=3600"));
+    let doc = reply.json();
+    let did = format!("did:web:alice.{BASE}");
+    assert_eq!(doc["id"], did);
+    assert_eq!(doc["alsoKnownAs"], json!([format!("at://alice.{BASE}")]));
+
+    // The key that actually signs alice's commits.
+    let key = signing_key_of(&h, "alice").await;
+    let method = &doc["verificationMethod"][0];
+    assert_eq!(method["id"], format!("{did}#atproto"));
+    assert_eq!(method["type"], "Multikey");
+    assert_eq!(method["controller"], did);
+    assert_eq!(
+        format!("did:key:{}", method["publicKeyMultibase"].as_str().unwrap()),
+        key.did_key()
+    );
+
+    // The PDS is the instance, at the base origin — not the pod's.
+    assert_eq!(
+        doc["service"],
+        json!([{
+            "id": "#atproto_pds",
+            "type": "AtprotoPersonalDataServer",
+            "serviceEndpoint": format!("https://{BASE}"),
+        }])
+    );
+
+    for host in [BASE.to_string(), format!("nobody.{BASE}")] {
+        let reply = get_on(&h, &host, "/.well-known/did.json").await;
+        assert_eq!(reply.status, StatusCode::NOT_FOUND, "{host}");
+    }
+}
