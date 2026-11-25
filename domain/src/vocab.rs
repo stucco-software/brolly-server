@@ -161,6 +161,13 @@ pub const SOLID_UNLISTED_DOCUMENT: &str = "http://www.w3.org/ns/solid/terms#Unli
 pub const SOLID_PUBLIC_TYPE_INDEX: &str = "http://www.w3.org/ns/solid/terms#publicTypeIndex";
 /// Points from the profile at the private type index.
 pub const SOLID_PRIVATE_TYPE_INDEX: &str = "http://www.w3.org/ns/solid/terms#privateTypeIndex";
+/// One entry in a type index: "documents of this class live here" (the Solid
+/// Type Indexes spec). What a Solid app reads to find a member's data.
+pub const SOLID_TYPE_REGISTRATION: &str = "http://www.w3.org/ns/solid/terms#TypeRegistration";
+/// A registration's class: what kind of thing is registered.
+pub const SOLID_FOR_CLASS: &str = "http://www.w3.org/ns/solid/terms#forClass";
+/// A registration's document: where the one instance lives.
+pub const SOLID_INSTANCE: &str = "http://www.w3.org/ns/solid/terms#instance";
 /// The preferences file's class. The workspace ontology names it
 /// `ConfigurationFile`, and no source spec defines a `PreferencesFile` — the
 /// solid terms and the workspace ontology were checked, and both NSS's
@@ -289,6 +296,12 @@ mod tests {
             SOLID_PRIVATE_TYPE_INDEX,
             "http://www.w3.org/ns/solid/terms#privateTypeIndex"
         );
+        assert_eq!(
+            SOLID_TYPE_REGISTRATION,
+            "http://www.w3.org/ns/solid/terms#TypeRegistration"
+        );
+        assert_eq!(SOLID_FOR_CLASS, "http://www.w3.org/ns/solid/terms#forClass");
+        assert_eq!(SOLID_INSTANCE, "http://www.w3.org/ns/solid/terms#instance");
         // The preferences file's class. The spec's table says
         // `pim:PreferencesFile`, but the workspace ontology defines no such
         // term — `ConfigurationFile` is the one it defines, and the one NSS's

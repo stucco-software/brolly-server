@@ -16,6 +16,7 @@ pub mod keys;
 pub mod legacy;
 pub mod oauth;
 pub mod plc;
+pub mod preferences;
 pub mod repo;
 pub mod service_auth;
 pub mod state;

@@ -4479,3 +4479,239 @@ async fn the_member_subdomain_serves_its_did_web_document() {
         assert_eq!(reply.status, StatusCode::NOT_FOUND, "{host}");
     }
 }
+
+// --- preferences (stage 3, C) -------------------------------------------------------
+
+async fn get_prefs(h: &Harness, cookie: &str) -> Reply {
+    send(
+        h,
+        Request::builder()
+            .uri("/xrpc/app.bsky.actor.getPreferences")
+            .header(header::HOST, BASE)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await
+}
+
+async fn put_prefs(h: &Harness, cookie: &str, body: serde_json::Value) -> Reply {
+    post_json(h, "/xrpc/app.bsky.actor.putPreferences", body, Some(cookie)).await
+}
+
+fn prefs_doc() -> String {
+    format!("https://alice.{BASE}/~/settings/atproto-preferences.ttl")
+}
+
+fn private_index() -> String {
+    format!("https://alice.{BASE}/~/settings/privateTypeIndex.ttl")
+}
+
+/// The registrations for the preferences class in alice's private index.
+fn registrations(h: &Harness, user: uuid::Uuid) -> Vec<String> {
+    use brolly_store::resources::PodRead;
+    use oxigraph::model::{GraphNameRef, NamedNode, NamedOrBlankNode, Term};
+    let pod = h.stores.pod(user).unwrap();
+    let index = NamedNode::new_unchecked(private_index());
+    let for_class = NamedNode::new_unchecked("http://www.w3.org/ns/solid/terms#forClass");
+    let instance = NamedNode::new_unchecked("http://www.w3.org/ns/solid/terms#instance");
+    let class = Term::NamedNode(NamedNode::new_unchecked(
+        "at://app.bsky.actor.defs#preferences",
+    ));
+    let read = pod.read_store();
+    read.quads_for_pattern(
+        None,
+        Some(for_class.as_ref()),
+        Some(class.as_ref()),
+        Some(GraphNameRef::NamedNode(index.as_ref())),
+    )
+    .filter_map(Result::ok)
+    .flat_map(|q| {
+        let subject = match &q.subject {
+            NamedOrBlankNode::NamedNode(n) => n.clone(),
+            _ => return Vec::new(),
+        };
+        read.quads_for_pattern(
+            Some((&NamedOrBlankNode::NamedNode(subject)).into()),
+            Some(instance.as_ref()),
+            None,
+            Some(GraphNameRef::NamedNode(index.as_ref())),
+        )
+        .filter_map(Result::ok)
+        .filter_map(|q| match q.object {
+            Term::NamedNode(n) => Some(n.as_str().to_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+    })
+    .collect()
+}
+
+#[tokio::test]
+async fn preferences_round_trip_through_a_pod_document_a_solid_app_can_find() {
+    let h = harness().await;
+    let (alice, cookie) = a_member(&h, "alice").await;
+
+    // Nothing is provisioned: no document, no registration, no preferences.
+    let reply = get_prefs(&h, &cookie).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json(), json!({"preferences": []}));
+    assert!(registrations(&h, alice).is_empty());
+
+    let preferences = json!([
+        {"$type": "app.bsky.actor.defs#adultContentPref", "enabled": false},
+        {"$type": "app.bsky.actor.defs#savedFeedsPrefV2", "items": [
+            {"id": "3l6ovcmm2vd2j", "type": "timeline", "value": "following", "pinned": true},
+        ]},
+        // A type this build has never heard of round-trips faithfully.
+        {"$type": "com.example.future#pref", "nested": {"n": 1.5, "flag": null}},
+    ]);
+    let put = put_prefs(&h, &cookie, json!({"preferences": preferences})).await;
+    assert_eq!(put.status, StatusCode::OK, "{}", put.text());
+    assert_eq!(
+        get_prefs(&h, &cookie).await.json()["preferences"],
+        preferences
+    );
+
+    // In the member's storage, as an RDF document, registered once in the
+    // private type index — where a Solid app looks for it.
+    let pod = h.stores.pod(alice).unwrap();
+    assert!(
+        pod.read(|r| {
+            use brolly_store::resources::PodRead;
+            r.meta(&prefs_doc())
+        })
+        .unwrap()
+        .is_some(),
+        "the document exists as an LDP resource"
+    );
+    assert_eq!(registrations(&h, alice), vec![prefs_doc()]);
+
+    // Owner-only: it inherits the settings' ACL, so the world cannot read it.
+    let anonymous = get_on(
+        &h,
+        &format!("alice.{BASE}"),
+        "/~/settings/atproto-preferences.ttl",
+    )
+    .await;
+    assert!(
+        matches!(
+            anonymous.status,
+            StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
+        ),
+        "an anonymous read got {}",
+        anonymous.status
+    );
+
+    // A second put replaces, and does not register twice.
+    let fewer = json!([{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": true}]);
+    let put = put_prefs(&h, &cookie, json!({"preferences": fewer})).await;
+    assert_eq!(put.status, StatusCode::OK, "{}", put.text());
+    assert_eq!(get_prefs(&h, &cookie).await.json()["preferences"], fewer);
+    assert_eq!(registrations(&h, alice), vec![prefs_doc()]);
+
+    // Nothing reached the repo or the firehose.
+    assert!(commits(&h.db.pool).await.is_empty());
+}
+
+#[tokio::test]
+async fn preferences_survive_what_the_member_does_to_the_document() {
+    let h = harness().await;
+    let (alice, cookie) = a_member(&h, "alice").await;
+    let one = json!([{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": true}]);
+    put_prefs(&h, &cookie, json!({"preferences": one})).await;
+    let pod = h.stores.pod(alice).unwrap();
+
+    // Deleted by an app: no preferences, and the next put recreates it.
+    pod.write(|w| w.remove(&prefs_doc())).unwrap();
+    let reply = get_prefs(&h, &cookie).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert_eq!(reply.json()["preferences"], json!([]));
+    put_prefs(&h, &cookie, json!({"preferences": one})).await;
+    assert_eq!(get_prefs(&h, &cookie).await.json()["preferences"], one);
+    assert_eq!(registrations(&h, alice), vec![prefs_doc()]);
+
+    // Rewritten by hand into something the faithful layer cannot read: no
+    // preferences, not a 500.
+    let doc = oxigraph::model::NamedNode::new_unchecked(prefs_doc());
+    let stray = oxigraph::model::Quad::new(
+        doc.clone(),
+        oxigraph::model::NamedNode::new_unchecked("http://purl.org/dc/terms/title"),
+        oxigraph::model::Literal::new_simple_literal("my settings"),
+        doc.clone(),
+    );
+    pod.write(|w| {
+        w.put(
+            &prefs_doc(),
+            brolly_store::resources::Content::Rdf(&[stray]),
+        )
+        .map(|_| ())
+    })
+    .unwrap();
+    let reply = get_prefs(&h, &cookie).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["preferences"], json!([]));
+}
+
+#[tokio::test]
+async fn put_preferences_refuses_what_is_not_preferences() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+
+    for body in [
+        json!({}),
+        json!({"preferences": {"$type": "app.bsky.actor.defs#adultContentPref"}}),
+        json!({"preferences": ["not an object"]}),
+        json!({"preferences": [{"enabled": true}]}),
+        json!({"preferences": [{"$type": 7}]}),
+        json!({"preferences": [{
+            "$type": "com.example.big#pref",
+            "blob": "x".repeat(brolly_atproto::preferences::MAX_BYTES),
+        }]}),
+    ] {
+        let reply = put_prefs(&h, &cookie, body.clone()).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{body}: {}",
+            reply.text()
+        );
+        assert_eq!(reply.json()["error"], "InvalidRequest");
+    }
+    assert_eq!(
+        get_prefs(&h, &cookie).await.json()["preferences"],
+        json!([])
+    );
+}
+
+#[tokio::test]
+async fn preferences_are_the_callers_own() {
+    let h = harness().await;
+    let (_, alice) = a_member(&h, "alice").await;
+    let (_, bob) = a_member(&h, "bob").await;
+    let mine = json!([{"$type": "app.bsky.actor.defs#adultContentPref", "enabled": true}]);
+    put_prefs(&h, &alice, json!({"preferences": mine})).await;
+    assert_eq!(get_prefs(&h, &bob).await.json()["preferences"], json!([]));
+
+    // Anonymous: refused before anything is read.
+    let anonymous = get(&h, "/xrpc/app.bsky.actor.getPreferences").await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+    let anonymous = post_json(
+        &h,
+        "/xrpc/app.bsky.actor.putPreferences",
+        json!({"preferences": []}),
+        None,
+    )
+    .await;
+    assert_eq!(anonymous.status, StatusCode::UNAUTHORIZED);
+
+    // An `atproto`-only token authenticates but holds no account-state grant.
+    let key = p256::ecdsa::SigningKey::from_slice(&[22u8; 32]).unwrap();
+    let token = atproto_access_token(&h, &alice, &key, "atproto").await;
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let url = format!("https://{BASE}/xrpc/app.bsky.actor.getPreferences");
+    let proof = dpop_proof(&key, "GET", &url, Some(&ath), Some(&nonce(&h)));
+    let refused = get_with_dpop(&h, "/xrpc/app.bsky.actor.getPreferences", &token, &proof).await;
+    assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.text());
+    assert_eq!(refused.json()["error"], "ScopeMissingError");
+}

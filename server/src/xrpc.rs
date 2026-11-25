@@ -738,6 +738,85 @@ pub async fn resolve_handle(
     }
 }
 
+/// `app.bsky.actor.getPreferences` (stage 3, C): the member's preferences,
+/// read from the document in their pod.
+pub async fn get_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let caller = match caller(&state, &headers, &method, &uri).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    // The reference's own gate: account state, asked for with the full scope.
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
+    let user = caller.user;
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return private(storage_unavailable());
+    };
+    let root = brolly_identity::routing::storage_root(&user.username, &state.base_domain);
+    let items = brolly_atproto::preferences::read(&pod.read_store(), &root);
+    private(Json(json!({ "preferences": items })).into_response())
+}
+
+/// `app.bsky.actor.putPreferences` (stage 3, C): replace the member's
+/// preferences — an LDP write to their pod, not a repo commit, so nothing
+/// reaches the firehose.
+pub async fn put_preferences(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: Bytes,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    let caller = match caller(&state, &headers, &method, &uri).await {
+        Ok(caller) => caller,
+        Err(response) => return response,
+    };
+    if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+        return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+    }
+    let user = caller.user;
+    let Ok(input) = serde_json::from_slice::<Value>(&body) else {
+        return private(invalid_request(
+            "body must be a JSON object with preferences",
+        ));
+    };
+    let items = match brolly_atproto::preferences::validate(&input) {
+        Ok(items) => items,
+        Err(e) => return private(invalid_request(&e.to_string())),
+    };
+    // A pod write like any other, so it counts against the member's quota.
+    if !crate::pod::within_quota(&state, &user, body.len()) {
+        return private(xrpc_error(
+            StatusCode::BAD_REQUEST,
+            "InvalidRequest",
+            "the pod is at its quota",
+        ));
+    }
+    let Ok(pod) = state.stores.pod(user.id) else {
+        return private(storage_unavailable());
+    };
+    let root = brolly_identity::routing::storage_root(&user.username, &state.base_domain);
+    match pod.write(|w| brolly_atproto::preferences::write(w, &root, items)) {
+        Ok(_) => private(StatusCode::OK.into_response()),
+        Err(e) => {
+            tracing::error!(error = %e, user = %user.id, "storing preferences failed");
+            private(storage_unavailable())
+        }
+    }
+}
+
 #[derive(Deserialize)]
 pub struct SyncQuery {
     did: String,
@@ -2846,6 +2925,8 @@ pub fn routes() -> Router<AppState> {
             "/xrpc/com.atproto.identity.resolveHandle",
             get(resolve_handle),
         )
+        .route("/xrpc/app.bsky.actor.getPreferences", get(get_preferences))
+        .route("/xrpc/app.bsky.actor.putPreferences", post(put_preferences))
         .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
         .route("/xrpc/com.atproto.sync.getBlocks", get(get_blocks))
         .route(
