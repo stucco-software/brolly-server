@@ -121,7 +121,8 @@ log, not a broken redirect.
 ### An app in front: `BROLLY_HOME_URL`, `BROLLY_SIGNUP_URL`, `BROLLY_ACCOUNT_HOME`
 
 For a deployment whose public face is another app — StuccoID in front of
-`id.stucco.software`. Each variable hands one of brolly's pages to that app;
+`id.stucco.software`. [signup-api.md](signup-api.md) walks through wiring
+one up end to end. Each variable hands one of brolly's pages to that app;
 unset, brolly serves the page itself. brolly keeps login, consent, security,
 connected apps and export. Each value must be an absolute `http(s)` URL, or
 the server refuses to start.
@@ -224,6 +225,10 @@ registers, and then never again.
 is routing, not taste. Pick a real name.
 
 ### Afterwards
+
+Invites can be minted and revoked from the console, at `/admin/invites`. A
+code is shown once, when it's minted, because only its hash is stored. The
+same verbs are on the CLI:
 
 ```fish
 brolly-admin invite --uses 5            # ordinary invites
