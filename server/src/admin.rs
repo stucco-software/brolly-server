@@ -119,6 +119,7 @@ fn tabs(current: &str) -> Vec<Tab> {
     [
         ("/admin", "Overview"),
         ("/admin/users", "Members"),
+        ("/admin/invites", "Invites"),
         ("/admin/agents", "Agents"),
     ]
     .into_iter()
@@ -702,5 +703,222 @@ pub async fn agent_credentials(
             }
         }
         Err(e) => refused(&state, "", webid, &format!("{e} — is the WebID linked?")).await,
+    }
+}
+
+// --- invites -----------------------------------------------------------------
+//
+// Codes are stored hashed, so the list can never show one. A minted code is
+// visible exactly once, on the POST's own `no-store` response; an admin who
+// navigates away has lost it and mints another. Rows are identified by hash,
+// which is URL-safe and irreversible. The CLI's rule carries over unchanged:
+// an admin invite is single-use, and the console refuses rather than coerces.
+
+/// One row of the invites table, ready to render.
+struct InviteView {
+    code_hash: String,
+    /// `@username`, or "the instance" for the CLI and the bootstrap.
+    inviter: String,
+    created: String,
+    expires: String,
+    uses: i32,
+    max_uses: i32,
+    admin: bool,
+    /// `revoked`, `spent`, `expired` or `open`.
+    state: &'static str,
+}
+
+#[derive(Template)]
+#[template(path = "admin/invites.html")]
+struct InvitesPage<'a> {
+    chrome: Chrome<'a>,
+    tabs: Vec<Tab>,
+    invites: Vec<InviteView>,
+    /// A just-minted code, shown once.
+    minted: Option<String>,
+    /// Where an invitee registers: the apex's `/register`.
+    register_url: String,
+    uses_entered: String,
+    expires_entered: String,
+    admin_entered: bool,
+    error: Option<String>,
+}
+
+async fn invites_page<'a>(
+    state: &'a AppState,
+    minted: Option<String>,
+    refused: Option<(&InviteForm, String)>,
+) -> Result<InvitesPage<'a>, ()> {
+    let rows = db::list_invites(&state.pool).await.map_err(|e| {
+        tracing::error!(error = %e, "invite list failed");
+    })?;
+    let now = time::OffsetDateTime::now_utc();
+    let invites = rows
+        .into_iter()
+        .map(|row| InviteView {
+            state: if row.revoked_at.is_some() {
+                "revoked"
+            } else if row.uses >= row.max_uses {
+                "spent"
+            } else if row.expires_at.is_some_and(|at| at <= now) {
+                "expired"
+            } else {
+                "open"
+            },
+            inviter: row
+                .inviter
+                .map_or_else(|| "the instance".to_string(), |name| format!("@{name}")),
+            created: row.created_at.date().to_string(),
+            expires: row
+                .expires_at
+                .map_or_else(|| "never".to_string(), |at| at.date().to_string()),
+            uses: row.uses,
+            max_uses: row.max_uses,
+            admin: row.grants_role.as_deref() == Some(ADMIN),
+            code_hash: row.code_hash,
+        })
+        .collect();
+    let (uses_entered, expires_entered, admin_entered, error) = match refused {
+        Some((form, error)) => (
+            form.uses.clone(),
+            form.expires_days.clone(),
+            form.admin.is_some(),
+            Some(error),
+        ),
+        None => ("1".to_string(), String::new(), false, None),
+    };
+    Ok(InvitesPage {
+        chrome: state.chrome(),
+        tabs: tabs("/admin/invites"),
+        invites,
+        minted,
+        register_url: format!("https://{}/register", state.base_domain),
+        uses_entered,
+        expires_entered,
+        admin_entered,
+        error,
+    })
+}
+
+fn uncached_invites(page: InvitesPage<'_>, status: StatusCode) -> Response {
+    (
+        status,
+        [
+            (axum::http::header::CACHE_CONTROL, "no-store"),
+            (axum::http::header::PRAGMA, "no-cache"),
+        ],
+        render(&page),
+    )
+        .into_response()
+}
+
+/// `GET /admin/invites`
+pub async fn invites(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin(&state, &headers, "/admin/invites").await {
+        return response;
+    }
+    match invites_page(&state, None, None).await {
+        Ok(page) => render(&page),
+        Err(()) => server_error(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct InviteForm {
+    #[serde(default)]
+    uses: String,
+    #[serde(default)]
+    expires_days: String,
+    /// A checkbox: present when ticked, absent otherwise.
+    admin: Option<String>,
+}
+
+/// What the form asks for, or why not: uses, expiry and the role granted.
+fn parse_invite(form: &InviteForm) -> Result<(i32, Option<time::Duration>, bool), String> {
+    let uses = match form.uses.trim() {
+        "" => 1,
+        uses => match uses.parse::<i32>() {
+            Ok(n) if n > 0 => n,
+            _ => return Err("Uses must be a whole number, 1 or more.".into()),
+        },
+    };
+    let expires = match form.expires_days.trim() {
+        "" => None,
+        days => match days.parse::<i64>() {
+            Ok(n) if n > 0 => Some(time::Duration::days(n)),
+            _ => return Err("Expiry must be a whole number of days, or blank for never.".into()),
+        },
+    };
+    let admin = form.admin.is_some();
+    if admin && uses != 1 {
+        return Err("Admin invites are single-use. Set uses to 1.".into());
+    }
+    Ok((uses, expires, admin))
+}
+
+/// `POST /admin/invites` — mint an invite and show its code, once.
+pub async fn mint_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    form: Result<Form<InviteForm>, FormRejection>,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/invites").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let Ok(Form(form)) = form else {
+        return (StatusCode::BAD_REQUEST, "malformed request").into_response();
+    };
+    let (uses, expires, grants_admin) = match parse_invite(&form) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            return match invites_page(&state, None, Some((&form, error))).await {
+                Ok(page) => uncached_invites(page, StatusCode::BAD_REQUEST),
+                Err(()) => server_error(),
+            };
+        }
+    };
+    let grants = grants_admin.then_some(ADMIN);
+    match db::create_invite(&state.pool, Some(admin.id), uses, expires, grants).await {
+        Ok(code) => {
+            // The code never rides a log line.
+            tracing::info!(admin = %admin.username, uses, grants_admin, "invite minted from the console");
+            match invites_page(&state, Some(code), None).await {
+                Ok(page) => uncached_invites(page, StatusCode::OK),
+                Err(()) => server_error(),
+            }
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "invite mint failed");
+            server_error()
+        }
+    }
+}
+
+/// `POST /admin/invites/{code_hash}/revoke`. Revoking an unknown or
+/// already-revoked invite changes nothing and lands on the list all the same.
+pub async fn revoke_invite(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    code_hash: Result<Path<String>, PathRejection>,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/invites").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let Ok(Path(code_hash)) = code_hash else {
+        return not_found();
+    };
+    match db::revoke_invite_by_hash(&state.pool, &code_hash).await {
+        Ok(n) => {
+            if n > 0 {
+                tracing::info!(admin = %admin.username, invite = %code_hash, "invite revoked from the console");
+            }
+            Redirect::to("/admin/invites").into_response()
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "invite revoke failed");
+            server_error()
+        }
     }
 }

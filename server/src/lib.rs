@@ -466,6 +466,9 @@ pub const SAME_ORIGIN_FORMS: &[&str] = &[
     // An entry ending in `/` is a prefix: the console's per-member actions
     // carry the username in the path.
     "/admin/users/",
+    // The console's invites: mint, and revoke by hash.
+    "/admin/invites",
+    "/admin/invites/",
     // The console's agent provisioning (ADR 0021): account, link, unlink,
     // mint — all admin-gated writes.
     "/admin/agents/account",
@@ -785,6 +788,14 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .route("/admin", get(admin::overview))
         .route("/admin/users", get(admin::users))
         .route("/admin/users/{username}/quota", post(admin::set_quota))
+        .route(
+            "/admin/invites",
+            get(admin::invites).post(admin::mint_invite),
+        )
+        .route(
+            "/admin/invites/{code_hash}/revoke",
+            post(admin::revoke_invite),
+        )
         .route("/admin/agents", get(admin::agents))
         .route("/admin/agents/account", post(admin::agent_account))
         .route("/admin/agents/link", post(admin::agent_link))

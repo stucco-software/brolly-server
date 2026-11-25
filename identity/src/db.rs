@@ -396,6 +396,52 @@ pub async fn redeem_invite(pool: &PgPool, code: &str) -> Result<Option<String>, 
     }
 }
 
+/// One invite, as the console lists it.
+///
+/// No code: `invites.code_hash` is the primary key and the plaintext is never
+/// stored. The hash identifies the row — it is hex SHA-256 of a high-entropy
+/// value, so it is URL-safe and says nothing about the code.
+///
+/// `inviter` is a username from a LEFT JOIN, `None` when the CLI or the
+/// bootstrap minted the invite or when its admin has since been deleted.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct InviteRow {
+    pub code_hash: String,
+    pub inviter: Option<String>,
+    pub created_at: time::OffsetDateTime,
+    pub expires_at: Option<time::OffsetDateTime>,
+    pub max_uses: i32,
+    pub uses: i32,
+    pub revoked_at: Option<time::OffsetDateTime>,
+    pub grants_role: Option<String>,
+}
+
+/// Every invite, newest first, spent and revoked ones included: "who did I
+/// invite and when" is a question a list that drops rows cannot answer.
+pub async fn list_invites(pool: &PgPool) -> Result<Vec<InviteRow>, DbError> {
+    Ok(sqlx::query_as::<_, InviteRow>(
+        "SELECT i.code_hash, u.username AS inviter, i.created_at, i.expires_at,
+                i.max_uses, i.uses, i.revoked_at, i.grants_role
+           FROM invites i LEFT JOIN users u ON u.id = i.created_by
+          ORDER BY i.created_at DESC",
+    )
+    .fetch_all(pool)
+    .await?)
+}
+
+/// Revoke an invite by its hash: the console can see a row but never its
+/// code. Returns how many rows changed — 0 for an unknown or already-revoked
+/// invite. `redeem_invite` checks `revoked_at`, so this stops redemption.
+pub async fn revoke_invite_by_hash(pool: &PgPool, code_hash: &str) -> Result<u64, DbError> {
+    Ok(sqlx::query(
+        "UPDATE invites SET revoked_at = now() WHERE code_hash = $1 AND revoked_at IS NULL",
+    )
+    .bind(code_hash)
+    .execute(pool)
+    .await?
+    .rows_affected())
+}
+
 pub async fn revoke_invite(pool: &PgPool, code: &str) -> Result<(), DbError> {
     sqlx::query("UPDATE invites SET revoked_at = now() WHERE code_hash = $1")
         .bind(hash_secret(code))

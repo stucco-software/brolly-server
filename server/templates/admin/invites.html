@@ -1,0 +1,85 @@
+{% extends "base.html" %}
+
+{% block title %}Invites — {{ chrome.instance_name }}{% endblock %}
+
+{% block nav %}{% include "admin/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="dashboard dashboard-wide">
+    <h1>Invites</h1>
+    {% include "admin/_tabs.html" %}
+    <section class="dashboard-card dashboard-card-wide">
+      <p class="lede">Invitees register at <span class="mono">{{ register_url }}</span> with a code.
+        Codes are stored hashed: each one is shown once, when it is minted, and never again.</p>
+
+      {% if let Some(code) = minted %}
+      <p class="notice" role="status">Invite minted. Copy the code now — it is shown once, and if
+        you leave this page it is gone and you will need to mint another.
+        <span class="mono" id="minted-code">{{ code }}</span></p>
+      {% endif %}
+
+      {% if let Some(error) = error %}
+      <p class="error" role="alert">{{ error }}</p>
+      {% endif %}
+
+      <div class="stack-form">
+        <form method="post" action="/admin/invites">
+          <div class="field">
+            <label for="invite-uses">Uses</label>
+            <input id="invite-uses" name="uses" inputmode="numeric" value="{{ uses_entered }}" required>
+          </div>
+          <div class="field">
+            <label for="invite-expires">Expires after (days, blank for never)</label>
+            <input id="invite-expires" name="expires_days" inputmode="numeric" value="{{ expires_entered }}">
+          </div>
+          <div class="field">
+            <label for="invite-admin">
+              <input id="invite-admin" name="admin" type="checkbox"{% if admin_entered %} checked{% endif %}>
+              Grants admin (single-use only)
+            </label>
+          </div>
+          <button type="submit">Mint invite</button>
+        </form>
+      </div>
+
+      <table class="table">
+        <thead>
+          <tr>
+            <th scope="col">Created</th>
+            <th scope="col">By</th>
+            <th scope="col">Uses</th>
+            <th scope="col">Expires</th>
+            <th scope="col">Status</th>
+            <th scope="col"></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for invite in invites %}
+          <tr>
+            <th scope="row">{{ invite.created }}</th>
+            <td>{{ invite.inviter }}</td>
+            <td>{{ invite.uses }} of {{ invite.max_uses }}</td>
+            <td>{{ invite.expires }}</td>
+            <td>
+              {% if invite.admin %}<mark class="chip chip-admin">admin</mark>{% endif %}
+              {% if invite.state == "open" %}<span class="hint">open</span>{% else %}<mark class="chip chip-disabled">{{ invite.state }}</mark>{% endif %}
+            </td>
+            <td>
+              {% if invite.state == "open" %}
+              <form method="post" action="/admin/invites/{{ invite.code_hash }}/revoke" class="inline-form">
+                <button type="submit" aria-label="Revoke the invite created {{ invite.created }}">Revoke</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+          {% if invites.is_empty() %}
+          <tr><td colspan="6"><span class="hint">No invites yet.</span></td></tr>
+          {% endif %}
+        </tbody>
+      </table>
+    </section>
+  </div>
+</div>
+{% endblock %}

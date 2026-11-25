@@ -180,7 +180,7 @@ async fn an_admin_and_alice(
     (keeper, alice.id)
 }
 
-const ADMIN_PAGES: [&str; 2] = ["/admin", "/admin/users"];
+const ADMIN_PAGES: [&str; 3] = ["/admin", "/admin/users", "/admin/invites"];
 
 // --- the guard ---------------------------------------------------------------
 
@@ -724,4 +724,196 @@ async fn an_untouched_save_keeps_who_set_it() {
     let row = rows.iter().find(|r| r.username == "alice").unwrap();
     assert_eq!(row.quota_bytes, Some(2 << 30));
     assert_eq!(row.quota_set_by, None, "still the CLI's, not re-stamped");
+}
+
+// --- invites -----------------------------------------------------------------
+
+/// The one code a mint response shows, by the id the page gives it.
+fn minted_code(body: &str) -> String {
+    let marker = "id=\"minted-code\">";
+    let start = body.find(marker).expect("the mint response shows the code") + marker.len();
+    body[start..]
+        .split('<')
+        .next()
+        .expect("code text")
+        .trim()
+        .to_string()
+}
+
+#[tokio::test]
+async fn an_admin_mints_an_invite_that_registers_a_member() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+
+    let (status, body, _) = post_as(
+        &router,
+        "/admin/invites",
+        "uses=1&expires_days=",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let code = minted_code(&body);
+    assert_eq!(code.len(), 64, "a generated secret");
+
+    // Spent by the invitee, as a member.
+    register(&router, "bob", &code).await;
+    let bob = db::find_by_username(&db.pool, "bob")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!bob.is_admin());
+
+    // Attributed to the admin who minted it.
+    let (_, list) = get_as(&router, "/admin/invites", Some(&keeper)).await;
+    assert!(list.contains("@keeper"), "{list}");
+}
+
+/// The awkward property, pinned so a later refactor cannot quietly store the
+/// plaintext to make the UI nicer.
+#[tokio::test]
+async fn a_minted_code_is_shown_once_and_never_again() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+
+    let (_, body, _) = post_as(&router, "/admin/invites", "uses=3", &keeper, None).await;
+    let code = minted_code(&body);
+
+    let (status, list) = get_as(&router, "/admin/invites", Some(&keeper)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        !list.contains(&code),
+        "the list cannot show a code it never stored"
+    );
+}
+
+/// The console refuses, matching the shipped CLI. Silently coercing to 1 would
+/// make the two entry points disagree about the same rule.
+#[tokio::test]
+async fn an_admin_invite_with_several_uses_is_refused() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+    let before = invite_count(&db.pool).await;
+
+    let (status, body, _) =
+        post_as(&router, "/admin/invites", "uses=5&admin=on", &keeper, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("single-use"), "{body}");
+    assert_eq!(invite_count(&db.pool).await, before, "nothing minted");
+}
+
+#[tokio::test]
+async fn an_admin_invite_grants_admin() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+
+    let (_, body, _) = post_as(&router, "/admin/invites", "uses=1&admin=on", &keeper, None).await;
+    register(&router, "carol", &minted_code(&body)).await;
+    let carol = db::find_by_username(&db.pool, "carol")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(carol.is_admin());
+}
+
+#[tokio::test]
+async fn nonsense_uses_and_expiry_are_refused() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+    let before = invite_count(&db.pool).await;
+
+    for body in [
+        "uses=0",
+        "uses=many",
+        "uses=1&expires_days=0",
+        "uses=1&expires_days=soon",
+    ] {
+        let (status, _, _) = post_as(&router, "/admin/invites", body, &keeper, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    }
+    assert_eq!(invite_count(&db.pool).await, before, "nothing minted");
+}
+
+/// Both existing minters (bootstrap, the CLI) pass no inviter, and the
+/// bootstrap invite is row one on every new instance.
+#[tokio::test]
+async fn an_invite_with_no_inviter_renders() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+    db::create_invite(&db.pool, None, 2, None, None)
+        .await
+        .unwrap();
+
+    let (status, list) = get_as(&router, "/admin/invites", Some(&keeper)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(list.contains("the instance"), "{list}");
+}
+
+/// "Who did I invite and when" is a question operators ask, and a list that
+/// silently drops rows cannot answer it.
+#[tokio::test]
+async fn spent_and_revoked_invites_stay_listed_and_revoking_stops_the_code() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+    let code = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
+    let hash = db::hash_secret(&code);
+
+    let (status, _, location) = post_as(
+        &router,
+        &format!("/admin/invites/{hash}/revoke"),
+        "",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/admin/invites"));
+    assert!(matches!(
+        db::redeem_invite(&db.pool, &code).await,
+        Err(db::DbError::InviteInvalid)
+    ));
+
+    let (_, list) = get_as(&router, "/admin/invites", Some(&keeper)).await;
+    assert!(list.contains("revoked"), "{list}");
+    // The keeper's own (spent) invite is still there too: two rows.
+    let rows = db::list_invites(&db.pool).await.unwrap();
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().any(|r| r.uses == r.max_uses));
+}
+
+#[tokio::test]
+async fn a_member_cannot_mint_or_see_invites() {
+    let (db, _dir, router) = harness().await;
+    let invite = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
+    let member = register(&router, "mallory", &invite).await;
+    let before = invite_count(&db.pool).await;
+
+    let (status, _) = get_as(&router, "/admin/invites", Some(&member)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _, _) = post_as(&router, "/admin/invites", "uses=1", &member, None).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(invite_count(&db.pool).await, before);
+}
+
+#[tokio::test]
+async fn a_cross_origin_mint_is_refused() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+    let before = invite_count(&db.pool).await;
+
+    let (status, _, _) = post_as(
+        &router,
+        "/admin/invites",
+        "uses=1",
+        &keeper,
+        Some("https://evil.example"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(invite_count(&db.pool).await, before);
 }
