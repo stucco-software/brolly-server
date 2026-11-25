@@ -121,6 +121,7 @@ fn tabs(current: &str) -> Vec<Tab> {
         ("/admin/users", "Members"),
         ("/admin/invites", "Invites"),
         ("/admin/agents", "Agents"),
+        ("/admin/integrations", "Integrations"),
     ]
     .into_iter()
     .map(|(href, label)| Tab {
@@ -1194,4 +1195,67 @@ pub async fn delete(
         }
         Err(_) => server_error(),
     }
+}
+
+// --- integrations ------------------------------------------------------------
+
+/// Where the service API is documented. Upstream rather than
+/// `BROLLY_SOURCE_URL`, which names a site, not a repository.
+const SERVICE_API_DOCS: &str =
+    "https://github.com/stucco-software/brolly-server/blob/main/docs/signup-api.md";
+
+/// One front-end page brolly can hand to another app.
+struct Handoff {
+    variable: &'static str,
+    what: &'static str,
+    url: Option<String>,
+}
+
+#[derive(Template)]
+#[template(path = "admin/integrations.html")]
+struct IntegrationsPage<'a> {
+    chrome: Chrome<'a>,
+    tabs: Vec<Tab>,
+    /// Whether `BROLLY_SERVICE_TOKEN` is set. Never the token or its hash.
+    service_api: bool,
+    api_base: String,
+    handoffs: Vec<Handoff>,
+    public_registration: bool,
+    signup_handed_off: bool,
+    docs: &'static str,
+}
+
+/// `GET /admin/integrations` — how an app in front of the instance is wired,
+/// read from the running configuration.
+pub async fn integrations(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(response) = require_admin(&state, &headers, "/admin/integrations").await {
+        return response;
+    }
+    let front = &state.front_end;
+    render(&IntegrationsPage {
+        chrome: state.chrome(),
+        tabs: tabs("/admin/integrations"),
+        service_api: front.service_token_hash.is_some(),
+        api_base: format!("https://{}/internal/v1/", state.base_domain),
+        handoffs: vec![
+            Handoff {
+                variable: "BROLLY_HOME_URL",
+                what: "The instance's front page",
+                url: front.home.clone(),
+            },
+            Handoff {
+                variable: "BROLLY_SIGNUP_URL",
+                what: "Signup (/register)",
+                url: front.signup.clone(),
+            },
+            Handoff {
+                variable: "BROLLY_ACCOUNT_HOME",
+                what: "Profile and account deletion",
+                url: front.account_home.clone(),
+            },
+        ],
+        public_registration: state.public_registration,
+        signup_handed_off: front.signup.is_some(),
+        docs: SERVICE_API_DOCS,
+    })
 }

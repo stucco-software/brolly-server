@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block title %}Integrations — {{ chrome.instance_name }}{% endblock %}
+
+{% block nav %}{% include "admin/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="dashboard dashboard-wide">
+    <h1>Integrations</h1>
+    {% include "admin/_tabs.html" %}
+    <section class="dashboard-card dashboard-card-wide" aria-labelledby="service-api">
+      <h2 id="service-api">Service API</h2>
+      <p class="lede">Lets an app in front of this instance create, look up and delete accounts and
+        send password resets, server to server. <a href="{{ docs }}">How to set it up</a>.</p>
+      <dl class="facts">
+        <dt>Status</dt>
+        <dd>
+          {% if service_api %}
+          On
+          <p class="hint">Calls need <span class="mono">Authorization: Bearer</span> and the value of
+            <span class="mono">BROLLY_SERVICE_TOKEN</span>, which is only in the deployment's
+            configuration.</p>
+          {% else %}
+          <mark class="chip chip-disabled">off</mark>
+          <p class="hint">Set <span class="mono">BROLLY_SERVICE_TOKEN</span> (32+ characters,
+            <span class="mono">openssl rand -hex 32</span>) and redeploy to turn it on.</p>
+          {% endif %}
+        </dd>
+        <dt>Base URL</dt>
+        <dd><span class="mono">{{ api_base }}</span></dd>
+      </dl>
+    </section>
+
+    <section class="dashboard-card dashboard-card-wide" aria-labelledby="handoffs">
+      <h2 id="handoffs">Pages handed to another app</h2>
+      <table class="table">
+        <thead>
+          <tr>
+            <th scope="col">Page</th>
+            <th scope="col">Variable</th>
+            <th scope="col">Goes to</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for handoff in handoffs %}
+          <tr>
+            <th scope="row">{{ handoff.what }}</th>
+            <td><span class="mono">{{ handoff.variable }}</span></td>
+            <td>
+              {% if let Some(url) = handoff.url %}
+              <span class="mono">{{ url }}</span>
+              {% else %}
+              <span class="hint">not set — served here</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      <p class="hint">
+        {% if signup_handed_off %}
+        Registration here is closed: accounts are created by the app at the signup URL, through the
+        service API.
+        {% else if public_registration %}
+        Registration here is open to anyone.
+        {% else %}
+        Registration here is by invite.
+        {% endif %}
+      </p>
+    </section>
+  </div>
+</div>
+{% endblock %}

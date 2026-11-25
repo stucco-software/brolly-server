@@ -212,6 +212,7 @@ async fn every_dashboard_page_needs_a_session_and_comes_back_afterwards() {
         "/account/security",
         "/account/apps",
         "/account/export",
+        "/account/developers",
         "/account/delete",
     ] {
         let reply = h.get(path, None).await;
@@ -253,6 +254,35 @@ async fn the_overview_shows_the_member_what_is_theirs() {
         reply.body.contains(ROOT),
         "the storage root is what a Solid client needs to be pointed at"
     );
+}
+
+/// Everything an app needs to be pointed at the member's account, on every
+/// protocol, as values rather than as a pitch.
+#[tokio::test]
+async fn the_developers_page_lists_the_members_connection_details() {
+    let h = harness().await;
+    let cookie = h.login().await;
+    sqlx::query("UPDATE users SET did_plc = 'did:plc:abc123' WHERE username = 'alice'")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+
+    let reply = h.get("/account/developers", Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::OK);
+    for value in [
+        WEBID.to_string(),
+        ROOT.to_string(),
+        // The Solid-OIDC issuer, the PDS and the Mastodon API server are all
+        // the apex.
+        format!("https://{BASE}"),
+        format!("alice.{BASE}"),
+        "did:plc:abc123".to_string(),
+        format!("@alice@{BASE}"),
+        format!("https://alice.{BASE}/actor"),
+    ] {
+        assert!(reply.body.contains(&value), "missing {value}");
+    }
+    assert!(reply.body.contains("aria-current=\"page\""));
 }
 
 /// A member sees what they hold against what they may hold — the same

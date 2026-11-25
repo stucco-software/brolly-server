@@ -780,6 +780,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             get(account::apps).post(account::revoke_app),
         )
         .route("/account/export", get(account::export))
+        .route("/account/developers", get(account::developers))
         .route(
             "/account/delete",
             get(account::delete_form).post(account::delete_account),
@@ -805,6 +806,7 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
             "/admin/invites/{code_hash}/revoke",
             post(admin::revoke_invite),
         )
+        .route("/admin/integrations", get(admin::integrations))
         .route("/admin/agents", get(admin::agents))
         .route("/admin/agents/account", post(admin::agent_account))
         .route("/admin/agents/link", post(admin::agent_link))

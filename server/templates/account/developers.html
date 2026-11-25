@@ -1,0 +1,29 @@
+{% extends "base.html" %}
+
+{% block title %}Developers — {{ chrome.instance_name }}{% endblock %}
+
+{% block nav %}{% include "account/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="dashboard">
+    <h1>Developers</h1>
+    {% include "account/_tabs.html" %}
+    {% for group in groups %}
+    <section class="dashboard-card" aria-labelledby="group-{{ loop.index }}">
+      <h2 id="group-{{ loop.index }}">{{ group.heading }}</h2>
+      <dl class="facts">
+        {% for detail in group.details %}
+        <dt>{{ detail.label }}</dt>
+        <dd>
+          <span class="mono">{{ detail.value }}</span>
+          <p class="hint">{{ detail.hint }}</p>
+        </dd>
+        {% endfor %}
+      </dl>
+      <p class="hint"><a href="{{ group.docs.0 }}">{{ group.docs.1 }}</a></p>
+    </section>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

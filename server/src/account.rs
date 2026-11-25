@@ -38,6 +38,7 @@ fn tabs(current: &str) -> Vec<Tab> {
         ("/account/security", "Security"),
         ("/account/apps", "Apps"),
         ("/account/export", "Export"),
+        ("/account/developers", "Developers"),
         ("/account/delete", "Delete"),
     ]
     .into_iter()
@@ -142,6 +143,127 @@ pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Resp
         used: brolly_domain::media::format_size(pod_bytes),
         quota: brolly_domain::media::format_size(quota_bytes),
         is_admin: session.user.is_admin(),
+    })
+}
+
+// --- developers -------------------------------------------------------------
+
+/// One value an app needs, with what it is for.
+struct Detail {
+    label: &'static str,
+    value: String,
+    hint: &'static str,
+}
+
+/// One protocol's worth of details.
+struct DetailGroup {
+    heading: &'static str,
+    details: Vec<Detail>,
+    /// The protocol's own documentation; this page writes none of its own.
+    docs: (&'static str, &'static str),
+}
+
+#[derive(Template)]
+#[template(path = "account/developers.html")]
+struct Developers<'a> {
+    chrome: Chrome<'a>,
+    tabs: Vec<Tab>,
+    groups: Vec<DetailGroup>,
+}
+
+/// `GET /account/developers` — where to point an app at this account.
+///
+/// Values, not a pitch: this is the signed-in surface, where instruction
+/// belongs (`the_unauthenticated_surface_sells_nothing`). Everything is
+/// derived from the username and the base domain, so it cannot drift from
+/// what the server actually answers on.
+pub async fn developers(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let session = match require_session(&state, &headers, "/account/developers").await {
+        Ok(s) => s,
+        Err(response) => return response,
+    };
+    let username = &session.user.username;
+    let base = &state.base_domain;
+    let apex = format!("https://{base}");
+    let groups = vec![
+        DetailGroup {
+            heading: "Solid",
+            details: vec![
+                Detail {
+                    label: "WebID",
+                    value: webid::webid(username, base),
+                    hint: "Your identity. Solid apps ask for it when you sign in.",
+                },
+                Detail {
+                    label: "Identity provider",
+                    value: apex.clone(),
+                    hint: "The OpenID issuer apps sign you in with.",
+                },
+                Detail {
+                    label: "Storage",
+                    value: routing::storage_root(username, base),
+                    hint: "Your pod. Everything an app stores for you lives under it.",
+                },
+            ],
+            docs: (
+                "https://solidproject.org/developers",
+                "Solid developer docs",
+            ),
+        },
+        DetailGroup {
+            heading: "ATProto",
+            details: vec![
+                Detail {
+                    label: "Handle",
+                    value: format!("{username}.{base}"),
+                    hint: "What you type to sign in to a Bluesky-compatible app.",
+                },
+                Detail {
+                    label: "DID",
+                    value: session
+                        .user
+                        .did_plc
+                        .clone()
+                        .unwrap_or_else(|| "Not registered yet".to_string()),
+                    hint: "Your permanent ATProto identifier.",
+                },
+                Detail {
+                    label: "PDS",
+                    value: apex.clone(),
+                    hint: "The server that hosts your repository.",
+                },
+            ],
+            docs: ("https://atproto.com/guides/overview", "ATProto docs"),
+        },
+        DetailGroup {
+            heading: "ActivityPub",
+            details: vec![
+                Detail {
+                    label: "Address",
+                    value: format!("@{}", webid::handle(username, base)),
+                    hint: "How people find and follow you from other servers.",
+                },
+                Detail {
+                    label: "Actor",
+                    value: webid::actor(username, base),
+                    hint: "Your ActivityPub actor document.",
+                },
+                Detail {
+                    label: "Mastodon API server",
+                    value: apex,
+                    hint: "The server to enter in a Mastodon-compatible app.",
+                },
+            ],
+            docs: (
+                "https://docs.joinmastodon.org/client/intro/",
+                "Mastodon client API docs",
+            ),
+        },
+    ];
+    render(&Developers {
+        chrome: state.chrome(),
+        tabs: tabs("/account/developers"),
+        groups,
     })
 }
 

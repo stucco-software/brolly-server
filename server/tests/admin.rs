@@ -17,6 +17,12 @@ use tower::ServiceExt;
 const SESSION_COOKIE: &str = brolly_identity::extract::SESSION_COOKIE;
 
 async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
+    harness_with(brolly_server::FrontEnd::default()).await
+}
+
+async fn harness_with(
+    front_end: brolly_server::FrontEnd,
+) -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Router) {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().expect("tempdir");
@@ -30,7 +36,7 @@ async fn harness() -> (brolly_test_support::TestDb, tempfile::TempDir, axum::Rou
         privacy_url: None,
         theme_css: false,
         public_registration: false,
-        front_end: brolly_server::FrontEnd::default(),
+        front_end,
         limiter: std::sync::Arc::new(brolly_server::ratelimit::Limiter::new()),
         www_redirect: None,
         max_upload_bytes: brolly_domain::media::MAX_UPLOAD_BYTES,
@@ -180,7 +186,12 @@ async fn an_admin_and_alice(
     (keeper, alice.id)
 }
 
-const ADMIN_PAGES: [&str; 3] = ["/admin", "/admin/users", "/admin/invites"];
+const ADMIN_PAGES: [&str; 4] = [
+    "/admin",
+    "/admin/users",
+    "/admin/invites",
+    "/admin/integrations",
+];
 
 // --- the guard ---------------------------------------------------------------
 
@@ -1219,4 +1230,51 @@ async fn an_unknown_member_cannot_be_disabled_or_deleted() {
         let (status, _, _) = post_as(&router, path, body, &keeper, None).await;
         assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
     }
+}
+
+// --- integrations ------------------------------------------------------------
+
+/// Unconfigured, the page says the service API is off and how to turn it on.
+#[tokio::test]
+async fn integrations_says_the_service_api_is_off_until_configured() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice) = an_admin_and_alice(&db, &router).await;
+
+    let (status, page) = get_as(&router, "/admin/integrations", Some(&keeper)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("BROLLY_SERVICE_TOKEN"), "{page}");
+    assert!(page.contains("https://brolly.test/internal/v1/"));
+    assert!(page.contains("signup-api.md"));
+}
+
+/// Configured, it shows what is set — and never the token.
+#[tokio::test]
+async fn integrations_shows_the_configuration_but_never_the_token() {
+    let service_token = "a-service-token-that-is-long-enough-to-be-accepted";
+    let (db, _dir, router) = harness_with(brolly_server::FrontEnd {
+        home: Some("https://front.example/".into()),
+        signup: Some("https://front.example/join".into()),
+        account_home: None,
+        service_token_hash: Some(db::hash_secret(service_token)),
+    })
+    .await;
+    // With a signup URL set, /register redirects away: sign the admin in
+    // directly instead.
+    let admin = db::create_user(&db.pool, "keeper", None, "correct-horse-battery", "admin")
+        .await
+        .unwrap();
+    let token = db::create_session(&db.pool, admin.id, time::Duration::hours(1), None)
+        .await
+        .unwrap();
+    let keeper = format!("{SESSION_COOKIE}={token}");
+
+    let (status, page) = get_as(&router, "/admin/integrations", Some(&keeper)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("https://front.example/join"));
+    assert!(page.contains("https://front.example/"));
+    assert!(!page.contains(service_token), "the token is never shown");
+    assert!(
+        !page.contains(&db::hash_secret(service_token)),
+        "nor its hash"
+    );
 }
