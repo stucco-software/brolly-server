@@ -47,8 +47,10 @@ answers half the lexicons the app expects and nothing else:
 - Handle and DID resolution the way the network resolves them:
   `identity.resolveHandle`, `/.well-known/atproto-did` on the member
   subdomain, `/.well-known/did.json` on the member subdomain.
-- `app.bsky.actor.getPreferences`/`putPreferences`, stored server-local the
-  way the reference PDS stores them.
+- `app.bsky.actor.getPreferences`/`putPreferences`, stored as a document in
+  the member's pod that their Solid apps can discover and read — not
+  server-local the way the reference PDS stores them (revised 2026-11-25,
+  decision C).
 - Unimplemented `app.bsky.*` requests forwarded to a configured AppView
   with `atproto-proxy` and a service-auth token, protected methods refused.
 - `requestCrawl` sent to a configured relay on startup.
@@ -131,7 +133,9 @@ All five sit on what stage 1 built and none writes anything.
   server fault.
 - **`/.well-known/atproto-did`** on the **member subdomain** (the handle's
   origin — `alice.brolly.test`, never the apex, which is not a handle):
-  `did=…` as `text/plain`. This is the atproto handle-resolution document,
+  the bare DID as `text/plain` (not `did=…` — that prefix is the DNS
+  method's `_atproto` TXT record; the HTTPS document's body is the DID
+  verbatim). This is the atproto handle-resolution document,
   and the subdomain is the whole point: the DNS-less fallback any
   `atproto` client can check. It answers what `resolveHandle` answers, and
   carries `Cache-Control: public, max-age=3600` — the document is stable
@@ -149,26 +153,55 @@ All five sit on what stage 1 built and none writes anything.
 
 ### C. Preferences
 
+*Revised 2026-11-25.* The draft stored preferences in a Postgres table, the
+reference's own shape. nk: preferences are "on the order of a profile" —
+member data with the same interop potential, so a preference set in bsky.app
+should be readable from other apps, Solid apps included. That is also the
+Postgres-is-admin-only rule: what a member made leaves with their export.
+
 - `app.bsky.actor.getPreferences` returns `{preferences: [...]}`;
-  `putPreferences` takes the array and answers 200. Both sit behind the
-  caller like every other XRPC procedure — a token's scope (`atproto` or
-  `transition:generic`) is enough; the reference asks for `transition:generic`.
-- Storage is one table, `atproto_preferences` (`user_id` PK referencing
-  `users` `ON DELETE CASCADE`, `preferences JSONB NOT NULL`) — server-local
-  actor state, the reference's own shape. Not repo records (see
-  non-goals): a preference change is not a commit, and `putPreferences` is
-  not a write path.
+  `putPreferences` takes `{preferences: [...]}` and answers 200. Both sit
+  behind the caller like every other XRPC procedure — a token's scope
+  (`atproto` or `transition:generic`) is enough; the reference asks for
+  `transition:generic`.
+- **Where:** one RDF document in the member's storage,
+  `/~/settings/atproto-preferences.ttl` — beside the preferences file and
+  the type indexes, inheriting their owner-only ACL, inside `/~/` because
+  it is the member's content, not a server projection (ADR 0010: the root
+  is the server's, `/~/` is the member's). Not provisioned: the first
+  `putPreferences` creates it ("pods are plain Solid" — nothing appears
+  before something writes it).
+- **What:** the body encoded by the faithful layer — the same lossless
+  JSON ⇄ RDF every ATProto record already takes (D7) — with subject
+  `<…/atproto-preferences.ttl#preferences>` and term space
+  `app.bsky.actor.getPreferences` (the output lexicon; `defs#preferences`
+  carries a fragment and cannot be a term space). A Solid client reads it as
+  Turtle; `getPreferences` decodes it back to exactly what was put, unknown
+  preference `$type`s included.
+- **Discovery:** the first `putPreferences` also registers the document in
+  the member's **private type index** — a `solid:TypeRegistration` with
+  `solid:forClass <at://app.bsky.actor.defs#preferences>` and
+  `solid:instance` the document — the way any Solid app announces a
+  document it keeps. Registered once; an existing registration for that
+  class is left alone.
+- **`putPreferences` replaces the document whole** (`put`, not a patch):
+  the lexicon's semantics are "here is the full set". It is an LDP write
+  under the pod's lock — new version, new `modified` — not a repo commit,
+  and nothing reaches the firehose.
+- **The member owns the document**, so the server tolerates what a member
+  or app does to it: missing → `getPreferences` answers `[]` (and the next
+  put recreates and re-registers it); content that does not decode
+  faithfully (triples an app wrote by hand) → `[]`, logged, never a 500. The
+  data is theirs to break; the endpoint stays up.
 - The body is validated as the lexicon's `app.bsky.actor.defs#preferences`
   shape *structurally*: a JSON array whose every item is an object with a
   string `$type`. Unknown preference `$type`s are stored and returned
-  faithfully — the same faithful-ingest rule the repo applies to unmapped
-  lexicons, for the same reason: a preference type this build has not
-  heard of is a client being newer than the server, not an error. The
-  array is capped at 1 MiB serialized, the repo's own record cap, so a
-  runaway client cannot turn its settings into a storage problem.
-- Unknown-but-valid JSON, a missing array, or a non-object item is
-  `InvalidRequest` — the lexicon's own answer to a body that is not
-  preferences.
+  faithfully — a preference type this build has not heard of is a client
+  being newer than the server, not an error. The array is capped at 1 MiB
+  serialized, the repo's own record cap, and the write counts against the
+  member's quota like any other pod write.
+- A missing array or a non-object item is `InvalidRequest` — the lexicon's
+  own answer to a body that is not preferences.
 
 ### D. The AppView proxy
 
@@ -261,12 +294,16 @@ All five sit on what stage 1 built and none writes anything.
   `did:web`); unknown handle → `InvalidRequest`; a bare username (no
   domain) is refused — a handle is a domain name.
 - **The subdomain documents**: `/.well-known/atproto-did` on
-  `alice.{base}` answers `did=…` as `text/plain` with the cache header;
+  `alice.{base}` answers the bare DID as `text/plain` with the cache header;
   the apex 404s it (it is not a handle); `did.json` on the member
   subdomain carries `id`, `alsoKnownAs`, the member's actual signing key
   and the PDS service at the base origin; the apex 404s it too.
 - **Preferences**: `putPreferences` stores and `getPreferences` returns
-  the same array; an anonymous caller and a missing scope are refused;
+  the same array; the document exists at `/~/settings/atproto-preferences.ttl`
+  as Turtle an owner's Solid client can `GET`, and the private type index
+  registers it; a second put replaces (not merges) and does not register
+  twice; a deleted document reads as `[]` and the next put recreates it;
+  undecodable content reads as `[]`; an anonymous caller and a missing scope are refused;
   a non-array body, a non-object item and a missing `$type` are
   `InvalidRequest`; unknown `$type`s round-trip; an over-cap array is
   refused; a second member's preferences do not leak into the first's.
@@ -287,8 +324,8 @@ All five sit on what stage 1 built and none writes anything.
 
 ## Rollout
 
-- One migration, additive: `atproto_preferences`. No data conversion — no
-  preferences exist yet.
+- No migration: preferences live in the pod (decision C, revised). No data
+  conversion — no preferences exist yet.
 - The wire is additive throughout: new read endpoints, two well-known
   documents on subdomains that currently 404, and preferences on a path
   that currently 501s. The one behaviour change on an existing path is
@@ -316,7 +353,8 @@ Five, one commit each:
    `/.well-known/atproto-did`, `/.well-known/did.json`. *Second because
    it is small and because the proxy (4) and any future relay-facing work
    cite the DID resolution it publishes.*
-3. **Preferences.** The table, both endpoints. *Third because bsky.app
+3. **Preferences.** The pod document, its type-index registration, both
+   endpoints. *Third because bsky.app
    needs it and it touches nothing but itself.*
 4. **The AppView proxy.** The configuration, the forwarder, the service
    token, the protected list. *Fourth because it consumes chunk 2's DID
@@ -334,6 +372,6 @@ Five, one commit each:
 |---|---|---|
 | A | `listRecords` walks the MST (`entries_prefixed`) with an `rkey` cursor, in memory per page; `describeRepo`'s collections are the MST's distinct first path segments | The MST *is* the index — key order is record order — so a listing is a walk, not a second index to keep consistent; a cursor on `rkey` is the reference's own shape, and in-page handling keeps the walk stateless |
 | B | `getBlocks` answers the existing subset, root in the CAR header; `getRepoStatus` reports `is_active` rather than enforcing it; unknown DID is `RepoNotFound` | A block set answers "do you have these" with the subset it has; status is a *report* to a crawler that already indexed the repo — the caller filter already enforces what enforcement would |
-| C | Preferences in a table, not repo records; structural validation (`$type`d objects), unknown `$type`s stored faithfully, 1 MiB cap | The reference's own shape (actor storage, not the repo); a preference is UI state, not content — publishing it to the firehose would be the behavioural change; faithful storage is the same rule the repo gives unmapped lexicons |
+| C | *(revised 2026-11-25)* Preferences in a pod document (`/~/settings/atproto-preferences.ttl`, faithful RDF, owner-only), registered in the private type index; not repo records, not a table; structural validation (`$type`d objects), unknown `$type`s stored faithfully, 1 MiB cap | Not the repo: a preference is UI state, and publishing it to the firehose would be the behavioural change. Not a table: it is member data with a profile's interop potential (nk), so it leaves with the export and a Solid app can find it through the type index; faithful storage is the same rule the repo gives unmapped lexicons |
 | D | The proxy forwards unmounted `app.bsky.*` only, drops the client's credentials, attaches `atproto-proxy` and a member-key service token (`lxm`=method, `aud`=AppView DID), streams both ways, and answers `UpstreamFailure` (502) when the AppView is down | The reference's delegation model (`auth-verifier.ts` reads exactly these); forwarding a PDS's own namespace would split its identity; replayed client credentials at a third party are a leak, not a feature; and "configured but down" must be distinguishable from "not implemented" |
 | E | `requestCrawl` is unauthenticated, config-gated (`BROLLY_RELAY_URL`), retried with capped backoff until it succeeds | The relay authorises the crawl by the endpoint it discovers, so a token from an unknown DID proves nothing; a boot-time failure must not cost the crawl slot; and the default-off rule keeps the wire unchanged for every existing deployment |
