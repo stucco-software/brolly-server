@@ -31,6 +31,10 @@ ipld-core = "0.4"
 serde_bytes = "0.11"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+# The MST listing walks (stage 3, A): `Tree::entries_prefixed` hands back a
+# Stream, and driving it is what `StreamExt` is. The same copy and feature set
+# the vendored atrium-repo already links, so this adds no second version.
+futures = { version = "0.3.30", default-features = false, features = ["alloc", "std"] }
 # The EC P-256 half of client authentication (stage 2, F): the keys a
 # confidential client's JWKS names, verified for its ES256 assertions. The
 # same copy identity's DPoP verifier uses.

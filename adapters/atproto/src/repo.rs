@@ -788,12 +788,172 @@ pub async fn get_record(
     collection: &str,
     rkey: &str,
 ) -> Result<Option<Value>, RepoError> {
+    Ok(get_record_entry(blocks, root, collection, rkey)
+        .await?
+        .map(|(_, value)| value))
+}
+
+/// A record and the CID the MST holds for it (stage 3, A).
+///
+/// `getRecord`'s wire answer carries the CID — it is what a client builds a
+/// `strongRef` from to like or reply — and the CID is the tree's, read in the
+/// same walk as the value, so the two cannot describe different versions.
+pub async fn get_record_entry(
+    blocks: PodBlocks,
+    root: Cid,
+    collection: &str,
+    rkey: &str,
+) -> Result<Option<(Cid, Value)>, RepoError> {
     let path = record_path(collection, rkey)?;
     let mut repo = Repository::open(blocks, root).await?;
+    let Some(cid) = repo.tree().get(&path).await? else {
+        return Ok(None);
+    };
     match repo.get_raw::<Ipld>(&path).await? {
-        Some(ipld) => Ok(Some(ipld_to_json(&ipld))),
+        Some(ipld) => Ok(Some((cid, ipld_to_json(&ipld)))),
         None => Ok(None),
     }
+}
+
+/// One listed record: where it lives, the block it is, and the JSON the wire
+/// carries (stage 3, A).
+#[derive(Debug, Clone)]
+pub struct ListedRecord {
+    pub rkey: String,
+    pub cid: Cid,
+    pub value: Value,
+}
+
+/// List a collection's records, in `rkey` order (stage 3, A).
+///
+/// The MST *is* the index — key order is record order — so a listing is a walk
+/// of `Tree::entries_prefixed`, not a second index to keep consistent. The
+/// walk collects keys first and reads record blocks only for the page it
+/// returns; `after` is the cursor (the last `rkey` the previous page handed
+/// out, exclusive, in the page's direction), and `reverse` flips the direction.
+/// Returns the page and the next cursor — `None` when there is no next page.
+///
+/// `root` is the repo's head — the *commit* — not the tree: the walk starts at
+/// the MST root the commit's `data` names.
+pub async fn list_records(
+    blocks: &mut PodBlocks,
+    root: Cid,
+    collection: &str,
+    after: Option<&str>,
+    limit: usize,
+    reverse: bool,
+) -> Result<(Vec<ListedRecord>, Option<String>), RepoError> {
+    // The collection, validated with atrium's own NSID grammar — the same
+    // check the write path's `record_path` makes, so a listing accepts no
+    // collection a write would refuse. `record_path` itself is not used: it
+    // requires a non-empty rkey, and a prefix is all the walk needs.
+    let prefix = format!("{}/", parse_nsid(collection)?.as_str());
+    // The cursor is an rkey and is held to the same grammar: a listing is not
+    // a place to accept a path the write path would refuse.
+    parse_rkey(after)?;
+
+    // Every key under the collection, in walk order, with its record CID.
+    // Reading the keys cannot be capped — the cursor's position is only known
+    // against the full ordered set — so the bound is the repo itself, the size
+    // the write path's per-record and per-diff caps already hold it to.
+    let data = read_commit(blocks, root).await?.data;
+    let mut keys: Vec<(String, Cid)> = Vec::new();
+    {
+        let mut tree = atrium_repo::mst::Tree::open(&mut *blocks, data);
+        let stream = tree.entries_prefixed(&prefix);
+        tokio::pin!(stream);
+        use futures::StreamExt;
+        while let Some(entry) = stream.next().await {
+            keys.push(entry?);
+        }
+    }
+
+    // The page: the keys past the cursor, in the direction asked for.
+    let mut page: Vec<(String, Cid)> = keys
+        .into_iter()
+        .filter_map(|(key, cid)| {
+            let rkey = key.strip_prefix(&prefix)?;
+            let keep = match (reverse, after) {
+                (false, Some(cursor)) => rkey > cursor,
+                (true, Some(cursor)) => rkey < cursor,
+                _ => true,
+            };
+            keep.then_some((rkey.to_owned(), cid))
+        })
+        .collect();
+    if reverse {
+        page.reverse();
+    }
+
+    let next = page.get(limit).map(|_| page[limit - 1].0.clone());
+    let mut listed = Vec::with_capacity(page.len().min(limit));
+    for (rkey, cid) in page.into_iter().take(limit) {
+        let bytes = blocks.read_block(cid).await?;
+        let ipld: Ipld = serde_ipld_dagcbor::from_slice(&bytes)
+            .map_err(|e| RepoError::Repo(format!("a record block does not parse: {e}")))?;
+        listed.push(ListedRecord {
+            rkey,
+            cid,
+            value: ipld_to_json(&ipld),
+        });
+    }
+    Ok((listed, next))
+}
+
+/// The distinct collections a repo holds, in key order (stage 3, A): the
+/// first path segment of every MST key, which the walk already sorts, so the
+/// distinct list is sorted with no second pass.
+pub async fn collections(blocks: &mut PodBlocks, root: Cid) -> Result<Vec<String>, RepoError> {
+    let data = read_commit(blocks, root).await?.data;
+    let mut names = Vec::new();
+    let mut tree = atrium_repo::mst::Tree::open(&mut *blocks, data);
+    let stream = tree.keys();
+    tokio::pin!(stream);
+    use futures::StreamExt;
+    while let Some(key) = stream.next().await {
+        let segment = key?.split('/').next().unwrap_or_default().to_owned();
+        if !segment.is_empty() && names.last().is_none_or(|last| *last != segment) {
+            names.push(segment);
+        }
+    }
+    Ok(names)
+}
+
+/// A CAR of the requested blocks that exist, framed with the repo's current
+/// root as its header root (stage 3, A).
+///
+/// This is `sync.getBlocks` — the "do you have these" primitive a
+/// resynchronising consumer asks with — so a missing CID is simply absent
+/// from the answer: the honest answer is the subset, and the CAR's content
+/// addressing already tells the consumer what it got.
+pub async fn blocks_car(
+    blocks: &mut PodBlocks,
+    root: Cid,
+    cids: &[Cid],
+) -> Result<Vec<u8>, RepoError> {
+    use atrium_repo::blockstore::CarStore;
+
+    let buffer = SharedBuffer::default();
+    let mut car = CarStore::create_with_roots(buffer.clone(), [root])
+        .await
+        .map_err(|e| RepoError::Repo(e.to_string()))?;
+    for cid in cids {
+        // A CID that is not stored is skipped, not an error — but `read_block`
+        // returns the same error for a missing block and a store fault, so the
+        // existence check is `contains`, which answers the one question that
+        // matters here without guessing which failure it was.
+        if !blocks.contains(cid) {
+            continue;
+        }
+        let bytes = blocks.read_block(*cid).await?;
+        car.write_block(
+            atrium_repo::blockstore::DAG_CBOR,
+            atrium_repo::blockstore::SHA2_256,
+            &bytes,
+        )
+        .await?;
+    }
+    Ok(buffer.take())
 }
 
 /// Export the repo as a CARv1 archive.

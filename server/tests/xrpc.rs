@@ -3908,3 +3908,431 @@ async fn the_new_members_repo_resolves_by_did() {
     assert_eq!(reply.json()["did"], did);
     assert_eq!(reply.json()["handle"], format!("alice.{BASE}"));
 }
+
+// --- the repo reads (stage 3, A) -------------------------------------------------
+
+/// Write one post through the real write path, so every read below reads what
+/// a client actually wrote rather than a fixture shaped like it.
+async fn write_post(h: &Harness, cookie: &str, collection: &str, rkey: &str, text: &str) -> Reply {
+    let reply = post_json(
+        h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": collection,
+            "rkey": rkey,
+            "record": {"$type": collection, "text": text},
+        }),
+        Some(cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    reply
+}
+
+fn rkeys_of(page: &serde_json::Value) -> Vec<String> {
+    page["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| {
+            let uri = record["uri"].as_str().unwrap();
+            uri.rsplit('/').next().unwrap().to_owned()
+        })
+        .collect()
+}
+
+const POST: &str = "app.bsky.feed.post";
+const FIVE: [&str; 5] = [
+    "3kaaaaaaaaaab",
+    "3kaaaaaaaaaac",
+    "3kaaaaaaaaaad",
+    "3kaaaaaaaaaae",
+    "3kaaaaaaaaaaf",
+];
+
+#[tokio::test]
+async fn list_records_pages_in_key_order_and_the_cursor_resumes() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    // Written out of order: the listing's order is the key's, not the write's.
+    for rkey in [FIVE[3], FIVE[0], FIVE[4], FIVE[1], FIVE[2]] {
+        write_post(&h, &cookie, POST, rkey, rkey).await;
+    }
+    let list = |query: String| {
+        let h = &h;
+        async move {
+            let reply = get(
+                h,
+                &format!(
+                    "/xrpc/com.atproto.repo.listRecords?repo=alice.{BASE}&collection={POST}{query}"
+                ),
+            )
+            .await;
+            assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+            reply.json()
+        }
+    };
+
+    let first = list("&limit=2".into()).await;
+    assert_eq!(rkeys_of(&first), FIVE[..2]);
+    let cursor = first["cursor"].as_str().expect("a next page").to_owned();
+
+    let second = list(format!("&limit=2&cursor={cursor}")).await;
+    assert_eq!(rkeys_of(&second), FIVE[2..4]);
+    let cursor = second["cursor"].as_str().unwrap().to_owned();
+
+    let last = list(format!("&limit=2&cursor={cursor}")).await;
+    assert_eq!(rkeys_of(&last), FIVE[4..]);
+    // The last page leaves the key out: the lexicon's cursor is an optional
+    // string, and a strict validator refuses `null` for one.
+    assert!(last.get("cursor").is_none(), "{last}");
+
+    // Reverse walks the other way, and its cursor resumes in that direction.
+    let backwards = list("&limit=3&reverse=true".into()).await;
+    assert_eq!(rkeys_of(&backwards), vec![FIVE[4], FIVE[3], FIVE[2]]);
+    let cursor = backwards["cursor"].as_str().unwrap().to_owned();
+    let rest = list(format!("&limit=3&reverse=true&cursor={cursor}")).await;
+    assert_eq!(rkeys_of(&rest), vec![FIVE[1], FIVE[0]]);
+
+    // An exactly-full last page has no next page either.
+    let all = list("&limit=5".into()).await;
+    assert_eq!(rkeys_of(&all), FIVE);
+    assert!(all.get("cursor").is_none(), "{all}");
+}
+
+#[tokio::test]
+async fn list_records_serves_what_get_record_serves() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    write_post(&h, &cookie, POST, FIVE[0], "the same bytes").await;
+
+    let listed = get(
+        &h,
+        &format!("/xrpc/com.atproto.repo.listRecords?repo=alice.{BASE}&collection={POST}"),
+    )
+    .await
+    .json();
+    let fetched = get(
+        &h,
+        &format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection={POST}&rkey={}",
+            FIVE[0]
+        ),
+    )
+    .await
+    .json();
+    let record = &listed["records"][0];
+    assert_eq!(record["uri"], fetched["uri"]);
+    assert_eq!(record["cid"], fetched["cid"]);
+    assert_eq!(record["value"], fetched["value"]);
+    assert!(
+        fetched["cid"].is_string(),
+        "getRecord names the CID: {fetched}"
+    );
+
+    // Asking for that version finds it; asking for another does not.
+    let uri = |cid: &str| {
+        format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection={POST}&rkey={}&cid={cid}",
+            FIVE[0]
+        )
+    };
+    let same = get(&h, &uri(fetched["cid"].as_str().unwrap())).await;
+    assert_eq!(same.status, StatusCode::OK, "{}", same.text());
+    let root = get(
+        &h,
+        &format!("/xrpc/com.atproto.sync.getLatestCommit?did=alice.{BASE}"),
+    )
+    .await
+    .json();
+    let other = get(&h, &uri(root["commit"].as_str().unwrap())).await;
+    assert_eq!(other.status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn list_records_refuses_what_the_lexicon_refuses() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    write_post(&h, &cookie, POST, FIVE[0], "one").await;
+
+    for query in [
+        format!("collection={POST}&limit=0"),
+        format!("collection={POST}&limit=101"),
+        "collection=not%20an%20nsid".to_string(),
+        format!("collection={POST}&cursor=.."),
+    ] {
+        let reply = get(
+            &h,
+            &format!("/xrpc/com.atproto.repo.listRecords?repo=alice.{BASE}&{query}"),
+        )
+        .await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{query}: {}",
+            reply.text()
+        );
+        assert_eq!(reply.json()["error"], "InvalidRequest", "{query}");
+    }
+
+    // A negative limit never reaches the handler: it is not a u32.
+    let reply = get(
+        &h,
+        &format!("/xrpc/com.atproto.repo.listRecords?repo=alice.{BASE}&collection={POST}&limit=-1"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+
+    // A collection nobody wrote to is an empty page, not an error.
+    let reply = get(
+        &h,
+        &format!(
+            "/xrpc/com.atproto.repo.listRecords?repo=alice.{BASE}&collection=com.example.nothing"
+        ),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json()["records"], json!([]));
+    assert!(reply.json().get("cursor").is_none());
+}
+
+#[tokio::test]
+async fn describe_repo_lists_the_collections_the_repo_holds() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let describe = || async {
+        get(
+            &h,
+            &format!("/xrpc/com.atproto.repo.describeRepo?repo=alice.{BASE}"),
+        )
+        .await
+        .json()
+    };
+
+    // A fresh repo holds nothing.
+    assert_eq!(describe().await["collections"], json!([]));
+
+    // Three collections, several records in one: each named once, in order.
+    write_post(&h, &cookie, "com.example.zebra", FIVE[0], "z").await;
+    write_post(&h, &cookie, POST, FIVE[0], "a").await;
+    write_post(&h, &cookie, POST, FIVE[1], "b").await;
+    write_post(&h, &cookie, "app.bsky.feed.like", FIVE[0], "l").await;
+    assert_eq!(
+        describe().await["collections"],
+        json!(["app.bsky.feed.like", POST, "com.example.zebra"])
+    );
+}
+
+#[tokio::test]
+async fn get_blocks_answers_the_subset_it_holds() {
+    let h = harness().await;
+    let (alice_id, alice) = a_member(&h, "alice").await;
+    let (_, bob) = a_member(&h, "bob").await;
+    let mine = write_post(&h, &alice, POST, FIVE[0], "alice's")
+        .await
+        .json();
+    // A real CID, just not one alice's repo holds.
+    let theirs = write_post(&h, &bob, POST, FIVE[0], "bob's").await.json();
+
+    let root = brolly_atproto::state::load(&h.db.pool, alice_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .root_cid;
+    let wanted = mine["cid"].as_str().unwrap();
+    let missing = theirs["cid"].as_str().unwrap();
+
+    let reply = get(
+        &h,
+        &format!("/xrpc/com.atproto.sync.getBlocks?did=alice.{BASE}&cids={wanted}&cids={root}&cids={missing}"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(
+        reply.content_type.as_deref(),
+        Some("application/vnd.ipld.car")
+    );
+    let (blocks, header) = rs_car_sync::car_read_all(&mut std::io::Cursor::new(&reply.body), true)
+        .expect("an independent reader must accept the CAR");
+    assert_eq!(
+        header
+            .roots
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>(),
+        vec![root.clone()]
+    );
+    let mut got: Vec<String> = blocks.iter().map(|(cid, _)| cid.to_string()).collect();
+    got.sort();
+    let mut expected = vec![wanted.to_owned(), root.clone()];
+    expected.sort();
+    assert_eq!(got, expected, "the missing CID is absent, not an error");
+
+    // The same block bytes getRepo serves.
+    let whole = get(
+        &h,
+        &format!("/xrpc/com.atproto.sync.getRepo?did=alice.{BASE}"),
+    )
+    .await;
+    let (all, _) = rs_car_sync::car_read_all(&mut std::io::Cursor::new(&whole.body), true).unwrap();
+    for (cid, bytes) in &blocks {
+        let (_, same) = all.iter().find(|(c, _)| c == cid).expect("in getRepo too");
+        assert_eq!(bytes, same);
+    }
+
+    let reply = get(
+        &h,
+        &format!("/xrpc/com.atproto.sync.getBlocks?did=alice.{BASE}&cids=not-a-cid"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.json()["error"], "InvalidRequest");
+}
+
+#[tokio::test]
+async fn get_latest_commit_is_the_head_the_write_landed() {
+    let h = harness().await;
+    let (alice_id, cookie) = a_member(&h, "alice").await;
+    write_post(&h, &cookie, POST, FIVE[0], "head").await;
+
+    let reply = get(
+        &h,
+        &format!("/xrpc/com.atproto.sync.getLatestCommit?did=alice.{BASE}"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let head = brolly_atproto::state::load(&h.db.pool, alice_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(reply.json()["commit"], head.root_cid);
+    assert_eq!(reply.json()["rev"], head.rev.as_str());
+
+    // And the same commit the firehose announced.
+    let announced = commits(&h.db.pool).await.pop().expect("a commit event");
+    assert_eq!(reply.json()["commit"], announced.commit_cid);
+    assert_eq!(reply.json()["rev"], announced.rev.as_str());
+}
+
+#[tokio::test]
+async fn get_repo_status_reports_what_happened_to_a_repo() {
+    let h = harness().await;
+    let (alice_id, _) = a_member(&h, "alice").await;
+    let did = format!("did:web:alice.{BASE}");
+    let status = || async {
+        get(
+            &h,
+            &format!("/xrpc/com.atproto.sync.getRepoStatus?did={did}"),
+        )
+        .await
+    };
+
+    let reply = status().await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    let rev = brolly_atproto::state::load(&h.db.pool, alice_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .rev;
+    assert_eq!(
+        reply.json(),
+        json!({"did": did, "active": true, "rev": rev.as_str()})
+    );
+
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'alice'")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+    // Reported, not hidden: this is the one endpoint whose job is to say so.
+    let reply = status().await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(
+        reply.json(),
+        json!({"did": did, "active": false, "status": "takendown"})
+    );
+
+    let reply = get(
+        &h,
+        &format!("/xrpc/com.atproto.sync.getRepoStatus?did=did:web:nobody.{BASE}"),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::BAD_REQUEST);
+    assert_eq!(reply.json()["error"], "RepoNotFound");
+}
+
+#[tokio::test]
+async fn list_repos_enumerates_every_repo_by_did() {
+    let h = harness().await;
+    let mut ids = Vec::new();
+    for name in ["carol", "alice", "bob"] {
+        ids.push((name, a_member(&h, name).await.0));
+    }
+    // A member with no repo is not a repo.
+    db::create_user(
+        &h.db.pool,
+        "norepo",
+        None,
+        "correct-horse-battery",
+        "member",
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE username = 'carol'")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+
+    async fn list(h: &Harness, query: &str) -> serde_json::Value {
+        let reply = get(h, &format!("/xrpc/com.atproto.sync.listRepos{query}")).await;
+        assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+        reply.json()
+    }
+    let dids = |page: &serde_json::Value| -> Vec<String> {
+        page["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|repo| repo["did"].as_str().unwrap().to_owned())
+            .collect()
+    };
+
+    let all = list(&h, "").await;
+    assert_eq!(
+        dids(&all),
+        ["alice", "bob", "carol"].map(|n| format!("did:web:{n}.{BASE}"))
+    );
+    assert!(all.get("cursor").is_none());
+    for (name, id) in &ids {
+        let head = brolly_atproto::state::load(&h.db.pool, *id)
+            .await
+            .unwrap()
+            .unwrap();
+        let entry = all["repos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|repo| repo["did"] == format!("did:web:{name}.{BASE}"))
+            .unwrap();
+        assert_eq!(entry["head"], head.root_cid);
+        assert_eq!(entry["rev"], head.rev.as_str());
+    }
+    // Carol is taken down: listed, and reported as such.
+    assert_eq!(all["repos"][2]["active"], false);
+    assert_eq!(all["repos"][2]["status"], "takendown");
+    assert_eq!(all["repos"][0]["active"], true);
+
+    let first = list(&h, "?limit=2").await;
+    assert_eq!(dids(&first), dids(&all)[..2]);
+    let cursor = first["cursor"].as_str().unwrap().to_owned();
+    let rest = list(&h, &format!("?limit=2&cursor={cursor}")).await;
+    assert_eq!(dids(&rest), dids(&all)[2..]);
+
+    for limit in ["0", "1001"] {
+        let reply = get(
+            &h,
+            &format!("/xrpc/com.atproto.sync.listRepos?limit={limit}"),
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::BAD_REQUEST, "limit={limit}");
+    }
+}

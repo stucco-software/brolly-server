@@ -494,6 +494,22 @@ async fn token_caller(
 /// nothing downstream of here would catch it. The two write callers filter
 /// their *caller* rather than their target, which is a different question.
 async fn resolve_repo(state: &AppState, repo: &str) -> Option<User> {
+    resolve_user(state, repo, true).await
+}
+
+/// Resolve a repo identifier to its member.
+///
+/// The one place every identifier form is accepted, and the one place the
+/// `is_active` filter is decided: every repo surface refuses a takendown
+/// member's data (`resolve_repo`), except `sync.getRepoStatus` — whose entire
+/// job is to *report* the takedown to a crawler that already indexed the repo
+/// (stage 3, A), and which therefore resolves without the filter.
+async fn resolve_user(state: &AppState, repo: &str, active_only: bool) -> Option<User> {
+    let found = |user: Option<User>| match active_only {
+        true => user.filter(User::is_active),
+        false => user,
+    };
+
     // **DID forms first.** A handle check runs `strip_suffix(".<base>")`, and
     // `did:web:alice.brolly.test` ends in the base domain too — so ordering the
     // handle branch first silently turns every did:web into the nonsense
@@ -506,11 +522,7 @@ async fn resolve_repo(state: &AppState, repo: &str) -> Option<User> {
             .ok()
             .flatten();
         return match row {
-            Some((id,)) => db::find_by_id(&state.pool, id)
-                .await
-                .ok()
-                .flatten()
-                .filter(User::is_active),
+            Some((id,)) => found(db::find_by_id(&state.pool, id).await.ok().flatten()),
             None => None,
         };
     }
@@ -519,30 +531,28 @@ async fn resolve_repo(state: &AppState, repo: &str) -> Option<User> {
     // host rather than looked up.
     if let Some(host) = repo.strip_prefix("did:web:") {
         return match extract::subdomain_user(host, &state.base_domain) {
-            Some(username) => db::find_by_username(&state.pool, &username)
-                .await
-                .ok()
-                .flatten()
-                .filter(User::is_active),
+            Some(username) => found(
+                db::find_by_username(&state.pool, &username)
+                    .await
+                    .ok()
+                    .flatten(),
+            ),
             None => None,
         };
     }
 
     // A handle: `alice.brolly.test`.
     if let Some(handle) = repo.strip_suffix(&format!(".{}", state.base_domain)) {
-        return db::find_by_username(&state.pool, handle)
-            .await
-            .ok()
-            .flatten()
-            .filter(User::is_active);
+        return found(
+            db::find_by_username(&state.pool, handle)
+                .await
+                .ok()
+                .flatten(),
+        );
     }
 
     // A bare username, which clients send more often than the spec suggests.
-    db::find_by_username(&state.pool, repo)
-        .await
-        .ok()
-        .flatten()
-        .filter(User::is_active)
+    found(db::find_by_username(&state.pool, repo).await.ok().flatten())
 }
 
 /// A member's repo, its blocks, and its signing key.
@@ -626,6 +636,9 @@ pub struct GetRecordQuery {
     repo: String,
     collection: String,
     rkey: String,
+    /// The version asked for. The repo holds only the current one, so a CID
+    /// that is not it is a record this host does not have.
+    cid: Option<String>,
 }
 
 /// `com.atproto.repo.getRecord`
@@ -648,13 +661,22 @@ pub async fn get_record(
     let Some(blocks) = handle.blocks() else {
         return storage_unavailable();
     };
-    match repo::get_record(blocks, handle.root, &query.collection, &query.rkey).await {
-        Ok(Some(value)) => Json(json!({
+    match repo::get_record_entry(blocks, handle.root, &query.collection, &query.rkey).await {
+        Ok(Some((cid, _)))
+            if query
+                .cid
+                .as_deref()
+                .is_some_and(|asked| asked != cid.to_string()) =>
+        {
+            not_found("no such record")
+        }
+        Ok(Some((cid, value))) => Json(json!({
             "uri": ingest::at_uri(
                 &did_of(&handle.user, &state),
                 &query.collection,
                 &query.rkey,
             ),
+            "cid": cid.to_string(),
             "value": value,
         }))
         .into_response(),
@@ -672,41 +694,6 @@ fn did_of(user: &User, state: &AppState) -> String {
     user.did_plc
         .clone()
         .unwrap_or_else(|| format!("did:web:{}.{}", user.username, state.base_domain))
-}
-
-#[derive(Deserialize)]
-pub struct DescribeRepoQuery {
-    repo: String,
-}
-
-/// `com.atproto.repo.describeRepo`
-pub async fn describe_repo(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<DescribeRepoQuery>,
-) -> Response {
-    if wrong_host(&state, &headers) {
-        return not_found("no such repository on this host");
-    }
-    let Some(user) = resolve_repo(&state, &query.repo).await else {
-        return not_found("could not resolve that repository");
-    };
-    let did = did_of(&user, &state);
-    let handle = format!("{}.{}", user.username, state.base_domain);
-
-    Json(json!({
-        "handle": handle,
-        "did": did,
-        "didDoc": {
-            "id": did,
-            "alsoKnownAs": [format!("at://{handle}")],
-        },
-        "collections": [],
-        // The handle resolves to this DID on this host, which is what a
-        // consumer checks before trusting the pairing.
-        "handleIsCorrect": true,
-    }))
-    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -754,6 +741,358 @@ pub async fn get_repo(
             )
         }
     }
+}
+
+/// Set a page's `cursor` only when there is a next page.
+///
+/// The lexicons declare `cursor` an optional *string*: absent means "last
+/// page", and a strict validator (the reference's own) refuses `null` where a
+/// string is declared — so the last page leaves the key out rather than
+/// sending one.
+fn with_cursor(page: &mut Value, cursor: Option<String>) {
+    if let Some(cursor) = cursor {
+        page["cursor"] = json!(cursor);
+    }
+}
+
+#[derive(Deserialize)]
+pub struct ListRecordsQuery {
+    repo: String,
+    collection: String,
+    limit: Option<u32>,
+    cursor: Option<String>,
+    reverse: Option<bool>,
+}
+
+/// `com.atproto.repo.listRecords` (stage 3, A): a collection's records, in
+/// `rkey` order, paged by cursor.
+pub async fn list_records(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListRecordsQuery>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    let Some(user) = resolve_repo(&state, &query.repo).await else {
+        return not_found("could not resolve that repository");
+    };
+    let handle = match open_repo(&state, user).await {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    // 1–100, the lexicon's own bounds; the default 50 is the reference's.
+    let limit = match query.limit.unwrap_or(50) {
+        1..=100 => query.limit.unwrap_or(50),
+        _ => {
+            return invalid_request("limit must be between 1 and 100");
+        }
+    };
+
+    let Some(mut blocks) = handle.blocks() else {
+        return storage_unavailable();
+    };
+    let did = did_of(&handle.user, &state);
+    match repo::list_records(
+        &mut blocks,
+        handle.root,
+        &query.collection,
+        query.cursor.as_deref(),
+        limit as usize,
+        query.reverse.unwrap_or(false),
+    )
+    .await
+    {
+        Ok((records, cursor)) => {
+            let mut page = json!({
+                "records": records.iter().map(|record| json!({
+                    "uri": ingest::at_uri(&did, &query.collection, &record.rkey),
+                    "cid": record.cid.to_string(),
+                    "value": record.value,
+                })).collect::<Vec<_>>(),
+            });
+            with_cursor(&mut page, cursor);
+            Json(page).into_response()
+        }
+        // A collection the grammar refuses is the caller's; anything else is
+        // ours, and a 400 would tell the client to fix a request that was fine.
+        Err(repo::RepoError::BadPath(e)) => invalid_request(&e),
+        Err(e) => {
+            tracing::error!(error = %e, "listing records failed");
+            xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "could not read the repository",
+            )
+        }
+    }
+}
+
+/// A real `com.atproto.repo.describeRepo` (stage 3, A): the collections the
+/// repo actually holds, not the placeholder it always answered with.
+#[derive(Deserialize)]
+pub struct DescribeRepoQuery {
+    repo: String,
+}
+
+pub async fn describe_repo(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<DescribeRepoQuery>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    let Some(user) = resolve_repo(&state, &query.repo).await else {
+        return not_found("could not resolve that repository");
+    };
+    let did = did_of(&user, &state);
+    let handle_name = format!("{}.{}", user.username, state.base_domain);
+
+    let collections = match open_repo(&state, user).await {
+        Ok(handle) => match handle.blocks() {
+            // A walk that fails is a fault to surface, not an empty repo to
+            // describe: an empty `collections` is a claim about the data.
+            Some(mut blocks) => match repo::collections(&mut blocks, handle.root).await {
+                Ok(collections) => collections,
+                Err(e) => {
+                    tracing::error!(error = %e, "listing a repo's collections failed");
+                    return xrpc_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "InternalServerError",
+                        "could not read the repository",
+                    );
+                }
+            },
+            None => return storage_unavailable(),
+        },
+        // A member with no repo yet: the honest description is the empty one,
+        // not a 404 — the member resolves, and their repo simply holds nothing.
+        Err(_) => Vec::new(),
+    };
+
+    Json(json!({
+        "handle": handle_name,
+        "did": did,
+        "didDoc": {
+            "id": did,
+            "alsoKnownAs": [format!("at://{handle_name}")],
+        },
+        "collections": collections,
+        // The handle resolves to this DID on this host, which is what a
+        // consumer checks before trusting the pairing.
+        "handleIsCorrect": true,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+pub struct GetBlocksQuery {
+    did: String,
+    cids: Vec<String>,
+}
+
+/// `com.atproto.sync.getBlocks` (stage 3, A): the requested blocks that exist,
+/// framed as a CAR with the repo's current root in its header.
+pub async fn get_blocks(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    // axum-extra's `Query`, not axum's: the lexicon's `cids` is a repeated
+    // parameter (`cids=a&cids=b`), and `serde_urlencoded` cannot gather a
+    // repeated key into a `Vec`. `serde_html_form` can.
+    axum_extra::extract::Query(query): axum_extra::extract::Query<GetBlocksQuery>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    let Some(user) = resolve_repo(&state, &query.did).await else {
+        return not_found("could not resolve that repository");
+    };
+    let handle = match open_repo(&state, user).await {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    let Some(mut blocks) = handle.blocks() else {
+        return storage_unavailable();
+    };
+
+    let mut cids = Vec::with_capacity(query.cids.len());
+    for cid in &query.cids {
+        match cid.parse() {
+            Ok(cid) => cids.push(cid),
+            Err(_) => return invalid_request("cids must be CIDs"),
+        }
+    }
+    match repo::blocks_car(&mut blocks, handle.root, &cids).await {
+        Ok(car) => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/vnd.ipld.car")],
+            car,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "block CAR failed");
+            xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "could not read the requested blocks",
+            )
+        }
+    }
+}
+
+/// `com.atproto.sync.getLatestCommit` (stage 3, A): the repo's current root
+/// and rev, straight off the state row — the table's whole job.
+pub async fn get_latest_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SyncQuery>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    let Some(user) = resolve_repo(&state, &query.did).await else {
+        return not_found("could not resolve that repository");
+    };
+    let handle = match open_repo(&state, user).await {
+        Ok(handle) => handle,
+        Err(response) => return response,
+    };
+    Json(json!({
+        "commit": handle.root.to_string(),
+        "rev": handle.rev.as_str(),
+    }))
+    .into_response()
+}
+
+/// `com.atproto.sync.getRepoStatus` (stage 3, A): what happened to a repo a
+/// crawler has already indexed. A takendown account is *reported*, not hidden
+/// — the caller filter enforces takedowns everywhere it matters, and this is
+/// the one endpoint whose job is to tell the network what happened.
+pub async fn get_repo_status(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<SyncQuery>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("no such repository on this host");
+    }
+    // No `is_active` filter: a takendown member still has a status, and it is
+    // this one.
+    let Some(user) = resolve_user(&state, &query.did, false).await else {
+        return xrpc_error(
+            StatusCode::BAD_REQUEST,
+            "RepoNotFound",
+            "could not find the repo",
+        );
+    };
+    let active = user.is_active();
+    let mut doc = json!({
+        "did": did_of(&user, &state),
+        "active": active,
+    });
+    if active {
+        // The lexicon's `rev`: the repo's current rev, given only while
+        // active. A member with no repo yet has none to give.
+        if let Ok(Some(current)) = state::load(&state.pool, user.id).await {
+            doc["rev"] = json!(current.rev.as_str());
+        }
+    } else {
+        doc["status"] = json!("takendown");
+    }
+    Json(doc).into_response()
+}
+
+/// One row of `sync.listRepos` (stage 3, A): the member's DID, the repo's
+/// head, and the rev the head carries.
+#[derive(sqlx::FromRow)]
+struct ListedRepo {
+    did: String,
+    head: String,
+    rev: String,
+    active: bool,
+}
+
+#[derive(Deserialize)]
+pub struct ListReposQuery {
+    limit: Option<u32>,
+    cursor: Option<String>,
+}
+
+/// `com.atproto.sync.listRepos` (stage 3, A): every member with a repo,
+/// ordered by DID — the enumeration a relay crawls with. The derived
+/// `did:web` sorts beside the `did:plc`s because the DID expression is what
+/// both order and cursor are computed on, in one place.
+pub async fn list_repos(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ListReposQuery>,
+) -> Response {
+    if wrong_host(&state, &headers) {
+        return not_found("not served here");
+    }
+    // 1–1000, the lexicon's own bounds; the default 500 is the reference's.
+    let limit = query.limit.unwrap_or(500);
+    if !(1..=1000).contains(&limit) {
+        return invalid_request("limit must be between 1 and 1000");
+    }
+    // The empty string sorts before every DID, so "no cursor" is the same
+    // comparison as any other — one query shape, no special case. Both the
+    // order and the cursor comparison are `COLLATE "C"`: byte order, the same
+    // on every deployment whatever the database's locale.
+    let cursor = query.cursor.unwrap_or_default();
+    let base = state.base_domain.clone();
+
+    let rows: Result<Vec<ListedRepo>, _> = sqlx::query_as(
+        "SELECT COALESCE(u.did_plc, 'did:web:' || u.username || '.' || $3) COLLATE \"C\" AS did, \
+                r.root_cid AS head, r.rev, u.status = 'active' AS active \
+         FROM users u JOIN atproto_repos r ON r.user_id = u.id \
+         WHERE COALESCE(u.did_plc, 'did:web:' || u.username || '.' || $3) COLLATE \"C\" > $1 \
+         ORDER BY did LIMIT $2",
+    )
+    .bind(cursor)
+    .bind((limit + 1) as i64)
+    .bind(&base)
+    .fetch_all(&state.pool)
+    .await;
+    let rows = match rows {
+        Ok(rows) => rows,
+        Err(e) => {
+            tracing::error!(error = %e, "listing repos failed");
+            return xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "could not list the repositories",
+            );
+        }
+    };
+
+    // limit + 1 fetched: the extra row is only the "there is more" signal.
+    let more = rows.len() > limit as usize;
+    let page: Vec<ListedRepo> = rows.into_iter().take(limit as usize).collect();
+    let cursor = more
+        .then(|| page.last().map(|repo| repo.did.clone()))
+        .flatten();
+
+    // A takendown member stays listed, reported as such — the same answer
+    // `getRepoStatus` gives, so a relay that enumerates learns what a relay
+    // that asks would.
+    let mut body = json!({
+        "repos": page.iter().map(|repo| {
+            let mut entry = json!({
+                "did": repo.did,
+                "head": repo.head,
+                "rev": repo.rev,
+                "active": repo.active,
+            });
+            if !repo.active {
+                entry["status"] = json!("takendown");
+            }
+            entry
+        }).collect::<Vec<_>>(),
+    });
+    with_cursor(&mut body, cursor);
+    Json(body).into_response()
 }
 
 // --- writes -------------------------------------------------------------------
@@ -2460,7 +2799,15 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/xrpc/com.atproto.repo.getRecord", get(get_record))
         .route("/xrpc/com.atproto.repo.describeRepo", get(describe_repo))
+        .route("/xrpc/com.atproto.repo.listRecords", get(list_records))
         .route("/xrpc/com.atproto.sync.getRepo", get(get_repo))
+        .route("/xrpc/com.atproto.sync.getBlocks", get(get_blocks))
+        .route(
+            "/xrpc/com.atproto.sync.getLatestCommit",
+            get(get_latest_commit),
+        )
+        .route("/xrpc/com.atproto.sync.getRepoStatus", get(get_repo_status))
+        .route("/xrpc/com.atproto.sync.listRepos", get(list_repos))
         .route(
             "/xrpc/com.atproto.sync.subscribeRepos",
             get(subscribe_repos),
