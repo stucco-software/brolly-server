@@ -205,52 +205,63 @@ Postgres-is-admin-only rule: what a member made leaves with their export.
 
 ### D. The AppView proxy
 
+*Revised 2026-11-25, as built* — the draft's protected list, its outbound
+`atproto-proxy` header and its silence on cookies and on a client's own
+`atproto-proxy` are corrected below.
+
 - **Configuration**: `BROLLY_APPVIEW_URL` (an `https` origin, no path) and
-  `BROLLY_APPVIEW_DID` (the AppView's DID, `did:plc:` or `did:web:` —
-  present in the `#appview` fragment below). Both or neither; unset, every
-  unimplemented method keeps answering 501 exactly as today, the
+  `BROLLY_APPVIEW_DID` (the AppView's DID, `did:plc:` or `did:web:`, no
+  fragment). Both or neither — one alone stops the start. Unset, every
+  unimplemented method keeps answering 501 exactly as before, the
   trunk-based rule.
 - **What forwards**: an XRPC request whose NSID is **not locally mounted**
-  and whose authority is `app.bsky` — the AppView's namespace. Everything
-  else unimplemented keeps its 501: `com.atproto.*` is ours or nobody's
-  (a PDS that forwards its own namespace is a PDS that has split its
-  identity), and third-party namespaces are not the AppView's to answer.
-- **Protected methods are never forwarded** — they answer 501 before the
-  forwarder runs. An `app.bsky.*` method that mints, checks or carries a
-  credential or an account-scoped action (`app.bsky.actor.getPreferences`,
-  `putPreferences`, everything under `app.bsky.notification.*` except the
-  list, `app.bsky.graph.*` verification internals — the reference's own
-  list is the source) belongs to the PDS or to nobody. The forwarder
-  refuses by NSID list, not by "methods we know are dangerous": a list of
-  what is ours is enumerable, a list of what is dangerous is not.
-- **The request**: the AppView's origin plus the same path and query, body
-  and method forwarded as-is (streamed, not buffered — a feed can be
-  megabytes and the proxy is not a participant in it). Headers: the
-  client's `Authorization` and `DPoP` are **dropped, never forwarded** —
-  they are credentials for *this* server, and a token replayed at the
-  AppView would be a token leaked to a third party. In their place, when
-  the caller authenticated: a service-auth token
-  (`Authorization: Bearer …`) minted with stage 2's `service_auth::issue`,
-  `lxm` = the method's NSID, `aud` = the AppView's DID, signed by the
-  **member's** repo signing key — the AppView's delegation model: the PDS
-  vouches, the member authorises. Anonymous callers forward anonymously —
-  AppView reads are public, and `getPreferences` (the protected one that
-  would need a member) is not forwardable anyway.
-- **`atproto-proxy: {appview_did}#appview`** on every forwarded request —
-  the AppView's own check that a request arrived via a PDS it can trust,
-  and the field the reference's `auth-verifier.ts` reads.
+  and whose authority is `app.bsky` — the AppView's namespace — on the apex
+  only. Everything else unimplemented keeps its 501: `com.atproto.*` is ours
+  or nobody's (a PDS that forwards its own namespace is a PDS that has split
+  its identity), and other namespaces (`chat.bsky.*` included) are not the
+  AppView's to answer.
+- **A client's `atproto-proxy`** (bsky.app sends
+  `did:web:api.bsky.app#bsky_appview`) is honoured only when its DID is the
+  configured AppView's; any other target is a 501 — forwarding it to our
+  AppView anyway would answer from the wrong service.
+- **Protected methods are never forwarded**: `app.bsky.actor.getPreferences`
+  and `putPreferences`, account state the PDS owns (C). Both are mounted, so
+  the list is defence in depth: a lost route must not leak them upstream.
+  The draft also listed `app.bsky.notification.*`; the reference PDS forwards
+  those (bsky.app registers push and marks notifications seen through its
+  PDS), so blocking them would break the app.
+- **The request**: the AppView's origin plus the same path and query, method
+  and body streamed as-is. Request headers forward by allow-list — `accept`,
+  `accept-language`, `content-type`, `content-encoding`,
+  `atproto-accept-labelers`, `x-bsky-topics` — so the client's
+  `Authorization`, `DPoP` and cookies are **never forwarded**: they are
+  credentials for *this* server, and a token replayed at the AppView would be
+  a token leaked to a third party.
+- **Credentials come from `Authorization` only.** With one, the caller is
+  authenticated as on any XRPC call (a bad credential is a 401, never a
+  downgrade to anonymous), must hold `transition:generic`, and a service
+  token goes up in its place — stage 2's `service_auth::issue`, `lxm` the
+  method, `aud` the AppView's DID, signed by the **member's** repo key: the
+  PDS vouches, the member authorises. Without one, the request forwards
+  anonymously — AppView reads are public. The dashboard's session cookie is
+  **not** a credential here: a cross-site page must not be able to make the
+  member's key vouch for a call they never made.
+- No `atproto-proxy` goes upstream: the AppView authenticates the call by
+  the service token, verified against the member's DID document; the header
+  is a client-to-PDS routing instruction, not a PDS-to-AppView one.
 - **The transport** is the same hardened client as every outbound call
-  (stage 0): `https` only, no proxies, public addresses only, no redirects,
-  timeouts. An AppView behind localhost is a deployment's choice at
-  config time, not a runtime bypass — `for_tests` is how the tests reach a
-  local one.
-- **The answer**: status, content-type and body stream back untouched. The
-  AppView's errors are the client's business — a proxy that re-wrote them
-  would be lying about whose answer it is. An unreachable AppView is
-  `UpstreamFailure`, a 502 with the reference's error name, not a
-  silent 501: the difference between "not implemented" and "configured
-  but down" is the difference between a client that gives up and one that
-  retries.
+  (stage 0, now `client_metadata::hardened_http`): `https` only, no proxies,
+  public addresses only, no redirects, a 30 s total timeout. An AppView
+  behind localhost is reachable only through `AppView::for_tests`.
+- **The answer**: status and body stream back untouched; response headers
+  return by allow-list (`content-type`, `content-language`,
+  `content-encoding`, `atproto-content-labelers`, `atproto-repo-rev`) — a
+  third party's `set-cookie` has no business on our origin — with
+  `Vary: Authorization`, and `Cache-Control: private` when a token went up.
+  The AppView's errors are the client's business. An unreachable AppView is
+  `UpstreamFailure`, a 502, not a silent 501: the difference between "not
+  implemented" and "configured but down" is the difference between a client
+  that gives up and one that retries.
 
 ### E. `requestCrawl` on startup
 
@@ -312,8 +323,11 @@ Postgres-is-admin-only rule: what a member made leaves with their export.
   streams back untouched; the request carries `atproto-proxy` and, when
   the caller authenticated, a service token whose `lxm` is the method and
   `aud` the AppView DID, minted by the member's key; the client's
-  `Authorization` and `DPoP` headers are absent from what the AppView
-  receives; a protected method is 501, not forwarded; an unconfigured
+  `Authorization`, `DPoP` and cookies are absent from what the AppView
+  receives, and its `set-cookie` is absent from what the client receives;
+  an anonymous or cookie-only call forwards with no token, a bad credential
+  is a 401; a protected method is answered locally, not forwarded; a
+  client `atproto-proxy` naming another service is 501; an unconfigured
   AppView keeps today's 501; a non-`app.bsky` unimplemented method is 501
   whether or not the AppView is configured; an AppView that is down is a
   502 `UpstreamFailure`.
@@ -373,5 +387,5 @@ Five, one commit each:
 | A | `listRecords` walks the MST (`entries_prefixed`) with an `rkey` cursor, in memory per page; `describeRepo`'s collections are the MST's distinct first path segments | The MST *is* the index — key order is record order — so a listing is a walk, not a second index to keep consistent; a cursor on `rkey` is the reference's own shape, and in-page handling keeps the walk stateless |
 | B | `getBlocks` answers the existing subset, root in the CAR header; `getRepoStatus` reports `is_active` rather than enforcing it; unknown DID is `RepoNotFound` | A block set answers "do you have these" with the subset it has; status is a *report* to a crawler that already indexed the repo — the caller filter already enforces what enforcement would |
 | C | *(revised 2026-11-25)* Preferences in a pod document (`/~/settings/atproto-preferences.ttl`, faithful RDF, owner-only), registered in the private type index; not repo records, not a table; structural validation (`$type`d objects), unknown `$type`s stored faithfully, 1 MiB cap | Not the repo: a preference is UI state, and publishing it to the firehose would be the behavioural change. Not a table: it is member data with a profile's interop potential (nk), so it leaves with the export and a Solid app can find it through the type index; faithful storage is the same rule the repo gives unmapped lexicons |
-| D | The proxy forwards unmounted `app.bsky.*` only, drops the client's credentials, attaches `atproto-proxy` and a member-key service token (`lxm`=method, `aud`=AppView DID), streams both ways, and answers `UpstreamFailure` (502) when the AppView is down | The reference's delegation model (`auth-verifier.ts` reads exactly these); forwarding a PDS's own namespace would split its identity; replayed client credentials at a third party are a leak, not a feature; and "configured but down" must be distinguishable from "not implemented" |
+| D | *(revised 2026-11-25)* The proxy forwards unmounted `app.bsky.*` only, by header allow-list both ways, drops the client's credentials, attaches a member-key service token (`lxm`=method, `aud`=AppView DID) only for an `Authorization` caller — never for the cookie — streams both ways, and answers `UpstreamFailure` (502) when the AppView is down | The reference's delegation model (`auth-verifier.ts` reads exactly these); forwarding a PDS's own namespace would split its identity; replayed client credentials at a third party are a leak, not a feature; and "configured but down" must be distinguishable from "not implemented" |
 | E | `requestCrawl` is unauthenticated, config-gated (`BROLLY_RELAY_URL`), retried with capped backoff until it succeeds | The relay authorises the crawl by the endpoint it discovers, so a token from an unknown DID proves nothing; a boot-time failure must not cost the crawl slot; and the default-off rule keeps the wire unchanged for every existing deployment |

@@ -140,6 +140,7 @@ async fn harness_with_jwks(
             dpop_nonce_secret: nonce_secret,
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
+            appview: None,
             clients,
             client_jwks,
             solid_clients: std::sync::Arc::new(StaticClientDocuments::default()),

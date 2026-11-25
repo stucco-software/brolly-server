@@ -447,17 +447,7 @@ impl<D: Document> Fetcher<D> {
         ok_ttl: Duration,
         err_ttl: Duration,
     ) -> Result<Self, reqwest::Error> {
-        // Idempotent. Here as well as in main so no constructor can reach
-        // reqwest's panic for a missing crypto provider.
-        crate::tls::install_crypto_provider();
-        let http = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .no_proxy()
-            .timeout(TIMEOUT)
-            .user_agent(FETCH_USER_AGENT)
-            .https_only(!allow_http)
-            .dns_resolver(PublicOnly { allow_loopback })
-            .build()?;
+        let http = hardened_http(allow_loopback, allow_http, TIMEOUT)?;
         let cache = Cache::builder()
             .max_capacity(CAPACITY)
             .expire_after(Lifetimes {
@@ -583,6 +573,31 @@ impl<D: Document> Expiry<String, Cached<D>> for Lifetimes {
 
 /// A DNS resolver that only returns public addresses.
 ///
+/// The hardened outbound transport (stage 0, S3), for any caller that
+/// reaches a host it did not choose: client metadata, JWKS, discovery, and
+/// the AppView proxy (stage 3, D). No redirects, no proxies, public addresses
+/// only (filtered at resolution), https only, a total timeout.
+///
+/// `allow_loopback` and `allow_http` exist for tests that stand a server up
+/// on `http://127.0.0.1:PORT`; production passes `false` for both.
+pub(crate) fn hardened_http(
+    allow_loopback: bool,
+    allow_http: bool,
+    timeout: Duration,
+) -> Result<reqwest::Client, reqwest::Error> {
+    // Idempotent. Here as well as in main so no constructor can reach
+    // reqwest's panic for a missing crypto provider.
+    crate::tls::install_crypto_provider();
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_proxy()
+        .timeout(timeout)
+        .user_agent(FETCH_USER_AGENT)
+        .https_only(!allow_http)
+        .dns_resolver(PublicOnly { allow_loopback })
+        .build()
+}
+
 /// Resolves with tokio's resolver, then drops every address [`is_public`]
 /// refuses. If none survive, resolution fails, so the connection is never
 /// attempted.

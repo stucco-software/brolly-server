@@ -2904,16 +2904,95 @@ async fn close_with(socket: &mut axum::extract::ws::WebSocket, frame: Result<Vec
     }
 }
 
-/// Anything under `/xrpc/` we do not implement.
+/// Anything under `/xrpc/` we do not implement — forwarded to the AppView
+/// when it is the AppView's to answer (stage 3, D), 501 otherwise.
 ///
 /// XRPC names an unimplemented method specifically, so a client can tell "this
 /// server does not do that" from "this server is broken".
-pub async fn unknown_method(Path(nsid): Path<String>) -> Response {
-    xrpc_error(
-        StatusCode::NOT_IMPLEMENTED,
-        "MethodNotImplemented",
-        &format!("{nsid} is not implemented by this server"),
-    )
+pub async fn unknown_method(
+    State(state): State<AppState>,
+    Path(nsid): Path<String>,
+    headers: HeaderMap,
+    method: Method,
+    uri: Uri,
+    body: axum::body::Body,
+) -> Response {
+    let not_implemented = || {
+        xrpc_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "MethodNotImplemented",
+            &format!("{nsid} is not implemented by this server"),
+        )
+    };
+    let Some(appview) = state.appview.clone() else {
+        return not_implemented();
+    };
+    if wrong_host(&state, &headers) || !crate::appview::forwardable(&nsid) {
+        return not_implemented();
+    }
+    // A client naming a different service than ours is asking for a route
+    // this server does not have; forwarding it to our AppView anyway would
+    // answer from the wrong service.
+    if let Some(target) = headers.get("atproto-proxy").and_then(|h| h.to_str().ok()) {
+        let did = target.split('#').next().unwrap_or_default();
+        if did != appview.did() {
+            return not_implemented();
+        }
+    }
+
+    // Credentials only from `Authorization`: the dashboard's cookie is a
+    // browser session on this origin, and a cross-site page must not be able
+    // to make the member's key vouch for a call they never made. A request
+    // with no `Authorization` forwards anonymously; one with a bad credential
+    // is refused, not downgraded.
+    let token = if headers.contains_key(header::AUTHORIZATION) {
+        let caller = match caller(&state, &headers, &method, &uri).await {
+            Ok(caller) => caller,
+            Err(response) => return response,
+        };
+        if !caller.kind.has_scope(SCOPE_TRANSITION_GENERIC) {
+            return private(scope_missing(SCOPE_TRANSITION_GENERIC));
+        }
+        let key = match signing_key(&state, &caller.user).await {
+            Ok(key) => key,
+            Err(response) => return private(response),
+        };
+        let at = now();
+        match service_auth::issue(
+            &key,
+            &did_of(&caller.user, &state),
+            appview.did(),
+            Some(&nsid),
+            at + service_auth::TTL_SECONDS,
+            at,
+        ) {
+            Ok(token) => Some(token),
+            Err(e) => {
+                tracing::error!(error = %e, "minting a service token for the AppView failed");
+                return private(xrpc_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "InternalServerError",
+                    "could not authorize the call to the AppView",
+                ));
+            }
+        }
+    } else {
+        None
+    };
+
+    let path_and_query = uri
+        .path_and_query()
+        .map_or(uri.path(), |pq| pq.as_str())
+        .to_owned();
+    let authenticated = token.is_some();
+    let response = appview
+        .forward(method, &path_and_query, &headers, body, token)
+        .await;
+    if authenticated {
+        private(response)
+    } else {
+        response
+    }
 }
 
 pub fn routes() -> Router<AppState> {

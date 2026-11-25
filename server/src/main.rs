@@ -181,6 +181,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .0,
         plc_client,
+        // The AppView proxy (stage 3, D): off unless both variables are set.
+        appview: brolly_server::appview::AppView::from_env()?.map(std::sync::Arc::new),
         // ATProto OAuth clients are identified by a URL serving their
         // metadata. Fetched from public addresses only, validated, cached.
         clients: std::sync::Arc::new(brolly_server::client_metadata::Fetcher::<

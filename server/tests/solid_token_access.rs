@@ -178,6 +178,7 @@ async fn harness_with((issuer_discovery, issuer_jwks, webid_documents): RemoteLo
             dpop_nonce_secret: [0x42; 64],
             commits: tokio::sync::broadcast::channel(64).0,
             plc_client: None,
+            appview: None,
             clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
             client_jwks: std::sync::Arc::new(
                 brolly_server::client_metadata::StaticDocuments::default(),

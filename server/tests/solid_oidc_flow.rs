@@ -91,6 +91,7 @@ async fn harness_with_webids(
         dpop_nonce_secret: [0x42; 64],
         commits: tokio::sync::broadcast::channel(64).0,
         plc_client: None,
+        appview: None,
         clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
         client_jwks: std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
         // Where Client ID Documents come from (spec 6, H3): a fixed,
@@ -1015,6 +1016,7 @@ async fn our_own_profile_is_not_a_client_id_document() {
         dpop_nonce_secret: [0x42; 64],
         commits: tokio::sync::broadcast::channel(64).0,
         plc_client: None,
+        appview: None,
         clients: std::sync::Arc::new(brolly_server::client_metadata::StaticClients::default()),
         client_jwks: std::sync::Arc::new(brolly_server::client_metadata::StaticDocuments::default()),
         solid_clients: std::sync::Arc::new(

@@ -64,6 +64,8 @@ repository heads, the PLC log.
 | `BROLLY_MAX_UPLOAD_BYTES` | no | `10485760` (10 MiB) | The most one upload may be. Advertised to Mastodon clients as the same number. |
 | `BROLLY_POD_QUOTA_BYTES` | no | `1073741824` (1 GiB) | The most a member's pod may hold on disk, store and blobs together. A write that would pass it is a `507`. Bounds what one grant — a public inbox, a shared container — can cost the instance. The default; an admin can set a different quota per member (`brolly-admin quota`, or the console). |
 | `BROLLY_PLC_SUBMIT` | no | off | `1` publishes `did:plc` operations to the real directory. |
+| `BROLLY_APPVIEW_URL` | no | — | The AppView unimplemented `app.bsky.*` methods forward to, an `https` origin with no path (e.g. `https://api.bsky.app`). Set with `BROLLY_APPVIEW_DID` or not at all; one without the other stops the start. Unset, those methods answer `501`. |
+| `BROLLY_APPVIEW_DID` | no | — | That AppView's DID, with no fragment (e.g. `did:web:api.bsky.app`): the audience of the service tokens minted for it. |
 | `BROLLY_PUBLIC_REGISTRATION` | no | off | `1` opens registration to anyone, on both the `/register` form and the `POST /api/accounts` API. Off, an instance is invite-only. |
 | `BROLLY_WWW_REDIRECT` | no | — | Where `www.{base_domain}` goes: an absolute URL (a path prefix is allowed), and every request to the `www` host is sent there with its path and query. Unset, `www` is untouched. |
 | `BROLLY_HOME_URL` | no | — | An app in front of the instance: the apex `/` redirects there instead of showing the login form. `/login` still renders. |
@@ -171,8 +173,18 @@ are still minted and held locally; `brolly-admin plc-retry` submits them once
 the directory can verify the domain. Publishing a `did:plc` that points at a
 host you do not control yet is not easily undone.
 
-This is the only ATProtocol behaviour that is gated. Everything else — keys,
-DIDs, repositories, XRPC, the firehose — is unconditional by ADR 0016.
+This and the AppView proxy are the only ATProtocol behaviours that are
+gated. Everything else — keys, DIDs, repositories, XRPC, the firehose — is
+unconditional by ADR 0016.
+
+### `BROLLY_APPVIEW_URL` and `BROLLY_APPVIEW_DID`
+
+The Bluesky app asks its PDS for timelines, threads and profiles — the
+network's aggregate view, which a PDS does not hold. With both set, the
+instance forwards every `app.bsky.*` method it does not implement to that
+AppView, with a service token the member's key signs in place of the
+client's own credential. Without them bsky.app logs in but shows nothing.
+For Bluesky's own AppView: `https://api.bsky.app` and `did:web:api.bsky.app`.
 
 ## Rate limits, and whose address they key on
 

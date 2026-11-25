@@ -19,6 +19,7 @@ use tower_http::services::ServeDir;
 pub mod account;
 pub mod activitypub;
 pub mod admin;
+pub mod appview;
 pub mod atproto_identity;
 pub mod atproto_oauth;
 pub mod auth;
@@ -147,6 +148,10 @@ pub struct AppState {
     /// published yet is very different from a member who was never given an
     /// identity at all (ADR 0016).
     pub plc_client: Option<reqwest::Client>,
+    /// The AppView unimplemented `app.bsky.*` methods forward to (stage 3,
+    /// D). `None` — the default, `BROLLY_APPVIEW_URL`/`_DID` unset — keeps
+    /// every unimplemented method answering 501.
+    pub appview: Option<std::sync::Arc<appview::AppView>>,
     /// The instance's DPoP nonce secret (stage 2, C).
     ///
     /// The HMAC key behind the time-bucketed nonces RFC 9449 hands out and

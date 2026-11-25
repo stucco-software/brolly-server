@@ -40,6 +40,11 @@ struct Harness {
 }
 
 async fn harness() -> Harness {
+    harness_with(None).await
+}
+
+/// The harness with an AppView configured (stage 3, D).
+async fn harness_with(appview: Option<std::sync::Arc<brolly_server::appview::AppView>>) -> Harness {
     let db = brolly_test_support::postgres().await;
     db::MIGRATOR.run(&db.pool).await.expect("migrations");
     let dir = tempfile::tempdir().unwrap();
@@ -91,6 +96,7 @@ async fn harness() -> Harness {
             ),
             dpop_nonce_secret: nonce_secret,
             plc_client: None,
+            appview,
             commits: commits.clone(),
             // an_xrpc_write_proof_is_good_for_one_request pushes a PAR as this
             // client, so it's registered exactly as production would accept it.
@@ -4714,4 +4720,273 @@ async fn preferences_are_the_callers_own() {
     let refused = get_with_dpop(&h, "/xrpc/app.bsky.actor.getPreferences", &token, &proof).await;
     assert_eq!(refused.status, StatusCode::FORBIDDEN, "{}", refused.text());
     assert_eq!(refused.json()["error"], "ScopeMissingError");
+}
+
+// --- the AppView proxy (stage 3, D) -------------------------------------------------
+
+const APPVIEW_DID: &str = "did:web:appview.test";
+
+/// What the stub AppView received.
+#[derive(Clone, Debug)]
+struct Seen {
+    method: String,
+    path_and_query: String,
+    headers: axum::http::HeaderMap,
+    body: Vec<u8>,
+}
+
+/// A stand-in AppView on a real loopback port: it records each request and
+/// answers with headers the proxy must filter — a `set-cookie` it must drop
+/// and a labelers header it must pass.
+async fn stub_appview() -> (String, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) {
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<Seen>::new()));
+    let record = seen.clone();
+    let app = axum::Router::new().fallback(move |request: Request<Body>| {
+        let record = record.clone();
+        async move {
+            let (parts, body) = request.into_parts();
+            let body = body.collect().await.unwrap().to_bytes().to_vec();
+            let path_and_query = parts.uri.path_and_query().unwrap().to_string();
+            record.lock().unwrap().push(Seen {
+                method: parts.method.to_string(),
+                path_and_query: path_and_query.clone(),
+                headers: parts.headers,
+                body,
+            });
+            let status = if path_and_query.contains("teapot") {
+                StatusCode::IM_A_TEAPOT
+            } else {
+                StatusCode::OK
+            };
+            axum::response::Response::builder()
+                .status(status)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::SET_COOKIE, "appview=leak")
+                .header("atproto-content-labelers", "did:plc:labeler")
+                .body(Body::from(
+                    json!({"feed": [], "from": "appview"}).to_string(),
+                ))
+                .unwrap()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (origin, seen)
+}
+
+async fn proxied_harness() -> (Harness, std::sync::Arc<std::sync::Mutex<Vec<Seen>>>) {
+    let (origin, seen) = stub_appview().await;
+    let appview = brolly_server::appview::AppView::for_tests(&origin, APPVIEW_DID).unwrap();
+    (harness_with(Some(std::sync::Arc::new(appview))).await, seen)
+}
+
+/// A member with a repo key who logs in over the legacy session path, so the
+/// proxy sees an `Authorization` credential rather than the dashboard cookie.
+async fn a_proxied_member(h: &Harness) -> String {
+    a_member(h, "alice").await;
+    sqlx::query("UPDATE users SET email_verified = true WHERE username = 'alice'")
+        .execute(&h.db.pool)
+        .await
+        .unwrap();
+    primary_access(h, "alice").await
+}
+
+#[tokio::test]
+async fn an_unimplemented_app_bsky_method_is_forwarded_with_a_service_token() {
+    let (h, seen) = proxied_harness().await;
+    let token = a_proxied_member(&h).await;
+
+    let reply = send(
+        &h,
+        Request::builder()
+            .uri("/xrpc/app.bsky.feed.getTimeline?limit=30&cursor=abc")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header("atproto-accept-labelers", "did:plc:mod")
+            .header(header::ACCEPT_LANGUAGE, "nl")
+            .header(header::COOKIE, "something=private")
+            .header("atproto-proxy", format!("{APPVIEW_DID}#bsky_appview"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    // The AppView's answer, untouched — minus the cookie a third party has no
+    // business setting on this origin.
+    assert_eq!(reply.json(), json!({"feed": [], "from": "appview"}));
+    assert_eq!(
+        reply.header("atproto-content-labelers"),
+        Some("did:plc:labeler")
+    );
+    assert!(reply.header("set-cookie").is_none());
+
+    let seen = seen.lock().unwrap().clone();
+    let request = &seen[0];
+    assert_eq!(request.method, "GET");
+    assert_eq!(
+        request.path_and_query,
+        "/xrpc/app.bsky.feed.getTimeline?limit=30&cursor=abc"
+    );
+    assert_eq!(request.headers["atproto-accept-labelers"], "did:plc:mod");
+    assert_eq!(request.headers["accept-language"], "nl");
+    assert!(request.headers.get("cookie").is_none());
+    assert!(request.headers.get("dpop").is_none());
+
+    // The client's credential stayed here; what went up is the member's
+    // delegation, verifiable against their key, for exactly this method.
+    let authorization = request.headers["authorization"].to_str().unwrap();
+    let service = authorization.strip_prefix("Bearer ").unwrap();
+    assert_ne!(service, token);
+    let key = signing_key_of(&h, "alice").await;
+    let claims = brolly_atproto::service_auth::verify(
+        service,
+        &key.did_key(),
+        APPVIEW_DID,
+        "app.bsky.feed.getTimeline",
+        unix_now(),
+    )
+    .expect("a service token the AppView can verify");
+    assert_eq!(claims.issuer, format!("did:web:alice.{BASE}"));
+}
+
+#[tokio::test]
+async fn a_procedure_forwards_its_body_and_the_appviews_errors_are_its_own() {
+    let (h, seen) = proxied_harness().await;
+    let token = a_proxied_member(&h).await;
+
+    let reply = post_with_token(
+        &h,
+        "/xrpc/app.bsky.notification.updateSeen",
+        &token,
+        json!({"seenAt": "2026-11-25T00:00:00Z"}),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    {
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen[0].method, "POST");
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&seen[0].body).unwrap(),
+            json!({"seenAt": "2026-11-25T00:00:00Z"})
+        );
+        assert_eq!(seen[0].headers["content-type"], "application/json");
+    }
+
+    // Whatever the AppView answers is the client's to read.
+    let reply = get_with_token(&h, "/xrpc/app.bsky.feed.teapot", &token).await;
+    assert_eq!(reply.status, StatusCode::IM_A_TEAPOT);
+}
+
+#[tokio::test]
+async fn an_anonymous_call_forwards_anonymously() {
+    let (h, seen) = proxied_harness().await;
+    a_member(&h, "alice").await;
+
+    let reply = get(
+        &h,
+        "/xrpc/app.bsky.actor.getProfile?actor=alice.brolly.test",
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert!(
+        seen.lock().unwrap()[0]
+            .headers
+            .get("authorization")
+            .is_none()
+    );
+
+    // The dashboard's cookie is not a credential here: a cross-site page must
+    // not make the member's key vouch for a call they never made.
+    let (_, cookie) = a_member(&h, "bob").await;
+    let reply = send(
+        &h,
+        Request::builder()
+            .uri("/xrpc/app.bsky.feed.getTimeline")
+            .header(header::HOST, BASE)
+            .header(header::COOKIE, cookie)
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::OK);
+    assert!(
+        seen.lock().unwrap()[1]
+            .headers
+            .get("authorization")
+            .is_none()
+    );
+
+    // A bad credential is refused, not downgraded to anonymous.
+    let reply = get_with_token(&h, "/xrpc/app.bsky.feed.getTimeline", "not-a-token").await;
+    assert_eq!(reply.status, StatusCode::UNAUTHORIZED);
+    assert_eq!(seen.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn what_is_not_the_appviews_is_not_forwarded() {
+    let (h, seen) = proxied_harness().await;
+    let token = a_proxied_member(&h).await;
+
+    for uri in [
+        // Not the AppView's namespace.
+        "/xrpc/com.atproto.admin.getAccountInfo",
+        "/xrpc/chat.bsky.convo.listConvos",
+        "/xrpc/com.example.thing.doIt",
+    ] {
+        let reply = get_with_token(&h, uri, &token).await;
+        assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED, "{uri}");
+        assert_eq!(reply.json()["error"], "MethodNotImplemented");
+    }
+
+    // A client asking for a different service than the configured one.
+    let reply = send(
+        &h,
+        Request::builder()
+            .uri("/xrpc/app.bsky.feed.getTimeline")
+            .header(header::HOST, BASE)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .header("atproto-proxy", "did:web:elsewhere.example#bsky_appview")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED);
+
+    // The protected preferences are answered here, never upstream.
+    let reply = get_with_token(&h, "/xrpc/app.bsky.actor.getPreferences", &token).await;
+    assert_eq!(reply.status, StatusCode::OK, "{}", reply.text());
+    assert_eq!(reply.json(), json!({"preferences": []}));
+
+    // Not on a member subdomain.
+    let reply = get_on(
+        &h,
+        &format!("alice.{BASE}"),
+        "/xrpc/app.bsky.feed.getTimeline",
+    )
+    .await;
+    assert_ne!(reply.status, StatusCode::OK);
+
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "nothing reached the AppView"
+    );
+}
+
+#[tokio::test]
+async fn without_an_appview_unimplemented_stays_501_and_a_dead_one_is_502() {
+    let h = harness().await;
+    let reply = get(&h, "/xrpc/app.bsky.feed.getTimeline").await;
+    assert_eq!(reply.status, StatusCode::NOT_IMPLEMENTED);
+    assert_eq!(reply.json()["error"], "MethodNotImplemented");
+
+    // Configured but unreachable: a port nothing listens on.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    drop(listener);
+    let appview = brolly_server::appview::AppView::for_tests(&origin, APPVIEW_DID).unwrap();
+    let h = harness_with(Some(std::sync::Arc::new(appview))).await;
+    let reply = get(&h, "/xrpc/app.bsky.feed.getTimeline").await;
+    assert_eq!(reply.status, StatusCode::BAD_GATEWAY);
+    assert_eq!(reply.json()["error"], "UpstreamFailure");
 }

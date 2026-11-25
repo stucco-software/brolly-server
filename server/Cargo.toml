@@ -53,7 +53,7 @@ percent-encoding = "2.3"
 # build next to RocksDB. Without a provider, building a Client panics, so both
 # binaries call `tls::install_crypto_provider()` first. Roots come from
 # rustls-platform-verifier (the OS store; `ca-certificates` in the image).
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider"] }
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls-no-provider", "stream"] }
 # Named directly only to reach `rustls::crypto::ring` and install it as the
 # process-wide provider (server/src/tls.rs). It resolves to the same 0.23 copy
 # reqwest and sqlx already link, and ring 0.17 is already in the tree. The
