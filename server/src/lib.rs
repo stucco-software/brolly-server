@@ -789,6 +789,15 @@ pub fn app(state: AppState, static_dir: &str) -> Router {
         .route("/admin/users", get(admin::users))
         .route("/admin/users/{username}/quota", post(admin::set_quota))
         .route(
+            "/admin/users/{username}/disable",
+            get(admin::disable_confirm).post(admin::disable),
+        )
+        .route("/admin/users/{username}/enable", post(admin::enable))
+        .route(
+            "/admin/users/{username}/delete",
+            get(admin::delete_confirm).post(admin::delete),
+        )
+        .route(
             "/admin/invites",
             get(admin::invites).post(admin::mint_invite),
         )

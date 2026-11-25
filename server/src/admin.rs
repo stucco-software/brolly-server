@@ -922,3 +922,276 @@ pub async fn revoke_invite(
         }
     }
 }
+
+// --- disable, enable, delete -------------------------------------------------
+//
+// Disable and delete each go through a confirmation page that says exactly
+// what will happen; delete also asks for the username typed out, because it
+// cannot be undone. Enable is a direct POST: it only gives back what disable
+// took, minus the credentials. An admin can never act on themselves or on
+// the last active admin — the console must not lock out the person using it
+// or leave the instance with nobody able to run it.
+
+#[derive(Template)]
+#[template(path = "admin/confirm.html")]
+struct ConfirmPage<'a> {
+    chrome: Chrome<'a>,
+    tabs: Vec<Tab>,
+    heading: String,
+    /// What will happen, one consequence per entry.
+    consequences: Vec<&'static str>,
+    action: String,
+    button: &'static str,
+    /// The username to type out, for an action that cannot be undone.
+    typed: Option<String>,
+    error: Option<String>,
+}
+
+fn confirm_page<'a>(
+    state: &'a AppState,
+    action: Action,
+    username: &str,
+    error: Option<String>,
+) -> ConfirmPage<'a> {
+    let (heading, consequences, button, typed) = match action {
+        Action::Disable => (
+            format!("Disable @{username}?"),
+            vec![
+                "They are signed out everywhere and can't sign in.",
+                "Every app they authorised loses access — Solid, Bluesky and Mastodon apps, and agent credentials.",
+                "Their pod, profile, posts and repository stop being served. Relays are told the account is taken down.",
+                "Nothing is deleted. Enabling them again restores everything except app access; they sign their apps in again.",
+            ],
+            "Disable",
+            None,
+        ),
+        Action::Delete => (
+            format!("Delete @{username}?"),
+            vec![
+                "Their pod and everything in it are deleted from this server.",
+                "Their account, sessions and every app authorisation are deleted.",
+                "Relays are told the account is gone.",
+                "This can't be undone. Export first if anything should be kept.",
+            ],
+            "Delete permanently",
+            Some(username.to_string()),
+        ),
+    };
+    ConfirmPage {
+        chrome: state.chrome(),
+        tabs: tabs("/admin/users"),
+        heading,
+        consequences,
+        action: format!("/admin/users/{username}/{}", action.verb()),
+        button,
+        typed,
+        error,
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Action {
+    Disable,
+    Delete,
+}
+
+impl Action {
+    fn verb(self) -> &'static str {
+        match self {
+            Action::Disable => "disable",
+            Action::Delete => "delete",
+        }
+    }
+}
+
+/// The member a path names, or the response that ends the request: 404 for
+/// nobody (an admin, so no disclosure), 500 for a failed lookup.
+async fn member(state: &AppState, username: &str) -> Result<User, Response> {
+    match db::find_by_username(&state.pool, username).await {
+        Ok(Some(member)) => Ok(member),
+        Ok(None) => Err(not_found()),
+        Err(e) => {
+            tracing::error!(error = %e, "member lookup failed");
+            Err(server_error())
+        }
+    }
+}
+
+/// Why an admin may not take `target` away, if they may not.
+async fn guard(state: &AppState, admin: &User, target: &User) -> Result<Option<String>, Response> {
+    if admin.id == target.id {
+        return Ok(Some("You can't do this to your own account.".into()));
+    }
+    if target.is_admin() && target.is_active() {
+        match db::count_admins(&state.pool).await {
+            Ok(n) if n <= 1 => {
+                return Ok(Some("This is the only active admin.".into()));
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::error!(error = %e, "admin count failed");
+                return Err(server_error());
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn refused_action(state: &AppState, action: Action, username: &str, error: String) -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        render(&confirm_page(state, action, username, Some(error))),
+    )
+        .into_response()
+}
+
+/// The GET half of disable and delete: the confirmation.
+async fn confirm(
+    state: AppState,
+    headers: HeaderMap,
+    username: Result<Path<String>, PathRejection>,
+    action: Action,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/users").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let Ok(Path(username)) = username else {
+        return not_found();
+    };
+    let target = match member(&state, &username).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    let error = match guard(&state, &admin, &target).await {
+        Ok(error) => error,
+        Err(response) => return response,
+    };
+    render(&confirm_page(&state, action, &target.username, error))
+}
+
+/// `GET /admin/users/{username}/disable`
+pub async fn disable_confirm(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    username: Result<Path<String>, PathRejection>,
+) -> Response {
+    confirm(state, headers, username, Action::Disable).await
+}
+
+/// `GET /admin/users/{username}/delete`
+pub async fn delete_confirm(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    username: Result<Path<String>, PathRejection>,
+) -> Response {
+    confirm(state, headers, username, Action::Delete).await
+}
+
+/// `POST /admin/users/{username}/disable`
+pub async fn disable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    username: Result<Path<String>, PathRejection>,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/users").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let Ok(Path(username)) = username else {
+        return not_found();
+    };
+    let target = match member(&state, &username).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    match guard(&state, &admin, &target).await {
+        Ok(None) => {}
+        Ok(Some(error)) => return refused_action(&state, Action::Disable, &target.username, error),
+        Err(response) => return response,
+    }
+    match crate::provision::disable_account(&state.pool, &state.commits, &target).await {
+        Ok(()) => {
+            tracing::info!(admin = %admin.username, member = %target.username, "member disabled from the console");
+            Redirect::to("/admin/users").into_response()
+        }
+        Err(_) => server_error(),
+    }
+}
+
+/// `POST /admin/users/{username}/enable`
+pub async fn enable(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    username: Result<Path<String>, PathRejection>,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/users").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let Ok(Path(username)) = username else {
+        return not_found();
+    };
+    let target = match member(&state, &username).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    if target.is_active() {
+        return Redirect::to("/admin/users").into_response();
+    }
+    match crate::provision::enable_account(&state.pool, &state.commits, &target).await {
+        Ok(()) => {
+            tracing::info!(admin = %admin.username, member = %target.username, "member enabled from the console");
+            Redirect::to("/admin/users").into_response()
+        }
+        Err(_) => server_error(),
+    }
+}
+
+#[derive(Deserialize)]
+pub struct DeleteForm {
+    #[serde(default)]
+    confirm: String,
+}
+
+/// `POST /admin/users/{username}/delete`
+pub async fn delete(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    username: Result<Path<String>, PathRejection>,
+    form: Result<Form<DeleteForm>, FormRejection>,
+) -> Response {
+    let admin = match require_admin(&state, &headers, "/admin/users").await {
+        Ok(admin) => admin,
+        Err(response) => return response,
+    };
+    let (Ok(Path(username)), Ok(Form(form))) = (username, form) else {
+        return (StatusCode::BAD_REQUEST, "malformed request").into_response();
+    };
+    let target = match member(&state, &username).await {
+        Ok(target) => target,
+        Err(response) => return response,
+    };
+    match guard(&state, &admin, &target).await {
+        Ok(None) => {}
+        Ok(Some(error)) => return refused_action(&state, Action::Delete, &target.username, error),
+        Err(response) => return response,
+    }
+    if form.confirm.trim() != target.username {
+        return refused_action(
+            &state,
+            Action::Delete,
+            &target.username,
+            format!("Type {} to confirm.", target.username),
+        );
+    }
+    match crate::provision::delete_account(&state.pool, &state.stores, &state.commits, &target)
+        .await
+    {
+        Ok(()) => {
+            tracing::info!(admin = %admin.username, member = %target.username, "member deleted from the console");
+            Redirect::to("/admin/users").into_response()
+        }
+        Err(_) => server_error(),
+    }
+}

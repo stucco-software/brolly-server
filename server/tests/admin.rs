@@ -917,3 +917,306 @@ async fn a_cross_origin_mint_is_refused() {
     assert_eq!(status, StatusCode::FORBIDDEN);
     assert_eq!(invite_count(&db.pool).await, before);
 }
+
+// --- disable, enable, delete -------------------------------------------------
+
+/// An admin, and alice registered through the door — so she has a session
+/// and a provisioned pod — returned as (admin cookie, alice cookie, alice id).
+async fn an_admin_and_a_registered_alice(
+    db: &brolly_test_support::TestDb,
+    router: &axum::Router,
+) -> (String, String, uuid::Uuid) {
+    let admin_invite = db::create_invite(&db.pool, None, 1, None, Some("admin"))
+        .await
+        .unwrap();
+    let keeper = register(router, "keeper", &admin_invite).await;
+    let invite = db::create_invite(&db.pool, None, 1, None, None)
+        .await
+        .unwrap();
+    let alice_cookie = register(router, "alice", &invite).await;
+    let alice = db::find_by_username(&db.pool, "alice")
+        .await
+        .unwrap()
+        .unwrap();
+    (keeper, alice_cookie, alice.id)
+}
+
+/// One live credential of every kind an app can hold for a member.
+async fn seed_credentials(pool: &sqlx::PgPool, user: uuid::Uuid) {
+    let later = "now() + interval '1 day'";
+    for sql in [
+        format!(
+            "INSERT INTO solid_refresh_tokens (token_hash, client_id, user_id, webid, scope, expires_at, family, grant_expires_at)
+             VALUES ('srt', 'https://app.example/id', $1, 'https://alice.brolly.test/profile#me', 'openid', {later}, md5(random()::text)::uuid, {later})"
+        ),
+        format!(
+            "INSERT INTO atproto_tokens (token_hash, kind, client_id, user_id, scope, dpop_jkt, expires_at)
+             VALUES ('at', 'refresh', 'https://app.example/client.json', $1, 'atproto', 'jkt', {later})"
+        ),
+        format!(
+            "INSERT INTO atproto_legacy_tokens (token_hash, kind, user_id, session_id, expires_at)
+             VALUES ('alt', 'refresh', $1, md5(random()::text)::uuid, {later})"
+        ),
+        format!(
+            "INSERT INTO atproto_auth_codes (code_hash, client_id, user_id, redirect_uri, scope, code_challenge, dpop_jkt, expires_at)
+             VALUES ('ac', 'https://app.example/client.json', $1, 'https://app.example/cb', 'atproto', 'c', 'jkt', {later})"
+        ),
+        "INSERT INTO solid_webid_links (webid, user_id) VALUES ('https://agent.example/#it', $1)".to_string(),
+    ] {
+        sqlx::query(&sql).bind(user).execute(pool).await.unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO solid_client_credentials (credential_id, secret_hash, webid)
+         VALUES ('cc', 'x', 'https://agent.example/#it')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO mastodon_apps (client_id, client_secret_hash, name, redirect_uris, scopes)
+         VALUES ('m', 'x', 'An app', ARRAY['https://app.example/cb'], 'read')",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO mastodon_tokens (token_hash, client_id, user_id, scopes) VALUES ('mt', 'm', $1, 'read')")
+        .bind(user)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// How many credentials the member still holds that could be presented.
+async fn live_credentials(pool: &sqlx::PgPool, user: uuid::Uuid) -> i64 {
+    let (n,): (i64,) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM sessions WHERE user_id = $1)
+              + (SELECT count(*) FROM solid_refresh_tokens WHERE user_id = $1 AND revoked_at IS NULL)
+              + (SELECT count(*) FROM atproto_tokens WHERE user_id = $1 AND revoked_at IS NULL)
+              + (SELECT count(*) FROM atproto_legacy_tokens WHERE user_id = $1 AND revoked_at IS NULL)
+              + (SELECT count(*) FROM mastodon_tokens WHERE user_id = $1 AND revoked_at IS NULL)
+              + (SELECT count(*) FROM atproto_auth_codes WHERE user_id = $1)
+              + (SELECT count(*) FROM solid_client_credentials c
+                   JOIN solid_webid_links l ON l.webid = c.webid
+                  WHERE l.user_id = $1 AND c.revoked_at IS NULL)",
+    )
+    .bind(user)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    n
+}
+
+#[tokio::test]
+async fn disabling_a_member_locks_everything_they_hold() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, alice_cookie, alice) = an_admin_and_a_registered_alice(&db, &router).await;
+    seed_credentials(&db.pool, alice).await;
+    assert!(live_credentials(&db.pool, alice).await >= 7, "seeded");
+
+    // A confirmation first, naming who.
+    let (status, page) = get_as(&router, "/admin/users/alice/disable", Some(&keeper)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("@alice"), "{page}");
+
+    let (status, _, location) =
+        post_as(&router, "/admin/users/alice/disable", "", &keeper, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/admin/users"));
+
+    let user = db::find_by_id(&db.pool, alice).await.unwrap().unwrap();
+    assert!(!user.is_active());
+    assert_eq!(
+        live_credentials(&db.pool, alice).await,
+        0,
+        "every credential revoked"
+    );
+    assert!(
+        db::authenticate(&db.pool, "alice", "correct-horse-battery")
+            .await
+            .is_err(),
+        "no new login"
+    );
+    let (status, _) = get_as(&router, "/account", Some(&alice_cookie)).await;
+    assert_ne!(status, StatusCode::OK, "the old session is gone");
+
+    // The list says so.
+    let (_, list) = get_as(&router, "/admin/users", Some(&keeper)).await;
+    assert!(list.contains("chip-disabled"));
+}
+
+#[tokio::test]
+async fn enabling_lets_a_member_log_in_again_but_revives_no_token() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice_cookie, alice) = an_admin_and_a_registered_alice(&db, &router).await;
+    seed_credentials(&db.pool, alice).await;
+    post_as(&router, "/admin/users/alice/disable", "", &keeper, None).await;
+
+    let (status, _, location) =
+        post_as(&router, "/admin/users/alice/enable", "", &keeper, None).await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/admin/users"));
+    assert!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_active()
+    );
+    assert!(
+        db::authenticate(&db.pool, "alice", "correct-horse-battery")
+            .await
+            .is_ok()
+    );
+    assert_eq!(
+        live_credentials(&db.pool, alice).await,
+        0,
+        "apps sign in again"
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_member_removes_the_account_and_the_pod() {
+    let (db, dir, router) = harness().await;
+    let (keeper, _alice_cookie, alice) = an_admin_and_a_registered_alice(&db, &router).await;
+    let pod_exists = |dir: &std::path::Path| {
+        walk(dir)
+            .iter()
+            .any(|p| p.to_string_lossy().contains(&alice.to_string()))
+    };
+    assert!(pod_exists(dir.path()), "registration provisioned a pod");
+
+    let (status, page) = get_as(&router, "/admin/users/alice/delete", Some(&keeper)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("@alice"), "{page}");
+
+    let (status, _, location) = post_as(
+        &router,
+        "/admin/users/alice/delete",
+        "confirm=alice",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::SEE_OTHER);
+    assert_eq!(location.as_deref(), Some("/admin/users"));
+    assert!(
+        db::find_by_username(&db.pool, "alice")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(!pod_exists(dir.path()), "the pod is gone");
+}
+
+fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(walk(&path));
+            }
+            out.push(path);
+        }
+    }
+    out
+}
+
+/// Deletion can't be undone, so it asks for the username typed out.
+#[tokio::test]
+async fn deleting_needs_the_username_typed_out() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice_cookie, _alice) = an_admin_and_a_registered_alice(&db, &router).await;
+
+    for body in ["", "confirm=", "confirm=bob"] {
+        let (status, _, _) =
+            post_as(&router, "/admin/users/alice/delete", body, &keeper, None).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body:?}");
+    }
+    assert!(
+        db::find_by_username(&db.pool, "alice")
+            .await
+            .unwrap()
+            .is_some()
+    );
+}
+
+/// The console must never lock out the person using it, or leave the
+/// instance with nobody able to run it.
+#[tokio::test]
+async fn an_admin_cannot_disable_or_delete_themselves() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice_cookie, _alice) = an_admin_and_a_registered_alice(&db, &router).await;
+
+    let (status, _, _) = post_as(&router, "/admin/users/keeper/disable", "", &keeper, None).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _, _) = post_as(
+        &router,
+        "/admin/users/keeper/delete",
+        "confirm=keeper",
+        &keeper,
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let keeper_user = db::find_by_username(&db.pool, "keeper")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(keeper_user.is_active());
+}
+
+#[tokio::test]
+async fn a_member_cannot_disable_or_delete_anyone() {
+    let (db, _dir, router) = harness().await;
+    let (_keeper, alice_cookie, _alice) = an_admin_and_a_registered_alice(&db, &router).await;
+
+    for (path, body) in [
+        ("/admin/users/keeper/disable", ""),
+        ("/admin/users/keeper/enable", ""),
+        ("/admin/users/keeper/delete", "confirm=keeper"),
+    ] {
+        let (status, _, _) = post_as(&router, path, body, &alice_cookie, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+    let keeper = db::find_by_username(&db.pool, "keeper")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(keeper.is_active());
+}
+
+#[tokio::test]
+async fn a_cross_origin_disable_or_delete_is_refused() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice_cookie, alice) = an_admin_and_a_registered_alice(&db, &router).await;
+
+    for (path, body) in [
+        ("/admin/users/alice/disable", ""),
+        ("/admin/users/alice/delete", "confirm=alice"),
+    ] {
+        let (status, _, _) =
+            post_as(&router, path, body, &keeper, Some("https://evil.example")).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}");
+    }
+    assert!(
+        db::find_by_id(&db.pool, alice)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_active()
+    );
+}
+
+#[tokio::test]
+async fn an_unknown_member_cannot_be_disabled_or_deleted() {
+    let (db, _dir, router) = harness().await;
+    let (keeper, _alice_cookie, _alice) = an_admin_and_a_registered_alice(&db, &router).await;
+    for (path, body) in [
+        ("/admin/users/nobody/disable", ""),
+        ("/admin/users/nobody/delete", "confirm=nobody"),
+    ] {
+        let (status, _, _) = post_as(&router, path, body, &keeper, None).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+}

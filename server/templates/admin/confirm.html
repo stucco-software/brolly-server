@@ -1,0 +1,36 @@
+{% extends "base.html" %}
+
+{% block title %}{{ heading }} — {{ chrome.instance_name }}{% endblock %}
+
+{% block nav %}{% include "admin/_nav.html" %}{% endblock %}
+
+{% block content %}
+<div class="wrap">
+  <div class="dashboard dashboard-wide">
+    <h1>{{ heading }}</h1>
+    {% include "admin/_tabs.html" %}
+    <section class="dashboard-card dashboard-card-wide">
+      <ul>
+        {% for consequence in consequences %}
+        <li>{{ consequence }}</li>
+        {% endfor %}
+      </ul>
+
+      {% if let Some(error) = error %}
+      <p class="error" role="alert">{{ error }}</p>
+      {% endif %}
+
+      <form method="post" action="{{ action }}" class="stack-form">
+        {% if let Some(username) = typed %}
+        <div class="field">
+          <label for="confirm">Type <span class="mono">{{ username }}</span> to confirm</label>
+          <input id="confirm" name="confirm" autocomplete="off" required>
+        </div>
+        {% endif %}
+        <button type="submit">{{ button }}</button>
+        <a href="/admin/users">Cancel</a>
+      </form>
+    </section>
+  </div>
+</div>
+{% endblock %}

@@ -21,6 +21,7 @@
             <th scope="col">Joined</th>
             <th scope="col">Federation identity</th>
             <th scope="col">Quota</th>
+            <th scope="col"></th>
           </tr>
         </thead>
         <tbody>
@@ -61,6 +62,16 @@
                 <span class="error" role="alert" id="quota-{{ member.username }}-error">{{ error }}</span>
                 {% endif %}
               </form>
+            </td>
+            <td>
+              {% if member.status == "disabled" %}
+              <form method="post" action="/admin/users/{{ member.username }}/enable" class="inline-form">
+                <button type="submit" aria-label="Enable @{{ member.username }}">Enable</button>
+              </form>
+              {% else %}
+              <a href="/admin/users/{{ member.username }}/disable" aria-label="Disable @{{ member.username }}">Disable</a>
+              {% endif %}
+              <a href="/admin/users/{{ member.username }}/delete" aria-label="Delete @{{ member.username }}">Delete</a>
             </td>
           </tr>
           {% endfor %}

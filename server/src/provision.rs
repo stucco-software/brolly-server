@@ -384,3 +384,108 @@ pub async fn delete_account(
     tracing::info!(user = %user.id, "account deleted");
     Ok(())
 }
+
+/// A status change that did not land.
+#[derive(Debug)]
+pub struct StatusChangeFailed;
+
+/// Every statement that takes a member's live credentials away. Sessions,
+/// unspent authorization codes and reset links are deleted; tokens are
+/// revoked, so a refresh presented later reads as revoked rather than
+/// unknown. Agent credentials hang off the member's linked WebIDs.
+const REVOKE_EVERYTHING: &[&str] = &[
+    "DELETE FROM sessions WHERE user_id = $1",
+    "DELETE FROM password_resets WHERE user_id = $1",
+    "DELETE FROM solid_auth_codes WHERE user_id = $1",
+    "DELETE FROM atproto_auth_codes WHERE user_id = $1",
+    "DELETE FROM mastodon_auth_codes WHERE user_id = $1",
+    "UPDATE solid_refresh_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    "UPDATE atproto_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    "UPDATE atproto_legacy_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    "UPDATE mastodon_tokens SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+    "UPDATE solid_client_credentials SET revoked_at = now()
+      WHERE revoked_at IS NULL
+        AND webid IN (SELECT webid FROM solid_webid_links WHERE user_id = $1)",
+];
+
+/// Disable a member: the account stops serving and everything they hold
+/// stops working, but nothing is deleted.
+///
+/// `status = 'disabled'` is what every surface checks — login, sessions,
+/// the pod, the profile, the actor, the repo, the public timeline. The
+/// revocations are belt to that braces: no token, session or code minted
+/// before the disable can be presented after an enable either, so an app a
+/// member authorised stays signed out until they sign it in again. All of
+/// it is one transaction, with the `#account` event that tells relays the
+/// repo is taken down.
+pub async fn disable_account(
+    pool: &PgPool,
+    commits: &tokio::sync::broadcast::Sender<brolly_atproto::firehose::Event>,
+    user: &db::User,
+) -> Result<(), StatusChangeFailed> {
+    set_status(pool, commits, user, false).await
+}
+
+/// Re-enable a disabled member. Their data was never touched; their
+/// credentials stay revoked, so they log in again and re-authorise apps.
+pub async fn enable_account(
+    pool: &PgPool,
+    commits: &tokio::sync::broadcast::Sender<brolly_atproto::firehose::Event>,
+    user: &db::User,
+) -> Result<(), StatusChangeFailed> {
+    set_status(pool, commits, user, true).await
+}
+
+async fn set_status(
+    pool: &PgPool,
+    commits: &tokio::sync::broadcast::Sender<brolly_atproto::firehose::Event>,
+    user: &db::User,
+    active: bool,
+) -> Result<(), StatusChangeFailed> {
+    let failed = |e: &dyn std::fmt::Display, what: &str| {
+        tracing::error!(error = %e, user = %user.id, active, "{what}");
+        StatusChangeFailed
+    };
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| failed(&e, "the status change could not begin"))?;
+    sqlx::query("UPDATE users SET status = $2 WHERE id = $1")
+        .bind(user.id)
+        .bind(if active { "active" } else { "disabled" })
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| failed(&e, "setting the status failed"))?;
+    if !active {
+        for sql in REVOKE_EVERYTHING {
+            sqlx::query(sql)
+                .bind(user.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| failed(&e, "revoking credentials failed"))?;
+        }
+    }
+    // As for deletion: only a member with a DID ever told the network about
+    // themselves, so only they announce.
+    let event = match user.did_plc.as_deref() {
+        Some(did) => Some(
+            brolly_atproto::firehose::record_account(
+                &mut tx,
+                did,
+                active,
+                (!active).then_some("takendown"),
+            )
+            .await
+            .map_err(|e| failed(&e, "recording the status's firehose event failed"))?,
+        ),
+        None => None,
+    };
+    tx.commit()
+        .await
+        .map_err(|e| failed(&e, "the status change could not commit"))?;
+    if let Some(event) = event {
+        let _ = commits.send(brolly_atproto::firehose::Event::Account(event));
+    }
+    tracing::info!(user = %user.id, active, "account status changed");
+    Ok(())
+}

@@ -226,6 +226,15 @@ is routing, not taste. Pick a real name.
 
 ### Afterwards
 
+Members can be disabled, re-enabled and deleted from the console's Members
+page. **Disable** signs them out everywhere, revokes every token, code and
+agent credential they hold, stops their pod, profile, actor and repository
+being served, and tells relays the account is taken down. Nothing is
+deleted. **Enable** restores the account, but not the revoked app access:
+they log in and authorise their apps again. **Delete** removes the pod and
+the account for good, after you type the username. An admin can't do either
+to themselves or to the last active admin.
+
 Invites can be minted and revoked from the console, at `/admin/invites`. A
 code is shown once, when it's minted, because only its hash is stored. The
 same verbs are on the CLI:
