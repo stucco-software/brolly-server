@@ -102,8 +102,21 @@ landed 2026-10-09 — so stage 4's remainder is unlocked on its blob-link
 dependency and waits only on stage 3's surface, per the dependency above.
 Stage 2 is complete (chunk 5, confidential clients, landed 2026-11-18), and
 stage 3 (the PDS surface) is implemented (2026-11-26) pending its live check.
-Next: stage 4's ATProto half (blobs and avatars, unspecced), then the
-finish-line pass against a deployed instance, then stage 8.
+Next: stage 4's ATProto half, then the finish-line pass against a deployed
+instance, then stage 8.
+
+**Stage 4's ATProto half is five parts (re-scoped 2026-11-26),** because ADR
+0022 makes the pod the core and the ATProto repo a projection of it. The
+blob endpoints alone would have kept records outside `/~/`, where no Solid
+app can see them:
+
+| Part | Contents | State |
+|---|---|---|
+| a | The data model, held: `$link`/`$bytes` both ways, floats refused, `$type` equal to the collection, vendored `com.atproto.*` and `app.bsky.*` lexicons with a full schema validator, `validationStatus` on writes. One gate for every write. | Specced next |
+| b | Records are Solid resources: `at://{did}/{coll}/{rkey}` is `/~/{coll}/{rkey}`, collection containers with a default ACL (public read, owner write), GET as faithful Turtle or as the record's JSON, existing `at://` graphs migrated on pod open | — |
+| c | One write path: XRPC and Solid writes are pod writes through the container's constraint (the lexicon); the adapter projects each into a signed commit in the same write; WAC decides who may write | — |
+| d | Blobs: `uploadBlob`, `sync.getBlob`, `sync.listBlobs`; `/~/media/{cid}` created on first reference and removed on last; public by default, governed by its ACL; sandboxed serving from the apex | — |
+| e | Identity both ways: the WebID's name, bio and avatar and `app.bsky.actor.profile/self` kept equal; commits only on real change; the avatar only when its target is public and a valid avatar | — |
 
 **Stage 5 is four parts,** because the first one had to move state before
 anything could report it:

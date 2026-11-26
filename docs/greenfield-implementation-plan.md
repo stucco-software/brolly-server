@@ -22,8 +22,8 @@ supersedes this section.
 | D6 | **Push, not pull** — your inbox *is* your home timeline | Reads answer from the viewer's own store by default |
 | D7 | **Two-layer vocabulary** — faithful always, canonical where things are the same thing | Export is complete; harmonization is opt-in per entity |
 | D8 | **Harmonize on the subject IRI**, not via `owl:sameAs` | All writers assert onto `…/profile#me`; nothing to join |
-| D9 | **Solid LDP is generic CRUD.** Publication = shape + location | A typed publication container, not a sync flag |
-| D10 | **No automatic cross-protocol collapse.** Bridging is an explicit per-write user decision | Display across surfaces is fine; delivery is opt-in |
+| D9 | **Solid LDP is generic CRUD.** Publication = shape + location | A typed publication container, not a sync flag. Load-bearing since ADR 0022: a container's shape is the hook a protocol's rules plug into |
+| D10 | **No automatic cross-protocol collapse.** Bridging is an explicit per-write user decision | Display across surfaces is fine; delivery is opt-in. Refined by ADR 0022: identity (name, bio, avatar) is one fact, harmonized on every surface |
 | D11 | **`did:plc` in every wire format** from the first commit; `did:web` for routing only | No AT-URI migration later |
 | D12 | **Federation off by default**; all federation code paths still exercised locally. **Scoped to ActivityPub by ADR 0016** — ATProtocol is always on, because a PDS hosts rather than pushes and a member without a `did:plc` has no identity at all | Ship dormant, flip in a one-line commit |
 | D13 | **Drop `com.mycorriza.rdf.resource`** | Nothing publishes arbitrary Solid RDF outward |
