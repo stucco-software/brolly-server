@@ -5,7 +5,9 @@
      lexicon tree, the spike), so not every path it cites resolves until it
      lands. -->
 
-**Status:** Drafted 2026-11-26; revised twice after adversarial reviews
+**Status:** Chunk 1 (the spike) done 2026-11-26: the validator is written,
+not adopted (Decision D, `spikes/lexicon-validation/RESULT.md`). Drafted
+2026-11-26; revised twice after adversarial reviews
 against the tree, the ATProto data-model and lexicon specs, and the
 reference PDS's `packages/pds/src/repo/prepare.ts`.
 **Roadmap:** `docs/specs/2026-09-17-interop-roadmap.md`, stage 4's ATProto
@@ -354,11 +356,16 @@ them rather than discover them:**
   reference's encoder refuses one too is **not verified** — `prepare.ts`
   has no float check of its own — so this is listed as a possible
   divergence. The reference verifiably makes H2's `$type` mismatch, the
-  legacy-blob and H4's lexicon refusals too (`prepare.ts`). For H1's
-  malformed `$link`/`$bytes`/`$type` deep inside a record, and a bare-string
-  `ref` in an unknown lexicon, the interop-tests vectors require the
-  refusal; whether the reference's `jsonToLex` keeps such a value as a plain
-  map instead is not verified, and the spike checks it.
+  legacy-blob and H4's lexicon refusals too (`prepare.ts`).
+- **H1's strictness is also beyond the reference's (the spike checked it):**
+  the reference PDS converts request bodies with `jsonToLex` in its default
+  non-strict mode (`packages/xrpc-server/src/util.ts`), which keeps a
+  malformed `$link` or `$bytes` object, a nested `$type` that is not a
+  non-empty string, and a blob with a bare-string `ref` as plain maps
+  rather than refusing them. brolly refuses all of them, as the
+  atproto-interop-tests invalid vectors and the reference's own strict mode
+  do — one model, held to the data model (ADR 0022). The line-cited table is
+  in `spikes/lexicon-validation/RESULT.md`.
 - `getRecord`, `listRecords` and the pod's faithful copy now say `$link` and
   `$bytes` for records with links or bytes. No front-end in this repo reads
   `ref`; any brolly front-end in another repo that does should read
@@ -389,7 +396,7 @@ them rather than discover them:**
 | A | `$link`/`$bytes` anywhere, strictly formed, emitted on read; non-integral numbers and integers past i64 refused, integral ones (`1.0`) accepted as integers; legacy blobs and bare-string refs refused on write | The data model's own JSON mapping, held to its interop vectors; integral numbers are integers to every JSON client, including the reference's |
 | B | `$type` must equal the collection, under any `validate`; missing → filled; filled in the gate only | The reference's rule; one place, so every surface gets the same fill |
 | C | Lexicons vendored and pinned per source repo (`com.atproto.*` from atproto, `app.bsky.*` from bsky, plus their ref closure), embedded with `include_dir`, parsed once and forced at startup | Deterministic validation with no runtime fetch; a bad pin stops the boot, not a write; the evolution rules make a stale pin safe |
-| D | The validator is adopted if a maintained crate passes a corpus written first and a four-point bar, written otherwise | ADR 0002's preference, held to an explicit bar rather than a crate's own claims |
+| D | The validator is **written**, in `adapters/atproto/src/lexicon/` on the vendored lexicons (spike, 2026-11-26). Neither candidate passed: `atproto-lexicon` 0.14.5 24/107 (no `null` type; 99/107 with it stripped — unpadded `$bytes`, `*/*`, `unknown`, `-00:00` and untyped union members wrong; an HTTP/DNS stack no feature removes; 17 unfixable advisories), `proto-blue-lexicon` 0.3.3 24/107 (no `null` type; 103/107 with it stripped — `unknown` and `*/*` wrong) | ADR 0002's preference, held to an explicit bar rather than a crate's own claims. `proto-blue-lexicon` is the one to re-check if it gains `null`, `unknown` and `*/*` upstream; adopting it now would mean carrying a fork |
 | E | `validate: false` cannot skip a known lexicon | The known lexicon is the container's shape; an interface that could skip it would let XRPC write what a Solid write may not (ADR 0022). A deliberate deviation from the reference |
 | F | One gate returns the IPLD it validated; the key check reruns after minting; part c wraps it, it does not register it | One conversion and one validation, so the committed block and the checked record cannot drift; ATProto types stay in the adapter |
 | G | `applyWrites` results carry their union `$type` | The lexicon's shape; a client reading `validationStatus` needs to know which result it holds |

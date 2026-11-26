@@ -1,0 +1,18 @@
+[package]
+name = "spike-lexicon-validation"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "AGPL-3.0-or-later"
+description = "THROWAWAY. Decides stage 4a's validator: each candidate against the corpus (spec H4). Delete once chunk 3 lands."
+
+# Its own workspace: candidate crates stay out of the server's lockfile.
+[workspace]
+
+[dependencies]
+serde_json = "1"
+anyhow = "1"
+# Candidates — Tasks 1.4 (A) and 1.5 (B). lex-json is B's own JSON -> LexValue.
+atproto-lexicon = "0.14.5"
+proto-blue-lexicon = "0.3.3"
+proto-blue-lex-json = "0.3.3"

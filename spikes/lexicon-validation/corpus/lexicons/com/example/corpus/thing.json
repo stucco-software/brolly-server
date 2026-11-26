@@ -1,0 +1,55 @@
+{
+  "lexicon": 1,
+  "id": "com.example.corpus.thing",
+  "defs": {
+    "main": {
+      "type": "record",
+      "key": "any",
+      "record": {
+        "type": "object",
+        "required": ["str"],
+        "nullable": ["maybe"],
+        "properties": {
+          "str": {"type": "string", "minLength": 2, "maxLength": 10, "maxGraphemes": 3},
+          "choice": {"type": "string", "enum": ["a", "b"]},
+          "fixed": {"type": "string", "const": "x"},
+          "known": {"type": "string", "knownValues": ["k1"]},
+          "count": {"type": "integer", "minimum": 1, "maximum": 5},
+          "flag": {"type": "boolean", "const": true},
+          "items": {"type": "array", "minLength": 1, "maxLength": 2, "items": {"type": "integer"}},
+          "raw": {"type": "bytes", "maxLength": 4},
+          "link": {"type": "cid-link"},
+          "maybe": {"type": "string"},
+          "anything": {"type": "unknown"},
+          "pic": {"type": "blob", "accept": ["image/*"], "maxSize": 100},
+          "when": {"type": "string", "format": "datetime"},
+          "who": {"type": "string", "format": "did"},
+          "lang": {"type": "string", "format": "language"},
+          "open": {"type": "union", "refs": ["#a", "#b"]},
+          "shut": {"type": "union", "refs": ["#a", "#b"], "closed": true},
+          "local": {"type": "ref", "ref": "#a"},
+          "remote": {"type": "ref", "ref": "com.atproto.repo.strongRef"},
+          "nothing": {"type": "null"},
+          "short": {"type": "string", "minGraphemes": 2},
+          "ichoice": {"type": "integer", "enum": [1, 2]},
+          "ifixed": {"type": "integer", "const": 7},
+          "rawmin": {"type": "bytes", "minLength": 2},
+          "tokened": {"type": "string", "knownValues": ["com.example.corpus.thing#tok"]},
+          "atid": {"type": "string", "format": "at-identifier"},
+          "hdl": {"type": "string", "format": "handle"},
+          "ns": {"type": "string", "format": "nsid"},
+          "t": {"type": "string", "format": "tid"},
+          "rk": {"type": "string", "format": "record-key"},
+          "u": {"type": "string", "format": "uri"},
+          "au": {"type": "string", "format": "at-uri"},
+          "c": {"type": "string", "format": "cid"},
+          "anyfile": {"type": "blob", "accept": ["*/*"]},
+          "globbed": {"type": "blob", "accept": ["image/pn*"]}
+        }
+      }
+    },
+    "a": {"type": "object", "required": ["n"], "properties": {"n": {"type": "integer"}}},
+    "b": {"type": "object", "properties": {"s": {"type": "string"}}},
+    "tok": {"type": "token", "description": "A token: only ever a value, so it has no failing case."}
+  }
+}

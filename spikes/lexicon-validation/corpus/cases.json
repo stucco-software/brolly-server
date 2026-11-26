@@ -1,0 +1,1294 @@
+[
+  {
+    "name": "minimal",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "required-missing",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "minLength",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "a"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "maxLength-bytes",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "\ud83d\ude00\ud83d\ude00\ud83d\ude00"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "maxGraphemes",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abcd"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "graphemes-combining",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "e\u0301e\u0301e\u0301"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "enum-in",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "choice": "a"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "enum-out",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "choice": "c"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "const-right",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "fixed": "x"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "const-wrong",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "fixed": "y"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "knownValues-open",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "known": "other"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "integer-min",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "count": 0
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "integer-max",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "count": 6
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "integer-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "count": 3
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "boolean-const-right",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "flag": true
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "boolean-const",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "flag": false
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "array-min",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "items": []
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "array-max",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "items": [
+        1,
+        2,
+        3
+      ]
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "array-item-type",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "items": [
+        "x"
+      ]
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "bytes-max",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "raw": {
+        "$bytes": "AQIDBAU"
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "bytes-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "raw": {
+        "$bytes": "AQIDBA"
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "cid-link-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "link": {
+        "$link": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a"
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "cid-link-string",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "link": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "nullable-null",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "maybe": null
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "not-nullable-null",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "known": null
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "unknown-object",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "anything": {
+        "x": 1
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "unknown-not-object",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "anything": "x"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "unknown-blob-shaped",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "anything": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "image/png",
+        "size": 1
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "blob-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "pic": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "image/png",
+        "size": 50
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "blob-too-big",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "pic": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "image/png",
+        "size": 101
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "blob-wrong-type",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "pic": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "text/plain",
+        "size": 50
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "datetime-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "when": "2026-11-26T12:00:00Z"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "datetime-fraction",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "when": "2026-11-26T12:00:00.123456Z"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "datetime-lower-t",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "when": "2026-11-26t12:00:00Z"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "datetime-minus-zero",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "when": "2026-11-26T12:00:00-00:00"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "datetime-no-seconds",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "when": "2026-11-26T12:00Z"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "datetime-no-zone",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "when": "2026-11-26T12:00:00"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "did-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "who": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "did-unknown-method",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "who": "did:example:xyz"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "did-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "who": "notadid"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "language-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "lang": "en-US"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "language-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "lang": "not a tag!"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "open-union-known",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "open": {
+        "$type": "com.example.corpus.thing#a",
+        "n": 1
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "open-union-unknown",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "open": {
+        "$type": "com.example.other#x"
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "union-no-type",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "open": {
+        "n": 1
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "union-member-invalid",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "open": {
+        "$type": "com.example.corpus.thing#a"
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "closed-union-unknown",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "shut": {
+        "$type": "com.example.other#x"
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "closed-union-known",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "shut": {
+        "$type": "com.example.corpus.thing#b",
+        "s": "y"
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "ref-local",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "local": {
+        "n": 1
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "ref-local-invalid",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "local": {
+        "n": "x"
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "ref-remote",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "remote": {
+        "uri": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kaaaaaaaaaab",
+        "cid": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a"
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "ref-remote-missing",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "remote": {
+        "uri": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kaaaaaaaaaab"
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "extra-field-ignored",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "zzz": 1
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "null-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "nothing": null
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "null-not-null",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "nothing": 0
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "minGraphemes-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "short": "ab"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "minGraphemes-short",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "short": "a"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "int-enum-in",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "ichoice": 2
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "int-enum-out",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "ichoice": 3
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "int-const-right",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "ifixed": 7
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "int-const-wrong",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "ifixed": 8
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "bytes-min-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "rawmin": {
+        "$bytes": "AQI"
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "bytes-min-short",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "rawmin": {
+        "$bytes": "AQ"
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "token-value",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "tokened": "com.example.corpus.thing#tok"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "at-identifier-handle",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "atid": "alice.example.com"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "at-identifier-did",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "atid": "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "at-identifier-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "atid": "not an identifier"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "handle-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "hdl": "alice.example.com"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "handle-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "hdl": "alice"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "nsid-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "ns": "com.example.thing"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "nsid-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "ns": "com.example"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "tid-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "t": "3kaaaaaaaaaab"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "tid-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "t": "3kaaaaaaaaaa0"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "record-key-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "rk": "self"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "record-key-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "rk": ".."
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "uri-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "u": "https://example.com/x"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "uri-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "u": "not a uri"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "at-uri-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "au": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kaaaaaaaaaab"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "at-uri-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "au": "https://example.com"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "cid-ok",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "c": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "cid-bad",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "c": "not-a-cid"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "accept-any",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "anyfile": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "application/zip",
+        "size": 50
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "accept-partial-glob",
+    "collection": "com.example.corpus.thing",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.thing",
+      "str": "abc",
+      "globbed": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "image/png",
+        "size": 50
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "key-self-ok",
+    "collection": "com.example.corpus.selfkey",
+    "rkey": "self",
+    "record": {
+      "$type": "com.example.corpus.selfkey"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "key-self-other",
+    "collection": "com.example.corpus.selfkey",
+    "rkey": "other",
+    "record": {
+      "$type": "com.example.corpus.selfkey"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "key-tid-ok",
+    "collection": "com.example.corpus.tidkey",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "com.example.corpus.tidkey"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "key-tid-bad",
+    "collection": "com.example.corpus.tidkey",
+    "rkey": "nottid",
+    "record": {
+      "$type": "com.example.corpus.tidkey"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "key-nsid-ok",
+    "collection": "com.example.corpus.nsidkey",
+    "rkey": "com.example.thing",
+    "record": {
+      "$type": "com.example.corpus.nsidkey"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "key-nsid-bad",
+    "collection": "com.example.corpus.nsidkey",
+    "rkey": "nope",
+    "record": {
+      "$type": "com.example.corpus.nsidkey"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "required-nullable-null",
+    "collection": "com.example.corpus.nullable",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.nullable",
+      "v": null
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "required-nullable-absent",
+    "collection": "com.example.corpus.nullable",
+    "rkey": "r",
+    "record": {
+      "$type": "com.example.corpus.nullable"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "post-ok",
+    "collection": "app.bsky.feed.post",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "text": "hi",
+      "createdAt": "2026-11-26T12:00:00Z"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "post-no-createdAt",
+    "collection": "app.bsky.feed.post",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "text": "hi"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "post-301-graphemes",
+    "collection": "app.bsky.feed.post",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "createdAt": "2026-11-26T12:00:00Z"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "post-four-langs",
+    "collection": "app.bsky.feed.post",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "text": "hi",
+      "createdAt": "2026-11-26T12:00:00Z",
+      "langs": [
+        "en",
+        "fr",
+        "de",
+        "es"
+      ]
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "post-reply-no-cid",
+    "collection": "app.bsky.feed.post",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "text": "hi",
+      "createdAt": "2026-11-26T12:00:00Z",
+      "reply": {
+        "root": {
+          "uri": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kaaaaaaaaaab"
+        },
+        "parent": {
+          "uri": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kaaaaaaaaaab",
+          "cid": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a"
+        }
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "post-image-embed",
+    "collection": "app.bsky.feed.post",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "text": "hi",
+      "createdAt": "2026-11-26T12:00:00Z",
+      "embed": {
+        "$type": "app.bsky.embed.images",
+        "images": [
+          {
+            "alt": "x",
+            "image": {
+              "$type": "blob",
+              "ref": {
+                "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+              },
+              "mimeType": "image/jpeg",
+              "size": 50
+            }
+          }
+        ]
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "profile-avatar-ok",
+    "collection": "app.bsky.actor.profile",
+    "rkey": "self",
+    "record": {
+      "$type": "app.bsky.actor.profile",
+      "avatar": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "image/jpeg",
+        "size": 500000
+      }
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "profile-avatar-too-big",
+    "collection": "app.bsky.actor.profile",
+    "rkey": "self",
+    "record": {
+      "$type": "app.bsky.actor.profile",
+      "avatar": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "image/jpeg",
+        "size": 2000000
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "profile-avatar-webp",
+    "collection": "app.bsky.actor.profile",
+    "rkey": "self",
+    "record": {
+      "$type": "app.bsky.actor.profile",
+      "avatar": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "image/webp",
+        "size": 500000
+      }
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "profile-name-65",
+    "collection": "app.bsky.actor.profile",
+    "rkey": "self",
+    "record": {
+      "$type": "app.bsky.actor.profile",
+      "avatar": {
+        "$type": "blob",
+        "ref": {
+          "$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"
+        },
+        "mimeType": "image/jpeg",
+        "size": 500000
+      },
+      "displayName": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "profile-wrong-rkey",
+    "collection": "app.bsky.actor.profile",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.actor.profile"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "like-ok",
+    "collection": "app.bsky.feed.like",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.feed.like",
+      "subject": {
+        "uri": "at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/app.bsky.feed.post/3kaaaaaaaaaab",
+        "cid": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a"
+      },
+      "createdAt": "2026-11-26T12:00:00Z"
+    },
+    "expect": "valid"
+  },
+  {
+    "name": "like-no-subject",
+    "collection": "app.bsky.feed.like",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.feed.like",
+      "createdAt": "2026-11-26T12:00:00Z"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "follow-bad-did",
+    "collection": "app.bsky.graph.follow",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "app.bsky.graph.follow",
+      "subject": "notadid",
+      "createdAt": "2026-11-26T12:00:00Z"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "post-bad-rkey",
+    "collection": "app.bsky.feed.post",
+    "rkey": "nottid",
+    "record": {
+      "$type": "app.bsky.feed.post",
+      "text": "hi",
+      "createdAt": "2026-11-26T12:00:00Z"
+    },
+    "expect": "invalid"
+  },
+  {
+    "name": "unknown-lexicon",
+    "collection": "com.example.nobody.knows",
+    "rkey": "3kaaaaaaaaaab",
+    "record": {
+      "$type": "com.example.nobody.knows",
+      "anything": 1
+    },
+    "expect": "unknown"
+  }
+]
