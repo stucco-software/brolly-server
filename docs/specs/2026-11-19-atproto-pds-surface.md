@@ -1,6 +1,8 @@
 # Stage 3: the PDS surface
 
-**Status:** Drafted 2026-11-19, five chunks, not yet reviewed. The roadmap's
+**Status:** Implemented 2026-11-26, all five chunks (C and D revised in
+flight, marked where they are); the deployed-instance check the rollout
+names is still to run. The roadmap's
 finish line items 1–3 ("the Bluesky app logs in and works; a relay indexes the
 account; a third-party OAuth app writes its own records") all stop at this
 stage's missing surface.
