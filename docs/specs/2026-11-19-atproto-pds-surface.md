@@ -267,8 +267,12 @@ Postgres-is-admin-only rule: what a member made leaves with their export.
 
 - Configuration: `BROLLY_RELAY_URL` (an `https` origin). Unset, nothing
   sends — the same trunk-based rule as the proxy.
-- On startup, after migrations and before the listener accepts, POST
-  `{hostname: base_domain}` to `{relay}/xrpc/com.atproto.identity.requestCrawl`,
+- On startup, once the listener is bound (so a relay that crawls straight
+  back finds the port open) and in its own task (so a relay that is down
+  never delays the start), POST
+  `{hostname: base_domain}` to `{relay}/xrpc/com.atproto.sync.requestCrawl`
+  (the draft said `com.atproto.identity.requestCrawl`; the lexicon is
+  `sync`),
   on the hardened transport, no credentials — the endpoint is the relay's
   own invitation to crawl, and the relay authorises by the PDS endpoint
   the crawl then discovers; a service-auth token from a DID the relay has

@@ -33,6 +33,7 @@ pub mod pod;
 pub mod profile;
 pub mod provision;
 pub mod ratelimit;
+pub mod relay;
 pub mod solid_oidc;
 pub mod tls;
 pub mod xrpc;

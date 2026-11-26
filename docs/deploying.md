@@ -66,6 +66,7 @@ repository heads, the PLC log.
 | `BROLLY_PLC_SUBMIT` | no | off | `1` publishes `did:plc` operations to the real directory. |
 | `BROLLY_APPVIEW_URL` | no | — | The AppView unimplemented `app.bsky.*` methods forward to, an `https` origin with no path (e.g. `https://api.bsky.app`). Set with `BROLLY_APPVIEW_DID` or not at all; one without the other stops the start. Unset, those methods answer `501`. |
 | `BROLLY_APPVIEW_DID` | no | — | That AppView's DID, with no fragment (e.g. `did:web:api.bsky.app`): the audience of the service tokens minted for it. |
+| `BROLLY_RELAY_URL` | no | — | A relay to invite to crawl on every start (`com.atproto.sync.requestCrawl`), an `https` origin with no path (e.g. `https://bsky.network`). Retried with backoff until it accepts. Set it only once the instance is on its real domain. |
 | `BROLLY_PUBLIC_REGISTRATION` | no | off | `1` opens registration to anyone, on both the `/register` form and the `POST /api/accounts` API. Off, an instance is invite-only. |
 | `BROLLY_WWW_REDIRECT` | no | — | Where `www.{base_domain}` goes: an absolute URL (a path prefix is allowed), and every request to the `www` host is sent there with its path and query. Unset, `www` is untouched. |
 | `BROLLY_HOME_URL` | no | — | An app in front of the instance: the apex `/` redirects there instead of showing the login form. `/login` still renders. |

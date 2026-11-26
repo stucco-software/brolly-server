@@ -230,6 +230,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.commits.clone(),
     ));
 
+    // `requestCrawl` (stage 3, E): off unless `BROLLY_RELAY_URL` is set.
+    // After the bind, so a relay that crawls straight back finds the port
+    // listening; in its own task, so a relay that is down never delays the
+    // start — it retries with capped backoff until one invitation lands.
+    if let Some(relay) = brolly_server::relay::Relay::from_env()? {
+        let hostname = state.base_domain.clone();
+        tokio::spawn(async move {
+            relay
+                .announce(&hostname, brolly_server::relay::Backoff::default())
+                .await;
+        });
+    }
+
     // With the peer address, so the rate limits have a key when no proxy is
     // in front of the deployment to report one.
     axum::serve(
