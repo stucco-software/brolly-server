@@ -5,7 +5,9 @@ the vendored lexicons, with `unicode-segmentation` for graphemes. Neither
 candidate passes the bar. `proto-blue-lexicon` came closest and is the one to
 re-check if it gains the missing pieces upstream.
 
-Measured 2026-11-26 against the corpus (`corpus/cases.json`, 107 cases: 47
+The corpus moved to the adapter's tests in stage 4a chunk 3; the spike reads it from there.
+
+Measured 2026-11-26 against the corpus (`adapters/atproto/tests/fixtures/lexicon-corpus/cases.json`, 107 cases: 47
 valid, 59 invalid, 1 unknown) and the vendored lexicons (`vendor/lexicons/`,
 274 files, pinned in `vendor/lexicons/SOURCES.md`).
 

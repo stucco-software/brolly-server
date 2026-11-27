@@ -73,12 +73,10 @@ fn lexicon_files(dirs: &[PathBuf]) -> anyhow::Result<Vec<Value>> {
 
 fn main() -> anyhow::Result<()> {
     let here = Path::new(env!("CARGO_MANIFEST_DIR"));
-    let docs = lexicon_files(&[
-        here.join("../../vendor/lexicons"),
-        here.join("corpus/lexicons"),
-    ])?;
+    let corpus = here.join("../../adapters/atproto/tests/fixtures/lexicon-corpus");
+    let docs = lexicon_files(&[here.join("../../vendor/lexicons"), corpus.join("lexicons")])?;
     let cases: Vec<Value> =
-        serde_json::from_str(&std::fs::read_to_string(here.join("corpus/cases.json"))?)?;
+        serde_json::from_str(&std::fs::read_to_string(corpus.join("cases.json"))?)?;
 
     let which = std::env::args().nth(1).context("usage: <candidate>")?;
     let candidate = candidates::load(&which, &docs)?;
