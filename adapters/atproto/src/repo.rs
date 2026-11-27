@@ -74,6 +74,10 @@ pub enum RepoError {
     /// [`MAX_RECORD_BYTES`], or a commit whose CAR diff slice would exceed
     /// [`MAX_DIFF_BYTES`] (1, B).
     TooLarge(String),
+    /// One of our own lexicons is broken (stage 4a, H5): a ref that does not
+    /// resolve, a type the validator has no rule for, a tree that did not
+    /// load. The server's fault, not the client's.
+    Lexicon(String),
 }
 
 impl std::fmt::Display for RepoError {
@@ -88,6 +92,7 @@ impl std::fmt::Display for RepoError {
                 write!(f, "the record was not where this write required it: {p}")
             }
             RepoError::TooLarge(what) => write!(f, "the write is too large: {what}"),
+            RepoError::Lexicon(m) => write!(f, "lexicon: {m}"),
         }
     }
 }

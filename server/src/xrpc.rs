@@ -1344,6 +1344,14 @@ fn write_refused(e: brolly_atproto::repo::RepoError) -> Response {
                 "the commit could not be signed",
             )
         }
+        brolly_atproto::repo::RepoError::Lexicon(m) => {
+            tracing::error!(error = %m, "a vendored lexicon could not judge a record");
+            xrpc_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "InternalServerError",
+                "the record could not be validated",
+            )
+        }
         _ => invalid_request(&e.to_string()),
     }
 }
