@@ -2,7 +2,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use atrium_api::types::string::Nsid;
+use atrium_api::types::string::{Nsid, Tid};
 use serde_json::{Map, Value};
 
 /// Why a set of lexicon documents did not load. The message names the
@@ -190,6 +190,56 @@ impl Registry {
             .def(nsid, name)
             .ok_or_else(|| fail(format!("{base}: {nsid}#{name} does not resolve")))?;
         self.walk(nsid, def, seen)
+    }
+
+    /// `record` — normalised JSON — against `collection`'s record lexicon,
+    /// and `rkey` (when known) against its `key` (H4, H5).
+    pub fn validate(
+        &self,
+        collection: &str,
+        rkey: Option<&str>,
+        record: &Value,
+    ) -> Result<super::Status, String> {
+        if !self.knows(collection) {
+            return Ok(super::Status::Unknown);
+        }
+        let main = self
+            .record(collection)
+            .ok_or_else(|| format!("{collection} is not a record type"))?;
+        if let Some(rkey) = rkey {
+            self.check_key(collection, rkey)?;
+        }
+        let schema = main.get("record").unwrap_or(&Value::Null);
+        self.check(collection, schema, record, "record", 0)?;
+        Ok(super::Status::Valid)
+    }
+
+    /// `rkey` against `collection`'s record `key`. Unknown collections pass;
+    /// the rkey's own grammar is checked where it is parsed.
+    pub fn check_key(&self, collection: &str, rkey: &str) -> Result<(), String> {
+        if !self.knows(collection) {
+            return Ok(());
+        }
+        let key = self
+            .record(collection)
+            .ok_or_else(|| format!("{collection} is not a record type"))?
+            .get("key")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let (ok, what) = match key {
+            "any" => (true, "any"),
+            "tid" => (Tid::new(rkey.to_string()).is_ok(), "a TID"),
+            "nsid" => (Nsid::new(rkey.to_string()).is_ok(), "an NSID"),
+            other => match other.strip_prefix("literal:") {
+                Some(want) => (rkey == want, want),
+                None => (false, other),
+            },
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(format!("record key {rkey} is not {what}"))
+        }
     }
 }
 
