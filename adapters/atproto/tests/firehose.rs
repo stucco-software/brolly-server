@@ -968,7 +968,7 @@ async fn a_blob_link_rides_the_diff_and_inverts() {
         "text": "with an image",
         "image": {
             "$type": "blob",
-            "ref": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
+            "ref": {"$link": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy"},
             "mimeType": "image/png",
             "size": 1234,
         },

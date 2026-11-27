@@ -1399,16 +1399,12 @@ async fn announce(state: &AppState, did: &str, landed: &Landed) {
 
 /// And into the pod, faithfully, so the other protocols can see it (D7).
 ///
-/// One op per non-delete write, paired with the record the caller asked for;
-/// a delete leaves the pod copy alone, exactly as the single delete always
-/// has. Best effort and explicitly so — the repo is the source of truth the
-/// network syncs, and a pod hiccup must not fail a landed write.
-async fn ingest_written(
-    state: &AppState,
-    user: &User,
-    ops: &[brolly_atproto::repo::AppliedOp],
-    records: &[Value],
-) {
+/// One op per non-delete write, from the record as committed (stage 4a,
+/// H1), so the pod never says something the repo does not; a delete leaves
+/// the pod copy alone, exactly as the single delete always has. Best effort
+/// and explicitly so — the repo is the source of truth the network syncs, and
+/// a pod hiccup must not fail a landed write.
+async fn ingest_written(state: &AppState, user: &User, ops: &[brolly_atproto::repo::AppliedOp]) {
     let Ok(pod) = state.stores.pod(user.id) else {
         tracing::error!(user = %user.id, "the pod is unavailable after a repo write");
         return;
@@ -1416,16 +1412,17 @@ async fn ingest_written(
     let did = did_of(user, state);
     let webid = webid::webid(&user.username, &state.base_domain);
     let document = webid::profile_document(&user.username, &state.base_domain);
-    for (op, record) in ops.iter().zip(records) {
-        if op.action == brolly_atproto::firehose::Action::Delete {
-            continue;
-        }
+    for op in ops {
+        let Some(committed) = op.record.as_ref() else {
+            continue; // a delete leaves the pod copy alone, as always
+        };
+        let record = brolly_atproto::data_model::to_json(committed);
         let Some((collection, rkey)) = op.path.split_once('/') else {
             continue;
         };
         let uri = ingest::at_uri(&did, collection, rkey);
         if let Err(e) = pod
-            .write(|w| Ok(ingest::ingest(w, record, &uri, &webid, &document)))
+            .write(|w| Ok(ingest::ingest(w, &record, &uri, &webid, &document)))
             .map_err(ingest::IngestError::from)
             .flatten()
         {
@@ -1441,11 +1438,10 @@ async fn commit_write(
     user: &User,
     writes: Vec<brolly_atproto::repo::PlannedWrite>,
     head: HeadSwap,
-    records: Vec<Value>,
 ) -> Result<Landed, Response> {
     let landed = perform_write(state, user, writes, head).await?;
     announce(state, &did_of(user, state), &landed).await;
-    ingest_written(state, user, &landed.applied.ops, &records).await;
+    ingest_written(state, user, &landed.applied.ops).await;
     Ok(landed)
 }
 
@@ -1503,17 +1499,10 @@ async fn create_record(
         ));
     }
 
-    // A record must declare its own type, or the faithful layer has nowhere to
-    // put its fields that would not collide with another lexicon's.
-    let mut record = input.record;
-    if record.get("$type").is_none() {
-        record["$type"] = json!(input.collection);
-    }
-
     let write = match brolly_atproto::repo::PlannedWrite::create(
         &input.collection,
         input.rkey.as_deref(),
-        &record,
+        &input.record,
     ) {
         Ok(write) => write,
         Err(e) => return private(write_refused(e)),
@@ -1524,7 +1513,7 @@ async fn create_record(
         None => HeadSwap::Plain,
     };
 
-    let landed = match commit_write(&state, &user, vec![write], head, vec![record]).await {
+    let landed = match commit_write(&state, &user, vec![write], head).await {
         Ok(landed) => landed,
         Err(response) => return private(response),
     };
@@ -1624,11 +1613,6 @@ async fn put_record(
         ));
     }
 
-    let mut record = input.record;
-    if record.get("$type").is_none() {
-        record["$type"] = json!(input.collection);
-    }
-
     let swap = match brolly_atproto::repo::RecordSwap::parse(
         input.swap_record.as_ref().map(|swap| swap.as_deref()),
     ) {
@@ -1638,7 +1622,7 @@ async fn put_record(
     let write = match brolly_atproto::repo::PlannedWrite::put(
         &input.collection,
         &input.rkey,
-        &record,
+        &input.record,
         swap,
     ) {
         Ok(write) => write,
@@ -1649,7 +1633,7 @@ async fn put_record(
         None => HeadSwap::Plain,
     };
 
-    let landed = match commit_write(&state, &user, vec![write], head, vec![record]).await {
+    let landed = match commit_write(&state, &user, vec![write], head).await {
         Ok(landed) => landed,
         Err(response) => return private(response),
     };
@@ -1717,11 +1701,6 @@ async fn swap_record(
         ));
     }
 
-    let mut record = input.record;
-    if record.get("$type").is_none() {
-        record["$type"] = json!(input.collection);
-    }
-
     let swap = match brolly_atproto::repo::RecordSwap::parse(Some(swap_record.as_deref())) {
         Ok(swap) => swap,
         Err(e) => return private(write_refused(e)),
@@ -1729,25 +1708,18 @@ async fn swap_record(
     let write = match brolly_atproto::repo::PlannedWrite::put(
         &input.collection,
         &input.rkey,
-        &record,
+        &input.record,
         swap,
     ) {
         Ok(write) => write,
         Err(e) => return private(write_refused(e)),
     };
 
-    let landed = match commit_write(
-        &state,
-        &user,
-        vec![write],
-        HeadSwap::AtCommit(swap_commit),
-        vec![record],
-    )
-    .await
-    {
-        Ok(landed) => landed,
-        Err(response) => return private(response),
-    };
+    let landed =
+        match commit_write(&state, &user, vec![write], HeadSwap::AtCommit(swap_commit)).await {
+            Ok(landed) => landed,
+            Err(response) => return private(response),
+        };
     private(write_response(&state, &user, &landed))
 }
 
@@ -1802,15 +1774,10 @@ async fn swap_commit(
         ));
     }
 
-    let mut record = input.record;
-    if record.get("$type").is_none() {
-        record["$type"] = json!(input.collection);
-    }
-
     let write = match brolly_atproto::repo::PlannedWrite::put(
         &input.collection,
         &input.rkey,
-        &record,
+        &input.record,
         brolly_atproto::repo::RecordSwap::Any,
     ) {
         Ok(write) => write,
@@ -1822,7 +1789,6 @@ async fn swap_commit(
         &user,
         vec![write],
         HeadSwap::AtCommit(input.commit_cid),
-        vec![record],
     )
     .await
     {
@@ -1906,39 +1872,22 @@ async fn apply_writes(
         )));
     }
 
-    // The plan and the records, in the order the batch applies them. A value
-    // without a `$type` is given its collection's, exactly as a single write
-    // is.
+    // The plan, in the order the batch applies it. Each value passes the same
+    // envelope a single write's record does.
     let mut writes = Vec::with_capacity(input.writes.len());
-    let mut records = Vec::with_capacity(input.writes.len());
     for write in &input.writes {
         let planned = match write {
             ApplyWrite::Create {
                 collection,
                 rkey,
                 value,
-            } => {
-                let mut record = value.clone();
-                if record.get("$type").is_none() {
-                    record["$type"] = json!(collection);
-                }
-                records.push(record.clone());
-                brolly_atproto::repo::PlannedWrite::create(collection, rkey.as_deref(), &record)
-            }
+            } => brolly_atproto::repo::PlannedWrite::create(collection, rkey.as_deref(), value),
             ApplyWrite::Update {
                 collection,
                 rkey,
                 value,
-            } => {
-                let mut record = value.clone();
-                if record.get("$type").is_none() {
-                    record["$type"] = json!(collection);
-                }
-                records.push(record.clone());
-                brolly_atproto::repo::PlannedWrite::update(collection, rkey, &record)
-            }
+            } => brolly_atproto::repo::PlannedWrite::update(collection, rkey, value),
             ApplyWrite::Delete { collection, rkey } => {
-                records.push(Value::Null);
                 brolly_atproto::repo::PlannedWrite::delete(collection, rkey)
             }
         };
@@ -1952,7 +1901,7 @@ async fn apply_writes(
         None => HeadSwap::Plain,
     };
 
-    let landed = match commit_write(&state, &user, writes, head, records).await {
+    let landed = match commit_write(&state, &user, writes, head).await {
         Ok(landed) => landed,
         Err(response) => return private(response),
     };
@@ -2031,7 +1980,7 @@ async fn delete_record(
 
     // A plain write: no swap was named, so the head's movement is retried
     // through rather than answered (1, C).
-    match commit_write(&state, &user, vec![write], HeadSwap::Plain, Vec::new()).await {
+    match commit_write(&state, &user, vec![write], HeadSwap::Plain).await {
         Ok(_) => private(Json(json!({})).into_response()),
         Err(response) => private(response),
     }

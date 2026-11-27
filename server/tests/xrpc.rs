@@ -374,6 +374,42 @@ async fn a_record_without_a_type_is_given_its_collection() {
     );
 }
 
+#[tokio::test]
+async fn the_pod_copy_is_what_was_committed_not_the_request() {
+    // H1/H2: the request leaves $type out and writes 1e3 for an integer; the
+    // commit fills one and normalises the other, and the pod must say what
+    // the repo says, not what the client sent.
+    let h = harness().await;
+    let (user_id, cookie) = a_member(&h, "alice").await;
+    let created = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "com.example.thing",
+            "rkey": "3kaaaaaaaaaab",
+            "record": {"n": 1e3},
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(created.status, StatusCode::OK, "{}", created.text());
+
+    let fetched = get(
+        &h,
+        &format!(
+            "/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=com.example.thing&rkey=3kaaaaaaaaaab"
+        ),
+    )
+    .await
+    .json();
+    let pod = h.stores.pod(user_id).unwrap();
+    let uri = created.json()["uri"].as_str().unwrap().to_string();
+    let stored = brolly_atproto::ingest::read(&pod.read_store(), &uri).expect("the pod copy");
+    assert_eq!(stored, fetched["value"]);
+    assert_eq!(stored["n"], 1000);
+    assert_eq!(stored["$type"], "com.example.thing");
+}
+
 // --- sync ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1195,7 +1231,7 @@ async fn a_blob_ref_round_trips_through_the_handler() {
                 "text": "with an image",
                 "image": {
                     "$type": "blob",
-                    "ref": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
+                    "ref": {"$link": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy"},
                     "mimeType": "image/png",
                     "size": 1234,
                 },
@@ -1216,10 +1252,130 @@ async fn a_blob_ref_round_trips_through_the_handler() {
     assert_eq!(fetched.status, StatusCode::OK, "{}", fetched.text());
     assert_eq!(
         fetched.json()["value"]["image"]["ref"],
-        "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
-        "a blob ref must read back as the CID string that named it"
+        json!({"$link": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy"}),
+        "a blob ref must read back as the $link that named it"
     );
     assert_eq!(fetched.json()["value"]["image"]["mimeType"], "image/png");
+}
+
+#[tokio::test]
+async fn a_profile_read_and_written_back_commits_the_same_record() {
+    // H1: bsky.app's profile editor reads the record and writes it back. The
+    // regression check is the `$link` read-back (the old code emitted a bare
+    // string); the CID check then holds that writing it back is a no-op update.
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    let put = |record: serde_json::Value| {
+        let h = &h;
+        let cookie = cookie.clone();
+        async move {
+            post_json(
+                h,
+                "/xrpc/com.atproto.repo.putRecord",
+                json!({"collection": "app.bsky.actor.profile", "rkey": "self", "record": record}),
+                Some(&cookie),
+            )
+            .await
+        }
+    };
+    let link = json!({"$link": "bafkreiccldh766hwcnuxnf2wh6jgzepf2nlu2lvcllt63eww5p6chi4ity"});
+    let first = put(json!({
+        "$type": "app.bsky.actor.profile",
+        "displayName": "Alice",
+        "avatar": {"$type": "blob", "ref": link, "mimeType": "image/jpeg", "size": 10000},
+    }))
+    .await;
+    assert_eq!(first.status, StatusCode::OK, "{}", first.text());
+
+    let read = get(
+        &h,
+        &format!("/xrpc/com.atproto.repo.getRecord?repo=alice.{BASE}&collection=app.bsky.actor.profile&rkey=self"),
+    )
+    .await
+    .json();
+    assert_eq!(read["value"]["avatar"]["ref"], link);
+
+    let second = put(read["value"].clone()).await;
+    assert_eq!(second.status, StatusCode::OK, "{}", second.text());
+    assert_eq!(
+        second.json()["cid"],
+        first.json()["cid"],
+        "the record CID moved"
+    );
+
+    // On the firehose the rewrite is one update whose new CID is its old one.
+    let last = commits(&h.db.pool)
+        .await
+        .pop()
+        .expect("the rewrite's commit");
+    assert_eq!(last.ops.len(), 1);
+    assert_eq!(last.ops[0].record_cid, last.ops[0].prev_cid);
+}
+
+#[tokio::test]
+async fn a_record_that_is_not_an_object_is_a_400_at_every_write_endpoint() {
+    let h = harness().await;
+    let (_, cookie) = a_member(&h, "alice").await;
+    for record in [json!("blah"), json!(1), json!([1]), json!(null)] {
+        let create = post_json(
+            &h,
+            "/xrpc/com.atproto.repo.createRecord",
+            json!({"collection": "com.example.thing", "record": record}),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(create.status, StatusCode::BAD_REQUEST, "create {record}");
+        assert_eq!(create.json()["error"], "InvalidRequest");
+        assert_eq!(create.json()["message"], "record must be an object");
+
+        // putRecord, and through the same `PlannedWrite::put`, the two swap routes.
+        let put = post_json(
+            &h,
+            "/xrpc/com.atproto.repo.putRecord",
+            json!({"collection": "com.example.thing", "rkey": "self", "record": record}),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(put.status, StatusCode::BAD_REQUEST, "put {record}");
+        assert_eq!(put.json()["error"], "InvalidRequest");
+
+        let batch = post_json(
+            &h,
+            "/xrpc/com.atproto.repo.applyWrites",
+            json!({"repo": format!("alice.{BASE}"), "writes": [{
+                "$type": "com.atproto.repo.applyWrites#create",
+                "collection": "com.example.thing",
+                "value": record,
+            }, {
+                "$type": "com.atproto.repo.applyWrites#update",
+                "collection": "com.example.thing",
+                "rkey": "self",
+                "value": record,
+            }]}),
+            Some(&cookie),
+        )
+        .await;
+        assert_eq!(
+            batch.status,
+            StatusCode::BAD_REQUEST,
+            "applyWrites {record}"
+        );
+        assert_eq!(batch.json()["error"], "InvalidRequest");
+        assert_eq!(batch.json()["message"], "record must be an object");
+    }
+
+    let mismatched = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({"collection": "com.example.thing", "record": {"$type": "com.example.other"}}),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(mismatched.status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        mismatched.json()["message"],
+        "Invalid $type: expected com.example.thing, got com.example.other"
+    );
 }
 
 // --- DPoP-bound callers ------------------------------------------------------------

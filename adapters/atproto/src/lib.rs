@@ -9,6 +9,7 @@
 pub mod blocks;
 pub mod client_assertion;
 pub mod client_metadata;
+pub mod data_model;
 pub mod firehose;
 pub mod identity;
 pub mod ingest;
@@ -17,6 +18,7 @@ pub mod legacy;
 pub mod oauth;
 pub mod plc;
 pub mod preferences;
+pub mod record;
 pub mod repo;
 pub mod service_auth;
 pub mod state;

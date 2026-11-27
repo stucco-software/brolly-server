@@ -6,7 +6,12 @@
      lands. -->
 
 **Status:** Chunk 1 (the spike) done 2026-11-26: the validator is written,
-not adopted (Decision D, `spikes/lexicon-validation/RESULT.md`). Drafted
+not adopted (Decision D, `spikes/lexicon-validation/RESULT.md`). Chunk 2
+(the data model and the envelope) landed 2026-11-27; review tightened H1
+beyond the table below — blobs carry exactly their four fields with a
+32-byte digest, a `$link` must be the canonical CIDv1 base32 string (so it
+reads back byte-identical), and error paths are built only on error,
+JSON-Pointer escaped, with long keys and deep paths truncated. Drafted
 2026-11-26; revised twice after adversarial reviews
 against the tree, the ATProto data-model and lexicon specs, and the
 reference PDS's `packages/pds/src/repo/prepare.ts`.

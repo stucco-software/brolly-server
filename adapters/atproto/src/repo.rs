@@ -62,6 +62,9 @@ pub enum RepoError {
     BadDid(String),
     /// A record path that failed the lexicon's own grammar (1, B).
     BadPath(String),
+    /// A record the data model or its envelope refuses (stage 4a, H1, H2):
+    /// the message is the client's, verbatim.
+    InvalidRecord(String),
     /// A write's compare-and-set did not hold: the record was not where the
     /// write required it to be — occupied where it had to be empty, or
     /// missing or moved where it had to be exact (1, B, 1, C). The lexicon's
@@ -80,6 +83,7 @@ impl std::fmt::Display for RepoError {
             RepoError::Signing(e) => write!(f, "signing: {e}"),
             RepoError::BadDid(d) => write!(f, "not a usable DID: {d}"),
             RepoError::BadPath(p) => write!(f, "record path must be collection/rkey, got {p}"),
+            RepoError::InvalidRecord(m) => f.write_str(m),
             RepoError::InvalidSwap(p) => {
                 write!(f, "the record was not where this write required it: {p}")
             }
@@ -220,101 +224,6 @@ async fn node_cids<S: AsyncBlockStoreRead>(
     Ok(())
 }
 
-// --- records as they are stored -------------------------------------------------
-
-/// A record value as it will live in its block: a `$blob`-typed value's `ref`
-/// is a CID link, and everything else is carried verbatim (1, H).
-///
-/// The JSON the wire carries cannot name a link; the block can. This is the
-/// whole of the conversion — the deprecated top-level `blobs` array stays
-/// empty, ops carry no blob list, and a record referencing a blob CID that
-/// has no bytes in the store is accepted, because the repo is a pointer set,
-/// not an oracle.
-pub fn record_ipld(value: &Value) -> Result<Ipld, RepoError> {
-    match value {
-        Value::Null => Ok(Ipld::Null),
-        Value::Bool(b) => Ok(Ipld::Bool(*b)),
-        Value::Number(n) => {
-            if let Some(i) = n.as_i64() {
-                Ok(Ipld::Integer(i as i128))
-            } else if let Some(u) = n.as_u64() {
-                Ok(Ipld::Integer(u as i128))
-            } else {
-                n.as_f64()
-                    .map(Ipld::Float)
-                    .ok_or_else(|| RepoError::Repo("a number the data model cannot carry".into()))
-            }
-        }
-        Value::String(s) => Ok(Ipld::String(s.clone())),
-        Value::Array(items) => items
-            .iter()
-            .map(record_ipld)
-            .collect::<Result<Vec<_>, _>>()
-            .map(Ipld::List),
-        Value::Object(fields) => {
-            // A `$blob`-typed value's `ref` becomes the link; its other fields
-            // (`mimeType`, `size`) are carried as they arrived (1, H).
-            let is_blob = fields.get("$type").and_then(Value::as_str) == Some("blob");
-            let mut out = BTreeMap::new();
-            for (name, field) in fields {
-                let converted = if is_blob && name == "ref" {
-                    blob_ref(field)?
-                } else {
-                    record_ipld(field)?
-                };
-                out.insert(name.clone(), converted);
-            }
-            Ok(Ipld::Map(out))
-        }
-    }
-}
-
-/// A blob ref's `ref`, as a link (1, H).
-///
-/// A plain CID string is what brolly's own clients send; `{"$link": "…"}` is
-/// the JSON form the reference stack uses for a CID, and a client echoing one
-/// back must round-trip too.
-fn blob_ref(value: &Value) -> Result<Ipld, RepoError> {
-    let text = match value {
-        Value::String(s) => Some(s.as_str()),
-        Value::Object(fields) if fields.len() == 1 => fields.get("$link").and_then(Value::as_str),
-        _ => None,
-    };
-    text.and_then(|s| s.parse::<Cid>().ok())
-        .map(Ipld::Link)
-        .ok_or_else(|| RepoError::Repo(format!("a blob ref is not a CID: {value}")))
-}
-
-/// A stored record as the wire sees it: links become CID strings again, so a
-/// record written with a blob ref reads back as the JSON that named it (1, H).
-pub fn ipld_to_json(ipld: &Ipld) -> Value {
-    match ipld {
-        Ipld::Null => Value::Null,
-        Ipld::Bool(b) => Value::Bool(*b),
-        Ipld::Integer(i) => i64::try_from(*i)
-            .ok()
-            .map(serde_json::Number::from)
-            .or_else(|| u64::try_from(*i).ok().map(serde_json::Number::from))
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        Ipld::Float(f) => serde_json::Number::from_f64(*f)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
-        Ipld::String(s) => Value::String(s.clone()),
-        // Nothing on the write path produces bytes — JSON cannot carry them —
-        // and a block that somehow does has no JSON spelling to invent here.
-        Ipld::Bytes(_) => Value::Null,
-        Ipld::List(items) => Value::Array(items.iter().map(ipld_to_json).collect()),
-        Ipld::Map(fields) => Value::Object(
-            fields
-                .iter()
-                .map(|(name, field)| (name.clone(), ipld_to_json(field)))
-                .collect(),
-        ),
-        Ipld::Link(cid) => Value::String(cid.to_string()),
-    }
-}
-
 // --- the write plan -------------------------------------------------------------
 
 /// What a write requires of the record it names, from `putRecord`'s
@@ -362,7 +271,8 @@ pub enum WriteAction {
 ///
 /// Constructed only through the named constructors, so no caller can assemble
 /// an invalid one: the collection and rkey are checked against atrium's own
-/// `Nsid`/`RecordKey` grammars and refused before any block is written.
+/// `Nsid`/`RecordKey` grammars, and the record is held to the envelope and the
+/// data model (`record::prepare`, stage 4a), before any block is written.
 #[derive(Debug, Clone)]
 pub struct PlannedWrite {
     action: WriteAction,
@@ -377,11 +287,14 @@ impl PlannedWrite {
     /// none — a TID, minted past the head's rev, so neither two writes in one
     /// batch nor two writes racing one head can mint the same one (1, B).
     pub fn create(collection: &str, rkey: Option<&str>, record: &Value) -> Result<Self, RepoError> {
+        let collection = parse_nsid(collection)?;
+        let rkey = parse_rkey(rkey)?;
+        let record = crate::record::prepare(&collection, record)?;
         Ok(PlannedWrite {
             action: WriteAction::Create,
-            collection: parse_nsid(collection)?,
-            rkey: parse_rkey(rkey)?,
-            record: Some(record_ipld(record)?),
+            collection,
+            rkey,
+            record: Some(record),
             swap: RecordSwap::Any,
         })
     }
@@ -394,22 +307,28 @@ impl PlannedWrite {
         record: &Value,
         swap: RecordSwap,
     ) -> Result<Self, RepoError> {
+        let collection = parse_nsid(collection)?;
+        let rkey = parse_rkey(Some(rkey))?;
+        let record = crate::record::prepare(&collection, record)?;
         Ok(PlannedWrite {
             action: WriteAction::Put,
-            collection: parse_nsid(collection)?,
-            rkey: parse_rkey(Some(rkey))?,
-            record: Some(record_ipld(record)?),
+            collection,
+            rkey,
+            record: Some(record),
             swap,
         })
     }
 
     /// An `applyWrites#update` write: the path must be occupied (1, B).
     pub fn update(collection: &str, rkey: &str, record: &Value) -> Result<Self, RepoError> {
+        let collection = parse_nsid(collection)?;
+        let rkey = parse_rkey(Some(rkey))?;
+        let record = crate::record::prepare(&collection, record)?;
         Ok(PlannedWrite {
             action: WriteAction::Update,
-            collection: parse_nsid(collection)?,
-            rkey: parse_rkey(Some(rkey))?,
-            record: Some(record_ipld(record)?),
+            collection,
+            rkey,
+            record: Some(record),
             swap: RecordSwap::Any,
         })
     }
@@ -461,7 +380,9 @@ pub fn record_path(collection: &str, rkey: &str) -> Result<String, RepoError> {
 
 // --- applying a batch -----------------------------------------------------------
 
-/// One op as it landed: what the event log's op row carries (1, B, 1, D).
+/// One op as it landed: what the event log's op row carries (1, B, 1, D),
+/// plus the committed record, which the op row does not carry and the pod's
+/// faithful copy is written from (stage 4a, H1).
 #[derive(Debug, Clone)]
 pub struct AppliedOp {
     /// The action as it resolved — a `putRecord` lands as `create` or
@@ -475,6 +396,10 @@ pub struct AppliedOp {
     /// inductive consumer needs and what chunk 3's frames emit. Undefined for
     /// a create (1, D).
     pub prev_cid: Option<Cid>,
+    /// The record as committed — the IPLD its block was made of; absent for
+    /// a delete. What the pod's faithful copy is written from (stage 4a, H1),
+    /// so the pod and the repo never describe different JSON.
+    pub record: Option<Ipld>,
 }
 
 /// A batch as it landed: one commit, one signature, one event (1, B).
@@ -649,6 +574,7 @@ pub async fn apply(
             record_cid,
             // The per-op prev, captured while the old MST was open (1, D).
             prev_cid: current,
+            record: write.record.clone(),
         });
     }
 
@@ -779,9 +705,9 @@ fn did_for(did: &str) -> Result<Did, RepoError> {
     Did::new(did.to_string()).map_err(|_| RepoError::BadDid(did.to_string()))
 }
 
-/// Read a record back, as the JSON the wire carries: a block's CID links come
-/// back as CID strings, so a record written with a blob ref reads back as the
-/// JSON that named it (1, H).
+/// Read a record back in the data model's JSON form: links as `{"$link": …}`,
+/// bytes as `{"$bytes": …}` (stage 4a, H1), so a record written in that form
+/// reads back as the JSON that named it.
 pub async fn get_record(
     blocks: PodBlocks,
     root: Cid,
@@ -810,7 +736,7 @@ pub async fn get_record_entry(
         return Ok(None);
     };
     match repo.get_raw::<Ipld>(&path).await? {
-        Some(ipld) => Ok(Some((cid, ipld_to_json(&ipld)))),
+        Some(ipld) => Ok(Some((cid, crate::data_model::to_json(&ipld)))),
         None => Ok(None),
     }
 }
@@ -894,7 +820,7 @@ pub async fn list_records(
         listed.push(ListedRecord {
             rkey,
             cid,
-            value: ipld_to_json(&ipld),
+            value: crate::data_model::to_json(&ipld),
         });
     }
     Ok((listed, next))
@@ -2132,7 +2058,7 @@ mod tests {
                     "alt": "a blob nothing uploaded yet",
                     "image": {
                         "$type": "blob",
-                        "ref": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
+                        "ref": {"$link": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy"},
                         "mimeType": "image/png",
                         "size": 1234,
                     },
@@ -2191,49 +2117,24 @@ mod tests {
         assert_eq!(read, Some(record));
     }
 
-    #[tokio::test]
-    async fn a_blob_ref_in_atriums_link_form_round_trips_too() {
-        // A client that echoes back the reference stack's `{"$link": …}`
-        // spelling must not lose its blob.
-        let (_dir, manager, user) = fixture();
-        let key = SigningKey::generate();
-        let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
-
+    #[test]
+    fn a_bare_string_blob_ref_is_refused() {
+        // The data model's blob `ref` is a `{"$link": …}`; a bare CID string
+        // is not one, however complete the rest of the blob (stage 4a, H1).
         let record = json!({
             "$type": "app.bsky.feed.post",
-            "text": "echoed",
-            "image": {"$type": "blob", "ref": {"$link": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy"}},
+            "text": "a bare ref",
+            "image": {
+                "$type": "blob",
+                "ref": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
+                "mimeType": "image/png",
+                "size": 1234,
+            },
         });
-        let applied = apply(
-            blocks(&manager, user),
-            root,
-            &key,
-            vec![
-                PlannedWrite::put(
-                    "app.bsky.feed.post",
-                    "3kaaaaaaaaaaa",
-                    &record,
-                    RecordSwap::Any,
-                )
-                .unwrap(),
-            ],
-            &genesis,
-        )
-        .await
-        .unwrap();
-
-        let read = get_record(
-            blocks(&manager, user),
-            applied.commit,
-            "app.bsky.feed.post",
-            "3kaaaaaaaaaaa",
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            read.unwrap()["image"]["ref"],
-            "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy"
-        );
+        assert!(matches!(
+            PlannedWrite::create("app.bsky.feed.post", Some("3kaaaaaaaaaaa"), &record),
+            Err(RepoError::InvalidRecord(_))
+        ));
     }
 
     #[tokio::test]
