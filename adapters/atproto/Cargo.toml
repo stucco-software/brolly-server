@@ -51,8 +51,9 @@ base32 = "0.5"
 time = { version = "0.3.55", features = ["parsing"] }
 base64 = "0.23.1"
 # The vendored lexicons, embedded in the binary (stage 4a, H3, Decision C):
-# no build script, no runtime fetch. On stable Rust a change under
-# vendor/lexicons/ does not by itself trigger a rebuild, so
+# no build script, no runtime fetch. The embedded files are tracked like
+# include_bytes!, so an edit to an existing lexicon rebuilds; on stable Rust a
+# file added or removed under vendor/lexicons/ does not, so
 # tools/refresh-lexicons.sh touches lexicon/mod.rs.
 include_dir = "0.7.4"
 # Grapheme clusters (UAX #29, extended) for maxGraphemes/minGraphemes (H4).

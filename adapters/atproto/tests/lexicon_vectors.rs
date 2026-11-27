@@ -158,13 +158,13 @@ fn every_format_holds_to_the_interop_syntax_vectors() {
     let mut wrong = Vec::new();
     for (format, valid, invalids) in table {
         for v in lines(valid) {
-            if !lexicon::formats::check(format, &v) {
+            if !lexicon::formats::check_syntax(format, &v) {
                 wrong.push(format!("{format}: refused valid {v:?}"));
             }
         }
         for file in invalids {
             for v in lines(file) {
-                if lexicon::formats::check(format, &v) {
+                if lexicon::formats::check_syntax(format, &v) {
                     wrong.push(format!("{format}: accepted invalid {v:?}"));
                 }
             }

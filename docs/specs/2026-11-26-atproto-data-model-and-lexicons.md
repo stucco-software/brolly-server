@@ -371,6 +371,12 @@ them rather than discover them:**
   atproto-interop-tests invalid vectors and the reference's own strict mode
   do — one model, held to the data model (ADR 0022). The line-cited table is
   in `spikes/lexicon-validation/RESULT.md`.
+- **`datetime` is also stricter than the reference's lexicon:** at this pin
+  the reference validates the `datetime` format leniently
+  (`isDatetimeStringLenient`, falling back to iso-datestring-validator),
+  accepting e.g. a datetime with no timezone. brolly holds the data model's
+  strict datetime (H4), so some clients' records the bsky PDS accepts are
+  refused here.
 - `getRecord`, `listRecords` and the pod's faithful copy now say `$link` and
   `$bytes` for records with links or bytes. No front-end in this repo reads
   `ref`; any brolly front-end in another repo that does should read
