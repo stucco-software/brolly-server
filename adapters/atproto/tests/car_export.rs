@@ -19,7 +19,9 @@
 
 use brolly_atproto::blocks::PodBlocks;
 use brolly_atproto::keys::SigningKey;
+use brolly_atproto::record::Validate;
 use brolly_atproto::repo::{self, PlannedWrite, RecordSwap};
+use brolly_test_support::atproto::post;
 use serde_json::json;
 
 const DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -57,7 +59,7 @@ async fn a_repo_with_two_lexicons(
         (
             "app.bsky.feed.post",
             "3kaaaaaaaaaaa",
-            json!({"$type": "app.bsky.feed.post", "text": "a mapped lexicon"}),
+            post("a mapped lexicon"),
         ),
         (
             "site.standard.doc",
@@ -73,7 +75,16 @@ async fn a_repo_with_two_lexicons(
             blocks(manager, user),
             root,
             &key,
-            vec![PlannedWrite::put(collection, rkey, &record, RecordSwap::Any).unwrap()],
+            vec![
+                PlannedWrite::put(
+                    collection,
+                    rkey,
+                    &record,
+                    RecordSwap::Any,
+                    Validate::Optimistic,
+                )
+                .unwrap(),
+            ],
             &rev,
         )
         .await

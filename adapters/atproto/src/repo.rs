@@ -35,6 +35,8 @@ use sha2::Digest;
 use crate::blocks::PodBlocks;
 use crate::firehose::{Action, CommitEvent};
 use crate::keys::SigningKey;
+use crate::lexicon::Status;
+use crate::record::{self, Validate};
 use crate::tid;
 
 /// A record block over this many bytes is refused rather than written (1, B).
@@ -276,14 +278,17 @@ pub enum WriteAction {
 ///
 /// Constructed only through the named constructors, so no caller can assemble
 /// an invalid one: the collection and rkey are checked against atrium's own
-/// `Nsid`/`RecordKey` grammars, and the record is held to the envelope and the
-/// data model (`record::prepare`, stage 4a), before any block is written.
+/// `Nsid`/`RecordKey` grammars, and the record is held to the gate
+/// (`record::check_record`, stage 4a: envelope, data model, lexicon), before
+/// any block is written.
 #[derive(Debug, Clone)]
 pub struct PlannedWrite {
     action: WriteAction,
     collection: Nsid,
     rkey: Option<RecordKey>,
     record: Option<Ipld>,
+    /// What the gate said; `None` for a delete (H6).
+    status: Option<Status>,
     swap: RecordSwap,
 }
 
@@ -291,15 +296,21 @@ impl PlannedWrite {
     /// A `createRecord` write. The rkey is minted when the caller supplies
     /// none — a TID, minted past the head's rev, so neither two writes in one
     /// batch nor two writes racing one head can mint the same one (1, B).
-    pub fn create(collection: &str, rkey: Option<&str>, record: &Value) -> Result<Self, RepoError> {
+    pub fn create(
+        collection: &str,
+        rkey: Option<&str>,
+        record: &Value,
+        validate: Validate,
+    ) -> Result<Self, RepoError> {
         let collection = parse_nsid(collection)?;
         let rkey = parse_rkey(rkey)?;
-        let record = crate::record::prepare(&collection, record)?;
+        let (record, status) = record::check_record(&collection, rkey.as_ref(), record, validate)?;
         Ok(PlannedWrite {
             action: WriteAction::Create,
             collection,
             rkey,
             record: Some(record),
+            status: Some(status),
             swap: RecordSwap::Any,
         })
     }
@@ -311,29 +322,37 @@ impl PlannedWrite {
         rkey: &str,
         record: &Value,
         swap: RecordSwap,
+        validate: Validate,
     ) -> Result<Self, RepoError> {
         let collection = parse_nsid(collection)?;
         let rkey = parse_rkey(Some(rkey))?;
-        let record = crate::record::prepare(&collection, record)?;
+        let (record, status) = record::check_record(&collection, rkey.as_ref(), record, validate)?;
         Ok(PlannedWrite {
             action: WriteAction::Put,
             collection,
             rkey,
             record: Some(record),
+            status: Some(status),
             swap,
         })
     }
 
     /// An `applyWrites#update` write: the path must be occupied (1, B).
-    pub fn update(collection: &str, rkey: &str, record: &Value) -> Result<Self, RepoError> {
+    pub fn update(
+        collection: &str,
+        rkey: &str,
+        record: &Value,
+        validate: Validate,
+    ) -> Result<Self, RepoError> {
         let collection = parse_nsid(collection)?;
         let rkey = parse_rkey(Some(rkey))?;
-        let record = crate::record::prepare(&collection, record)?;
+        let (record, status) = record::check_record(&collection, rkey.as_ref(), record, validate)?;
         Ok(PlannedWrite {
             action: WriteAction::Update,
             collection,
             rkey,
             record: Some(record),
+            status: Some(status),
             swap: RecordSwap::Any,
         })
     }
@@ -345,6 +364,7 @@ impl PlannedWrite {
             collection: parse_nsid(collection)?,
             rkey: parse_rkey(Some(rkey))?,
             record: None,
+            status: None,
             swap: RecordSwap::Any,
         })
     }
@@ -405,6 +425,9 @@ pub struct AppliedOp {
     /// a delete. What the pod's faithful copy is written from (stage 4a, H1),
     /// so the pod and the repo never describe different JSON.
     pub record: Option<Ipld>,
+    /// What validation said — the `validationStatus` the write answers
+    /// with (H6); absent for a delete.
+    pub status: Option<Status>,
 }
 
 /// A batch as it landed: one commit, one signature, one event (1, B).
@@ -471,6 +494,12 @@ pub async fn apply(
             let minted = tid::mint_after(&floor);
             floor = minted.clone();
             write.rkey = parse_rkey(Some(minted.as_str()))?;
+            // A minted TID against the lexicon's key type: a create into a
+            // `literal:self` collection with no rkey is refused, not
+            // committed under a TID (H5).
+            if let Some(rkey) = &write.rkey {
+                record::check_key(&write.collection, rkey)?;
+            }
         }
     }
 
@@ -580,6 +609,7 @@ pub async fn apply(
             // The per-op prev, captured while the old MST was open (1, D).
             prev_cid: current,
             record: write.record.clone(),
+            status: write.status,
         });
     }
 
@@ -1185,6 +1215,7 @@ pub async fn reachable(blocks: PodBlocks, root: Cid) -> Result<Vec<Cid>, RepoErr
 mod tests {
     use super::*;
     use atrium_crypto::verify::verify_signature;
+    use brolly_test_support::atproto::post;
     use serde_json::json;
 
     const DID: &str = "did:plc:aaaaaaaaaaaaaaaaaaaaaaaa";
@@ -1221,8 +1252,13 @@ mod tests {
         PlannedWrite::put(
             collection,
             rkey,
-            &json!({"$type": collection, "text": text}),
+            &json!({
+                "$type": collection,
+                "text": text,
+                "createdAt": brolly_test_support::atproto::CREATED_AT,
+            }),
             RecordSwap::Any,
+            Validate::Optimistic,
         )
     }
 
@@ -1261,6 +1297,7 @@ mod tests {
                     "3kaaaaaaaaaaa",
                     &record,
                     RecordSwap::Any,
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1385,7 +1422,7 @@ mod tests {
         let key = SigningKey::generate();
         let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
-        let record = json!({"$type": "app.bsky.feed.post", "text": "one"});
+        let record = post("one");
         let applied = apply(
             blocks(&manager, user),
             root,
@@ -1396,6 +1433,7 @@ mod tests {
                     "3kaaaaaaaaaaa",
                     &record,
                     RecordSwap::Any,
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1479,6 +1517,7 @@ mod tests {
                     "3kbbbbbbbbbbb",
                     &record,
                     RecordSwap::Any,
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1659,7 +1698,8 @@ mod tests {
                 PlannedWrite::create(
                     "app.bsky.feed.post",
                     Some("3kaaaaaaaaaaa"),
-                    &json!({"$type": "app.bsky.feed.post", "text": "first"}),
+                    &post("first"),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1677,7 +1717,8 @@ mod tests {
                 PlannedWrite::create(
                     "app.bsky.feed.post",
                     Some("3kaaaaaaaaaaa"),
-                    &json!({"$type": "app.bsky.feed.post", "text": "second"}),
+                    &post("second"),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1711,8 +1752,9 @@ mod tests {
                 PlannedWrite::put(
                     "app.bsky.feed.post",
                     "3kaaaaaaaaaaa",
-                    &json!({"$type": "app.bsky.feed.post", "text": "created"}),
+                    &post("created"),
                     RecordSwap::MustNotExist,
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1731,8 +1773,9 @@ mod tests {
                 PlannedWrite::put(
                     "app.bsky.feed.post",
                     "3kaaaaaaaaaaa",
-                    &json!({"$type": "app.bsky.feed.post", "text": "replaced"}),
+                    &post("replaced"),
                     RecordSwap::MustBe(created.ops[0].record_cid.unwrap()),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1786,8 +1829,9 @@ mod tests {
                 PlannedWrite::put(
                     "app.bsky.feed.post",
                     "3kaaaaaaaaaaa",
-                    &json!({"$type": "app.bsky.feed.post", "text": "x"}),
+                    &post("x"),
                     RecordSwap::MustNotExist,
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1808,8 +1852,9 @@ mod tests {
                 PlannedWrite::put(
                     "app.bsky.feed.post",
                     "3kaaaaaaaaaaa",
-                    &json!({"$type": "app.bsky.feed.post", "text": "x"}),
+                    &post("x"),
                     RecordSwap::MustBe(stale),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1830,8 +1875,9 @@ mod tests {
                 PlannedWrite::put(
                     "app.bsky.feed.post",
                     "3kaaaaaaaaaaa",
-                    &json!({"$type": "app.bsky.feed.post", "text": "two"}),
+                    &post("two"),
                     RecordSwap::MustBe(real),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1859,7 +1905,8 @@ mod tests {
                 PlannedWrite::update(
                     "app.bsky.feed.post",
                     "3kaaaaaaaaaaa",
-                    &json!({"$type": "app.bsky.feed.post", "text": "a two"}),
+                    &post("a two"),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
                 PlannedWrite::delete("app.bsky.feed.post", "3kbbbbbbbbbbb").unwrap(),
@@ -1936,7 +1983,8 @@ mod tests {
                 PlannedWrite::create(
                     "app.bsky.feed.post",
                     Some("3kaaaaaaaaaaa"),
-                    &json!({"$type": "app.bsky.feed.post", "text": "collision"}),
+                    &post("collision"),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -1964,7 +2012,8 @@ mod tests {
             PlannedWrite::update(
                 "app.bsky.feed.post",
                 "3kaaaaaaaaaaa",
-                &json!({"$type": "app.bsky.feed.post", "text": "ghost"}),
+                &post("ghost"),
+                Validate::Optimistic,
             )
             .unwrap(),
             PlannedWrite::delete("app.bsky.feed.post", "3kaaaaaaaaaaa").unwrap(),
@@ -1985,13 +2034,15 @@ mod tests {
         let key = SigningKey::generate();
         let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
+        // A collection with no lexicon, so the size cap is what refuses, not
+        // a post's `maxGraphemes`.
         let big = "x".repeat(MAX_RECORD_BYTES + 1);
         let before = block_count(&dir);
         let refused = apply(
             blocks(&manager, user),
             root,
             &key,
-            vec![a_put("app.bsky.feed.post", "3kaaaaaaaaaaa", &big).unwrap()],
+            vec![a_put("com.example.big", "3kaaaaaaaaaaa", &big).unwrap()],
             &genesis,
         )
         .await;
@@ -2007,6 +2058,8 @@ mod tests {
         // Three records of 900 KB each are individually fine and together a
         // diff slice over the 2 MB the Sync spec allows — refused at the
         // write, because `tooBig` is deprecated and cannot absorb it (1, B).
+        // A collection with no lexicon, so the size cap is what refuses, not
+        // a post's `maxGraphemes`.
         let (_dir, manager, user) = fixture();
         let key = SigningKey::generate();
         let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
@@ -2016,9 +2069,9 @@ mod tests {
             root,
             &key,
             vec![
-                a_put("app.bsky.feed.post", "3kaaaaaaaaaaa", &"x".repeat(900_000)).unwrap(),
-                a_put("app.bsky.feed.post", "3kbbbbbbbbbbb", &"y".repeat(900_000)).unwrap(),
-                a_put("app.bsky.feed.post", "3kccccccccccc", &"z".repeat(900_000)).unwrap(),
+                a_put("com.example.big", "3kaaaaaaaaaaa", &"x".repeat(900_000)).unwrap(),
+                a_put("com.example.big", "3kbbbbbbbbbbb", &"y".repeat(900_000)).unwrap(),
+                a_put("com.example.big", "3kccccccccccc", &"z".repeat(900_000)).unwrap(),
             ],
             &genesis,
         )
@@ -2036,7 +2089,10 @@ mod tests {
         let (root, genesis) = create(blocks(&manager, user), DID, &key).await.unwrap();
 
         let writes: Vec<PlannedWrite> = (0..=MAX_BATCH_OPS)
-            .map(|n| a_put("app.bsky.feed.post", &format!("3ka{n:011}"), "too many").unwrap())
+            .map(|n| {
+                let rkey = brolly_test_support::atproto::tid(n as u64);
+                a_put("app.bsky.feed.post", &rkey, "too many").unwrap()
+            })
             .collect();
         let refused = apply(blocks(&manager, user), root, &key, writes, &genesis).await;
         assert!(
@@ -2057,6 +2113,7 @@ mod tests {
         let record = json!({
             "$type": "app.bsky.feed.post",
             "text": "with an image",
+            "createdAt": brolly_test_support::atproto::CREATED_AT,
             "embed": {
                 "$type": "app.bsky.embed.images",
                 "images": [{
@@ -2080,6 +2137,7 @@ mod tests {
                     "3kaaaaaaaaaaa",
                     &record,
                     RecordSwap::Any,
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -2129,6 +2187,7 @@ mod tests {
         let record = json!({
             "$type": "app.bsky.feed.post",
             "text": "a bare ref",
+            "createdAt": brolly_test_support::atproto::CREATED_AT,
             "image": {
                 "$type": "blob",
                 "ref": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
@@ -2137,7 +2196,12 @@ mod tests {
             },
         });
         assert!(matches!(
-            PlannedWrite::create("app.bsky.feed.post", Some("3kaaaaaaaaaaa"), &record),
+            PlannedWrite::create(
+                "app.bsky.feed.post",
+                Some("3kaaaaaaaaaaa"),
+                &record,
+                Validate::Optimistic
+            ),
             Err(RepoError::InvalidRecord(_))
         ));
     }
@@ -2158,13 +2222,15 @@ mod tests {
                 PlannedWrite::create(
                     "app.bsky.feed.post",
                     None,
-                    &json!({"$type": "app.bsky.feed.post", "text": "one"}),
+                    &post("one"),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
                 PlannedWrite::create(
                     "app.bsky.feed.post",
                     None,
-                    &json!({"$type": "app.bsky.feed.post", "text": "two"}),
+                    &post("two"),
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             ],
@@ -2187,5 +2253,52 @@ mod tests {
             rkeys.push(rkey.to_string());
         }
         assert_ne!(rkeys[0], rkeys[1], "two mints must not collide");
+    }
+
+    #[tokio::test]
+    async fn a_create_with_no_rkey_into_a_self_keyed_collection_is_refused() {
+        let (_dir, manager, user) = fixture();
+        let key = SigningKey::generate();
+        let (root, rev) = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let write = PlannedWrite::create(
+            "app.bsky.actor.profile",
+            None,
+            &json!({"$type": "app.bsky.actor.profile", "displayName": "a"}),
+            Validate::Optimistic,
+        )
+        .unwrap();
+        let err = apply(blocks(&manager, user), root, &key, vec![write], &rev)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, RepoError::InvalidRecord(_)), "{err}");
+        assert!(err.to_string().contains("is not self"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_write_carries_its_validation_status_to_the_applied_op() {
+        let (_dir, manager, user) = fixture();
+        let key = SigningKey::generate();
+        let (root, rev) = create(blocks(&manager, user), DID, &key).await.unwrap();
+        let writes = vec![
+            PlannedWrite::create(
+                "app.bsky.feed.post",
+                None,
+                &brolly_test_support::atproto::post("hi"),
+                Validate::Optimistic,
+            )
+            .unwrap(),
+            PlannedWrite::create(
+                "com.example.thing",
+                None,
+                &json!({"x": 1}),
+                Validate::Optimistic,
+            )
+            .unwrap(),
+        ];
+        let applied = apply(blocks(&manager, user), root, &key, writes, &rev)
+            .await
+            .unwrap();
+        assert_eq!(applied.ops[0].status, Some(Status::Valid));
+        assert_eq!(applied.ops[1].status, Some(Status::Unknown));
     }
 }

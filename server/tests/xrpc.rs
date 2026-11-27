@@ -14,6 +14,7 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use brolly_identity::db;
 use brolly_server::{AppState, app};
+use brolly_test_support::atproto::{CREATED_AT, post, tid};
 use http_body_util::BodyExt;
 use p256::ecdsa::signature::Signer;
 use serde_json::json;
@@ -297,7 +298,7 @@ async fn a_write_lands_in_both_the_repo_and_the_pod() {
             "repo": format!("alice.{BASE}"),
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "in both places"},
+            "record": post("in both places"),
         }),
         Some(&cookie),
     )
@@ -359,7 +360,7 @@ async fn a_record_without_a_type_is_given_its_collection() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kccccccccccc",
-            "record": {"text": "no type given"},
+            "record": {"text": "no type given", "createdAt": CREATED_AT},
         }),
         Some(&cookie),
     )
@@ -424,7 +425,7 @@ async fn get_repo_serves_a_car_an_independent_reader_accepts() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "exported"},
+            "record": post("exported"),
         }),
         Some(&cookie),
     )
@@ -504,7 +505,7 @@ async fn a_disabled_member_serves_no_repo() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "before"},
+            "record": post("before"),
         }),
         Some(&cookie),
     )
@@ -589,7 +590,7 @@ async fn a_deleted_record_is_gone_from_the_repo() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "delete me"},
+            "record": post("delete me"),
         }),
         Some(&cookie),
     )
@@ -625,7 +626,7 @@ async fn create_record_on_an_occupied_path_refuses_invalid_swap() {
     let body = json!({
         "collection": "app.bsky.feed.post",
         "rkey": "3kaaaaaaaaaaa",
-        "record": {"$type": "app.bsky.feed.post", "text": "first"},
+        "record": post("first"),
     });
     let first = post_json(
         &h,
@@ -642,7 +643,7 @@ async fn create_record_on_an_occupied_path_refuses_invalid_swap() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "second"},
+            "record": post("second"),
         }),
         Some(&cookie),
     )
@@ -675,7 +676,7 @@ async fn a_rkey_less_create_mints_a_tid_rkey() {
         "/xrpc/com.atproto.repo.createRecord",
         json!({
             "collection": "app.bsky.feed.post",
-            "record": {"$type": "app.bsky.feed.post", "text": "minted"},
+            "record": post("minted"),
         }),
         Some(&cookie),
     )
@@ -702,7 +703,7 @@ async fn put_record_creates_and_replaces() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": text},
+            "record": post(text),
         })
     };
 
@@ -768,7 +769,7 @@ async fn a_stale_swap_record_refuses_invalid_swap() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "first"},
+            "record": post("first"),
         }),
         Some(&cookie),
     )
@@ -781,7 +782,7 @@ async fn a_stale_swap_record_refuses_invalid_swap() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "swapped"},
+            "record": post("swapped"),
             "swapRecord": "bafyreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
         }),
         Some(&cookie),
@@ -802,7 +803,7 @@ async fn a_stale_swap_record_refuses_invalid_swap() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "swapped"},
+            "record": post("swapped"),
             "swapRecord": null,
         }),
         Some(&cookie),
@@ -823,7 +824,7 @@ async fn a_stale_swap_commit_refuses_invalid_swap() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "swapped"},
+            "record": post("swapped"),
             "swapCommit": "bafyreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy",
         }),
         Some(&cookie),
@@ -850,7 +851,7 @@ async fn the_swap_routes_write_against_the_exact_head_and_record() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "first"},
+            "record": post("first"),
         }),
         Some(&cookie),
     )
@@ -869,7 +870,7 @@ async fn the_swap_routes_write_against_the_exact_head_and_record() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "second"},
+            "record": post("second"),
             "swapRecord": record_cid,
             "swapCommit": commit_cid,
         }),
@@ -885,7 +886,7 @@ async fn the_swap_routes_write_against_the_exact_head_and_record() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "third"},
+            "record": post("third"),
             "swapRecord": record_cid,
             "swapCommit": swapped.json()["commit"]["cid"].as_str().unwrap(),
         }),
@@ -906,7 +907,7 @@ async fn the_swap_routes_write_against_the_exact_head_and_record() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "third"},
+            "record": post("third"),
             "commitCid": head,
         }),
         Some(&cookie),
@@ -921,7 +922,7 @@ async fn the_swap_routes_write_against_the_exact_head_and_record() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "fourth"},
+            "record": post("fourth"),
             "commitCid": head,
         }),
         Some(&cookie),
@@ -937,7 +938,7 @@ async fn the_swap_routes_write_against_the_exact_head_and_record() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "fifth"},
+            "record": post("fifth"),
         }),
         Some(&cookie),
     )
@@ -961,14 +962,14 @@ async fn apply_writes_applies_a_batch_as_one_commit() {
                 {"$type": "com.atproto.repo.applyWrites#create",
                  "collection": "app.bsky.feed.post",
                  "rkey": "3kaaaaaaaaaaa",
-                 "value": {"$type": "app.bsky.feed.post", "text": "a"}},
+                 "value": post("a")},
                 {"$type": "com.atproto.repo.applyWrites#create",
                  "collection": "app.bsky.feed.post",
-                 "value": {"$type": "app.bsky.feed.post", "text": "b"}},
+                 "value": post("b")},
                 {"$type": "com.atproto.repo.applyWrites#update",
                  "collection": "app.bsky.feed.post",
                  "rkey": "3kaaaaaaaaaaa",
-                 "value": {"$type": "app.bsky.feed.post", "text": "a2"}},
+                 "value": post("a2")},
             ],
         }),
         Some(&cookie),
@@ -1035,11 +1036,11 @@ async fn an_invalid_op_refuses_the_whole_batch() {
                 {"$type": "com.atproto.repo.applyWrites#create",
                  "collection": "app.bsky.feed.post",
                  "rkey": "3kaaaaaaaaaaa",
-                 "value": {"$type": "app.bsky.feed.post", "text": "would land"}},
+                 "value": post("would land")},
                 {"$type": "com.atproto.repo.applyWrites#create",
                  "collection": "app.bsky.feed.post",
                  "rkey": "3kaaaaaaaaaaa",
-                 "value": {"$type": "app.bsky.feed.post", "text": "collision"}},
+                 "value": post("collision")},
             ],
         }),
         Some(&cookie),
@@ -1078,8 +1079,8 @@ async fn a_batch_over_two_hundred_writes_is_refused() {
             json!({
                 "$type": "com.atproto.repo.applyWrites#create",
                 "collection": "app.bsky.feed.post",
-                "rkey": format!("3kb{n:010}"),
-                "value": {"$type": "app.bsky.feed.post", "text": "too many"},
+                "rkey": tid(n),
+                "value": post("too many"),
             })
         })
         .collect();
@@ -1113,9 +1114,11 @@ async fn a_record_over_a_megabyte_is_refused() {
         &h,
         "/xrpc/com.atproto.repo.createRecord",
         json!({
-            "collection": "app.bsky.feed.post",
+            // A collection with no lexicon, so the size cap is what
+            // refuses, not a post's `maxGraphemes`.
+            "collection": "com.example.big",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "x".repeat(1_000_001)},
+            "record": {"text": "x".repeat(1_000_001)},
         }),
         Some(&cookie),
     )
@@ -1146,7 +1149,7 @@ async fn two_concurrent_put_records_both_land() {
             json!({
                 "collection": "app.bsky.feed.post",
                 "rkey": rkey,
-                "record": {"$type": "app.bsky.feed.post", "text": text},
+                "record": post(text),
             }),
             Some(&cookie),
         )
@@ -1229,6 +1232,7 @@ async fn a_blob_ref_round_trips_through_the_handler() {
             "record": {
                 "$type": "app.bsky.feed.post",
                 "text": "with an image",
+                "createdAt": CREATED_AT,
                 "image": {
                     "$type": "blob",
                     "ref": {"$link": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy"},
@@ -1584,7 +1588,7 @@ async fn create_with_token(h: &Harness, token: &str, proof: &str, rkey: &str) ->
                     "repo": format!("alice.{BASE}"),
                     "collection": "app.bsky.feed.post",
                     "rkey": rkey,
-                    "record": {"$type": "app.bsky.feed.post", "text": "signed once"},
+                    "record": post("signed once"),
                 })
                 .to_string(),
             ))
@@ -1659,7 +1663,7 @@ async fn a_proof_without_a_nonce_gets_the_dpop_challenge_and_the_retry_works() {
                     json!({
                         "collection": "app.bsky.feed.post",
                         "rkey": "3kaaaaaaaaaab",
-                        "record": {"$type": "app.bsky.feed.post", "text": "nonceless"},
+                        "record": post("nonceless"),
                     })
                     .to_string(),
                 ))
@@ -2372,7 +2376,7 @@ async fn a_legacy_session_writes_through_the_bearer_arm() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "with the legacy token"},
+            "record": post("with the legacy token"),
         }),
     )
     .await;
@@ -2887,7 +2891,7 @@ async fn a_write_is_announced_on_the_firehose() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "announced"},
+            "record": post("announced"),
         }),
         Some(&cookie),
     )
@@ -2923,7 +2927,7 @@ async fn a_delete_is_announced_too() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "gone soon"},
+            "record": post("gone soon"),
         }),
         Some(&cookie),
     )
@@ -2965,8 +2969,8 @@ async fn the_announcement_chains_to_the_previous_commit() {
             "/xrpc/com.atproto.repo.createRecord",
             json!({
                 "collection": "app.bsky.feed.post",
-                "rkey": format!("3k{n}"),
-                "record": {"$type": "app.bsky.feed.post", "text": format!("post {n}")},
+                "rkey": tid(n),
+                "record": post(&format!("post {n}")),
             }),
             Some(&cookie),
         )
@@ -3048,8 +3052,8 @@ async fn a_relay_receives_backfill_from_its_cursor() {
             "/xrpc/com.atproto.repo.createRecord",
             json!({
                 "collection": "app.bsky.feed.post",
-                "rkey": format!("3k{n}"),
-                "record": {"$type": "app.bsky.feed.post", "text": format!("post {n}")},
+                "rkey": tid(n),
+                "record": post(&format!("post {n}")),
             }),
             Some(&cookie),
         )
@@ -3270,7 +3274,7 @@ async fn deleting_an_account_announces_it_on_the_firehose() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "gone soon"},
+            "record": post("gone soon"),
         }),
         Some(&cookie),
     )
@@ -3342,7 +3346,7 @@ async fn a_cursor_ahead_of_the_head_is_refused() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "the head"},
+            "record": post("the head"),
         }),
         Some(&cookie),
     )
@@ -3450,8 +3454,8 @@ async fn an_event_committed_during_the_backfill_is_delivered_exactly_once() {
             "/xrpc/com.atproto.repo.createRecord",
             json!({
                 "collection": "app.bsky.feed.post",
-                "rkey": format!("3k{n}"),
-                "record": {"$type": "app.bsky.feed.post", "text": format!("post {n}")},
+                "rkey": tid(n),
+                "record": post(&format!("post {n}")),
             }),
             Some(&cookie),
         )
@@ -3485,7 +3489,7 @@ async fn an_event_committed_during_the_backfill_is_delivered_exactly_once() {
                         json!({
                             "collection": "app.bsky.feed.post",
                             "rkey": "3kggggggggggg",
-                            "record": {"$type": "app.bsky.feed.post", "text": "the raced write"},
+                            "record": post("the raced write"),
                         })
                         .to_string(),
                     ))
@@ -3527,7 +3531,7 @@ async fn an_event_committed_during_the_backfill_is_delivered_exactly_once() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3khhhhhhhhhhh",
-            "record": {"$type": "app.bsky.feed.post", "text": "the marker"},
+            "record": post("the marker"),
         }),
         Some(&cookie),
     )
@@ -3572,7 +3576,7 @@ async fn a_subscriber_without_a_cursor_receives_only_what_happens_next() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "before the attach"},
+            "record": post("before the attach"),
         }),
         Some(&cookie),
     )
@@ -3615,7 +3619,7 @@ async fn a_subscriber_without_a_cursor_receives_only_what_happens_next() {
                         json!({
                             "collection": "app.bsky.feed.post",
                             "rkey": "3kbbbbbbbbbbb",
-                            "record": {"$type": "app.bsky.feed.post", "text": "live"},
+                            "record": post("live"),
                         })
                         .to_string(),
                     ))
@@ -3645,7 +3649,7 @@ async fn a_subscriber_without_a_cursor_receives_only_what_happens_next() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kccccccccccc",
-            "record": {"$type": "app.bsky.feed.post", "text": "the marker"},
+            "record": post("the marker"),
         }),
         Some(&cookie),
     )
@@ -3685,7 +3689,7 @@ async fn a_second_processs_writes_reach_live_subscribers() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "the setup"},
+            "record": post("the setup"),
         }),
         Some(&cookie),
     )
@@ -3768,7 +3772,7 @@ async fn a_second_processs_writes_reach_live_subscribers() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kbbbbbbbbbbb",
-            "record": {"$type": "app.bsky.feed.post", "text": "the marker"},
+            "record": post("the marker"),
         }),
         Some(&cookie),
     )
@@ -3808,7 +3812,7 @@ async fn a_subscriber_slower_than_the_buffer_is_named_and_closed() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "the anchor"},
+            "record": post("the anchor"),
         }),
         Some(&cookie),
     )
@@ -3917,7 +3921,7 @@ async fn registering_provisions_a_usable_atproto_identity() {
         json!({
             "collection": "app.bsky.feed.post",
             "rkey": "3kaaaaaaaaaaa",
-            "record": {"$type": "app.bsky.feed.post", "text": "straight after signing up"},
+            "record": post("straight after signing up"),
         }),
         Some(&cookie),
     )
@@ -4082,7 +4086,7 @@ async fn write_post(h: &Harness, cookie: &str, collection: &str, rkey: &str, tex
         json!({
             "collection": collection,
             "rkey": rkey,
-            "record": {"$type": collection, "text": text},
+            "record": {"$type": collection, "text": text, "createdAt": CREATED_AT},
         }),
         Some(cookie),
     )
@@ -4278,7 +4282,26 @@ async fn describe_repo_lists_the_collections_the_repo_holds() {
     write_post(&h, &cookie, "com.example.zebra", FIVE[0], "z").await;
     write_post(&h, &cookie, POST, FIVE[0], "a").await;
     write_post(&h, &cookie, POST, FIVE[1], "b").await;
-    write_post(&h, &cookie, "app.bsky.feed.like", FIVE[0], "l").await;
+    // A like must be a like (stage 4a, H5): a subject, not a post's text.
+    let like = post_json(
+        &h,
+        "/xrpc/com.atproto.repo.createRecord",
+        json!({
+            "collection": "app.bsky.feed.like",
+            "rkey": FIVE[0],
+            "record": {
+                "$type": "app.bsky.feed.like",
+                "subject": {
+                    "uri": format!("at://did:plc:aaaaaaaaaaaaaaaaaaaaaaaa/{POST}/{}", FIVE[0]),
+                    "cid": "bafyreidfayvfuwqa7qlnopdjiqrxzs6blmoeu4rujcjtnci5beludirz2a",
+                },
+                "createdAt": CREATED_AT,
+            },
+        }),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(like.status, StatusCode::OK, "{}", like.text());
     assert_eq!(
         describe().await["collections"],
         json!(["app.bsky.feed.like", POST, "com.example.zebra"])

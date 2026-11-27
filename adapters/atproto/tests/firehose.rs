@@ -20,8 +20,10 @@ use atrium_repo::blockstore::{AsyncBlockStoreRead, AsyncBlockStoreWrite};
 use brolly_atproto::blocks::PodBlocks;
 use brolly_atproto::firehose::{self, Action, CommitEvent, NewCommit, NewOp, Op};
 use brolly_atproto::keys::SigningKey;
+use brolly_atproto::record::Validate;
 use brolly_atproto::repo::{self, PlannedWrite, RecordSwap};
 use brolly_identity::db::MIGRATOR;
+use brolly_test_support::atproto::{CREATED_AT, post, tid};
 use serde_json::json;
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -786,8 +788,9 @@ async fn a_repo_with_a_post() -> (
             PlannedWrite::put(
                 "app.bsky.feed.post",
                 "3kaaaaaaaaaaa",
-                &json!({"$type": "app.bsky.feed.post", "text": "hello atproto"}),
+                &post("hello atproto"),
                 RecordSwap::Any,
+                Validate::Optimistic,
             )
             .unwrap(),
         ],
@@ -857,15 +860,17 @@ async fn every_op_kind_rides_the_frames_and_inverts() {
             PlannedWrite::put(
                 "app.bsky.feed.post",
                 "3kaaaaaaaaaaa",
-                &json!({"$type": "app.bsky.feed.post", "text": "a one"}),
+                &post("a one"),
                 RecordSwap::Any,
+                Validate::Optimistic,
             )
             .unwrap(),
             PlannedWrite::put(
                 "app.bsky.feed.post",
                 "3kbbbbbbbbbbb",
-                &json!({"$type": "app.bsky.feed.post", "text": "b one"}),
+                &post("b one"),
                 RecordSwap::Any,
+                Validate::Optimistic,
             )
             .unwrap(),
         ],
@@ -885,7 +890,8 @@ async fn every_op_kind_rides_the_frames_and_inverts() {
             PlannedWrite::update(
                 "app.bsky.feed.post",
                 "3kaaaaaaaaaaa",
-                &json!({"$type": "app.bsky.feed.post", "text": "a two"}),
+                &post("a two"),
+                Validate::Optimistic,
             )
             .unwrap(),
             PlannedWrite::delete("app.bsky.feed.post", "3kbbbbbbbbbbb").unwrap(),
@@ -966,6 +972,7 @@ async fn a_blob_link_rides_the_diff_and_inverts() {
     let record = json!({
         "$type": "app.bsky.feed.post",
         "text": "with an image",
+        "createdAt": CREATED_AT,
         "image": {
             "$type": "blob",
             "ref": {"$link": "bafkreig7fderwgqduywg2x3jlygcgszsozt4xcctjkykzkdxvxdvhxrdvy"},
@@ -983,6 +990,7 @@ async fn a_blob_link_rides_the_diff_and_inverts() {
                 "3kaaaaaaaaaaa",
                 &record,
                 RecordSwap::Any,
+                Validate::Optimistic,
             )
             .unwrap(),
         ],
@@ -1038,16 +1046,17 @@ async fn a_long_historys_commits_each_invert() {
     // deletes interleaved with more creates, then the same against a tree
     // that already has shape. Each round touches different keys than the last
     // round's deletes, so every op lands on a record that exists.
-    for round in 0..3 {
+    for round in 0..3u64 {
         let mut writes = Vec::new();
         for n in 0..12 {
-            let rkey = format!("3k{}{}", ["a", "b", "c"][round], n);
+            let rkey = tid(round * 100 + n);
             writes.push(
                 PlannedWrite::put(
                     "app.bsky.feed.post",
                     &rkey,
-                    &json!({"$type": "app.bsky.feed.post", "text": format!("{rkey} one")}),
+                    &post(&format!("{rkey} one")),
                     RecordSwap::Any,
+                    Validate::Optimistic,
                 )
                 .unwrap(),
             );
@@ -1056,20 +1065,21 @@ async fn a_long_historys_commits_each_invert() {
             // Updates and deletes of the previous round's creates — disjoint
             // key ranges, so every op lands on a record that exists and no
             // key is written twice within the stage.
-            let prior = ["a", "a", "b"][round];
+            let prior = [0, 0, 1][round as usize];
             for n in 0..4 {
                 writes.push(
                     PlannedWrite::update(
                         "app.bsky.feed.post",
-                        &format!("3k{prior}{n}"),
-                        &json!({"$type": "app.bsky.feed.post", "text": format!("3k{prior}{n} two")}),
+                        &tid(prior * 100 + n),
+                        &post(&format!("{} two", tid(prior * 100 + n))),
+                        Validate::Optimistic,
                     )
                     .unwrap(),
                 );
             }
             for n in 4..8 {
                 writes.push(
-                    PlannedWrite::delete("app.bsky.feed.post", &format!("3k{prior}{n}")).unwrap(),
+                    PlannedWrite::delete("app.bsky.feed.post", &tid(prior * 100 + n)).unwrap(),
                 );
             }
         }
@@ -1128,10 +1138,7 @@ async fn a_record_the_slice_needs_is_actually_there() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        read,
-        Some(json!({"$type": "app.bsky.feed.post", "text": "hello atproto"}))
-    );
+    assert_eq!(read, Some(post("hello atproto")));
 }
 
 // --- advice and errors, against a foreign decoder (1, F) ---------------------------

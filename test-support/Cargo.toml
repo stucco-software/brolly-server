@@ -7,6 +7,7 @@ publish.workspace = true
 description = "Test fixtures and container provisioning. Dev-only."
 
 [dependencies]
+serde_json = "1.0.151"
 sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres"] }
 testcontainers-modules = { version = "0.15.0", features = ["postgres"] }
 tokio = { version = "1.53.1", features = ["rt", "macros"] }

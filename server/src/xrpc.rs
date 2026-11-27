@@ -1511,6 +1511,7 @@ async fn create_record(
         &input.collection,
         input.rkey.as_deref(),
         &input.record,
+        brolly_atproto::record::Validate::Optimistic,
     ) {
         Ok(write) => write,
         Err(e) => return private(write_refused(e)),
@@ -1632,6 +1633,7 @@ async fn put_record(
         &input.rkey,
         &input.record,
         swap,
+        brolly_atproto::record::Validate::Optimistic,
     ) {
         Ok(write) => write,
         Err(e) => return private(write_refused(e)),
@@ -1718,6 +1720,7 @@ async fn swap_record(
         &input.rkey,
         &input.record,
         swap,
+        brolly_atproto::record::Validate::Optimistic,
     ) {
         Ok(write) => write,
         Err(e) => return private(write_refused(e)),
@@ -1787,6 +1790,7 @@ async fn swap_commit(
         &input.rkey,
         &input.record,
         brolly_atproto::repo::RecordSwap::Any,
+        brolly_atproto::record::Validate::Optimistic,
     ) {
         Ok(write) => write,
         Err(e) => return private(write_refused(e)),
@@ -1889,12 +1893,22 @@ async fn apply_writes(
                 collection,
                 rkey,
                 value,
-            } => brolly_atproto::repo::PlannedWrite::create(collection, rkey.as_deref(), value),
+            } => brolly_atproto::repo::PlannedWrite::create(
+                collection,
+                rkey.as_deref(),
+                value,
+                brolly_atproto::record::Validate::Optimistic,
+            ),
             ApplyWrite::Update {
                 collection,
                 rkey,
                 value,
-            } => brolly_atproto::repo::PlannedWrite::update(collection, rkey, value),
+            } => brolly_atproto::repo::PlannedWrite::update(
+                collection,
+                rkey,
+                value,
+                brolly_atproto::record::Validate::Optimistic,
+            ),
             ApplyWrite::Delete { collection, rkey } => {
                 brolly_atproto::repo::PlannedWrite::delete(collection, rkey)
             }

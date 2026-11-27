@@ -1005,6 +1005,7 @@ dependencies = [
 name = "brolly-test-support"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "sqlx",
  "testcontainers-modules",
  "tokio",

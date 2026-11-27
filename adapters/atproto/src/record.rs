@@ -118,11 +118,6 @@ fn envelope(collection: &Nsid, record: &Value) -> Result<Ipld, RepoError> {
         .map_err(|e| RepoError::InvalidRecord(e.to_string()))
 }
 
-/// Until `PlannedWrite` moves to [`check_record`] (the next task).
-pub fn prepare(collection: &Nsid, record: &Value) -> Result<Ipld, RepoError> {
-    envelope(collection, record)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

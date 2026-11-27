@@ -12,6 +12,8 @@
 // useful message rather than thread `Result` through every test signature.
 #![allow(clippy::expect_used)]
 
+pub mod atproto;
+
 use sqlx::PgPool;
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::ContainerAsync;
