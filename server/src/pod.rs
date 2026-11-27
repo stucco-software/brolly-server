@@ -18,7 +18,7 @@ use brolly_identity::routing::{SubdomainRoute, subdomain_route};
 use brolly_identity::{Credential, Scope, Subject, Via, extract, routing, webid};
 use brolly_solid::conditional::{self, Preconditions};
 use brolly_solid::ldp::{self, Description, LdpError, LdpOutcome};
-use brolly_solid::oidc::{keys, tokens};
+use brolly_solid::oidc::{keys, store, tokens};
 use brolly_solid::patch;
 use brolly_solid::storage;
 use brolly_solid::storage_description;
@@ -499,11 +499,12 @@ pub(crate) async fn subject_for(
 /// visited: an app holding Bob's token is Bob wherever it reads.
 ///
 /// The fast path, for tokens our own issuer minted: the WebID must be one
-/// this instance hosts and an active member. A foreign issuer's tokens take
+/// this instance hosts and an active member, or a WebID linked to an account
+/// ([`linked_subject`]). A foreign issuer's tokens take
 /// [`remote_solid_subject`]. A failure to look the member up is ours (H2).
 async fn solid_subject(state: &AppState, claims: tokens::AccessClaims) -> Result<Subject, Refused> {
     let Some(username) = webid::local_username(&claims.webid, &state.base_domain) else {
-        return Err(Refused::Token);
+        return linked_subject(state, claims).await;
     };
     let user = match db::find_by_username(&state.pool, &username).await {
         Ok(Some(user)) if user.is_active() => user,
@@ -523,7 +524,64 @@ async fn solid_subject(state: &AppState, claims: tokens::AccessClaims) -> Result
     ))
 }
 
-// --- the remote path (spec 6, H5) ---------------------------------------------
+/// Our own token naming a WebID this instance does not host: the
+/// `client_credentials` grant's (ADR 0020), minted for a WebID linked to an
+/// account. Its `iss` is ours, so it never takes the remote path, and the
+/// checks that path and the link made are made again here, on use:
+///
+/// * the link still exists — the unlink is the kill switch, and it retires
+///   the tokens already issued along with the credentials that mint them;
+/// * the account it is linked to is active;
+/// * the WebID's own document still names this issuer — the binding the
+///   link was made on, read through the same cached fetch the remote path
+///   uses, so a WebID that has moved to another issuer withdraws this one.
+///
+/// The subject is remote — the WebID alone, no local user — exactly the
+/// shape a foreign issuer's token produces, so WAC gives the agent what was
+/// granted to its WebID and nothing the linked account holds. Every refusal
+/// is `invalid_token`, as on the remote path; a lookup failure is ours (H2).
+async fn linked_subject(
+    state: &AppState,
+    claims: tokens::AccessClaims,
+) -> Result<Subject, Refused> {
+    let owner = match store::webid_link_owner(&state.pool, &claims.webid).await {
+        Ok(Some(owner)) => owner,
+        Ok(None) => return Err(Refused::Token),
+        Err(e) => {
+            tracing::error!(error = %e, "a linked WebID's lookup failed");
+            return Err(Refused::Unavailable);
+        }
+    };
+    match db::find_by_id(&state.pool, owner).await {
+        Ok(Some(user)) if user.is_active() => {}
+        Ok(_) => return Err(Refused::Token),
+        Err(e) => {
+            tracing::error!(error = %e, "a linked WebID's account lookup failed");
+            return Err(Refused::Unavailable);
+        }
+    }
+
+    let issuer = format!("https://{}", state.base_domain);
+    let bound = match Url::parse(&claims.webid) {
+        Ok(webid) => match state.webid_documents.fetch(&webid).await {
+            Ok(document) => document.names(&issuer),
+            Err(_) => false,
+        },
+        Err(_) => false,
+    };
+    if !bound {
+        tracing::debug!(webid = %claims.webid, "a linked WebID no longer names this issuer");
+        return Err(Refused::Token);
+    }
+
+    Ok(Subject::remote(
+        claims.webid,
+        Scope::parse(&claims.scope),
+        Via::SolidDpop,
+    ))
+}
+
+// --- the remote path (spec 6, H5)---------------------------------------------
 //
 // A token another Solid-OIDC issuer signed: verified against that issuer's
 // own key set, and trusted for the WebID it names only once the WebID's own

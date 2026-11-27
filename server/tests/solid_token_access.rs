@@ -1428,3 +1428,198 @@ async fn a_remote_subject_naming_the_owners_webid_is_not_the_owner() {
         "a remote subject naming the owner's WebID gained the owner's access: {body}"
     );
 }
+
+// --- a linked WebID's own token (ADR 0020) -----------------------------------
+//
+// A client_credentials token: signed by this instance, naming a WebID this
+// instance does not host but has linked to an account. It never takes the
+// remote path — its `iss` is ours — so the fast path has to know what to do
+// with a WebID that is not a member's.
+
+/// The agent a collector authenticates as: hosted elsewhere, linked here.
+const AGENT: &str = "https://pushbroom.co/agent#it";
+
+/// The harness with the agent's WebID document naming `issuer`.
+async fn an_agent_harness(issuer: &str) -> Harness {
+    let webids = StaticDocuments::default().with(AGENT, profile_naming(AGENT, issuer));
+    harness_with((
+        Arc::new(StaticDocuments::default()),
+        Arc::new(StaticDocuments::default()),
+        Arc::new(webids),
+    ))
+    .await
+}
+
+/// An account with `AGENT` linked to it and a credential pair minted for it.
+async fn a_linked_agent(harness: &Harness) -> (uuid::Uuid, String, String) {
+    let user = db::create_user(
+        &harness._db.pool,
+        "pushbroom",
+        None,
+        "correct-horse-battery-staple",
+        "member",
+    )
+    .await
+    .unwrap();
+    brolly_solid::oidc::store::link_webid(&harness._db.pool, user.id, AGENT)
+        .await
+        .unwrap();
+    let (id, secret) =
+        brolly_solid::oidc::store::issue_client_credentials(&harness._db.pool, AGENT)
+            .await
+            .unwrap();
+    (user.id, id, secret)
+}
+
+/// The collector's token request (ADR 0020): Basic, a DPoP proof, and
+/// `grant_type=client_credentials&scope=webid`.
+async fn an_agent_token(harness: &Harness, id: &str, secret: &str, key: &SigningKey) -> String {
+    let token_url = format!("https://{BASE_DOMAIN}/oauth/solid/token");
+    let basic = base64::engine::general_purpose::STANDARD.encode(format!("{id}:{secret}"));
+    let (status, body) = send(
+        harness,
+        Request::builder()
+            .method("POST")
+            .uri("/oauth/solid/token")
+            .header(header::HOST, BASE_DOMAIN)
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header(header::AUTHORIZATION, format!("Basic {basic}"))
+            .header("DPoP", dpop_proof(key, "POST", &token_url, None))
+            .body(Body::from("grant_type=client_credentials&scope=webid"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "token endpoint: {body}");
+    serde_json::from_str::<serde_json::Value>(&body).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
+/// The member grants `webid` Read and Write on the root by default, beside
+/// the owner's own authorization.
+async fn grant_write_on_the_root(harness: &Harness, webid: &str) {
+    let g = format!("{ROOT}.acl");
+    let owner = format!("{g}#owner");
+    let agent = format!("{g}#agent");
+    let mut grant = Vec::new();
+    for (who, member) in [
+        (&owner, format!("{POD}/profile#me")),
+        (&agent, webid.to_string()),
+    ] {
+        grant.push(t(&g, who, &format!("{ACL}default"), ROOT));
+        grant.push(t(&g, who, &format!("{ACL}accessTo"), ROOT));
+        grant.push(t(&g, who, &format!("{ACL}mode"), &format!("{ACL}Read")));
+        grant.push(t(&g, who, &format!("{ACL}mode"), &format!("{ACL}Write")));
+        grant.push(t(&g, who, &format!("{ACL}agent"), &member));
+    }
+    harness
+        .pod
+        .write(|w| w.put(&g, Content::Auxiliary(&grant)))
+        .unwrap();
+}
+
+/// An N3 PATCH of the note, as the agent: the write the collector makes.
+async fn an_agent_patch(harness: &Harness, token: &str, key: &SigningKey) -> (StatusCode, String) {
+    let ath = B64.encode(Sha256::digest(token.as_bytes()));
+    let n3 = format!(
+        "@prefix solid: <http://www.w3.org/ns/solid/terms#> .\n\
+         _:p a solid:InsertDeletePatch ;\n\
+           solid:inserts {{ <{NOTE}> <https://example.org/tag> \"collected\" . }} ."
+    );
+    let request = Request::builder()
+        .method("PATCH")
+        .uri("/~/note")
+        .header(header::HOST, POD_HOST)
+        .header(header::AUTHORIZATION, format!("DPoP {token}"))
+        .header("DPoP", dpop_proof(key, "PATCH", NOTE, Some(&ath)))
+        .header(header::CONTENT_TYPE, "text/n3")
+        .body(Body::from(n3))
+        .unwrap();
+    challenged(harness, request).await
+}
+
+#[tokio::test]
+async fn a_linked_webids_token_writes_what_the_member_granted_it() {
+    // ADR 0020's whole purpose: the collector's token, minted here for its
+    // linked WebID, writes to a pod whose owner granted that WebID access.
+    let harness = an_agent_harness(&format!("https://{BASE_DOMAIN}")).await;
+    let (_, id, secret) = a_linked_agent(&harness).await;
+    grant_write_on_the_root(&harness, AGENT).await;
+
+    let key = client_key();
+    let token = an_agent_token(&harness, &id, &secret, &key).await;
+    let (status, challenge) = an_agent_patch(&harness, &token, &key).await;
+    assert_eq!(status, StatusCode::NO_CONTENT, "challenge: {challenge}");
+
+    let (status, body) = a_remote_read(&harness, &token, &key, "/~/note", NOTE).await;
+    assert_eq!(status, StatusCode::OK, "body: {body}");
+    assert!(body.contains("collected"), "the write landed: {body}");
+}
+
+#[tokio::test]
+async fn a_linked_webid_holds_only_what_it_was_granted() {
+    // Authenticated as the agent, not as the account it is linked to: no
+    // grant to the agent's WebID, no write — and a 403, because the token
+    // itself was good.
+    let harness = an_agent_harness(&format!("https://{BASE_DOMAIN}")).await;
+    let (_, id, secret) = a_linked_agent(&harness).await;
+
+    let key = client_key();
+    let token = an_agent_token(&harness, &id, &secret, &key).await;
+    let (status, _) = an_agent_patch(&harness, &token, &key).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn an_unlinked_webids_outstanding_token_is_refused() {
+    // The unlink is the kill switch (ADR 0020, decision 4): it retires the
+    // tokens already issued, not just the credentials that would mint more.
+    let harness = an_agent_harness(&format!("https://{BASE_DOMAIN}")).await;
+    let (user_id, id, secret) = a_linked_agent(&harness).await;
+    grant_write_on_the_root(&harness, AGENT).await;
+
+    let key = client_key();
+    let token = an_agent_token(&harness, &id, &secret, &key).await;
+    brolly_solid::oidc::store::unlink_webid(&harness._db.pool, user_id, AGENT)
+        .await
+        .unwrap();
+
+    let (status, challenge) = an_agent_patch(&harness, &token, &key).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(challenge.contains(INVALID_TOKEN), "got: {challenge}");
+}
+
+#[tokio::test]
+async fn a_disabled_accounts_linked_webid_is_refused() {
+    let harness = an_agent_harness(&format!("https://{BASE_DOMAIN}")).await;
+    let (user_id, id, secret) = a_linked_agent(&harness).await;
+    grant_write_on_the_root(&harness, AGENT).await;
+
+    let key = client_key();
+    let token = an_agent_token(&harness, &id, &secret, &key).await;
+    sqlx::query("UPDATE users SET status = 'disabled' WHERE id = $1")
+        .bind(user_id)
+        .execute(&harness._db.pool)
+        .await
+        .unwrap();
+
+    let (status, challenge) = an_agent_patch(&harness, &token, &key).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(challenge.contains(INVALID_TOKEN), "got: {challenge}");
+}
+
+#[tokio::test]
+async fn a_linked_webid_that_no_longer_names_this_issuer_is_refused() {
+    // The WebID's own assertion is the binding, read again on use: a
+    // document that has moved to another issuer withdraws this one.
+    let harness = an_agent_harness("https://login.elsewhere.example").await;
+    let (_, id, secret) = a_linked_agent(&harness).await;
+    grant_write_on_the_root(&harness, AGENT).await;
+
+    let key = client_key();
+    let token = an_agent_token(&harness, &id, &secret, &key).await;
+    let (status, challenge) = an_agent_patch(&harness, &token, &key).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert!(challenge.contains(INVALID_TOKEN), "got: {challenge}");
+}

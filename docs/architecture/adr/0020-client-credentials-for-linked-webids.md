@@ -75,6 +75,15 @@ operator gate (linking is CLI-only) already stands where the token would.
   and the WebID's document — the same triple the link checked — binds it.
   The pushbroom document must therefore name `https://id.stucco.software`
   (slash or not) for cross-pod access, not the dead `login.` issuer.
+- This instance's own pods verify these tokens on the fast path (our `iss`,
+  our key) but cannot treat the WebID as a member's: a non-local WebID is
+  accepted only while its link exists, its account is active, and its
+  document still names this issuer, and it becomes a remote subject — WAC
+  gives it what was granted to the agent WebID, nothing the linked account
+  holds. Re-checking the link on use makes the unlink retire outstanding
+  tokens too, not only the pairs. (Added 2026-11-27: the grant shipped
+  without this half, and every linked WebID's write to a brolly pod was a
+  401.)
 - Multiple pairs may be minted for one WebID (rotation by minting); retiring
   them all at once is the unlink. Per-pair revocation is not built.
 - `names()`' slash tolerance applies to the remote verification path too — a
