@@ -18,6 +18,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
+    // The vendored lexicons are parsed here, before anything else is
+    // opened, so a tree that does not load stops the boot with a clear
+    // error rather than refusing the first write (stage 4a, Decision C).
+    if let Err(e) = brolly_atproto::lexicon::vendored() {
+        tracing::error!(error = %e, "the vendored lexicons did not load");
+        return Err(e.into());
+    }
+
     // Absent unless asked for, so a local instance does not try to publish
     // test identities to the real PLC directory. Built here, before the
     // database, so a host with no CA bundle fails at once with a clear error
