@@ -95,3 +95,85 @@ fn a_duplicate_id_fails_the_load() {
     docs.push(docs[0].clone());
     assert!(Registry::from_docs(docs).is_err());
 }
+
+fn lines(file: &str) -> Vec<String> {
+    std::fs::read_to_string(fixtures().join("interop/syntax").join(file))
+        .unwrap()
+        .lines()
+        .map(|l| l.trim_end_matches('\r').to_string())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect()
+}
+
+#[test]
+fn every_format_holds_to_the_interop_syntax_vectors() {
+    let table: [(&str, &str, &[&str]); 11] = [
+        (
+            "at-identifier",
+            "atidentifier_syntax_valid.txt",
+            &["atidentifier_syntax_invalid.txt"],
+        ),
+        (
+            "at-uri",
+            "aturi_syntax_valid.txt",
+            &["aturi_syntax_invalid.txt"],
+        ),
+        ("cid", "cid_syntax_valid.txt", &["cid_syntax_invalid.txt"]),
+        (
+            "datetime",
+            "datetime_syntax_valid.txt",
+            &["datetime_syntax_invalid.txt", "datetime_parse_invalid.txt"],
+        ),
+        ("did", "did_syntax_valid.txt", &["did_syntax_invalid.txt"]),
+        (
+            "handle",
+            "handle_syntax_valid.txt",
+            &["handle_syntax_invalid.txt"],
+        ),
+        (
+            "language",
+            "language_syntax_valid.txt",
+            &["language_syntax_invalid.txt"],
+        ),
+        (
+            "nsid",
+            "nsid_syntax_valid.txt",
+            &["nsid_syntax_invalid.txt"],
+        ),
+        (
+            "record-key",
+            "recordkey_syntax_valid.txt",
+            &["recordkey_syntax_invalid.txt"],
+        ),
+        ("tid", "tid_syntax_valid.txt", &["tid_syntax_invalid.txt"]),
+        ("uri", "uri_syntax_valid.txt", &["uri_syntax_invalid.txt"]),
+    ];
+    let mut wrong = Vec::new();
+    for (format, valid, invalids) in table {
+        for v in lines(valid) {
+            if !lexicon::formats::check(format, &v) {
+                wrong.push(format!("{format}: refused valid {v:?}"));
+            }
+        }
+        for file in invalids {
+            for v in lines(file) {
+                if lexicon::formats::check(format, &v) {
+                    wrong.push(format!("{format}: accepted invalid {v:?}"));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} disagreements:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
+#[test]
+fn an_unknown_format_is_accepted() {
+    // The evolution rules let a newer lexicon name a format this pin does not
+    // know; the field is still a string.
+    assert!(lexicon::formats::check("some-future-format", "anything"));
+}
