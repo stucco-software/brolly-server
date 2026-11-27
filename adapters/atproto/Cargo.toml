@@ -48,8 +48,17 @@ oxigraph = "0.5.9"
 # encoder atrium uses is the one that has to produce it.
 serde_ipld_dagcbor = "0.6"
 base32 = "0.5"
-time = "0.3.55"
+time = { version = "0.3.55", features = ["parsing"] }
 base64 = "0.23.1"
+# The vendored lexicons, embedded in the binary (stage 4a, H3, Decision C):
+# no build script, no runtime fetch. On stable Rust a change under
+# vendor/lexicons/ does not by itself trigger a rebuild, so
+# tools/refresh-lexicons.sh touches lexicon/mod.rs.
+include_dir = "0.7.4"
+# Grapheme clusters (UAX #29, extended) for maxGraphemes/minGraphemes (H4).
+unicode-segmentation = "1.13.3"
+# The datetime, uri and at-uri formats, after the reference's own patterns.
+regex = "1"
 # 0.13 rather than a third version: the tree already carries 0.13 (via the
 # ActivityPub stack) and 0.14. `multiple-versions` is a warning, not a licence
 # to keep adding.

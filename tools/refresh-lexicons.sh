@@ -91,4 +91,7 @@ Both repositories are dual-licensed MIT / Apache-2.0
 notices are beside this file as \`LICENSE-MIT-atproto.txt\` and
 \`LICENSE-MIT-bsky.txt\`.
 EOF
+# include_dir cannot tell cargo the tree changed on stable Rust; touching the
+# module that embeds it forces the rebuild.
+touch "$root/adapters/atproto/src/lexicon/mod.rs"
 echo "vendored $(find "$out" -name '*.json' | wc -l | tr -d ' ') lexicons"
