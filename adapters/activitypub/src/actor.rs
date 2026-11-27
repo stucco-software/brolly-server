@@ -163,6 +163,12 @@ pub fn webfinger(username: &str, base_domain: &str) -> Value {
                 "rel": "http://www.w3.org/ns/pim/space#storage",
                 "href": brolly_identity::routing::storage_root(username, base_domain),
             },
+            // The WebID, for Solid apps that resolve a handle to the identity
+            // they write into access rules (Pushbroom's sharing).
+            {
+                "rel": "http://www.w3.org/ns/solid/terms#webid",
+                "href": webid::webid(username, base_domain),
+            },
         ],
     })
 }
@@ -382,6 +388,20 @@ mod tests {
             .find(|l| l["rel"].as_str().is_some_and(|r| r.ends_with("#storage")))
             .expect("a storage link");
         assert_eq!(storage["href"], "https://alice.brolly.id/~/");
+    }
+
+    #[test]
+    fn webfinger_names_the_webid() {
+        // Solid apps (Pushbroom's sharing) resolve a handle to the WebID they
+        // write into access rules. There is no settled rel for it; this is the
+        // one brolly and Pushbroom agree on.
+        let jrd = webfinger("alice", BASE);
+        let links = jrd["links"].as_array().expect("links");
+        let webid = links
+            .iter()
+            .find(|l| l["rel"] == "http://www.w3.org/ns/solid/terms#webid")
+            .expect("a webid link");
+        assert_eq!(webid["href"], "https://alice.brolly.id/profile#me");
     }
 
     #[test]
