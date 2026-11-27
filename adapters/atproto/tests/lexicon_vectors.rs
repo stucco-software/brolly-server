@@ -186,7 +186,7 @@ fn an_unknown_format_is_accepted() {
 }
 
 use brolly_atproto::data_model;
-use brolly_atproto::lexicon::Status;
+use brolly_atproto::lexicon::{Refusal, Status};
 
 /// What the whole pre-commit path says about one record: the data model,
 /// then the lexicon. A data-model refusal is a refusal.
@@ -197,7 +197,9 @@ fn verdict(
     record: &Value,
 ) -> Result<Status, String> {
     let ipld = data_model::record_from_json(record).map_err(|e| e.to_string())?;
-    registry.validate(collection, Some(rkey), &data_model::to_json(&ipld))
+    registry
+        .validate(collection, Some(rkey), &data_model::to_json(&ipld))
+        .map_err(|e| e.to_string())
 }
 
 #[test]
@@ -273,12 +275,16 @@ fn a_refusal_names_its_path_in_the_references_shape() {
     });
     assert_eq!(
         registry.validate("app.bsky.feed.post", None, &post),
-        Err("record/text must not be longer than 300 graphemes".to_string())
+        Err(Refusal::Record(
+            "record/text must not be longer than 300 graphemes".to_string()
+        ))
     );
     let no_date = serde_json::json!({"$type": "app.bsky.feed.post", "text": "hi"});
     assert_eq!(
         registry.validate("app.bsky.feed.post", None, &no_date),
-        Err("record must have the property \"createdAt\"".to_string())
+        Err(Refusal::Record(
+            "record must have the property \"createdAt\"".to_string()
+        ))
     );
 }
 
@@ -288,7 +294,14 @@ fn a_collection_that_is_not_a_record_type_is_refused() {
     let err = registry
         .validate("app.bsky.feed.getTimeline", None, &serde_json::json!({}))
         .unwrap_err();
-    assert_eq!(err, "app.bsky.feed.getTimeline is not a record type");
+    assert_eq!(
+        err,
+        Refusal::NotARecord("app.bsky.feed.getTimeline".to_string())
+    );
+    assert_eq!(
+        err.to_string(),
+        "app.bsky.feed.getTimeline is not a record type"
+    );
 }
 
 #[test]
@@ -305,7 +318,10 @@ fn key_types_hold() {
             .check_key("app.bsky.feed.post", "3kaaaaaaaaaab")
             .is_ok()
     );
-    assert!(registry.check_key("app.bsky.feed.post", "nottid").is_err());
+    assert_eq!(
+        registry.check_key("app.bsky.feed.post", "nottid"),
+        Err(Refusal::Key("record key nottid is not a TID".to_string()))
+    );
     assert!(registry.check_key("com.example.nobody", "anything").is_ok());
 }
 
@@ -342,5 +358,190 @@ fn a_deep_record_is_refused_not_overflowed() {
     let err = registry
         .validate("com.example.deep", None, &value)
         .unwrap_err();
-    assert!(err.contains("nested too deeply"), "{err}");
+    assert!(matches!(err, Refusal::Record(_)), "{err:?}");
+    assert!(err.to_string().contains("nested too deeply"), "{err}");
+}
+
+/// The vendored tree plus one more document.
+fn with_doc(doc: Value) -> Result<Registry, lexicon::LoadError> {
+    let mut docs = vendored_docs();
+    docs.push(doc);
+    Registry::from_docs(docs)
+}
+
+/// A record lexicon `com.example.t` whose record has `properties`.
+fn record_doc(key: &str, properties: Value) -> Value {
+    serde_json::json!({
+        "lexicon": 1, "id": "com.example.t",
+        "defs": {"main": {"type": "record", "key": key,
+            "record": {"type": "object", "properties": properties}}}
+    })
+}
+
+#[test]
+fn an_unsupported_key_type_is_refused_by_name() {
+    for key in ["foo", "literal:"] {
+        let registry = with_doc(record_doc(key, serde_json::json!({}))).unwrap();
+        assert_eq!(
+            registry.check_key("com.example.t", "x"),
+            Err(Refusal::Key(format!(
+                "record key x is not allowed: unsupported key type {key}"
+            ))),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn a_union_type_must_be_an_nsid_with_at_most_one_fragment() {
+    let registry = lexicon::vendored().unwrap();
+    for t in [
+        "#image",
+        "app.bsky.embed.images#main#x",
+        "app.bsky.embed.images#",
+        "not an nsid",
+    ] {
+        let post = serde_json::json!({
+            "$type": "app.bsky.feed.post",
+            "text": "hi",
+            "createdAt": "2026-11-27T00:00:00.000Z",
+            "embed": {"$type": t},
+        });
+        assert_eq!(
+            registry.validate("app.bsky.feed.post", None, &post),
+            Err(Refusal::Record(
+                "record/embed $type must be an NSID, optionally with a #fragment".to_string()
+            )),
+            "{t}"
+        );
+    }
+    // An open union still takes a well-formed type it does not know.
+    let post = serde_json::json!({
+        "$type": "app.bsky.feed.post",
+        "text": "hi",
+        "createdAt": "2026-11-27T00:00:00.000Z",
+        "embed": {"$type": "com.example.embed#thing"},
+    });
+    assert_eq!(
+        registry.validate("app.bsky.feed.post", None, &post),
+        Ok(Status::Valid)
+    );
+}
+
+#[test]
+fn graphemes_are_counted_against_both_bounds() {
+    let registry = with_doc(record_doc(
+        "any",
+        serde_json::json!({
+            "s": {"type": "string", "maxGraphemes": 3, "minGraphemes": 2}
+        }),
+    ))
+    .unwrap();
+    let check = |s: &str| registry.validate("com.example.t", None, &serde_json::json!({"s": s}));
+    // "é" written as e + combining acute: two code points, one grapheme.
+    let e = "e\u{301}";
+    assert_eq!(check(&e.repeat(3)), Ok(Status::Valid));
+    assert_eq!(
+        check(&e.repeat(4)),
+        Err(Refusal::Record(
+            "record/s must not be longer than 3 graphemes".to_string()
+        ))
+    );
+    assert_eq!(
+        check(e),
+        Err(Refusal::Record(
+            "record/s must not be shorter than 2 graphemes".to_string()
+        ))
+    );
+    assert_eq!(
+        check("a"),
+        Err(Refusal::Record(
+            "record/s must not be shorter than 2 graphemes".to_string()
+        ))
+    );
+    assert_eq!(check("ab"), Ok(Status::Valid));
+}
+
+#[test]
+fn an_inline_token_field_is_the_lexicons_fault() {
+    let registry = with_doc(record_doc(
+        "any",
+        serde_json::json!({"t": {"type": "token"}}),
+    ))
+    .unwrap();
+    let err = registry
+        .validate("com.example.t", None, &serde_json::json!({"t": "x"}))
+        .unwrap_err();
+    assert!(matches!(err, Refusal::Lexicon(_)), "{err:?}");
+}
+
+#[test]
+fn a_constraint_of_the_wrong_type_fails_the_load() {
+    for props in [
+        serde_json::json!({"s": {"type": "string", "maxLength": "300"}}),
+        serde_json::json!({"s": {"type": "string", "maxGraphemes": -1}}),
+        serde_json::json!({"s": {"type": "string", "enum": ["a", 1]}}),
+        serde_json::json!({"s": {"type": "string", "const": 1}}),
+        serde_json::json!({"n": {"type": "integer", "maximum": 1.5}}),
+        serde_json::json!({"n": {"type": "integer", "enum": ["a"]}}),
+        serde_json::json!({"b": {"type": "boolean", "const": "true"}}),
+        serde_json::json!({"a": {"type": "array", "items": {"type": "string"}, "maxLength": "3"}}),
+        serde_json::json!({"b": {"type": "blob", "accept": "image/*"}}),
+        serde_json::json!({"b": {"type": "blob", "maxSize": "1000"}}),
+        serde_json::json!({"y": {"type": "bytes", "minLength": -2}}),
+        serde_json::json!({"u": {"type": "union", "refs": [], "closed": "yes"}}),
+    ] {
+        assert!(
+            with_doc(record_doc("any", props.clone())).is_err(),
+            "{props}"
+        );
+    }
+}
+
+#[test]
+fn required_and_nullable_must_name_properties() {
+    for (list, name) in [("required", "missing"), ("nullable", "missing")] {
+        let doc = serde_json::json!({
+            "lexicon": 1, "id": "com.example.t",
+            "defs": {"main": {"type": "record", "key": "any",
+                "record": {"type": "object", list: [name],
+                    "properties": {"here": {"type": "string"}}}}}
+        });
+        let err = with_doc(doc).unwrap_err();
+        assert!(err.to_string().contains(name), "{list}: {err}");
+    }
+}
+
+#[test]
+fn a_ref_to_a_record_fails_the_load() {
+    let err = with_doc(record_doc(
+        "any",
+        serde_json::json!({"p": {"type": "ref", "ref": "app.bsky.feed.post"}}),
+    ))
+    .unwrap_err();
+    assert!(err.to_string().contains("app.bsky.feed.post#main"), "{err}");
+}
+
+#[test]
+fn a_token_as_a_union_member_fails_the_load() {
+    let doc = serde_json::json!({
+        "lexicon": 1, "id": "com.example.t",
+        "defs": {
+            "main": {"type": "record", "key": "any", "record": {"type": "object",
+                "properties": {"u": {"type": "union", "refs": ["#tok"]}}}},
+            "tok": {"type": "token"}
+        }
+    });
+    let err = with_doc(doc).unwrap_err();
+    assert!(err.to_string().contains("com.example.t#tok"), "{err}");
+    // Through a ref, a token is a value, and loads.
+    let doc = serde_json::json!({
+        "lexicon": 1, "id": "com.example.t",
+        "defs": {
+            "main": {"type": "record", "key": "any", "record": {"type": "object",
+                "properties": {"r": {"type": "ref", "ref": "#tok"}}}},
+            "tok": {"type": "token"}
+        }
+    });
+    assert!(with_doc(doc).is_ok());
 }

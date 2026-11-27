@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use atrium_api::types::string::{Nsid, Tid};
 use serde_json::{Map, Value};
 
+use super::{Refusal, Status};
+
 /// Why a set of lexicon documents did not load. The message names the
 /// document and the def.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -125,6 +127,7 @@ impl Registry {
         seen: &mut BTreeSet<String>,
     ) -> Result<(), LoadError> {
         let ty = type_of(schema).ok_or_else(|| fail(format!("{base}: a schema has no type")))?;
+        constraints(base, ty, schema)?;
         match ty {
             "record" => {
                 let record = schema.get("record").unwrap_or(&Value::Null);
@@ -139,13 +142,25 @@ impl Registry {
                         self.walk(base, prop, seen)?;
                     }
                 }
+                let declared = schema.get("properties").and_then(Value::as_object);
                 for list in ["required", "nullable"] {
-                    if let Some(names) = schema.get(list)
-                        && !names
-                            .as_array()
-                            .is_some_and(|a| a.iter().all(Value::is_string))
-                    {
-                        return Err(fail(format!("{base}: {list} must be a list of names")));
+                    let Some(names) = schema.get(list) else {
+                        continue;
+                    };
+                    let names = names
+                        .as_array()
+                        .ok_or_else(|| fail(format!("{base}: {list} must be a list of names")))?;
+                    for name in names {
+                        let name = name.as_str().ok_or_else(|| {
+                            fail(format!("{base}: {list} must be a list of names"))
+                        })?;
+                        // The reference refuses a required name that is not a
+                        // property; a nullable one is as meaningless.
+                        if !declared.is_some_and(|p| p.contains_key(name)) {
+                            return Err(fail(format!(
+                                "{base}: {list} names {name:?}, which is not a property"
+                            )));
+                        }
                     }
                 }
                 Ok(())
@@ -161,7 +176,7 @@ impl Registry {
                     .get("ref")
                     .and_then(Value::as_str)
                     .ok_or_else(|| fail(format!("{base}: a ref has no ref")))?;
-                self.follow(base, r, seen)
+                self.follow(base, r, Via::Ref, seen)
             }
             "union" => {
                 let refs = schema
@@ -172,7 +187,7 @@ impl Registry {
                     let r = r
                         .as_str()
                         .ok_or_else(|| fail(format!("{base}: a union ref is not a string")))?;
-                    self.follow(base, r, seen)?;
+                    self.follow(base, r, Via::Union, seen)?;
                 }
                 Ok(())
             }
@@ -181,14 +196,35 @@ impl Registry {
         }
     }
 
-    fn follow(&self, base: &str, r: &str, seen: &mut BTreeSet<String>) -> Result<(), LoadError> {
+    fn follow(
+        &self,
+        base: &str,
+        r: &str,
+        via: Via,
+        seen: &mut BTreeSet<String>,
+    ) -> Result<(), LoadError> {
         let (nsid, name) = resolve(base, r);
-        if !seen.insert(format!("{nsid}#{name}")) {
-            return Ok(());
-        }
         let def = self
             .def(nsid, name)
             .ok_or_else(|| fail(format!("{base}: {nsid}#{name} does not resolve")))?;
+        // Checked on every arrival, not just the first: the same def may be
+        // reached as a ref (a token is fine) and as a union member (it is not).
+        match (type_of(def), via) {
+            (Some("record"), _) => {
+                return Err(fail(format!(
+                    "{base}: {nsid}#{name} is a record, which a ref cannot name"
+                )));
+            }
+            (Some("token"), Via::Union) => {
+                return Err(fail(format!(
+                    "{base}: {nsid}#{name} is a token, which cannot be a union member"
+                )));
+            }
+            _ => {}
+        }
+        if !seen.insert(format!("{nsid}#{name}")) {
+            return Ok(());
+        }
         self.walk(nsid, def, seen)
     }
 
@@ -199,30 +235,30 @@ impl Registry {
         collection: &str,
         rkey: Option<&str>,
         record: &Value,
-    ) -> Result<super::Status, String> {
+    ) -> Result<Status, Refusal> {
         if !self.knows(collection) {
-            return Ok(super::Status::Unknown);
+            return Ok(Status::Unknown);
         }
         let main = self
             .record(collection)
-            .ok_or_else(|| format!("{collection} is not a record type"))?;
+            .ok_or_else(|| Refusal::NotARecord(collection.to_string()))?;
         if let Some(rkey) = rkey {
             self.check_key(collection, rkey)?;
         }
         let schema = main.get("record").unwrap_or(&Value::Null);
         self.check(collection, schema, record, "record", 0)?;
-        Ok(super::Status::Valid)
+        Ok(Status::Valid)
     }
 
     /// `rkey` against `collection`'s record `key`. Unknown collections pass;
     /// the rkey's own grammar is checked where it is parsed.
-    pub fn check_key(&self, collection: &str, rkey: &str) -> Result<(), String> {
+    pub fn check_key(&self, collection: &str, rkey: &str) -> Result<(), Refusal> {
         if !self.knows(collection) {
             return Ok(());
         }
         let key = self
             .record(collection)
-            .ok_or_else(|| format!("{collection} is not a record type"))?
+            .ok_or_else(|| Refusal::NotARecord(collection.to_string()))?
             .get("key")
             .and_then(Value::as_str)
             .unwrap_or("");
@@ -231,16 +267,84 @@ impl Registry {
             "tid" => (Tid::new(rkey.to_string()).is_ok(), "a TID"),
             "nsid" => (Nsid::new(rkey.to_string()).is_ok(), "an NSID"),
             other => match other.strip_prefix("literal:") {
-                Some(want) => (rkey == want, want),
-                None => (false, other),
+                Some(want) if !want.is_empty() => (rkey == want, want),
+                _ => {
+                    return Err(Refusal::Key(format!(
+                        "record key {rkey} is not allowed: unsupported key type {key}"
+                    )));
+                }
             },
         };
         if ok {
             Ok(())
         } else {
-            Err(format!("record key {rkey} is not {what}"))
+            Err(Refusal::Key(format!("record key {rkey} is not {what}")))
         }
     }
+}
+
+/// How a def was reached in the closure walk.
+#[derive(Clone, Copy)]
+enum Via {
+    Ref,
+    Union,
+}
+
+/// Whether a value is of a scalar field type.
+type IsScalar = fn(&Value) -> bool;
+
+/// A schema's constraint fields, where present, are of the type the
+/// validator reads them as — so a `"maxLength": "300"` fails the load
+/// rather than silently constraining nothing.
+fn constraints(base: &str, ty: &str, schema: &Value) -> Result<(), LoadError> {
+    let wrong = |field: &str, what: &str| fail(format!("{base}: a {ty}'s {field} must be {what}"));
+    let sizes: &[&str] = match ty {
+        "string" => &["maxLength", "minLength", "maxGraphemes", "minGraphemes"],
+        "array" | "bytes" => &["maxLength", "minLength"],
+        "blob" => &["maxSize"],
+        _ => &[],
+    };
+    for field in sizes {
+        if schema.get(*field).is_some_and(|v| v.as_u64().is_none()) {
+            return Err(wrong(field, "a non-negative integer"));
+        }
+    }
+    let scalar: Option<(IsScalar, &str, &str)> = match ty {
+        "integer" => Some((|v| v.as_i64().is_some(), "an integer", "integers")),
+        "string" => Some((Value::is_string, "a string", "strings")),
+        "boolean" => Some((Value::is_boolean, "a boolean", "booleans")),
+        _ => None,
+    };
+    if let Some((is, what, plural)) = scalar {
+        if schema.get("const").is_some_and(|v| !is(v)) {
+            return Err(wrong("const", what));
+        }
+        if ty != "boolean"
+            && let Some(allowed) = schema.get("enum")
+            && !allowed.as_array().is_some_and(|a| a.iter().all(is))
+        {
+            return Err(wrong("enum", &format!("a list of {plural}")));
+        }
+    }
+    if ty == "integer" {
+        for field in ["minimum", "maximum"] {
+            if schema.get(field).is_some_and(|v| v.as_i64().is_none()) {
+                return Err(wrong(field, "an integer"));
+            }
+        }
+    }
+    if ty == "blob"
+        && let Some(accept) = schema.get("accept")
+        && !accept
+            .as_array()
+            .is_some_and(|a| a.iter().all(Value::is_string))
+    {
+        return Err(wrong("accept", "a list of strings"));
+    }
+    if ty == "union" && schema.get("closed").is_some_and(|v| !v.is_boolean()) {
+        return Err(wrong("closed", "a boolean"));
+    }
+    Ok(())
 }
 
 fn type_of(schema: &Value) -> Option<&str> {

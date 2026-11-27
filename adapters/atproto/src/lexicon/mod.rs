@@ -34,6 +34,36 @@ impl Status {
     }
 }
 
+/// Why a record was refused. Chunk 4's gate maps `Record`, `Key` and
+/// `NotARecord` to a client error and `Lexicon` to a server one. `Display`
+/// gives the problem as the wire says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refusal {
+    /// The record does not hold to its lexicon: a path-first problem
+    /// (`record/text must be a string`). The client's fault.
+    Record(String),
+    /// The record key does not hold to the record's `key`.
+    Key(String),
+    /// The collection names a loaded lexicon whose `main` is not a record.
+    NotARecord(String),
+    /// The lexicon itself is broken — a ref that does not resolve, a type it
+    /// has no rule for. Our fault, not the client's.
+    Lexicon(String),
+}
+
+impl std::fmt::Display for Refusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Refusal::Record(problem) | Refusal::Key(problem) | Refusal::Lexicon(problem) => {
+                f.write_str(problem)
+            }
+            Refusal::NotARecord(collection) => write!(f, "{collection} is not a record type"),
+        }
+    }
+}
+
+impl std::error::Error for Refusal {}
+
 static TREE: include_dir::Dir<'static> =
     include_dir::include_dir!("$CARGO_MANIFEST_DIR/../../vendor/lexicons");
 
